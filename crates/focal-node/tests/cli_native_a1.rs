@@ -57,10 +57,12 @@ fn scratch(prefix: &str) -> tempfile::TempDir {
 mod deadline;
 #[path = "support/ports.rs"]
 mod ports;
+use deadline::progress;
 fn address() -> String {
     ports::address()
 }
 fn start(root: &Path, advertise: &str) -> Server {
+    progress::admit();
     deadline::observe(root);
     // Four rows per member: the balancer splits the group while the
     // workflow runs (doc 25 §8), so every step below runs across a reshape.
@@ -92,9 +94,8 @@ fn start(root: &Path, advertise: &str) -> Server {
             }
         }
     });
-    let server = Server(child);
-    let status = receive
-        .recv_timeout(Duration::from_secs(25))
+    let mut server = Server(child);
+    let status = progress::reported(&receive, &mut server.0, root, Duration::from_secs(25))
         .expect("server did not publish readiness");
     assert!(
         matches!(status["condition"].as_str(), Some("Ready" | "CatchingUp")),

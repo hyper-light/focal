@@ -69,6 +69,7 @@ fn address() -> String {
     ports::address()
 }
 fn start(root: &Path, address: Option<&str>) -> (Server, Value) {
+    progress::admit();
     let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
     command.args(["--data-dir", root.to_str().unwrap(), "start", "node"]);
     if let Some(address) = address {
@@ -101,8 +102,7 @@ fn start(root: &Path, address: Option<&str>) -> (Server, Value) {
         }
     });
     let mut server = Server(child);
-    let status = receive
-        .recv_timeout(Duration::from_secs(25))
+    let status = progress::reported(&receive, &mut server.0, root, Duration::from_secs(25))
         .unwrap_or_else(|error| {
             let exit = server.0.try_wait();
             let holders = Command::new("lsof")

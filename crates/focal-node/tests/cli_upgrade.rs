@@ -33,6 +33,7 @@ impl Drop for Server {
 mod deadline;
 #[path = "support/ports.rs"]
 mod ports;
+use deadline::progress;
 fn address() -> String {
     ports::address()
 }
@@ -79,6 +80,7 @@ fn spawn(
     address: Option<&str>,
     announced: Option<&str>,
 ) -> (Child, mpsc::Receiver<Value>) {
+    progress::admit();
     let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
     command.args(["--data-dir", root.to_str().unwrap(), "start", "node"]);
     if let Some(address) = address {
@@ -120,9 +122,8 @@ fn start_announcing(
 ) -> (Server, Value) {
     deadline::observe(root);
     let (child, receive) = spawn(root, address, announced);
-    let server = Server(child);
-    let status = receive
-        .recv_timeout(Duration::from_secs(30))
+    let mut server = Server(child);
+    let status = progress::reported(&receive, &mut server.0, root, Duration::from_secs(30))
         .expect("the node did not publish readiness");
     assert!(
         matches!(status["condition"].as_str(), Some("Ready" | "CatchingUp")),
@@ -352,9 +353,8 @@ fn the_fence_rises_only_once_every_node_reports_the_level_and_a_lower_binary_ref
     // the binary: a rehearsal at the fence's own level still serves.
     drop(server);
     let (child, receive) = spawn(host, None, Some(&compiled_text));
-    let server = Server(child);
-    let status = receive
-        .recv_timeout(Duration::from_secs(30))
+    let mut server = Server(child);
+    let status = progress::reported(&receive, &mut server.0, host, Duration::from_secs(30))
         .expect("a binary at the fence's level did not start");
     assert!(
         matches!(status["condition"].as_str(), Some("Ready" | "CatchingUp")),

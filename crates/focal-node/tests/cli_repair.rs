@@ -37,6 +37,7 @@ impl Drop for Server {
 mod deadline;
 #[path = "support/ports.rs"]
 mod ports;
+use deadline::progress;
 fn address() -> String {
     ports::address()
 }
@@ -89,6 +90,7 @@ fn admin(root: &Path, args: &[&str]) -> Value {
     })
 }
 fn start(root: &Path, address: Option<&str>) -> (Server, Value) {
+    progress::admit();
     deadline::observe(root);
     let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
     command.args(["--data-dir", root.to_str().unwrap(), "start", "node"]);
@@ -114,9 +116,8 @@ fn start(root: &Path, address: Option<&str>) -> (Server, Value) {
             }
         }
     });
-    let server = Server(child);
-    let status = receive
-        .recv_timeout(Duration::from_secs(30))
+    let mut server = Server(child);
+    let status = progress::reported(&receive, &mut server.0, root, Duration::from_secs(30))
         .expect("the node did not publish readiness");
     assert!(
         matches!(status["condition"].as_str(), Some("Ready" | "CatchingUp")),

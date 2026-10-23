@@ -16355,3 +16355,24 @@ check advisories bans licenses sources` passes and focal-compare's Clippy is cle
 roster gains `cty` 0.2.2 (MIT OR Apache-2.0), which mimalloc's bindings brought with hyper-heap
 (1f36e0e1) and the roster had missed: `scripts/release/notices.py` refused the locked graph as
 stale for it, and now writes the notices and the SBOM.
+
+### 2026-10-23 — A test's wait for a started node is charged to the node's periods, after the OS has run its executable
+
+`cli_network` failed once in twenty-five runs beside twelve busy loops, every node of its first
+four tests unreported after the 25 s their start gave them. The time was the operating system's: on
+macOS a launch of focal's 209 MB debug binary waits while syspolicyd and XprotectService assess it,
+4.27 s for a fresh copy with no CPU of its own (1.81 s and 1.10 s of theirs), 6.6 to 6.8 s beside
+twelve busy loops, which starve those daemons, and again once the binary has gone unrun for a few
+minutes. Forty-seven waits for a started node's first report, in forty-three test files, were a
+wall clock of 15 to 45 s that counted the assessment as the node's start. Each start now runs the executable to its exit first
+(`progress::admit`, a wait on the fact itself), then waits for the node's report as every wait on
+`focal` processes is charged: to the periods its root owner runs, its allowance's worth, and while
+it does not answer yet the frozen window of the wall clock (`progress::reported`, beside
+`Progress`); a failed wait names why, and a node that exits is not waited for. Six helpers made the
+guard that stops the node only after the wait, so a wait that failed left its node running; each
+makes it first. Measured beside twelve busy loops with a freshly linked binary: the four first
+admissions took 6.6 to 6.8 s and the starts after them 7.1 to 7.5 s (cli_network 6 of 6, as in
+every run since). The node's own start is mostly waiting: a founder reported after 2.9 to 3.6 s on an
+idle machine with 0.05 to 0.25 s of CPU, 0.4 to 0.8 s opening its directory (183 F_FULLFSYNC calls,
+1.08 s together, in one start) and the rest its groups' first elections, the directory partition's
+last.

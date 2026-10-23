@@ -10,7 +10,6 @@
 use std::{
     cell::RefCell,
     path::{Path, PathBuf},
-    process::Command,
     time::Duration,
 };
 
@@ -41,14 +40,7 @@ pub fn observed() -> Vec<PathBuf> {
 /// The periods the root owner of the process on `root` has run; none while
 /// it does not answer.
 pub fn periods(root: &Path) -> Option<u64> {
-    let output = Command::new(env!("CARGO_BIN_EXE_focal"))
-        .args(["--data-dir", root.to_str()?, "inspect", "node", "--metrics"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    progress::periods_in(&String::from_utf8_lossy(&output.stdout))
+    progress::root_periods(root)
 }
 pub struct Deadline {
     wait: progress::Progress<'static>,

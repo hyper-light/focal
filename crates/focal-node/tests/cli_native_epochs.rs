@@ -40,6 +40,7 @@ fn private(path: &Path) {
 mod deadline;
 #[path = "support/ports.rs"]
 mod ports;
+use deadline::progress;
 fn address() -> String {
     ports::address()
 }
@@ -55,6 +56,7 @@ fn start(root: &Path, advertise: Option<&str>) -> Server {
 /// [`start`] with a released family retiring once `grace_ms` of the node's logical time has
 /// passed since its last event settled.
 fn start_with(root: &Path, advertise: Option<&str>, grace_ms: &str) -> Server {
+    progress::admit();
     deadline::observe(root);
     let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
     command.args(["--data-dir", root.to_str().unwrap(), "start", "node"]);
@@ -85,9 +87,8 @@ fn start_with(root: &Path, advertise: Option<&str>, grace_ms: &str) -> Server {
             }
         }
     });
-    let server = Server(child);
-    let status = receive
-        .recv_timeout(Duration::from_secs(25))
+    let mut server = Server(child);
+    let status = progress::reported(&receive, &mut server.0, root, Duration::from_secs(25))
         .expect("server did not publish readiness");
     assert!(
         matches!(status["condition"].as_str(), Some("Ready" | "CatchingUp")),

@@ -18,6 +18,7 @@ mod monitor;
 mod owners;
 #[path = "support/mcp_peer.rs"]
 mod peer;
+use deadline::progress;
 #[path = "support/mcp_summary.rs"]
 mod summary;
 #[path = "support/mcp_watch.rs"]
@@ -42,6 +43,7 @@ impl Drop for Process {
     }
 }
 fn start(root: &Path) -> Process {
+    progress::admit();
     deadline::observe(root);
     let mut process = Process(
         Command::new(env!("CARGO_BIN_EXE_focal"))
@@ -68,7 +70,7 @@ fn start(root: &Path) -> Process {
         }
     });
     assert_eq!(
-        receive.recv_timeout(Duration::from_secs(20)).unwrap()["condition"],
+        progress::reported(&receive, &mut process.0, root, Duration::from_secs(20)).unwrap()["condition"],
         "Ready"
     );
     process

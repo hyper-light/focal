@@ -22,6 +22,8 @@ use std::{
     time::Duration,
 };
 
+#[path = "support/progress.rs"]
+mod progress;
 struct Server(Child);
 impl Drop for Server {
     fn drop(&mut self) {
@@ -30,6 +32,7 @@ impl Drop for Server {
     }
 }
 fn start(root: &Path) -> Server {
+    progress::admit();
     let mut process = Command::new(env!("CARGO_BIN_EXE_focal"))
         .arg("--data-dir")
         .arg(root)
@@ -52,9 +55,9 @@ fn start(root: &Path) -> Server {
             }
         }
     });
-    let server = Server(process);
+    let mut server = Server(process);
     assert_eq!(
-        receive.recv_timeout(Duration::from_secs(20)).unwrap()["condition"],
+        progress::reported(&receive, &mut server.0, root, Duration::from_secs(20)).unwrap()["condition"],
         "Ready"
     );
     server

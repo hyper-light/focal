@@ -53,10 +53,12 @@ fn success(root: &Path, args: &[&str]) -> Value {
 mod deadline;
 #[path = "support/ports.rs"]
 mod ports;
+use deadline::progress;
 fn address() -> String {
     ports::address()
 }
 fn start(root: &Path, address: Option<&str>) -> (Server, Value) {
+    progress::admit();
     deadline::observe(root);
     let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
     command.args(["--data-dir", root.to_str().unwrap(), "start", "node"]);
@@ -90,8 +92,7 @@ fn start(root: &Path, address: Option<&str>) -> (Server, Value) {
         }
     });
     let mut server = Server(child);
-    let status = receive
-        .recv_timeout(Duration::from_secs(30))
+    let status = progress::reported(&receive, &mut server.0, root, Duration::from_secs(30))
         .unwrap_or_else(|error| {
             panic!(
                 "process did not report startup ({error}; data dir {}, exit {:?})",

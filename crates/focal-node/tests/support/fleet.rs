@@ -191,6 +191,7 @@ pub fn failure(node: &Node, context: Option<&str>, args: &[&str]) -> (i32, Strin
 /// every JSON record the process prints that carries a `condition`.
 pub fn spawn(node: &Node, args: &[&str], envs: &[(&str, &str)]) -> (Child, mpsc::Receiver<Value>) {
     deadline::observe(node.root());
+    progress::admit();
     let mut command = base(node, None);
     command.args(["start", "node"]).args(args);
     command.envs(envs.iter().copied());
@@ -219,14 +220,25 @@ pub fn spawn(node: &Node, args: &[&str], envs: &[(&str, &str)]) -> (Child, mpsc:
 }
 pub fn start_with(node: &Node, args: &[&str], envs: &[(&str, &str)]) -> Server {
     let (child, receive) = spawn(node, args, envs);
-    let status = receive
-        .recv_timeout(Duration::from_secs(45))
-        .unwrap_or_else(|_| panic!("{} did not publish readiness", node.root().display()));
+    let mut server = Server(child, None);
+    let status = progress::reported(
+        &receive,
+        &mut server.0,
+        node.root(),
+        Duration::from_secs(45),
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "{} did not publish readiness: {error}",
+            node.root().display()
+        )
+    });
     assert!(
         matches!(status["condition"].as_str(), Some("Ready" | "CatchingUp")),
         "{status}"
     );
-    Server(child, Some(receive))
+    server.1 = Some(receive);
+    server
 }
 pub fn start(node: &Node, args: &[&str]) -> Server {
     start_with(node, args, &[])
@@ -529,6 +541,7 @@ pub fn readiness(node: &Node) -> Value {
 /// killing the process: a full volume modelled as a write failure.
 pub fn start_limited(node: &Node, args: &[&str], blocks: u64) -> Server {
     deadline::observe(node.root());
+    progress::admit();
     let mut command = Command::new("/bin/sh");
     command.args([
         "-c",
@@ -563,14 +576,20 @@ pub fn start_limited(node: &Node, args: &[&str], blocks: u64) -> Server {
             }
         }
     });
-    let status = receive
-        .recv_timeout(Duration::from_secs(45))
-        .expect("the limited node did not publish readiness");
+    let mut server = Server(child, None);
+    let status = progress::reported(
+        &receive,
+        &mut server.0,
+        node.root(),
+        Duration::from_secs(45),
+    )
+    .expect("the limited node did not publish readiness");
     assert!(
         matches!(status["condition"].as_str(), Some("Ready" | "CatchingUp")),
         "{status}"
     );
-    Server(child, Some(receive))
+    server.1 = Some(receive);
+    server
 }
 /// The largest file under the data directory, in bytes.
 pub fn largest_file(root: &Path) -> u64 {

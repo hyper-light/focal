@@ -92,6 +92,7 @@ fn start(root: &Path, address: Option<&str>) -> (Server, Value) {
 }
 /// Start a server with extra environment for the process.
 fn start_with(root: &Path, address: Option<&str>, envs: &[(&str, &str)]) -> (Server, Value) {
+    progress::admit();
     STARTED.with(|started| {
         let mut started = started.borrow_mut();
         if !started.iter().any(|known| known == root) {
@@ -131,8 +132,7 @@ fn start_with(root: &Path, address: Option<&str>, envs: &[(&str, &str)]) -> (Ser
         }
     });
     let mut server = Server(child);
-    let status = receive
-        .recv_timeout(Duration::from_secs(30))
+    let status = progress::reported(&receive, &mut server.0, root, Duration::from_secs(30))
         .unwrap_or_else(|error| {
             panic!(
                 "process did not report startup ({error}; data dir {}, exit {:?})",

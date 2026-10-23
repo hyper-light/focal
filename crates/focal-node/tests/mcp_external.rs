@@ -30,10 +30,13 @@ impl Drop for Server {
 }
 #[path = "support/ports.rs"]
 mod ports;
+#[path = "support/progress.rs"]
+mod progress;
 fn address() -> String {
     ports::address()
 }
 fn start(root: &Path, advertise: &str) -> Server {
+    progress::admit();
     let mut child = Command::new(env!("CARGO_BIN_EXE_focal"))
         .args([
             "--data-dir",
@@ -61,9 +64,8 @@ fn start(root: &Path, advertise: &str) -> Server {
             }
         }
     });
-    let server = Server(child);
-    let status = receive
-        .recv_timeout(Duration::from_secs(25))
+    let mut server = Server(child);
+    let status = progress::reported(&receive, &mut server.0, root, Duration::from_secs(25))
         .expect("server did not publish readiness");
     assert!(
         matches!(status["condition"].as_str(), Some("Ready" | "CatchingUp")),

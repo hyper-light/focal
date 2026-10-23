@@ -34,6 +34,7 @@ impl Drop for Server {
 mod deadline;
 #[path = "support/ports.rs"]
 mod ports;
+use deadline::progress;
 struct Node {
     dir: tempfile::TempDir,
 }
@@ -70,6 +71,7 @@ fn admin(node: &Node, args: &[&str]) -> Value {
 /// Start and wait for the readiness record; a `--invite-file` start prints
 /// the joined identity first.
 fn start(node: &Node, args: &[&str]) -> Server {
+    progress::admit();
     deadline::observe(node.root());
     let mut child = Command::new(env!("CARGO_BIN_EXE_focal"))
         .args(["--data-dir", node.root().to_str().unwrap(), "start", "node"])
@@ -94,10 +96,14 @@ fn start(node: &Node, args: &[&str]) -> Server {
             }
         }
     });
-    let server = Server(child);
-    let status = receive
-        .recv_timeout(Duration::from_secs(30))
-        .expect("the node did not publish readiness");
+    let mut server = Server(child);
+    let status = progress::reported(
+        &receive,
+        &mut server.0,
+        node.root(),
+        Duration::from_secs(30),
+    )
+    .expect("the node did not publish readiness");
     assert!(
         matches!(status["condition"].as_str(), Some("Ready" | "CatchingUp")),
         "{status}"

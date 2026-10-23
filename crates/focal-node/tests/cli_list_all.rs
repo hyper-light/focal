@@ -15,6 +15,8 @@ use std::{
     sync::mpsc,
     time::Duration,
 };
+#[path = "support/progress.rs"]
+mod progress;
 struct Server(Child);
 impl Drop for Server {
     fn drop(&mut self) {
@@ -24,6 +26,7 @@ impl Drop for Server {
 }
 fn start(root: &Path) -> Server {
     use std::os::unix::fs::PermissionsExt;
+    progress::admit();
     std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut child = command(root, &["start", "node"])
         .stdout(Stdio::piped())
@@ -43,11 +46,12 @@ fn start(root: &Path) -> Server {
             }
         }
     });
+    let mut server = Server(child);
     assert_eq!(
-        receive.recv_timeout(Duration::from_secs(20)).unwrap()["condition"],
+        progress::reported(&receive, &mut server.0, root, Duration::from_secs(20)).unwrap()["condition"],
         "Ready"
     );
-    Server(child)
+    server
 }
 fn command(root: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));

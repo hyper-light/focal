@@ -7,6 +7,8 @@
     clippy::arithmetic_side_effects,
     clippy::disallowed_macros
 )]
+#[path = "support/progress.rs"]
+mod progress;
 #[path = "support/cli_upload_control.rs"]
 mod upload_control;
 use serde_json::{Value, json};
@@ -27,6 +29,7 @@ impl Drop for Process {
     }
 }
 fn start(root: &Path) -> Process {
+    progress::admit();
     std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut process = Process(
         Command::new(env!("CARGO_BIN_EXE_focal"))
@@ -52,7 +55,7 @@ fn start(root: &Path) -> Process {
         }
     });
     assert_eq!(
-        receive.recv_timeout(Duration::from_secs(20)).unwrap()["condition"],
+        progress::reported(&receive, &mut process.0, root, Duration::from_secs(20)).unwrap()["condition"],
         "Ready"
     );
     process

@@ -37,10 +37,12 @@ fn private(path: &Path) {
 mod deadline;
 #[path = "support/ports.rs"]
 mod ports;
+use deadline::progress;
 fn address() -> String {
     ports::address()
 }
 fn start(root: &Path, advertise: &str) -> Server {
+    progress::admit();
     deadline::observe(root);
     let mut child = Command::new(env!("CARGO_BIN_EXE_focal"))
         .args([
@@ -69,9 +71,8 @@ fn start(root: &Path, advertise: &str) -> Server {
             }
         }
     });
-    let server = Server(child);
-    let status = receive
-        .recv_timeout(Duration::from_secs(25))
+    let mut server = Server(child);
+    let status = progress::reported(&receive, &mut server.0, root, Duration::from_secs(25))
         .expect("server did not publish readiness");
     assert!(
         matches!(status["condition"].as_str(), Some("Ready" | "CatchingUp")),
@@ -162,6 +163,7 @@ const FAR: u64 = 4_102_444_800_000;
 const POSTED: u64 = 2;
 
 fn start_with(root: &Path, advertise: &str, env: &[(&str, &str)]) -> Server {
+    progress::admit();
     deadline::observe(root);
     let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
     command
@@ -191,9 +193,8 @@ fn start_with(root: &Path, advertise: &str, env: &[(&str, &str)]) -> Server {
             }
         }
     });
-    let server = Server(child);
-    let status = receive
-        .recv_timeout(Duration::from_secs(25))
+    let mut server = Server(child);
+    let status = progress::reported(&receive, &mut server.0, root, Duration::from_secs(25))
         .expect("server did not publish readiness");
     assert!(
         matches!(status["condition"].as_str(), Some("Ready" | "CatchingUp")),
