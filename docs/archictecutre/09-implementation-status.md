@@ -16288,5 +16288,10 @@ step (the audit's F64), a pause averages half of it, and 64 spanned about 16 s. 
 the policy's own: as many resends as its clock holds at the pauses' expected length, each half its
 step, the steps doubling from the base to the cap (`RetryPolicy::availability_resends`; 124 for
 the default policy), and a policy with no backoff resends as many times as it attempts. An
-availability refusal admitted nothing, so it is resent for as long as the request has. Test:
+availability refusal admitted nothing, so it is resent for as long as the request has. Measured
+(compare/work-faults on fba5bbed, the copy as above): isolated for 20 s, every write committed
+(13,200; none refused, none unknown; the 99th percentile 15.1 s, the writes the outage held waiting
+it out); killed for 30 s, 12,416 of 12,514 committed where 10,206 of 10,581 had, 88 refused and 10
+of unknown outcome, each given up at its 30 s clock: the ten unknown were in flight to the copy,
+restarted 3 to 6 s before, as their clocks ran out (a restarted copy's first custody, open). Test:
 `availability_resends_span_the_policys_clock_at_their_expected_pause`.
