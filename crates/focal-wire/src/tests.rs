@@ -417,13 +417,19 @@ async fn server(
     registry: PeerRegistry,
     handler: Arc<dyn RequestHandler>,
 ) -> (Arc<QuicServer>, Spawned<Result<(), WireError>>) {
-    server_at(pki, registry, handler, "127.0.0.1:0".parse().unwrap()).await
+    server_at(
+        pki,
+        registry,
+        handler,
+        "127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap(),
+    )
+    .await
 }
 async fn server_at(
     pki: &Pki,
     registry: PeerRegistry,
     handler: Arc<dyn RequestHandler>,
-    address: std::net::SocketAddr,
+    address: impl Into<Bind>,
 ) -> (Arc<QuicServer>, Spawned<Result<(), WireError>>) {
     let (certificate, key) = pki.issue(true);
     let tls = server_tls(
@@ -3802,11 +3808,12 @@ fn a_probe_dials_through_a_cooldown_and_a_peer_that_answers_ends_it() {
         use std::collections::BTreeMap;
         let pki = Pki::new();
         let (certificate, key) = pki.issue(false);
-        // An address nothing answers at yet: a UDP socket bound and dropped.
-        let address = {
-            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-            socket.local_addr().unwrap()
-        };
+        // An address nothing answers at yet: a UDP socket bound and held unread, then handed to
+        // the server that answers there, so the port is never free between. Dropped and its
+        // address bound again seconds later, it lost the port to another socket of a busy suite
+        // (Linux CI 39887469244: the server's bind failed `Connection`).
+        let held = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = held.local_addr().unwrap();
         // A cooldown longer than the test: only an answer can end it.
         let pool = PeerConnectionPool::new(
             connector(&pki, certificate.clone(), key),
@@ -3857,7 +3864,17 @@ fn a_probe_dials_through_a_cooldown_and_a_peer_that_answers_ends_it() {
             };
             verified.request().reply(answer)
         });
-        let (server, task) = server_at(&pki, registry, handler, address).await;
+        // What the unanswered dial left in the socket is no one's now: the server starts from an
+        // empty socket, as one bound afresh would.
+        held.set_nonblocking(true).unwrap();
+        let mut datagram = [0u8; 2048];
+        // One dial's datagrams at most, the pool's cooldown sending no other meanwhile.
+        for _ in 0..1024 {
+            if held.recv_from(&mut datagram).is_err() {
+                break;
+            }
+        }
+        let (server, task) = server_at(&pki, registry, handler, held).await;
         // Replication within the cooldown is still spared its dial...
         assert_eq!(pool.send(2, &packet).await, Err(PeerSendError::Lost));
         assert_eq!(pool.stats().refused_unreachable, 1);
