@@ -93,6 +93,67 @@ impl CompletionWindow {
 mod tests {
     use super::*;
 
+    /// The drain after an outage, replayed: thirty seconds of jobs refused in microseconds, then
+    /// a backlog served by jobs that each take half a second, as many at once as the window
+    /// holds. Returns the window a second from the outage's end on, and how many jobs ended in
+    /// those twenty seconds, with the refusals sampled or not.
+    fn drain(sample_refusals: bool) -> (Vec<usize>, u64) {
+        let start = Instant::now();
+        let mut window = CompletionWindow::new(10);
+        let mut at = Duration::ZERO;
+        // Before the outage: jobs of 3 ms, ten at once.
+        while at < Duration::from_secs(5) {
+            at += Duration::from_micros(300);
+            window.ended(Duration::from_millis(3), start + at);
+        }
+        // The outage: every job refused at once, a thousand a second.
+        while at < Duration::from_secs(35) {
+            at += Duration::from_millis(1);
+            if sample_refusals {
+                window.ended(Duration::from_micros(20), start + at);
+            }
+        }
+        // The drain: as many jobs in flight as the window allows, each half a second.
+        let mut windows = Vec::new();
+        let mut ended = 0u64;
+        let service = Duration::from_millis(500);
+        let mut next_second = at + Duration::from_secs(1);
+        let end = at + Duration::from_secs(20);
+        while at < end {
+            let running = window.window();
+            // A turn of half a second: the jobs running end together.
+            at += service;
+            for _ in 0..running {
+                window.ended(service, start + at);
+                ended += 1;
+            }
+            while at >= next_second {
+                windows.push(window.window());
+                next_second += Duration::from_secs(1);
+            }
+        }
+        (windows, ended)
+    }
+
+    /// A refusal before a job's work is no sample of the pipeline's service: sampled, the
+    /// microseconds it took held the window at its floor through the first ten seconds of a
+    /// half-second backlog; not, the window grows with what the pipeline completes.
+    #[test]
+    fn refusals_sampled_hold_the_window_at_its_floor_through_a_drain() {
+        let (sampled, sampled_ended) = drain(true);
+        let (served, served_ended) = drain(false);
+        // Sampled, the refusals' twenty microseconds stand as the least a job takes for the
+        // filter's ten seconds, and the window stays at its floor until they go.
+        assert_eq!(sampled.get(..10), Some(&[10; 10][..]));
+        // Not sampled, the half second the backlog's jobs take is the least, and the window
+        // grows with what they complete from the drain's first seconds.
+        assert!(
+            served.get(1).is_some_and(|window| *window > 10),
+            "{served:?}"
+        );
+        assert!(served_ended > sampled_ended);
+    }
+
     /// A pipeline that completes a job every millisecond, each taking 10 ms, holds ten at once
     /// by Little's law: its window is twice that, learned from the completions alone.
     #[test]

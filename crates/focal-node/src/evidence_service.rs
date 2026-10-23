@@ -1165,11 +1165,20 @@ impl EvidenceDriver {
                 // No wait could be kept: the driver is off its shard.
                 Turn::Closed(_, _) => return Err(AccessError::Unavailable),
                 Turn::Done((identity, began, done)) => {
-                    if let Some(refused) = done.send(&self.placements) {
-                        self.door.answered(refused);
+                    let refused = done.send(&self.placements);
+                    match refused {
+                        Some(refused) => self.door.answered(refused),
+                        // A job's time is a sample of what the pipeline serves only when it
+                        // served, as BBR takes a round trip only from what was delivered: a job
+                        // refused before its work took microseconds, its sample became the least
+                        // a job takes, and the window it bounds stood at its floor for the
+                        // filter's ten seconds after an outage while the jobs it held back each
+                        // took half a second (compare/work-faults on fba5bbed: a backlog drained
+                        // at twenty a second through a window of ten).
+                        None => self
+                            .window
+                            .ended(began.elapsed(), std::time::Instant::now()),
                     }
-                    self.window
-                        .ended(began.elapsed(), std::time::Instant::now());
                     self.door.window.store(
                         u64::try_from(self.window.window()).unwrap_or(u64::MAX),
                         Ordering::Relaxed,

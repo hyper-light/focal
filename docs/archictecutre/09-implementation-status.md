@@ -16295,3 +16295,17 @@ it out); killed for 30 s, 12,416 of 12,514 committed where 10,206 of 10,581 had,
 of unknown outcome, each given up at its 30 s clock: the ten unknown were in flight to the copy,
 restarted 3 to 6 s before, as their clocks ran out (a restarted copy's first custody, open). Test:
 `availability_resends_span_the_policys_clock_at_their_expected_pause`.
+
+### 2026-10-23 — The evidence window learns only from jobs that served
+
+After a content copy's 30 s outage, the artifact submissions the outage held drained at twenty a
+second through the evidence driver's window of ten, and those from its first seconds reached their
+clients' 30 s clocks before their turn (compare/work-faults on fba5bbed). The window is BBR's,
+learned from the jobs' completions: twice what ends within the least time a job takes, that least
+kept by a ten-second filter. Every job that ended was a sample, a refusal included: the outage's
+refusals, made before any work in microseconds, became the least a job takes, and the window stood
+at its floor of ten for the filter's ten seconds after them while the backlog's jobs each took half
+a second. A job's time is now a sample only when the job served, as BBR takes a round trip only
+from what was delivered (Cardwell et al., ACM Queue 2016). Test:
+`refusals_sampled_hold_the_window_at_its_floor_through_a_drain` (the drain replayed: sampled, the
+window stays at ten for the first ten seconds; served jobs only, it grows from the second).
