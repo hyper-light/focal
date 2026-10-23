@@ -16376,3 +16376,22 @@ every run since). The node's own start is mostly waiting: a founder reported aft
 idle machine with 0.05 to 0.25 s of CPU, 0.4 to 0.8 s opening its directory (183 F_FULLFSYNC calls,
 1.08 s together, in one start) and the rest its groups' first elections, the directory partition's
 last.
+
+### 2026-10-23 — The evidence window says what it learned from
+
+Over an 80 ms path losing 3% of its packets, focal's work among 500 agents settled a claim in 14 s at
+the median (compare.yml in work mode on load-reads 09c3b89e, run 39973458138): its three evidence-path steps (the work artifact,
+the evaluation's begin and its report) took 2.7 to 3.5 s at the median where the other eight took
+0.56 s, and the leader held 4,201 artifact requests at the evidence door with the window at its floor
+of ten, as it stood at the end of every run, the delay alone included. The window is twice what
+completes within the least time a job takes, and the jobs it runs differ: an obligation whose copies
+already hold receipts ends in about a millisecond, an artifact's seal takes its copies' round trips.
+The node now exports the least the window counts completions over,
+`focal_evidence_window_least_nanoseconds`, to measure it in the running system before changing it.
+One gauge, where four were written: a metrics page is one operator read (61,436 bytes) and must
+list a three-host fleet's node whole in one round (its three sessions, two root members, two
+measured peers and a tenant), which four families of the window's learning (its least, its most,
+the served jobs' count and time) overran by 125 bytes (`metrics::rounds::tests`, the round test);
+the page's fixed part is now 43,530 bytes at its widest, 552 under that round. Test:
+`artifact_jobs_past_the_queue_wait_at_the_door_and_are_each_served` checks the least of its eight
+served jobs is set and within the exercise's time.

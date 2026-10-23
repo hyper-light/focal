@@ -542,8 +542,11 @@ struct EvidenceDoor {
     door: crate::pace::Door,
     held: AtomicU64,
     timed_out: AtomicU64,
-    /// The jobs the driver runs at once, as it has learned them ([`CompletionWindow`]).
+    /// The jobs the driver runs at once, as it has learned them ([`CompletionWindow`]), and the
+    /// least a served job took within its filter's window, in nanoseconds: the time the window
+    /// counts completions over.
     window: AtomicU64,
+    window_least_ns: AtomicU64,
     /// Required copies a job did not ask, the liveness view holding them suspect or dead
     /// ([`CopyHealth`]).
     copies_unavailable: AtomicU64,
@@ -620,6 +623,8 @@ pub struct EvidenceDoorStats {
     pub held: u64,
     pub timed_out: u64,
     pub window: u64,
+    /// The least a served job took within the window's filter ([`EvidenceDoor`]).
+    pub window_least_ns: u64,
     pub copies_unavailable: u64,
     pub copies_given_up: u64,
     /// Requests refused before their job ran, by cause ([`EvidenceDoor`]).
@@ -828,6 +833,7 @@ impl EvidenceCoordinator {
             held: self.door.held.load(Ordering::Relaxed),
             timed_out: self.door.timed_out.load(Ordering::Relaxed),
             window: self.door.window.load(Ordering::Relaxed),
+            window_least_ns: self.door.window_least_ns.load(Ordering::Relaxed),
             copies_unavailable: self.door.copies_unavailable.load(Ordering::Relaxed),
             copies_given_up: self.door.copies_given_up.load(Ordering::Relaxed),
             refused_memory: self.door.refused_memory.load(Ordering::Relaxed),
@@ -1175,9 +1181,16 @@ impl EvidenceDriver {
                         // filter's ten seconds after an outage while the jobs it held back each
                         // took half a second (compare/work-faults on fba5bbed: a backlog drained
                         // at twenty a second through a window of ten).
-                        None => self
-                            .window
-                            .ended(began.elapsed(), std::time::Instant::now()),
+                        None => {
+                            self.window
+                                .ended(began.elapsed(), std::time::Instant::now());
+                            self.door.window_least_ns.store(
+                                self.window.least().map_or(0, |least| {
+                                    u64::try_from(least.as_nanos()).unwrap_or(u64::MAX)
+                                }),
+                                Ordering::Relaxed,
+                            );
+                        }
                     }
                     self.door.window.store(
                         u64::try_from(self.window.window()).unwrap_or(u64::MAX),

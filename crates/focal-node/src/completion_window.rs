@@ -73,6 +73,11 @@ impl CompletionWindow {
         }
     }
 
+    /// The least time a job took within the filter's window, once any has ended.
+    pub(crate) fn least(&self) -> Option<Duration> {
+        self.base.map(|(least, _)| least)
+    }
+
     /// The jobs the pipeline may run at once.
     pub(crate) fn window(&self) -> usize {
         usize::try_from(self.most.0)

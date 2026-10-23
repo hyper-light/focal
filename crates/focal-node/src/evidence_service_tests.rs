@@ -869,6 +869,7 @@ fn artifact_jobs_past_the_queue_wait_at_the_door_and_are_each_served() {
                 .await
                 .unwrap();
             const JOBS: u128 = 8;
+            let exercised = std::time::Instant::now();
             let mut jobs = focal_rt::Concurrent::new(JOBS as usize).unwrap();
             for id in 0..JOBS {
                 let coordinator = &coordinator;
@@ -889,6 +890,13 @@ fn artifact_jobs_past_the_queue_wait_at_the_door_and_are_each_served() {
             let door = coordinator.door_stats();
             assert!(door.held >= 1, "{door:?}");
             assert_eq!(door.timed_out, 0, "{door:?}");
+            // Every job served, each a sample: the least of them is what the window counts over,
+            // at most the whole exercise's time.
+            assert!(door.window_least_ns > 0, "{door:?}");
+            assert!(
+                u128::from(door.window_least_ns) <= exercised.elapsed().as_nanos(),
+                "{door:?}"
+            );
             drop(coordinator);
         };
         let (result, ()) = hyper_rt::combine::join2(driver.run(&pool, None), exercise).await;
@@ -933,6 +941,7 @@ fn a_job_held_past_its_request_time_is_refused_and_counted() {
                 held: 1,
                 timed_out: 1,
                 window: 1,
+                window_least_ns: 0,
                 copies_unavailable: 0,
                 copies_given_up: 0,
                 refused_memory: 0,

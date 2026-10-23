@@ -615,6 +615,7 @@ impl MetricsSnapshot {
                 held: wide,
                 timed_out: wide,
                 window: wide,
+                window_least_ns: wide,
                 copies_unavailable: wide,
                 copies_given_up: wide,
                 refused_memory: wide,
