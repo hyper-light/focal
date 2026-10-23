@@ -53,6 +53,7 @@ crc32c	0.6.8	Apache-2.0 OR MIT	registry+https://github.com/rust-lang/crates.io-i
 crc32fast	1.5.1	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
 critical-section	1.2.0	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
 crypto-common	0.1.7	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
+cty	0.2.2	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
 data-encoding	2.11.1	MIT	registry+https://github.com/rust-lang/crates.io-index
 der-parser	10.0.0	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
 deranged	0.5.8	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
@@ -243,7 +244,7 @@ time-macros	0.2.32	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crate
 tinystr	0.8.4	Unicode-3.0	registry+https://github.com/rust-lang/crates.io-index
 tinyvec	1.13.2	Zlib OR Apache-2.0 OR MIT	registry+https://github.com/rust-lang/crates.io-index
 tinyvec_macros	0.1.1	MIT OR Apache-2.0 OR Zlib	registry+https://github.com/rust-lang/crates.io-index
-tokio	1.53.1	MIT	registry+https://github.com/rust-lang/crates.io-index
+tokio	1.53.3	MIT	registry+https://github.com/rust-lang/crates.io-index
 tokio-macros	2.7.2	MIT	registry+https://github.com/rust-lang/crates.io-index
 tokio-rustls	0.26.6	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
 tokio-stream	0.1.19	MIT	registry+https://github.com/rust-lang/crates.io-index

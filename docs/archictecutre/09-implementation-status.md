@@ -16334,3 +16334,15 @@ the steps asked 180; the reads queued behind each other, and the claims' first w
 claims before them (step 0's 99th percentile 7.9 s). A caller now reads as many steps at once as
 it writes (`inflight`), unless the shape sets fewer, as each agent of a real run reads for itself.
 Test: `a_callers_lifecycle_reads_are_its_writes_unless_set`.
+
+### 2026-10-23 — tokio 1.53.3, past RUSTSEC-2026-0386
+
+The advisory published today (tokio's safe `AsyncFd` constructors accept any `AsRawFd`, which
+violates I/O safety; tokio PR 8587) failed `cargo deny check advisories` on every branch (CI
+39977515989). tokio is in the locked graph only through focal-compare's clients of the systems it
+measures (async-nats, redis, rdkafka); neither focal-compare nor any of focal's own crates calls
+`AsyncFd`. The lock moves tokio alone to 1.53.3, the advisory's fix on the same minor; `cargo deny
+check advisories bans licenses sources` passes and focal-compare's Clippy is clean. The dependency
+roster gains `cty` 0.2.2 (MIT OR Apache-2.0), which mimalloc's bindings brought with hyper-heap
+(1f36e0e1) and the roster had missed: `scripts/release/notices.py` refused the locked graph as
+stale for it, and now writes the notices and the SBOM.
