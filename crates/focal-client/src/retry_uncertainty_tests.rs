@@ -202,8 +202,9 @@ async fn a_write_that_found_no_connection_is_a_refusal_not_an_unknown_outcome_on
     assert_eq!(seen.lock().unwrap().len(), 3);
     // Never connected: the refusal it was.
     let seen = Mutex::new(Vec::new());
+    let never = usize::try_from(quick.availability_resends()).unwrap() + 1;
     assert!(matches!(
-        client(vec![Step::NotConnected; 80], &seen)
+        client(vec![Step::NotConnected; never], &seen)
             .request(request())
             .await,
         Err(ClientError::Access(AccessError::Unavailable))

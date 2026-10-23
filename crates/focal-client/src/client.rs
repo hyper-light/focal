@@ -13,10 +13,6 @@ pub struct RetryPolicy {
 /// Backed-off resends of one request after capacity refusals before the
 /// refusal is reported; each resend is bounded by the retry policy's clock.
 const CAPACITY_RESENDS: u32 = 3;
-/// Backed-off resends after availability refusals (a leader change, a
-/// service still opening) before the refusal is reported: at the largest
-/// backoff these span the default policy's clock, which bounds them all.
-const UNAVAILABLE_RESENDS: u32 = 64;
 /// The client's capacity resends, in thousandths of a token: ten tokens,
 /// gRPC's retry throttling (gRFC A6) at its example service config's values.
 const RETRY_TOKENS: u64 = 10_000;
@@ -76,6 +72,45 @@ impl Default for RetryPolicy {
     }
 }
 impl RetryPolicy {
+    /// The backed-off resends of an availability refusal (a leader change, a service still
+    /// opening, a required copy down) this policy makes before it reports the refusal: as many
+    /// pauses as its clock holds at their expected length, each drawn uniformly over its step
+    /// (`jittered`, half the step on average), the steps doubling from the base to the cap. A
+    /// refusal of availability admitted nothing, so it is resent for as long as the request has.
+    /// A fixed 64 spanned the default clock only at the cap's whole step; drawn over the step
+    /// (the audit's F64) they spanned half of it, and participants gave up artifact submissions
+    /// after about 16 s of a required copy's 20 s outage, their 30 s clock unspent
+    /// (compare/work-faults, 2026-10-23). A policy with no backoff resends no more than it
+    /// attempts: nothing else counts its resends.
+    pub(crate) fn availability_resends(&self) -> u32 {
+        let half = |step: Duration| step.as_nanos().checked_div(2).unwrap_or(0);
+        let step = |doublings: u32| {
+            self.base_backoff
+                .saturating_mul(1u32 << doublings)
+                .min(self.max_backoff)
+        };
+        // The doubling steps, sixteen at most (`jittered`'s), then the one they end at.
+        let clock = self.max_elapsed.as_nanos();
+        let mut spanned = 0u128;
+        let mut resends = 0u128;
+        for doublings in 0..16u32 {
+            if spanned >= clock {
+                return u32::try_from(resends).unwrap_or(u32::MAX);
+            }
+            let expected = half(step(doublings));
+            if expected == 0 {
+                return self.max_attempts;
+            }
+            spanned = spanned.saturating_add(expected);
+            resends = resends.saturating_add(1);
+        }
+        let expected = half(step(16));
+        if expected == 0 {
+            return self.max_attempts;
+        }
+        let rest = clock.saturating_sub(spanned).div_ceil(expected);
+        u32::try_from(resends.saturating_add(rest)).unwrap_or(u32::MAX)
+    }
     /// The pause before the attempt that follows `backoffs` refusals, as
     /// this client takes it: the exponential step from the base, capped,
     /// spread by full jitter over a fresh draw (`jittered`). For a caller
@@ -733,6 +768,7 @@ impl<T: ClientTransport> Client<T> {
         // that outlasts it is reported as the refusal it was.
         let mut capacity_refusals = 0u32;
         let mut unavailable_refusals = 0u32;
+        let availability_resends = self.policy.availability_resends();
         let mut last_refusal: Option<AccessError> = None;
         let mut attempt = 0u32;
         let mut backoffs = 0u32;
@@ -781,7 +817,7 @@ impl<T: ClientTransport> Client<T> {
                             DomainOutcome::Refuse { .. } | DomainOutcome::Inform { .. },
                         )) if uncertain && request.operation.is_mutation() => break,
                         Response::Error(AccessError::Unavailable)
-                            if unavailable_refusals < UNAVAILABLE_RESENDS =>
+                            if unavailable_refusals < availability_resends =>
                         {
                             unavailable_refusals = unavailable_refusals.saturating_add(1);
                             last_refusal = Some(AccessError::Unavailable);
@@ -818,7 +854,7 @@ impl<T: ClientTransport> Client<T> {
                 // on, or a body the listener would not admit): without effect,
                 // and resent as a refusal in a reply is.
                 Ok(Err(WireError::Access(AccessError::Unavailable)))
-                    if unavailable_refusals < UNAVAILABLE_RESENDS =>
+                    if unavailable_refusals < availability_resends =>
                 {
                     unavailable_refusals = unavailable_refusals.saturating_add(1);
                     last_refusal = Some(AccessError::Unavailable);

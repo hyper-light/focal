@@ -16201,7 +16201,11 @@ acknowledged while one sent before it is not (TCP's gap-filling sample, RFC 7323
 its gain cycle's phases from its connection's seed. In hyper-quic's harness BBR now carries 96.3%
 of 10 Mbit/s at 80 ms with 5% of the packets skipping the delay, where it carried 27.0%, and slates'
 bake-off puts its ping p99 at 1.125 of the best where 1.484 (hyper-raft `docs/transport.md` §4ag).
-vendor/README.md; docs/dependencies/inventory.tsv.
+Measured after, focal's work over the same path: a write 125 ms at the median and 229 ms at the
+99th percentile with 5% of the packets reordered (compare/work-bbr, run 39933450976), as with the
+delay alone (three runs: 99th percentile 238 to 265 ms, against 223 to 251 ms before both batches,
+within what runs on different runners vary by), and 151 and 280 ms with ±20 ms of jitter (1.6 s at
+the 99th percentile before both). vendor/README.md; docs/dependencies/inventory.tsv.
 
 ### 2026-10-23 — An artifact job does not ask a copy the liveness view holds down
 
@@ -16228,6 +16232,39 @@ request time. Counters `focal_evidence_copies_unavailable_total`,
 no dial; held alive again, the copy's address hears the job; held dead while waited for, the job is
 refused and the wait counted).
 
+Refused at once, every job a participant resent through the outage was refused after its own work:
+a native frame's artifact verified and stored its payload before it met the copy it would not ask,
+and the resends queued at the content owner past its queue of 32, which refused each call past it
+`Capacity` at once; counted by cause on the leader (`focal_evidence_jobs_refused_total{error}`), a
+copy killed for 30 s left 2,056 jobs answered `Capacity` and isolated for 20 s 1,612, none refused
+before they ran (`focal_evidence_requests_refused_total{cause}`). A job that replicates is now
+refused before its own work when the view holds one of its other copies down (an inline
+attestation, which replicates nothing, is not), and a call past the content owner's full queue
+waits at its door, oldest first, until the owner takes one before it, within the call's time
+(`ContentDoor`, the session's and the coordinator's rule; `focal_content_requests_held_total`,
+`focal_content_requests_timed_out_total`). The comparison's faults may name a role rather than a node
+(`kill=copy@S+D`, `isolate=copy@S+D`, `kill=leader@S+D`, read from `focal inspect placement` as the
+fault begins): of three runs killing focal2 by name, two met no copy. Measured, work among 500
+agents with a node holding a content copy (not the leader) killed for 30 s or isolated for 20 s,
+two runs each after:
+
+| fault | unknown | refused | of them `Capacity` | committed |
+|---|---|---|---|---|
+| killed, before (f96d7318) | 367 | 156 | 156 | 9,028 |
+| killed, after | 0 | 372, 375 | 0 | 10,230, 10,206 |
+| isolated, before | 86 | 0 | 0 | 12,512 |
+| isolated, after | 0 | 99, 102 | 0 | 12,423, 12,390 |
+
+Every write now has a known outcome. Those still refused are artifact submissions whose client
+resent them, `Unavailable`, until its policy's clock ran out with a required copy still down: an
+artifact is acknowledged only once every required copy of the placement holds it (26 §1), and a
+heal seats twice the failures tolerated and one voters in distinct failure domains, three for one
+failure: with one node of three down there is none to seat (`heal_placement` refuses,
+`NoPlacement`), so a three-node cluster's artifacts wait for the copy. Tests:
+`calls_past_the_content_owners_queue_wait_at_its_door_and_are_each_served` (the owner held by a
+test-only command while twice its queue's calls are asked: those past the queue held, each served
+once it is let go).
+
 ### 2026-10-23 — A leader asked to hand over while it applies hands over once it has
 
 `cli_network`'s promote-and-transfer test failed on macOS CI (run 39933447657): `transfer leader`,
@@ -16240,3 +16277,16 @@ holds such a transfer as it holds one that waits for the replica's proposal, wit
 time, and asks it once the leader is ready (`ControlReplica::transfer_waits`). Test:
 `a_leader_that_has_not_applied_what_it_committed_waits_to_hand_over` (focal-control: committed and
 not applied, the transfer is refused `NotReady` and waits; applied, it waits no more).
+
+### 2026-10-23 — An availability refusal is resent for the client's whole clock
+
+In the work runs with a content copy isolated for 20 s (above), the artifact submissions refused
+`Unavailable` were given up after 12 to 20 s, 15 s at the median, with their participants' 30 s
+clock unspent. The client resent an availability refusal 64 times at most, a number that spanned
+the default clock at the cap's whole step of 500 ms; since each pause is drawn uniformly over its
+step (the audit's F64), a pause averages half of it, and 64 spanned about 16 s. The bound is now
+the policy's own: as many resends as its clock holds at the pauses' expected length, each half its
+step, the steps doubling from the base to the cap (`RetryPolicy::availability_resends`; 124 for
+the default policy), and a policy with no backoff resends as many times as it attempts. An
+availability refusal admitted nothing, so it is resent for as long as the request has. Test:
+`availability_resends_span_the_policys_clock_at_their_expected_pause`.

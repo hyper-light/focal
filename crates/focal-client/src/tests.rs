@@ -380,7 +380,11 @@ async fn availability_refusals_are_resent_within_the_clock_and_reported_as_refus
             requests: Mutex::new(vec![]),
             refusals: 9,
         },
-        policy(),
+        RetryPolicy {
+            base_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(2),
+            ..policy()
+        },
         WireLimits::default(),
         8,
     )
@@ -389,17 +393,19 @@ async fn availability_refusals_are_resent_within_the_clock_and_reported_as_refus
     let response = client.submit(expected.clone()).await.unwrap();
     assert_eq!(response, MutationReply::Committed(receipt(&expected)));
     assert_eq!(client.transport().requests.lock().unwrap().len(), 10);
+    let short = RetryPolicy {
+        max_attempts: 3,
+        max_elapsed: Duration::from_millis(200),
+        base_backoff: Duration::from_millis(5),
+        max_backoff: Duration::from_millis(20),
+    };
+    let bound = usize::try_from(short.availability_resends()).unwrap();
     let client = Client::new(
         UnavailableThen {
             requests: Mutex::new(vec![]),
             refusals: usize::MAX,
         },
-        RetryPolicy {
-            max_attempts: 3,
-            max_elapsed: Duration::from_millis(200),
-            base_backoff: Duration::from_millis(5),
-            max_backoff: Duration::from_millis(20),
-        },
+        short,
         WireLimits::default(),
         8,
     )
@@ -410,7 +416,26 @@ async fn availability_refusals_are_resent_within_the_clock_and_reported_as_refus
         "{error:?}"
     );
     let sent = client.transport().requests.lock().unwrap().len();
-    assert!(sent > 3 && sent <= 64, "{sent}");
+    assert!(sent > 3 && sent <= bound + 1, "{sent} of {bound}");
+}
+/// An availability refusal is resent for the policy's clock: as many resends as the clock holds
+/// at the pauses' expected length, half of each step, which doubles from the base to the cap. The
+/// default policy's steps are 20, 40, 80, 160 and 320 ms, then the cap's 500 ms: sixteen pauses
+/// expected to take 3.06 s, and 108 more at 250 ms for the clock's other 26.94 s. A fixed 64,
+/// drawn over their steps, spanned about 16 s of its 30 s. A policy with no backoff resends as
+/// many times as it attempts.
+#[test]
+fn availability_resends_span_the_policys_clock_at_their_expected_pause() {
+    assert_eq!(RetryPolicy::default().availability_resends(), 16 + 108);
+    assert_eq!(policy().availability_resends(), policy().max_attempts);
+    let one = RetryPolicy {
+        max_attempts: 4,
+        max_elapsed: Duration::from_millis(10),
+        base_backoff: Duration::from_millis(10),
+        max_backoff: Duration::from_millis(10),
+    };
+    // Expected 5 ms a pause: two span the clock.
+    assert_eq!(one.availability_resends(), 2);
 }
 #[test]
 fn exhausted_retry_retains_exact_request_and_redacts_error_payload() {
