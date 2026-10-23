@@ -910,6 +910,11 @@ impl MetricsSnapshot {
             "Required copies an artifact job did not ask, the liveness view holding them suspect or dead; each refused its job at once.",
             self.evidence.copies_unavailable,
         );
+        text.counter(
+            "focal_evidence_copies_given_up_total",
+            "Required copies whose wait an artifact job ended, the liveness view coming to hold them suspect or dead; each refused its job.",
+            self.evidence.copies_given_up,
+        );
         if let Some(StorageMetrics::Log(log)) = &self.storage {
             render_log(&mut text, log);
         }

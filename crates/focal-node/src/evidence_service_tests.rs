@@ -312,10 +312,11 @@ fn empty_owner_reconciles_cancellation_after_content_cas_and_fences_completed_pr
             .await
             .unwrap();
         let job = driver.receiver.recv().await.unwrap();
-        let refused = AtomicU64::new(0);
+        let (not_asked, given_up) = (AtomicU64::new(0), AtomicU64::new(0));
         let health = CopyHealth {
             liveness: None,
-            refused: &refused,
+            not_asked: &not_asked,
+            given_up: &given_up,
         };
         let completed = process(&fixture.host, &pool, &health, 1, Ok(old_snapshot), job).await;
         let Completed::Seal {
@@ -933,6 +934,7 @@ fn a_job_held_past_its_request_time_is_refused_and_counted() {
                 timed_out: 1,
                 window: 1,
                 copies_unavailable: 0,
+                copies_given_up: 0,
             }
         );
         // The job the queue took goes with the driver that never ran, and its charge with it.
@@ -946,7 +948,8 @@ fn a_job_held_past_its_request_time_is_refused_and_counted() {
 /// A required copy the liveness view holds dead is not asked: its job is refused at once as
 /// `Unavailable`, an outcome its participant knows and asks again on, and counted, with no dial to
 /// the copy and nothing waiting out the pool's request time (one node of three killed left 406
-/// submissions of unknown outcome, compare/work-faults 2026-10-22). Held alive again, it is asked.
+/// submissions of unknown outcome, compare/work-faults 2026-10-22). Held alive again, it is asked;
+/// held dead while it is waited for, the wait ends and the job is refused.
 #[test]
 fn a_copy_the_liveness_view_holds_dead_is_not_asked_and_its_job_is_refused_at_once() {
     focal_rt::block_on(async move {
@@ -1049,8 +1052,20 @@ fn a_copy_the_liveness_view_holds_dead_is_not_asked_and_its_job_is_refused_at_on
                 .await
                 .unwrap();
                 assert_eq!(coordinator.door_stats().copies_unavailable, 1);
-                pool.close();
-                assert!(request.await.is_err());
+                // The copy dies while the job waits for it: the job is refused once the view
+                // says so, its wait bounded by the frozen window alone.
+                publisher.publish_view(held_as(crate::liveness::MemberStatus::Dead));
+                let refused = crate::test_waits::charged(
+                    Vec::new,
+                    Duration::from_secs(2),
+                    Duration::from_millis(10),
+                    request.as_mut(),
+                )
+                .await
+                .unwrap();
+                assert!(matches!(refused, Err(AccessError::Unavailable)));
+                let stats = coordinator.door_stats();
+                assert_eq!((stats.copies_unavailable, stats.copies_given_up), (1, 1));
             }
             drop(coordinator);
         };

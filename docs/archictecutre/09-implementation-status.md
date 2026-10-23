@@ -16205,8 +16205,8 @@ vendor/README.md; docs/dependencies/inventory.tsv.
 
 ### 2026-10-23 — An artifact job does not ask a copy the liveness view holds down
 
-focal's work among 500 agents on three 1-CPU nodes, one node killed for 30 s and later one isolated
-for 20 s (compare/work-faults, runs 39893835344 and 39893849327): 406 and 333 artifact submissions
+focal's work among 500 agents on three 1-CPU nodes, a node killed for 30 s in one run and one
+isolated for 20 s in another (compare/work-faults, runs 39893835344 and 39893849327): 406 and 333 artifact submissions
 ended of unknown outcome, every one the worker's artifact (step 3), and the kill run's leader timed
 310 jobs out at the evidence door. An artifact is acknowledged only once every required copy answers
 Durable (26 §1), and the job asked the dead copy as it asked the others: its requests rode the
@@ -16214,8 +16214,16 @@ connection the peer no longer answered (2,303 unanswered on the leader), each wa
 request time while the job held its place in the driver's window and the jobs behind it waited at the
 door past their requests' time. A job now reads the node's liveness view before asking a copy
 (`CopyHealth`): a copy held suspect or dead is not asked, and the job is refused at once as
-`Unavailable`, an outcome its participant knows and asks again on, as an obligation short of a copy
-is refused; the copies held alive are asked as before. Counter
-`focal_evidence_copies_unavailable_total`. Test:
+`Unavailable`, an outcome its participant knows and resends on (a repeated seal returns its
+reference), as an obligation short of a copy is refused; the copies held alive are asked as before.
+A copy the view comes to hold so while a job waits for it ends the wait, and the job is refused
+then, the other copies left where they are (each keeps the chunks it took, and the job asked again
+moves only what it lacks): the driver watches the view, one wait for all its jobs, and every job it
+runs is polled on the change's wake (`focal_rt::Concurrent`), each looking at the copies it waits
+for again. Suspect is enough: Lifeguard's suspicion lasts three to eighteen periods, and a copy
+falsely suspected costs its jobs a resend, where one that died held each of them for the pool's
+request time. Counters `focal_evidence_copies_unavailable_total`,
+`focal_evidence_copies_given_up_total`. Test:
 `a_copy_the_liveness_view_holds_dead_is_not_asked_and_its_job_is_refused_at_once` (refused, counted,
-no dial; held alive again, the copy's address hears the job).
+no dial; held alive again, the copy's address hears the job; held dead while waited for, the job is
+refused and the wait counted).

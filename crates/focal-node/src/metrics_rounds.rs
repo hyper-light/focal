@@ -614,6 +614,7 @@ impl MetricsSnapshot {
                 timed_out: wide,
                 window: wide,
                 copies_unavailable: wide,
+                copies_given_up: wide,
             },
             storage: Some(crate::metrics::StorageMetrics::Wal(
                 focal_log::WalWriterStats::default(),

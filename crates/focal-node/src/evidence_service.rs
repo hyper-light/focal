@@ -515,29 +515,31 @@ struct EvidenceDoor {
     /// Required copies a job did not ask, the liveness view holding them suspect or dead
     /// ([`CopyHealth`]).
     copies_unavailable: AtomicU64,
+    /// Required copies whose wait a job ended, the liveness view coming to hold them suspect or
+    /// dead while it waited ([`CopyHealth`]).
+    copies_given_up: AtomicU64,
 }
-/// What a job knows of its copies' health: the node's liveness view, and the count of copies it did
-/// not ask for it. A copy the view holds suspect or dead is not asked. Its requests ride a connection
-/// its peer no longer answers, each waiting out the pool's request time while the job holds a place
-/// in the driver's window and every job behind it waits at the door: a three-node work run with one
-/// node killed left 2,303 requests unanswered, 310 jobs timed out at the door and 406 submissions of
-/// unknown outcome (compare/work-faults, 2026-10-22). Refused at once, a submission's outcome is
-/// known and its participant asks again, as an obligation short of a copy is refused (26 §1).
+/// What a job knows of its copies' health: the node's liveness view, and the counts of copies it did
+/// not ask for it and of those whose wait it ended. A copy the view holds suspect or dead is not
+/// asked, and a copy asked before the view came to hold it so is waited for no longer. Its requests
+/// ride a connection its peer no longer answers, each waiting out the pool's request time while the
+/// job holds a place in the driver's window and every job behind it waits at the door: a three-node
+/// work run with one node killed left 2,303 requests unanswered, 310 jobs timed out at the door and
+/// 406 submissions of unknown outcome (compare/work-faults, 2026-10-22). Refused at once, a
+/// submission's outcome is known and its participant asks again, as an obligation short of a copy
+/// is refused (26 §1). The driver watches the view for the jobs: a change wakes it, and every job
+/// it runs is polled on a wake ([`Concurrent`]), each looking again at the copies it waits for.
 struct CopyHealth<'a> {
     liveness: Option<&'a crate::liveness::LivenessHandle>,
-    refused: &'a AtomicU64,
+    not_asked: &'a AtomicU64,
+    given_up: &'a AtomicU64,
 }
 impl CopyHealth<'_> {
-    /// Whether `peer` is held suspect or dead, counted when it is.
-    fn unavailable(&self, peer: u64) -> bool {
-        let unavailable = self
-            .liveness
+    /// Whether the view holds `peer` suspect or dead.
+    fn held_down(&self, peer: u64) -> bool {
+        self.liveness
             .and_then(|liveness| liveness.status_of(peer))
-            .is_some_and(|status| status != crate::liveness::MemberStatus::Alive);
-        if unavailable {
-            self.refused.fetch_add(1, Ordering::Relaxed);
-        }
-        unavailable
+            .is_some_and(|status| status != crate::liveness::MemberStatus::Alive)
     }
 }
 /// What the evidence coordinator's door has held: requests held at all, and those whose request
@@ -548,6 +550,7 @@ pub struct EvidenceDoorStats {
     pub timed_out: u64,
     pub window: u64,
     pub copies_unavailable: u64,
+    pub copies_given_up: u64,
 }
 pub struct EvidenceDriver {
     door: Arc<EvidenceDoor>,
@@ -741,6 +744,7 @@ impl EvidenceCoordinator {
             timed_out: self.door.timed_out.load(Ordering::Relaxed),
             window: self.door.window.load(Ordering::Relaxed),
             copies_unavailable: self.door.copies_unavailable.load(Ordering::Relaxed),
+            copies_given_up: self.door.copies_given_up.load(Ordering::Relaxed),
         }
     }
     pub async fn seal(
@@ -911,6 +915,9 @@ enum Turn<D> {
     Job,
     Closed(Queue, SyncError<()>),
     Done(D),
+    /// The liveness view changed, or (false) can be watched no more: its sender gone, or no place
+    /// to wait in.
+    Liveness(bool),
 }
 /// The driver's two queues.
 #[derive(Clone, Copy)]
@@ -944,8 +951,11 @@ impl EvidenceDriver {
         let door = self.door.clone();
         let health = CopyHealth {
             liveness,
-            refused: &door.copies_unavailable,
+            not_asked: &door.copies_unavailable,
+            given_up: &door.copies_given_up,
         };
+        // The view's changes, watched for the jobs ([`CopyHealth`]): one wait, the driver's.
+        let mut changes = liveness.map(crate::liveness::LivenessHandle::changes);
         let mut tasks = Concurrent::new(self.window.window()).map_err(|_| AccessError::Capacity)?;
         // The participant jobs in flight, by what each is, and the jobs of
         // the same identity that run after each: an exact retry that comes
@@ -979,36 +989,47 @@ impl EvidenceDriver {
             let room = window.min(tasks.capacity());
             let mut update_slot = None;
             let mut job_slot = None;
-            let turn = std::future::poll_fn(|cx| {
-                if updates && let Poll::Ready(update) = pin!(self.control.recv()).poll(cx) {
-                    return Poll::Ready(match update {
-                        Ok(update) => {
-                            update_slot = Some(update);
-                            Turn::Update
-                        }
-                        Err(closed) => Turn::Closed(Queue::Updates, closed),
-                    });
-                }
-                if receiving
-                    && tasks.len() < room
-                    && let Poll::Ready(job) = pin!(self.receiver.recv()).poll(cx)
-                {
-                    return Poll::Ready(match job {
-                        Ok(job) => {
-                            job_slot = Some(job);
-                            Turn::Job
-                        }
-                        Err(closed) => Turn::Closed(Queue::Jobs, closed),
-                    });
-                }
-                if !tasks.is_empty()
-                    && let Poll::Ready(Some(done)) = tasks.poll_next(cx)
-                {
-                    return Poll::Ready(Turn::Done(done));
-                }
-                Poll::Pending
-            })
-            .await;
+            // The wait for the view's change lives as the turn does, and ends with it.
+            let turn = {
+                let changed = changes.as_mut().map(|changes| changes.changed());
+                let mut changed = pin!(changed);
+                std::future::poll_fn(|cx| {
+                    if updates && let Poll::Ready(update) = pin!(self.control.recv()).poll(cx) {
+                        return Poll::Ready(match update {
+                            Ok(update) => {
+                                update_slot = Some(update);
+                                Turn::Update
+                            }
+                            Err(closed) => Turn::Closed(Queue::Updates, closed),
+                        });
+                    }
+                    if receiving
+                        && tasks.len() < room
+                        && let Poll::Ready(job) = pin!(self.receiver.recv()).poll(cx)
+                    {
+                        return Poll::Ready(match job {
+                            Ok(job) => {
+                                job_slot = Some(job);
+                                Turn::Job
+                            }
+                            Err(closed) => Turn::Closed(Queue::Jobs, closed),
+                        });
+                    }
+                    if !tasks.is_empty()
+                        && let Poll::Ready(Some(done)) = tasks.poll_next(cx)
+                    {
+                        return Poll::Ready(Turn::Done(done));
+                    }
+                    // Polled after the jobs, which have looked at the view the change published.
+                    if let Some(changed) = changed.as_mut().as_pin_mut()
+                        && let Poll::Ready(watched) = changed.poll(cx)
+                    {
+                        return Poll::Ready(Turn::Liveness(watched.is_ok()));
+                    }
+                    Poll::Pending
+                })
+                .await
+            };
             match turn {
                 Turn::Update => {
                     let Some(update) = update_slot.take() else {
@@ -1046,6 +1067,9 @@ impl EvidenceDriver {
                     }
                 }
                 Turn::Closed(Queue::Jobs, SyncError::Closed(())) => receiving = false,
+                // Every job was polled on the change's wake, each looking at its copies again.
+                Turn::Liveness(true) => {}
+                Turn::Liveness(false) => changes = None,
                 // No wait could be kept: the driver is off its shard.
                 Turn::Closed(_, _) => return Err(AccessError::Unavailable),
                 Turn::Done((identity, began, done)) => {
@@ -2281,9 +2305,15 @@ async fn replicate(
     // copy that fails or answers late delays no other, and what the others
     // took they hold whatever became of it. The first failure is what the
     // replication failed with. A copy the liveness view holds suspect or
-    // dead is not asked and fails the replication; the others are asked as
-    // before ([`CopyHealth`]).
+    // dead is not asked and fails the replication, and one it comes to hold
+    // so while it is waited for ends the wait: the replication fails at once,
+    // the others left where they are (a copy keeps the chunks it took, and
+    // the job asked again moves only what it lacks) ([`CopyHealth`]).
     let mut copies = Concurrent::new(placement.copies.len()).map_err(|_| AccessError::Capacity)?;
+    let mut waiting = Vec::new();
+    waiting
+        .try_reserve_exact(placement.copies.len())
+        .map_err(|_| AccessError::Capacity)?;
     let mut failed = None;
     for peer in placement
         .copies
@@ -2292,23 +2322,56 @@ async fn replicate(
         .filter(|peer| *peer != node)
     {
         placement.admits(peer)?;
-        if health.unavailable(peer) {
+        if health.held_down(peer) {
+            health.not_asked.fetch_add(1, Ordering::Relaxed);
             failed.get_or_insert(AccessError::Unavailable);
             continue;
         }
-        // One for each copy: within the set's bound.
+        // One for each copy: within the set's and the list's bound.
         copies
-            .push(replicate_to(
+            .push(replicate_one(
                 content, pool, scope, transfer, peer, reference,
             ))
             .map_err(|_| AccessError::Capacity)?;
+        waiting.push(peer);
     }
-    while let Some(replicated) = copies.join_next().await {
-        if let Err(error) = replicated {
-            failed.get_or_insert(error);
+    loop {
+        let next = std::future::poll_fn(|cx| {
+            if waiting.iter().any(|peer| health.held_down(*peer)) {
+                return Poll::Ready(None);
+            }
+            copies.poll_next(cx).map(Some)
+        })
+        .await;
+        match next {
+            None => {
+                health.given_up.fetch_add(1, Ordering::Relaxed);
+                return Err(AccessError::Unavailable);
+            }
+            Some(None) => break,
+            Some(Some((peer, replicated))) => {
+                waiting.retain(|waited| *waited != peer);
+                if let Err(error) = replicated {
+                    failed.get_or_insert(error);
+                }
+            }
         }
     }
     failed.map_or(Ok(()), Err)
+}
+/// [`replicate_to`], its copy named with what became of it.
+async fn replicate_one(
+    content: &ContentHost,
+    pool: &PeerConnectionPool,
+    scope: CustodyScope,
+    transfer: [u8; 16],
+    peer: u64,
+    reference: &ContentRef,
+) -> (u64, Result<(), AccessError>) {
+    (
+        peer,
+        replicate_to(content, pool, scope, transfer, peer, reference).await,
+    )
 }
 /// One copy of [`replicate`]: nothing is sent to a copy that holds the
 /// object, and a copy that took it says so durably before its receipt is

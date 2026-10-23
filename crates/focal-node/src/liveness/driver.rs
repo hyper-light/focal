@@ -318,6 +318,11 @@ impl LivenessHandle {
     pub fn view(&self) -> LivenessView {
         self.view.borrow().clone()
     }
+    /// The published view's changes, for a watcher that reads it again as it changes: one of the
+    /// view's waits ([`watch::WAITERS`]) while it waits.
+    pub fn changes(&self) -> watch::Receiver<LivenessView> {
+        self.view.clone()
+    }
     /// The status `node` holds in the published view, read in place, not copied with the view: a
     /// member the driver has not heard from has none.
     pub fn status_of(&self, node: u64) -> Option<MemberStatus> {
