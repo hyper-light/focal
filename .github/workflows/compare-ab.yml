@@ -27,6 +27,12 @@ on:
       warmup:
         description: "Seconds sent and not measured, first"
         default: "15"
+      mode:
+        description: "append (each record stored), deliver or work (focal-load's lifecycles; work among the agents)"
+        default: "append"
+      agents:
+        description: "deliver or work: the agents the lifecycles go among (work needs 3 at least); empty, deliver's one issuer and one consumer"
+        default: ""
 
 permissions:
   contents: read
@@ -158,12 +164,15 @@ jobs:
         env:
           NODE_CPUS: "1"
           FOCAL_LOAD_IMAGE: focal:bench-b
+          # A branch named ab/work-<anything> compares focal's work lifecycle among 500 agents.
+          MODE: ${{ github.event.inputs.mode || (startsWith(github.ref_name, 'ab/work') && 'work' || 'append') }}
+          AGENTS: ${{ github.event.inputs.agents || (startsWith(github.ref_name, 'ab/work') && '500' || '') }}
         run: |
           rounds=${{ github.event.inputs.rounds || '2' }}
           for round in $(seq 1 "$rounds"); do
             order="a b"
             if [ $((round % 2)) -eq 0 ]; then order="b a"; fi
-            for rate in ${{ github.event.inputs.rates || '100 1000 4000' }}; do
+            for rate in ${{ github.event.inputs.rates || (startsWith(github.ref_name, 'ab/work') && '20 50 100' || '100 1000 4000') }}; do
               for side in $order; do
                 docker tag "focal:bench-$side" focal:bench
                 # A failed run is recorded and the rest still run.
@@ -183,7 +192,7 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
           python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
-          import glob, json, os, statistics
+          import glob, json, os, re, statistics
           def cpu(path, writes):
               """The nodes' CPU over a run, from run.sh's cgroup counters taken
               before and after the load: the busiest node's and all nodes'
@@ -211,7 +220,12 @@ jobs:
               return (busiest["usage_usec"] / writes, sum(d["usage_usec"] for d in nodes) / writes,
                       100 * busiest["usage_usec"] / wall, busiest.get("throttled_usec", 0) / 1000)
           rows = {}
-          for path in glob.glob("tools/compare/compose/reports/*/*/focal-*-128.json"):
+          # Append runs are named by rate and payload; deliver and work runs say so after them.
+          # The nodes' own files beside a report (`<report>.json.focal1.replicas.json`) are not.
+          report_name = re.compile(r"focal-\d+-128(-[a-z0-9-]+)?\.json")
+          for path in glob.glob("tools/compare/compose/reports/*/*/focal-*-128*.json"):
+              if not report_name.fullmatch(os.path.basename(path)):
+                  continue
               side, round_ = path.split(os.sep)[-3:-1]
               r = json.load(open(path))
               m = r["measured_writes"]
