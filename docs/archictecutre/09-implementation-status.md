@@ -16463,3 +16463,29 @@ with its plaintext), what the content store's chunks are sealed with (29 §11). 
 files changed (hyper-quic's BBR, hyper-seal's sealed file and its tests, a hyper-transport
 document comment); the workspace's Clippy is clean against the snapshot. vendor/README.md;
 docs/dependencies/inventory.tsv.
+
+### 2026-10-23 — Where 3% loss costs a write: the replication legs, measured apart from the client legs
+
+focal's work among 500 agents at 20 claims a second (compare.yml's work mode) with 80 ms of delay
+and 3% loss on chosen legs only: `tools/compare/compose/run.sh` takes `netem-peers=ARGS` and
+`netem-clients=ARGS` (369be46f), a prio qdisc on each container's interface whose second band
+carries netem, u32 filters sending the packets for the named destinations through it. Every leg
+(CI 39999934754, on 9e68a154), node to node only (40004211357), node to client only (40004218953):
+
+| 80 ms + 3% loss on | write p50 / p99 | other steps p50 | evidence steps p50 / p99 | claim settled p50 / p99 |
+|---|---|---|---|---|
+| every leg | 598 / 4,066 ms | 548 ms | 1,006 / 4,726 ms | 10.5 / 14.1 s |
+| node to node only | 364 / 768 ms | 344 ms | 490 / 844 ms | 4.3 / 5.4 s |
+| node to client only | 82 / 250 ms | 82 ms | 85 / 246 ms | 2.3 / 3.0 s |
+
+The evidence steps are the writes that wait on the node's evidence jobs, steps 3, 8 and 9 of
+focal-load's work lifecycle (the reports' CSVs, `step`); the other steps are its eight others.
+The client legs cost their round trip; the replication legs double the write median (a 160 ms round
+trip, 344 ms at the median), and carry the evidence steps' tail. Followers rejected no append
+(`focal_sessions_appends_rejected_total` 0). Not shown yet: why. The hypothesis to measure is a
+follower's acknowledgement held behind one lost append, its log acknowledged only as far as it is
+contiguous, with each write its own append to each follower; the next measurement is each
+follower's append-to-acknowledgement time and appends a second on the leader, then fewer, larger
+appends, and forward erasure correction (Michel, De Coninck and Bonaventure, IFIP Networking 2019)
+if a repair's round trip remains the cost. hyper-quic already acknowledges a packet that arrives
+out of order at once (its reordering threshold 1), so a loss costs a round trip, not a probe timeout.
