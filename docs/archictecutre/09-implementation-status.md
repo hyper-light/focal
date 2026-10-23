@@ -16420,3 +16420,18 @@ service, up to a tenth of a seal's round trips losing a datagram; a kind's windo
 floor once its jobs take more than twice its least on average (BBR's gain of two), the bound an
 unloaded measurement of a kind's time would lift (Envoy's adaptive concurrency re-measures its least
 at a pinned low concurrency and compares like percentiles).
+
+### 2026-10-23 — An operator's command beside a node finds its directory's keys and makes none
+
+`ClusterAdmin::open`, which every admin command opens (`focal diagnose node --metrics` among them),
+resolved the data directory's keys with `Settings::data_keys`, which makes them where the directory
+has none, where the command line's own local client finds them (`found_data_keys`: "made nowhere:
+this command runs beside the node that owns them"). A founder writes its identity before it makes
+its keys, so a command asked between the two made the directory's keys in its node's place. The
+no-clobber publication of a key file (the first maker's link stands, a later maker finds it whole)
+kept the node and the command on one key, but a read made durable state. The admin open now finds
+the keys and, before they exist, is refused `not_ready` (`ClusterAdminError::Unkeyed`), the node
+being still founding or joining. Test: `an_admin_command_beside_a_founding_directory_makes_no_keys`
+(a founder's directory, its identity written: refused `not_ready`, no keys made; before, the open
+succeeded and made them). Found while reading what a test's start wait may ask of a node still
+starting (the entry above).

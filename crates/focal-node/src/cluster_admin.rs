@@ -121,6 +121,10 @@ pub enum ClusterAdminError {
     UnknownNode(u64),
     #[error("node {0} is not alive, eligible and reporting; it cannot take over")]
     NotReady(u64),
+    /// The data directory has its node's identity and no keys yet: its node is still founding or
+    /// joining, and a command beside it makes none in its place.
+    #[error("data directory {} has no keys yet: its node has not finished starting", .0.display())]
+    Unkeyed(PathBuf),
     #[error(
         "the upgrade fence cannot rise to level {level}: nodes {behind:?} report a lower capability or none"
     )]
@@ -285,6 +289,7 @@ impl ClusterAdminError {
             Self::PartitionPending { .. } => Failure::error("partition_pending", 5),
             Self::LeaderLeaving(_) => Failure::error("leader_leaving", 5),
             Self::NotReady(_) => Failure::error("node_not_ready", 5),
+            Self::Unkeyed(_) => Failure::error("not_ready", 6),
             Self::MembersBehind { .. } => Failure::error("members_behind", 5),
             Self::OutsideResidency { .. } => Failure::error("outside_residency", 5),
             Self::FenceRegression { .. } => Failure::error("invalid_input", 2),
@@ -861,7 +866,12 @@ impl ClusterAdmin {
     pub fn open(settings: &Settings) -> Result<Self> {
         let root = settings.data_dir()?;
         let identity = decode_identity(&root.join("IDENTITY"))?;
-        let keys = settings.data_keys(&root)?;
+        // The data directory's keys where it has them, made nowhere: this command runs beside the
+        // node that owns them, and one asked while that node founds itself, its identity written
+        // and its keys not yet made, finds none and makes none in its place.
+        let keys = settings
+            .found_data_keys(&root)?
+            .ok_or_else(|| ClusterAdminError::Unkeyed(root.clone()))?;
         Ok(Self {
             root,
             identity,

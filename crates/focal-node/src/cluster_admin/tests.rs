@@ -463,3 +463,32 @@ fn the_same_membership_change_asked_again_resumes_its_unsettled_request() {
     })
     .unwrap()
 }
+
+/// An operator's command beside a node that has written its identity and not yet its keys, a
+/// founder between the two, finds no keys and makes none: it is refused `not_ready` for the
+/// moment, where it made the directory's keys in its node's place.
+#[test]
+fn an_admin_command_beside_a_founding_directory_makes_no_keys() {
+    let disk = tempfile::tempdir().unwrap();
+    crate::set_test_mode(disk.path(), 0o700);
+    let mut settings = Settings::default();
+    settings.node.data_dir = Some(disk.path().into());
+    // The founder's directory: its identity written, its keys not yet made.
+    let directory = crate::node_directory::NodeDirectory::open(&settings).unwrap();
+    assert!(settings.found_data_keys(disk.path()).unwrap().is_none());
+    let refused = ClusterAdmin::open(&settings).err();
+    assert!(
+        matches!(refused, Some(ClusterAdminError::Unkeyed(_))),
+        "{:?}",
+        refused.as_ref().map(ToString::to_string)
+    );
+    assert_eq!(
+        refused.map(|error| error.classification().code),
+        Some("not_ready")
+    );
+    assert!(
+        settings.found_data_keys(disk.path()).unwrap().is_none(),
+        "the command made the directory's keys"
+    );
+    drop(directory);
+}
