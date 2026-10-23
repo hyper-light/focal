@@ -915,6 +915,38 @@ impl MetricsSnapshot {
             "Required copies whose wait an artifact job ended, the liveness view coming to hold them suspect or dead; each refused its job.",
             self.evidence.copies_given_up,
         );
+        text.header(
+            "focal_evidence_requests_refused_total",
+            "counter",
+            "Artifact requests refused before their job ran: no memory for the job or its place at the door, or a run of one request past those that may wait behind it.",
+        );
+        for (cause, value) in [
+            ("memory", self.evidence.refused_memory),
+            ("same_request", self.evidence.refused_same),
+        ] {
+            text.labeled(
+                "focal_evidence_requests_refused_total",
+                &[("cause", cause)],
+                value,
+            );
+        }
+        text.header(
+            "focal_evidence_jobs_refused_total",
+            "counter",
+            "Artifact jobs whose participant was refused, by the error it was answered.",
+        );
+        for (error, value) in [
+            ("capacity", self.evidence.jobs_capacity),
+            ("unavailable", self.evidence.jobs_unavailable),
+            ("outcome_unknown", self.evidence.jobs_unknown),
+            ("other", self.evidence.jobs_other),
+        ] {
+            text.labeled(
+                "focal_evidence_jobs_refused_total",
+                &[("error", error)],
+                value,
+            );
+        }
         if let Some(StorageMetrics::Log(log)) = &self.storage {
             render_log(&mut text, log);
         }

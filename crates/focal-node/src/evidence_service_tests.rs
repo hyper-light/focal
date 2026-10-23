@@ -350,7 +350,7 @@ fn empty_owner_reconciles_cancellation_after_content_cas_and_fences_completed_pr
             )
             .await
             .unwrap();
-        completed.send(&driver.placements);
+        let _ = completed.send(&driver.placements);
         assert_eq!(receive.await.unwrap(), Err(AccessError::Unavailable));
         assert_eq!(fixture.budget.stats().used, steady);
         assert_eq!(
@@ -935,6 +935,12 @@ fn a_job_held_past_its_request_time_is_refused_and_counted() {
                 window: 1,
                 copies_unavailable: 0,
                 copies_given_up: 0,
+                refused_memory: 0,
+                refused_same: 0,
+                jobs_capacity: 0,
+                jobs_unavailable: 0,
+                jobs_unknown: 0,
+                jobs_other: 0,
             }
         );
         // The job the queue took goes with the driver that never ran, and its charge with it.
@@ -1066,6 +1072,8 @@ fn a_copy_the_liveness_view_holds_dead_is_not_asked_and_its_job_is_refused_at_on
                 assert!(matches!(refused, Err(AccessError::Unavailable)));
                 let stats = coordinator.door_stats();
                 assert_eq!((stats.copies_unavailable, stats.copies_given_up), (1, 1));
+                // Both jobs' participants were answered `Unavailable`, and counted so.
+                assert_eq!((stats.jobs_unavailable, stats.jobs_capacity), (2, 0));
             }
             drop(coordinator);
         };

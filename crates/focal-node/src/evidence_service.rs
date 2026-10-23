@@ -394,7 +394,8 @@ enum Completed {
     },
 }
 impl Completed {
-    fn send(self, placements: &BTreeMap<LedgerId, PlacementRow>) {
+    /// Answers the job's participant, and says what it was refused with, if anything.
+    fn send(self, placements: &BTreeMap<LedgerId, PlacementRow>) -> Option<Refused> {
         let current = |scope: Option<CustodyScope>| {
             scope.is_some_and(|scope| {
                 placements
@@ -416,7 +417,9 @@ impl Completed {
                         Err(AccessError::Unavailable)
                     }
                 });
+                let refused = Refused::of(&result);
                 let _ = reply.send(result);
+                refused
             }
             Self::Attest {
                 scope,
@@ -430,7 +433,9 @@ impl Completed {
                         Err(AccessError::Unavailable)
                     }
                 });
+                let refused = Refused::of(&result);
                 let _ = reply.send(result);
+                refused
             }
             Self::AttestNative {
                 scope,
@@ -444,7 +449,9 @@ impl Completed {
                         Err(AccessError::Unavailable)
                     }
                 });
+                let refused = Refused::of(&result);
                 let _ = reply.send(result);
+                refused
             }
             Self::Obligation {
                 scope,
@@ -458,7 +465,9 @@ impl Completed {
                         Err(AccessError::Unavailable)
                     }
                 });
+                let refused = Refused::of(&result);
                 let _ = reply.send(result);
+                refused
             }
             Self::Archive {
                 scope,
@@ -472,7 +481,9 @@ impl Completed {
                         Err(AccessError::Unavailable)
                     }
                 });
+                let refused = Refused::of(&result);
                 let _ = reply.send(result);
+                refused
             }
             Self::Repair {
                 scope,
@@ -486,8 +497,29 @@ impl Completed {
                         Err(AccessError::Unavailable)
                     }
                 });
+                let refused = Refused::of(&result);
                 let _ = reply.send(result);
+                refused
             }
+        }
+    }
+}
+/// What a participant's job was refused with, by the error it was answered.
+#[derive(Clone, Copy)]
+enum Refused {
+    Capacity,
+    Unavailable,
+    OutcomeUnknown,
+    Other,
+}
+impl Refused {
+    fn of<T>(result: &Result<T, AccessError>) -> Option<Self> {
+        match result {
+            Ok(_) => None,
+            Err(AccessError::Capacity) => Some(Self::Capacity),
+            Err(AccessError::Unavailable) => Some(Self::Unavailable),
+            Err(AccessError::OutcomeUnknown) => Some(Self::OutcomeUnknown),
+            Err(_) => Some(Self::Other),
         }
     }
 }
@@ -518,6 +550,27 @@ struct EvidenceDoor {
     /// Required copies whose wait a job ended, the liveness view coming to hold them suspect or
     /// dead while it waited ([`CopyHealth`]).
     copies_given_up: AtomicU64,
+    /// Requests refused before their job ran: no memory for the job or its place at the door,
+    /// and the runs of one request past those that may wait behind it.
+    refused_memory: AtomicU64,
+    refused_same: AtomicU64,
+    /// Jobs whose participant was refused, by the error: their room, a copy or the placement
+    /// unavailable, an outcome no copy could say, anything else.
+    jobs_capacity: AtomicU64,
+    jobs_unavailable: AtomicU64,
+    jobs_unknown: AtomicU64,
+    jobs_other: AtomicU64,
+}
+impl EvidenceDoor {
+    fn answered(&self, refused: Refused) {
+        let counter = match refused {
+            Refused::Capacity => &self.jobs_capacity,
+            Refused::Unavailable => &self.jobs_unavailable,
+            Refused::OutcomeUnknown => &self.jobs_unknown,
+            Refused::Other => &self.jobs_other,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
 }
 /// What a job knows of its copies' health: the node's liveness view, and the counts of copies it did
 /// not ask for it and of those whose wait it ended. A copy the view holds suspect or dead is not
@@ -551,6 +604,14 @@ pub struct EvidenceDoorStats {
     pub window: u64,
     pub copies_unavailable: u64,
     pub copies_given_up: u64,
+    /// Requests refused before their job ran, by cause ([`EvidenceDoor`]).
+    pub refused_memory: u64,
+    pub refused_same: u64,
+    /// Jobs whose participant was refused, by the error.
+    pub jobs_capacity: u64,
+    pub jobs_unavailable: u64,
+    pub jobs_unknown: u64,
+    pub jobs_other: u64,
 }
 pub struct EvidenceDriver {
     door: Arc<EvidenceDoor>,
@@ -680,7 +741,10 @@ impl EvidenceCoordinator {
         let allocation = self
             .budget
             .reserve(BudgetKind::Payload, BudgetLane::Ordinary, bytes)
-            .map_err(|_| AccessError::Capacity)?
+            .map_err(|_| {
+                self.door.refused_memory.fetch_add(1, Ordering::Relaxed);
+                AccessError::Capacity
+            })?
             .commit();
         let ledger = request.request().ledger;
         let route = request.request().route_epoch;
@@ -713,7 +777,10 @@ impl EvidenceCoordinator {
                 .door
                 .hold(word, first)
                 .map_err(|refusal| match refusal {
-                    crate::pace::DoorRefusal::Memory => AccessError::Capacity,
+                    crate::pace::DoorRefusal::Memory => {
+                        self.door.refused_memory.fetch_add(1, Ordering::Relaxed);
+                        AccessError::Capacity
+                    }
                     _ => AccessError::Unavailable,
                 })?;
             // The driver may have taken a job between the queue found full and the word held,
@@ -745,6 +812,12 @@ impl EvidenceCoordinator {
             window: self.door.window.load(Ordering::Relaxed),
             copies_unavailable: self.door.copies_unavailable.load(Ordering::Relaxed),
             copies_given_up: self.door.copies_given_up.load(Ordering::Relaxed),
+            refused_memory: self.door.refused_memory.load(Ordering::Relaxed),
+            refused_same: self.door.refused_same.load(Ordering::Relaxed),
+            jobs_capacity: self.door.jobs_capacity.load(Ordering::Relaxed),
+            jobs_unavailable: self.door.jobs_unavailable.load(Ordering::Relaxed),
+            jobs_unknown: self.door.jobs_unknown.load(Ordering::Relaxed),
+            jobs_other: self.door.jobs_other.load(Ordering::Relaxed),
         }
     }
     pub async fn seal(
@@ -1051,6 +1124,7 @@ impl EvidenceDriver {
                             if after.len() < room && after.try_reserve(1).is_ok() {
                                 after.push_back(job);
                             } else {
+                                self.door.refused_same.fetch_add(1, Ordering::Relaxed);
                                 job.refuse(AccessError::Capacity);
                             }
                         }
@@ -1073,7 +1147,9 @@ impl EvidenceDriver {
                 // No wait could be kept: the driver is off its shard.
                 Turn::Closed(_, _) => return Err(AccessError::Unavailable),
                 Turn::Done((identity, began, done)) => {
-                    done.send(&self.placements);
+                    if let Some(refused) = done.send(&self.placements) {
+                        self.door.answered(refused);
+                    }
                     self.window
                         .ended(began.elapsed(), std::time::Instant::now());
                     self.door.window.store(
