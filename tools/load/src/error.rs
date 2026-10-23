@@ -34,6 +34,10 @@ pub enum LoadError {
     Report(serde_json::Error),
     /// The run's shard could not be started: its tables refused.
     Runtime(focal_rt::RtError),
+    /// The inbox tails did not all take their starting place, `positioned` of `tails` with none
+    /// more for a whole [`crate::watch::WAIT`]: the run would have begun with an agent unable to see
+    /// what was delivered to it.
+    Tails { positioned: usize, tails: usize },
 }
 
 impl fmt::Display for LoadError {
@@ -52,6 +56,10 @@ impl fmt::Display for LoadError {
             Self::Memory(error) => write!(f, "measurement memory: {error}"),
             Self::Report(error) => write!(f, "report: {error}"),
             Self::Runtime(error) => write!(f, "runtime: {error}"),
+            Self::Tails { positioned, tails } => write!(
+                f,
+                "{positioned} of {tails} inbox tails took their starting place, none more within the wait"
+            ),
         }
     }
 }

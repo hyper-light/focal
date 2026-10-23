@@ -16151,3 +16151,18 @@ widens to the window as memory allows (`focal_rt::Concurrent::widen`). Gauge `fo
 Tests: `completion_window::tests` (the window of a job a millisecond taking 10 ms each is 20; a stale
 most gives way; a slow job does not stretch the bound),
 `a_widened_set_runs_as_many_more_and_a_narrower_width_changes_nothing`.
+
+### 2026-10-22 — A thousand agents do the work among themselves
+
+focal-load's `work` among 1,000 enrolled agents, each a client of its own on one connection, three
+1-CPU nodes (CI 39870118553, the evidence door and the enrollment registry decoded once per root):
+1,200 and 3,000 claims satisfied in the measured minute at 20 and 50 claims a second, eleven writes
+each, none refused and none unknown; satisfied p50 47 and 128 ms, p99 158 and 622 ms; writes p50 2
+and 7 ms; the leader 46% and 66% busy, holding 1,002 connections and 1,000 parked inbox reads.
+Two claims of each run never ended: each waited at its post for good, its worker not seeing it.
+focal-load's tails start past every delivery committed before their first page, as a consumer joins
+a log at its end, and the callers began their schedule while a thousand tails were still taking
+their places, so the first claims could be posted behind where their workers read from. The run
+now begins, and its clock with it, once every tail has taken its place (`Watch::all_positioned`,
+bounded by the tails' progress: refused once a whole `WAIT` passes with none more taking it). Tests:
+`the_run_waits_for_every_tail_to_take_its_place`, `a_stop_ends_the_wait_for_the_tails`.

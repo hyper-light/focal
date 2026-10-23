@@ -78,6 +78,10 @@ pub struct Watch {
     issuer: Cell<TailCounts>,
     /// Every agent's tail together.
     agents: Cell<TailCounts>,
+    /// The tails that have taken their starting place in their inboxes, and the run waiting for
+    /// them all to have ([`Watch::all_positioned`]).
+    positioned: Cell<usize>,
+    positioning: RefCell<Option<std::task::Waker>>,
 }
 
 impl Watch {
@@ -93,6 +97,52 @@ impl Watch {
             consumer: Cell::new(TailCounts::default()),
             issuer: Cell::new(TailCounts::default()),
             agents: Cell::new(TailCounts::default()),
+            positioned: Cell::new(0),
+            positioning: RefCell::new(None),
+        }
+    }
+    /// A tail took its starting place: every delivery committed from here on is in what it reads.
+    fn take_position(&self) {
+        self.positioned.set(self.positioned.get().saturating_add(1));
+        if let Some(waker) = self.positioning.borrow_mut().take() {
+            waker.wake();
+        }
+    }
+    /// Waits until `tails` tails have taken their starting place in their inboxes: a tail starts
+    /// past every delivery committed before its first page, as a consumer joins a log at its end,
+    /// so a run that begins before its tails have would deliver to an agent that never sees it
+    /// (two claims of a thousand agents' run waited at their posts for good, CI 39870118553).
+    /// Bounded by the tails' progress: refused once a whole [`WAIT`] passes with none more taking
+    /// its place.
+    pub async fn all_positioned(&self, tails: usize) -> Result<(), LoadError> {
+        loop {
+            let seen = self.positioned.get();
+            if seen >= tails {
+                return Ok(());
+            }
+            let more = std::future::poll_fn(|cx| {
+                if self.positioned.get() != seen || self.stopped.get() {
+                    return std::task::Poll::Ready(());
+                }
+                *self.positioning.borrow_mut() = Some(cx.waker().clone());
+                std::task::Poll::Pending
+            });
+            match race2(more, focal_rt::time::sleep(WAIT)).await {
+                Either::First(()) if self.stopped.get() => {
+                    return Err(LoadError::Tails {
+                        positioned: self.positioned.get(),
+                        tails,
+                    });
+                }
+                Either::First(()) => {}
+                Either::Second(slept) => {
+                    slept.map_err(LoadError::Runtime)?;
+                    return Err(LoadError::Tails {
+                        positioned: self.positioned.get(),
+                        tails,
+                    });
+                }
+            }
         }
     }
     /// Waits for `claim`'s post to show: registered before the post is sent.
@@ -144,6 +194,9 @@ impl Watch {
     /// Ends the tails at their next page, and every wait with them.
     pub fn stop(&self) {
         self.stopped.set(true);
+        if let Some(waker) = self.positioning.borrow_mut().take() {
+            waker.wake();
+        }
         self.posted.borrow_mut().clear();
         self.answered.borrow_mut().clear();
         self.evaluations.borrow_mut().clear();
@@ -327,6 +380,7 @@ pub async fn tail(
             // prefix's last record.
             after = Some((page.native_sequence, u32::MAX));
             started = true;
+            watch.take_position();
             continue;
         }
         let mut read = 0u64;
@@ -353,4 +407,59 @@ pub async fn tail(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[cfg_attr(test, allow(clippy::unwrap_used, clippy::panic))]
+mod tests {
+    use super::*;
+
+    /// The run begins once every tail has taken its place, whichever order they take them in.
+    #[test]
+    fn the_run_waits_for_every_tail_to_take_its_place() {
+        focal_rt::block_on(async {
+            let watch = Watch::new(4);
+            let take = |after| {
+                let watch = &watch;
+                async move {
+                    focal_rt::time::sleep(Duration::from_millis(after))
+                        .await
+                        .unwrap();
+                    watch.take_position();
+                }
+            };
+            let ((positioned, ()), ((), ())) = hyper_rt::combine::join2(
+                hyper_rt::combine::join2(watch.all_positioned(3), take(30)),
+                hyper_rt::combine::join2(take(10), take(20)),
+            )
+            .await;
+            positioned.unwrap();
+            assert_eq!(watch.positioned.get(), 3);
+        })
+        .unwrap();
+    }
+
+    /// A run stopped while its tails take their places ends the wait at once, refused.
+    #[test]
+    fn a_stop_ends_the_wait_for_the_tails() {
+        focal_rt::block_on(async {
+            let watch = Watch::new(4);
+            let stop = async {
+                focal_rt::time::sleep(Duration::from_millis(10))
+                    .await
+                    .unwrap();
+                watch.take_position();
+                watch.stop();
+            };
+            let (positioned, ()) = hyper_rt::combine::join2(watch.all_positioned(2), stop).await;
+            assert!(matches!(
+                positioned,
+                Err(LoadError::Tails {
+                    positioned: 1,
+                    tails: 2
+                })
+            ));
+        })
+        .unwrap();
+    }
 }

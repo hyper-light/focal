@@ -111,7 +111,10 @@ own inbox:
 | 11 | issuer | `claim.release_scope` | the claim settled satisfied |
 
 Each waiter is registered before the write that answers it, so a fact that arrives
-first is not passed over. The report's `deliver` section counts a claim settled
+first is not passed over. A tail starts past every delivery committed before its first
+page, as a consumer joins a log at its end, so a run (`deliver` or `work`) begins its
+schedule, and its clock, only once every tail has taken that place: a claim posted
+earlier would have been posted behind where its recipient reads from. The report's `deliver` section counts a claim settled
 satisfied as `delivered`; a claim that settled any other way, or whose next fact did
 not reach its agent within the run's bound, as `undelivered`.
 

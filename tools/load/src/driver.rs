@@ -1591,42 +1591,79 @@ async fn run_phase(
         )),
         None => None,
     };
-    let run_start_epoch_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| LoadError::Clock)?
-        .as_nanos();
-    let run_start = Instant::now();
-    let mut callers =
-        focal_rt::Concurrent::new(jobs.len()).map_err(|_| LoadError::Bound("callers"))?;
-    for job in jobs {
-        let slot = usize::from(job.index)
-            .checked_rem(conns.len())
-            .ok_or(LoadError::Bound("connections"))?;
-        let conn = conns.get(slot).ok_or(LoadError::Bound("connections"))?;
-        let side = match consumer {
-            Some(side) => Some(ConsumerSide {
-                principal: side.principal,
-                conn: consumer_conns
-                    .get(slot)
-                    .ok_or(LoadError::Bound("consumer connections"))?,
-                generations: side.generations,
-                watch: side.watch,
-            }),
-            None => None,
-        };
-        let index = job.index;
-        callers
-            .push(async move {
-                (
-                    index,
-                    worker(job, phase, run_start, generations, conn, (side, agents)).await,
-                )
-            })
-            .map_err(|_| LoadError::Bound("callers"))?;
-    }
+    // The tails the run reads its sides' inboxes with, and the watch they take their places in.
+    let (positions, tails) = match (consumer, agents) {
+        (Some(side), _) => (Some(side.watch), 2),
+        (None, Some(run)) => (Some(run.watch), run.agents.len()),
+        (None, None) => (None, 0),
+    };
+    let stop = || {
+        if let Some(side) = consumer {
+            side.watch.stop();
+        }
+        if let Some(run) = agents {
+            run.watch.stop();
+        }
+    };
     // Every caller to its end, the first failure kept; the tails stopped either way, so none
-    // outlives the callers it serves.
+    // outlives the callers it serves. The callers begin, and the run's clock with them, once
+    // every tail has taken its place: a claim posted before its recipient's tail had was posted
+    // behind where that tail reads from (`Watch::all_positioned`).
     let collect = async {
+        if let Some(watch) = positions
+            && let Err(error) = watch.all_positioned(tails).await
+        {
+            stop();
+            return Err(error);
+        }
+        let run_start_epoch_ns = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(since) => since.as_nanos(),
+            Err(_) => {
+                stop();
+                return Err(LoadError::Clock);
+            }
+        };
+        let run_start = Instant::now();
+        let mut callers = match focal_rt::Concurrent::new(jobs.len()) {
+            Ok(callers) => callers,
+            Err(_) => {
+                stop();
+                return Err(LoadError::Bound("callers"));
+            }
+        };
+        let pushed = (|| {
+            for job in jobs {
+                let slot = usize::from(job.index)
+                    .checked_rem(conns.len())
+                    .ok_or(LoadError::Bound("connections"))?;
+                let conn = conns.get(slot).ok_or(LoadError::Bound("connections"))?;
+                let side = match consumer {
+                    Some(side) => Some(ConsumerSide {
+                        principal: side.principal,
+                        conn: consumer_conns
+                            .get(slot)
+                            .ok_or(LoadError::Bound("consumer connections"))?,
+                        generations: side.generations,
+                        watch: side.watch,
+                    }),
+                    None => None,
+                };
+                let index = job.index;
+                callers
+                    .push(async move {
+                        (
+                            index,
+                            worker(job, phase, run_start, generations, conn, (side, agents)).await,
+                        )
+                    })
+                    .map_err(|_| LoadError::Bound("callers"))?;
+            }
+            Ok::<(), LoadError>(())
+        })();
+        if let Err(error) = pushed {
+            stop();
+            return Err(error);
+        }
         let mut outcomes = Vec::with_capacity(callers.len());
         let mut failed = None;
         while let Some((index, outcome)) = callers.join_next().await {
@@ -1637,18 +1674,13 @@ async fn run_phase(
                 }
             }
         }
-        if let Some(side) = consumer {
-            side.watch.stop();
-        }
-        if let Some(run) = agents {
-            run.watch.stop();
-        }
+        stop();
         match failed {
             Some(error) => Err(error),
-            None => Ok(outcomes),
+            None => Ok((outcomes, run_start, run_start_epoch_ns)),
         }
     };
-    let mut outcomes = match (consumer, &tail_conns) {
+    let (mut outcomes, run_start, run_start_epoch_ns) = match (consumer, &tail_conns) {
         (Some(side), Some((consumer_tail, issuer_tail))) => {
             let (outcomes, consumer_tailed, issuer_tailed) = hyper_rt::combine::join3(
                 collect,
