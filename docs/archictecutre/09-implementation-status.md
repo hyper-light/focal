@@ -16555,3 +16555,25 @@ segment at every open, the header's look included, and wipes all of it at drop a
 with volatile writes, which no compiler merges; a wipe at `memset`'s speed behind a barrier that
 keeps it, and a segment's buffer made when a segment is first read, are owed in hyper-seal
 (shared crate) with the next re-vendor.
+
+The whole system in work mode (compare CI's `work`, 500 agents among three nodes of one CPU each,
+20, 50 and 100 claims a second; `compare/work-seal-on` run 40032185474 at b27f4299 against run
+40021782035 at 92421e45, the same workflow; read with one script over both runs' reports). The
+sealed side sealed: its nodes recorded fence 9 (`focal_upgrade_fence_level`), and a node founded
+at this binary seals from its first start (`focal run demo` on an empty data directory: `SEALED`,
+the domain's 61-byte key, the chunk and manifest under 32-hex keyed names). No write was refused
+or left unknown on either side at any rate.
+
+| Claims/s | Side | Writes committed | Write p50 / p99 | Evidence steps p50 / p99 | Claim settled p50 / p99 | CPU s, leader / followers |
+|---|---|---|---|---|---|---|
+| 20 | clear | 13,200 | 1.7 / 6.7 ms | 3.8 / 8.9 ms | 0.03 / 0.06 s | 38.9 / 20.5, 21.7 |
+| 20 | sealed | 13,200 | 1.8 / 6.3 ms | 4.1 / 9.9 ms | 0.03 / 0.08 s | 37.5 / 21.3, 22.1 |
+| 50 | clear | 33,014 | 4.5 / 54.3 ms | 8.3 / 67.2 ms | 0.08 / 0.55 s | 75.3 / 43.4, 41.3 |
+| 50 | sealed | 33,007 | 3.9 / 36.8 ms | 7.4 / 45.8 ms | 0.06 / 0.43 s | 74.5 / 44.2, 46.8 |
+| 100 | clear | 70,552 | 795.8 / 29,609 ms | 802.9 / 1,714.6 ms | 29.0 / 44.7 s | 117.0 / 55.6, 59.0 |
+| 100 | sealed | 70,318 | 789.6 / 28,493 ms | 793.4 / 1,465.6 ms | 27.5 / 43.4 s | 113.0 / 67.2, 61.5 |
+
+Sealing costs the work path nothing these runs can see: the p99s moved both ways within one run's
+spread on shared runners, and the leader's CPU within 1.1% at 20 and 50 claims a second. At 100
+the one-CPU leader is past its ceiling on both sides (write p99 near 30 s), the cliff its own
+entry takes up.
