@@ -246,7 +246,7 @@ fn error_diagnostics_are_shape_checked_for_inline_and_durable_content() {
             ));
             drop(coordinator);
         };
-        let (result, ()) = hyper_rt::combine::join2(driver.run(&pool), exercise).await;
+        let (result, ()) = hyper_rt::combine::join2(driver.run(&pool, None), exercise).await;
         result.unwrap();
         pool.close();
         fixture.close().await;
@@ -312,7 +312,12 @@ fn empty_owner_reconciles_cancellation_after_content_cas_and_fences_completed_pr
             .await
             .unwrap();
         let job = driver.receiver.recv().await.unwrap();
-        let completed = process(&fixture.host, &pool, 1, Ok(old_snapshot), job).await;
+        let refused = AtomicU64::new(0);
+        let health = CopyHealth {
+            liveness: None,
+            refused: &refused,
+        };
+        let completed = process(&fixture.host, &pool, &health, 1, Ok(old_snapshot), job).await;
         let Completed::Seal {
             ref _allocation, ..
         } = completed
@@ -468,7 +473,7 @@ fn control_mailbox_replaces_policy_while_all_transfer_slots_are_blocked() {
             drop(checked);
             drop(coordinator);
         };
-        let (result, ()) = hyper_rt::combine::join2(driver.run(&pool), exercise).await;
+        let (result, ()) = hyper_rt::combine::join2(driver.run(&pool, None), exercise).await;
         result.unwrap();
         fixture.close().await;
     })
@@ -541,7 +546,7 @@ fn required_new_copies_apply_to_existing_content_and_restart_retains_bytes() {
             );
             drop(coordinator);
         };
-        let (result, ()) = hyper_rt::combine::join2(driver.run(&pool), exercise).await;
+        let (result, ()) = hyper_rt::combine::join2(driver.run(&pool, None), exercise).await;
         result.unwrap();
         pool.close();
         fixture.host.stop().await.unwrap();
@@ -833,7 +838,7 @@ fn native_inline_payloads_are_sealed_locally_and_replicated_to_every_required_co
             );
             drop(coordinator);
         };
-        let (result, ()) = hyper_rt::combine::join2(driver.run(&pool), exercise).await;
+        let (result, ()) = hyper_rt::combine::join2(driver.run(&pool, None), exercise).await;
         result.unwrap();
         pool.close();
         fixture.close().await;
@@ -885,7 +890,7 @@ fn artifact_jobs_past_the_queue_wait_at_the_door_and_are_each_served() {
             assert_eq!(door.timed_out, 0, "{door:?}");
             drop(coordinator);
         };
-        let (result, ()) = hyper_rt::combine::join2(driver.run(&pool), exercise).await;
+        let (result, ()) = hyper_rt::combine::join2(driver.run(&pool, None), exercise).await;
         result.unwrap();
         pool.close();
         fixture.close().await;
@@ -926,12 +931,134 @@ fn a_job_held_past_its_request_time_is_refused_and_counted() {
             EvidenceDoorStats {
                 held: 1,
                 timed_out: 1,
-                window: 1
+                window: 1,
+                copies_unavailable: 0,
             }
         );
         // The job the queue took goes with the driver that never ran, and its charge with it.
         drop(driver);
         drop(coordinator);
+        fixture.close().await;
+    })
+    .unwrap()
+}
+
+/// A required copy the liveness view holds dead is not asked: its job is refused at once as
+/// `Unavailable`, an outcome its participant knows and asks again on, and counted, with no dial to
+/// the copy and nothing waiting out the pool's request time (one node of three killed left 406
+/// submissions of unknown outcome, compare/work-faults 2026-10-22). Held alive again, it is asked.
+#[test]
+fn a_copy_the_liveness_view_holds_dead_is_not_asked_and_its_job_is_refused_at_once() {
+    focal_rt::block_on(async move {
+        let fixture = Fixture::new();
+        let held = placement(1, &[1, 2]);
+        fixture
+            .host
+            .install_policy(held.custody_policy())
+            .await
+            .unwrap();
+        let (coordinator, driver) = EvidenceCoordinator::channel(
+            fixture.host.clone(),
+            1,
+            vec![held],
+            fixture.budget.clone(),
+            1,
+        )
+        .unwrap();
+        let pool = pool();
+        let blackhole =
+            hyper_rt::udp::UdpSocket::bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+                .unwrap();
+        pool.replace_routes(
+            1,
+            BTreeMap::from([(
+                2,
+                PeerEndpoint {
+                    address: blackhole.local_addr().unwrap(),
+                    server_name: "localhost".into(),
+                    name: None,
+                },
+            )]),
+        )
+        .unwrap();
+        let (liveness, publisher) = crate::liveness::LivenessHandle::channel(
+            &fixture.budget,
+            crate::liveness::LivenessConfig::default(),
+            1,
+            ledger(),
+        )
+        .unwrap();
+        let held_as = |status| {
+            let mut view = liveness.view();
+            view.members.insert(
+                2,
+                crate::liveness::MemberView {
+                    generation: 1,
+                    status,
+                    incarnation: 1,
+                    confirmed: true,
+                    decided_at_ms: 0,
+                    suspected_by: None,
+                    confirmations: 0,
+                    extensions: 0,
+                    extended_ms: 0,
+                    timeout_ms: 0,
+                    rtt_ms: None,
+                },
+            );
+            view
+        };
+        publisher.publish_view(held_as(crate::liveness::MemberStatus::Dead));
+        let exercise = async {
+            assert_eq!(
+                coordinator.seal(seal_request(), far()).await,
+                Err(AccessError::Unavailable)
+            );
+            assert_eq!(coordinator.door_stats().copies_unavailable, 1);
+            assert_eq!(pool.stats().dials, 0);
+            publisher.publish_view(held_as(crate::liveness::MemberStatus::Alive));
+            {
+                let request = coordinator.attest(
+                    artifact_request(10, ArtifactPayload::Content(fixture.reference.clone())),
+                    far(),
+                );
+                let mut request = std::pin::pin!(request);
+                let mut datagram = [0; 2048];
+                // The copy's address hears the job's dial, or the wait is wedged: bounded by the
+                // frozen window alone (`crate::test_waits`).
+                crate::test_waits::charged(
+                    Vec::new,
+                    Duration::from_secs(2),
+                    Duration::from_millis(10),
+                    async {
+                        match hyper_rt::combine::race2(
+                            blackhole.recv_from(&mut datagram),
+                            request.as_mut(),
+                        )
+                        .await
+                        {
+                            hyper_rt::combine::Either::First(received) => {
+                                assert!(received.unwrap().0 > 0);
+                            }
+                            hyper_rt::combine::Either::Second(_) => {
+                                panic!("custody completed without the copy")
+                            }
+                        }
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(coordinator.door_stats().copies_unavailable, 1);
+                pool.close();
+                assert!(request.await.is_err());
+            }
+            drop(coordinator);
+        };
+        let (result, ()) =
+            hyper_rt::combine::join2(driver.run(&pool, Some(&liveness)), exercise).await;
+        result.unwrap();
+        drop(liveness);
+        drop(publisher);
         fixture.close().await;
     })
     .unwrap()
@@ -1020,7 +1147,7 @@ fn replication_records_a_receipt_per_verified_copy_and_the_obligation_reads_them
                 .unwrap();
             assert_eq!(renewed.policy_revision, 2);
         };
-        match hyper_rt::combine::race2(exercise, driver.run(&pool)).await {
+        match hyper_rt::combine::race2(exercise, driver.run(&pool, None)).await {
             hyper_rt::combine::Either::First(()) => {}
             hyper_rt::combine::Either::Second(result) => panic!("driver stopped: {result:?}"),
         }

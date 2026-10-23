@@ -623,7 +623,7 @@ impl Fleet {
             let driver = focal_rt::spawn(async move {
                 let (replication, evidence) = hyper_rt::combine::join2(
                     channel.drive(&sending),
-                    evidence_driver.run(&sending),
+                    evidence_driver.run(&sending, None),
                 )
                 .await;
                 assert!(replication.unwrap().peak_inflight <= 4);

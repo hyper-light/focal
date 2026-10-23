@@ -905,6 +905,11 @@ impl MetricsSnapshot {
             "Artifact jobs the evidence driver runs at once, learned from their completions.",
             self.evidence.window,
         );
+        text.counter(
+            "focal_evidence_copies_unavailable_total",
+            "Required copies an artifact job did not ask, the liveness view holding them suspect or dead; each refused its job at once.",
+            self.evidence.copies_unavailable,
+        );
         if let Some(StorageMetrics::Log(log)) = &self.storage {
             render_log(&mut text, log);
         }

@@ -16202,3 +16202,20 @@ its gain cycle's phases from its connection's seed. In hyper-quic's harness BBR 
 of 10 Mbit/s at 80 ms with 5% of the packets skipping the delay, where it carried 27.0%, and slates'
 bake-off puts its ping p99 at 1.125 of the best where 1.484 (hyper-raft `docs/transport.md` §4ag).
 vendor/README.md; docs/dependencies/inventory.tsv.
+
+### 2026-10-23 — An artifact job does not ask a copy the liveness view holds down
+
+focal's work among 500 agents on three 1-CPU nodes, one node killed for 30 s and later one isolated
+for 20 s (compare/work-faults, runs 39893835344 and 39893849327): 406 and 333 artifact submissions
+ended of unknown outcome, every one the worker's artifact (step 3), and the kill run's leader timed
+310 jobs out at the evidence door. An artifact is acknowledged only once every required copy answers
+Durable (26 §1), and the job asked the dead copy as it asked the others: its requests rode the
+connection the peer no longer answered (2,303 unanswered on the leader), each waiting out the pool's
+request time while the job held its place in the driver's window and the jobs behind it waited at the
+door past their requests' time. A job now reads the node's liveness view before asking a copy
+(`CopyHealth`): a copy held suspect or dead is not asked, and the job is refused at once as
+`Unavailable`, an outcome its participant knows and asks again on, as an obligation short of a copy
+is refused; the copies held alive are asked as before. Counter
+`focal_evidence_copies_unavailable_total`. Test:
+`a_copy_the_liveness_view_holds_dead_is_not_asked_and_its_job_is_refused_at_once` (refused, counted,
+no dial; held alive again, the copy's address hears the job).

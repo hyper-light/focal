@@ -1971,7 +1971,7 @@ impl NetworkService {
             }),
             focal_rt::boxed(|| async move {
                 let _ = match evidence {
-                    Some(driver) => driver.run(&this.pool).await,
+                    Some(driver) => driver.run(&this.pool, Some(&this.handles.liveness)).await,
                     None => std::future::pending().await,
                 };
                 Err(ServiceError::Owner("evidence driver ended"))

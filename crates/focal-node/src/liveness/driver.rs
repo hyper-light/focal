@@ -318,6 +318,11 @@ impl LivenessHandle {
     pub fn view(&self) -> LivenessView {
         self.view.borrow().clone()
     }
+    /// The status `node` holds in the published view, read in place, not copied with the view: a
+    /// member the driver has not heard from has none.
+    pub fn status_of(&self, node: u64) -> Option<MemberStatus> {
+        self.view.borrow().member(node).map(|member| member.status)
+    }
     pub fn config(&self) -> &LivenessConfig {
         &self.config
     }
@@ -629,6 +634,12 @@ pub struct LivenessDriver {
     _allocation: Allocation,
 }
 impl LivenessDriver {
+    /// Publishes `view` as if the driver had reached it: a test's statuses for members it never
+    /// probed.
+    #[cfg(test)]
+    pub(crate) fn publish_view(&self, view: LivenessView) {
+        self.view.send_replace(view);
+    }
     /// Run until the pool closes or every handle is dropped.
     pub async fn run(mut self, pool: &PeerConnectionPool) {
         let started = Instant::now();

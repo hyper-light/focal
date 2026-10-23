@@ -512,6 +512,33 @@ struct EvidenceDoor {
     timed_out: AtomicU64,
     /// The jobs the driver runs at once, as it has learned them ([`CompletionWindow`]).
     window: AtomicU64,
+    /// Required copies a job did not ask, the liveness view holding them suspect or dead
+    /// ([`CopyHealth`]).
+    copies_unavailable: AtomicU64,
+}
+/// What a job knows of its copies' health: the node's liveness view, and the count of copies it did
+/// not ask for it. A copy the view holds suspect or dead is not asked. Its requests ride a connection
+/// its peer no longer answers, each waiting out the pool's request time while the job holds a place
+/// in the driver's window and every job behind it waits at the door: a three-node work run with one
+/// node killed left 2,303 requests unanswered, 310 jobs timed out at the door and 406 submissions of
+/// unknown outcome (compare/work-faults, 2026-10-22). Refused at once, a submission's outcome is
+/// known and its participant asks again, as an obligation short of a copy is refused (26 §1).
+struct CopyHealth<'a> {
+    liveness: Option<&'a crate::liveness::LivenessHandle>,
+    refused: &'a AtomicU64,
+}
+impl CopyHealth<'_> {
+    /// Whether `peer` is held suspect or dead, counted when it is.
+    fn unavailable(&self, peer: u64) -> bool {
+        let unavailable = self
+            .liveness
+            .and_then(|liveness| liveness.status_of(peer))
+            .is_some_and(|status| status != crate::liveness::MemberStatus::Alive);
+        if unavailable {
+            self.refused.fetch_add(1, Ordering::Relaxed);
+        }
+        unavailable
+    }
 }
 /// What the evidence coordinator's door has held: requests held at all, and those whose request
 /// time ran out while held; and the jobs its driver runs at once, as it has learned them.
@@ -520,6 +547,7 @@ pub struct EvidenceDoorStats {
     pub held: u64,
     pub timed_out: u64,
     pub window: u64,
+    pub copies_unavailable: u64,
 }
 pub struct EvidenceDriver {
     door: Arc<EvidenceDoor>,
@@ -712,6 +740,7 @@ impl EvidenceCoordinator {
             held: self.door.held.load(Ordering::Relaxed),
             timed_out: self.door.timed_out.load(Ordering::Relaxed),
             window: self.door.window.load(Ordering::Relaxed),
+            copies_unavailable: self.door.copies_unavailable.load(Ordering::Relaxed),
         }
     }
     pub async fn seal(
@@ -890,18 +919,33 @@ enum Queue {
     Jobs,
 }
 impl EvidenceDriver {
-    pub async fn run(self, pool: &PeerConnectionPool) -> Result<(), AccessError> {
+    /// Runs the jobs, asking the copies over `pool`, and asking none `liveness` holds suspect or
+    /// dead ([`CopyHealth`]).
+    pub async fn run(
+        self,
+        pool: &PeerConnectionPool,
+        liveness: Option<&crate::liveness::LivenessHandle>,
+    ) -> Result<(), AccessError> {
         if hyper_rt::futures::shard_id().is_none() {
             return Err(AccessError::Unavailable);
         }
-        std::panic::AssertUnwindSafe(self.run_inner(pool))
+        std::panic::AssertUnwindSafe(self.run_inner(pool, liveness))
             .catch_unwind()
             .await
             .map_err(|_| AccessError::Unavailable)?
     }
-    async fn run_inner(mut self, pool: &PeerConnectionPool) -> Result<(), AccessError> {
+    async fn run_inner(
+        mut self,
+        pool: &PeerConnectionPool,
+        liveness: Option<&crate::liveness::LivenessHandle>,
+    ) -> Result<(), AccessError> {
         let content = self.content.clone();
         let node = self.node;
+        let door = self.door.clone();
+        let health = CopyHealth {
+            liveness,
+            refused: &door.copies_unavailable,
+        };
         let mut tasks = Concurrent::new(self.window.window()).map_err(|_| AccessError::Capacity)?;
         // The participant jobs in flight, by what each is, and the jobs of
         // the same identity that run after each: an exact retry that comes
@@ -914,9 +958,10 @@ impl EvidenceDriver {
         let mut same: BTreeMap<JobIdentity, VecDeque<Job>> = BTreeMap::new();
         let begin = |placement, identity, job| {
             let content = &content;
+            let health = &health;
             async move {
                 let began = std::time::Instant::now();
-                let done = process(content, pool, node, placement, job).await;
+                let done = process(content, pool, health, node, placement, job).await;
                 (identity, began, done)
             }
         };
@@ -1103,6 +1148,7 @@ mod tests;
 async fn process(
     content: &ContentHost,
     pool: &PeerConnectionPool,
+    health: &CopyHealth<'_>,
     node: u64,
     placement: Result<PlacementRow, AccessError>,
     job: Job,
@@ -1112,7 +1158,7 @@ async fn process(
         JobKind::Seal(response) => {
             let result = match (&placement, &job.request) {
                 (Ok(row), Some(request)) => {
-                    seal(content, pool, node, &row.placement, request).await
+                    seal(content, pool, health, node, &row.placement, request).await
                 }
                 (Err(error), _) => Err(error.clone()),
                 (Ok(_), None) => Err(AccessError::InvalidRequest),
@@ -1131,6 +1177,7 @@ async fn process(
                     attest(
                         content,
                         pool,
+                        health,
                         node,
                         &row.placement,
                         request,
@@ -1150,7 +1197,7 @@ async fn process(
         JobKind::AttestNative(response) => {
             let result = match (&placement, job.request) {
                 (Ok(row), Some(request)) => {
-                    attest_native(content, pool, node, &row.placement, request).await
+                    attest_native(content, pool, health, node, &row.placement, request).await
                 }
                 (Err(error), _) => Err(error.clone()),
                 (Ok(_), None) => Err(AccessError::InvalidRequest),
@@ -1181,7 +1228,7 @@ async fn process(
         }
         JobKind::Archive { bytes, reply } => {
             let result = match &placement {
-                Ok(row) => archive(content, pool, node, &row.placement, bytes).await,
+                Ok(row) => archive(content, pool, health, node, &row.placement, bytes).await,
                 Err(error) => Err(error.clone()),
             };
             drop(job._allocation);
@@ -1761,6 +1808,7 @@ async fn push(
 async fn archive(
     content: &ContentHost,
     pool: &PeerConnectionPool,
+    health: &CopyHealth<'_>,
     node: u64,
     placement: &EvidencePlacement,
     bytes: Vec<u8>,
@@ -1777,7 +1825,7 @@ async fn archive(
             .and_then(|bytes| bytes.try_into().ok())
             .ok_or(AccessError::InvalidRequest)?,
     );
-    replicate(content, pool, node, placement, request, &reference).await?;
+    replicate(content, pool, health, node, placement, request, &reference).await?;
     let obligation = obligation(content, pool, node, placement, &reference).await?;
     Ok(ArchiveOutcome {
         reference,
@@ -1871,6 +1919,7 @@ async fn obligation(
 async fn attest_native(
     content: &ContentHost,
     pool: &PeerConnectionPool,
+    health: &CopyHealth<'_>,
     node: u64,
     placement: &EvidencePlacement,
     request: VerifiedRequest,
@@ -1907,13 +1956,14 @@ async fn attest_native(
         length: payload.length,
         class: payload.class,
     };
-    replicate(content, pool, node, placement, key.id, &reference).await?;
+    replicate(content, pool, health, node, placement, key.id, &reference).await?;
     content.check_policy(placement.scope).await?;
     Ok(NativeEvidencedRequest { request, evidence })
 }
 async fn seal(
     content: &ContentHost,
     pool: &PeerConnectionPool,
+    health: &CopyHealth<'_>,
     node: u64,
     placement: &EvidencePlacement,
     request: &VerifiedRequest,
@@ -1924,6 +1974,7 @@ async fn seal(
     replicate(
         content,
         pool,
+        health,
         node,
         placement,
         request.request().request_id,
@@ -1972,6 +2023,7 @@ fn artifact(operation: &Operation) -> Option<&NewArtifact> {
 async fn attest(
     content: &ContentHost,
     pool: &PeerConnectionPool,
+    health: &CopyHealth<'_>,
     node: u64,
     placement: &EvidencePlacement,
     request: VerifiedRequest,
@@ -1996,7 +2048,10 @@ async fn attest(
                 return Err(AccessError::Capacity);
             }
             ensure_local(content, pool, node, placement, custody_id, reference).await?;
-            replicate(content, pool, node, placement, custody_id, reference).await?;
+            replicate(
+                content, pool, health, node, placement, custody_id, reference,
+            )
+            .await?;
             let bytes = content
                 .read_bytes(placement.scope, reference.clone(), maximum)
                 .await?;
@@ -2208,6 +2263,7 @@ async fn local(
 async fn replicate(
     content: &ContentHost,
     pool: &PeerConnectionPool,
+    health: &CopyHealth<'_>,
     node: u64,
     placement: &EvidencePlacement,
     request: RequestId,
@@ -2224,8 +2280,11 @@ async fn replicate(
     // Every copy is asked at once, and every one of them to the end: a
     // copy that fails or answers late delays no other, and what the others
     // took they hold whatever became of it. The first failure is what the
-    // replication failed with.
+    // replication failed with. A copy the liveness view holds suspect or
+    // dead is not asked and fails the replication; the others are asked as
+    // before ([`CopyHealth`]).
     let mut copies = Concurrent::new(placement.copies.len()).map_err(|_| AccessError::Capacity)?;
+    let mut failed = None;
     for peer in placement
         .copies
         .iter()
@@ -2233,6 +2292,10 @@ async fn replicate(
         .filter(|peer| *peer != node)
     {
         placement.admits(peer)?;
+        if health.unavailable(peer) {
+            failed.get_or_insert(AccessError::Unavailable);
+            continue;
+        }
         // One for each copy: within the set's bound.
         copies
             .push(replicate_to(
@@ -2240,7 +2303,6 @@ async fn replicate(
             ))
             .map_err(|_| AccessError::Capacity)?;
     }
-    let mut failed = None;
     while let Some(replicated) = copies.join_next().await {
         if let Err(error) = replicated {
             failed.get_or_insert(error);
