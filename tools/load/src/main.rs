@@ -181,8 +181,8 @@ mod tests {
         assert!(shape(&format!("{deliver}poll_ms: 1001\n")).is_err());
         // The inbox read's wait at the node: none (polling), up to the tool's bound.
         assert!(shape(&format!("{deliver}inbox_wait_ms: 0\n")).is_ok());
-        assert!(shape(&format!("{deliver}inbox_wait_ms: 10000\n")).is_ok());
-        assert!(shape(&format!("{deliver}inbox_wait_ms: 10001\n")).is_err());
+        assert!(shape(&format!("{deliver}inbox_wait_ms: 20000\n")).is_ok());
+        assert!(shape(&format!("{deliver}inbox_wait_ms: 20001\n")).is_err());
         assert!(shape("claims: 4\nconsumer_enrollment: /d\n").is_err());
     }
 

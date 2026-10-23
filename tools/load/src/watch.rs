@@ -82,6 +82,10 @@ pub struct Watch {
     /// them all to have ([`Watch::all_positioned`]).
     positioned: Cell<usize>,
     positioning: RefCell<Option<std::task::Waker>>,
+    /// The waker of the task the tails run in, to be woken as the run stops: a tail lets go of
+    /// the read it has out at the node then, where it waited for the read's answer, up to a whole
+    /// inbox wait ([`Watch::stopping`]). Every tail of a watch runs in one task, the run's.
+    stopping: RefCell<Option<std::task::Waker>>,
 }
 
 impl Watch {
@@ -99,7 +103,18 @@ impl Watch {
             agents: Cell::new(TailCounts::default()),
             positioned: Cell::new(0),
             positioning: RefCell::new(None),
+            stopping: RefCell::new(None),
         }
+    }
+    /// Ends once the run stops ([`Watch::stop`]).
+    fn stopping(&self) -> impl std::future::Future<Output = ()> + '_ {
+        std::future::poll_fn(|cx| {
+            if self.stopped.get() {
+                return std::task::Poll::Ready(());
+            }
+            *self.stopping.borrow_mut() = Some(cx.waker().clone());
+            std::task::Poll::Pending
+        })
     }
     /// A tail took its starting place: every delivery committed from here on is in what it reads.
     fn take_position(&self) {
@@ -195,6 +210,9 @@ impl Watch {
     pub fn stop(&self) {
         self.stopped.set(true);
         if let Some(waker) = self.positioning.borrow_mut().take() {
+            waker.wake();
+        }
+        if let Some(waker) = self.stopping.borrow_mut().take() {
             waker.wake();
         }
         self.posted.borrow_mut().clear();
@@ -341,7 +359,12 @@ pub async fn tail(
             request_id: RequestId::from_u128(ids()?),
             operation,
         };
-        let reply = conn.request(envelope).await;
+        // The read is let go once the run stops: its node answers a read no one waits for into
+        // a stream its client has reset.
+        let reply = match race2(conn.request(envelope), watch.stopping()).await {
+            Either::First(reply) => reply,
+            Either::Second(()) => break,
+        };
         watch.count(side, |counts| counts.polls = counts.polls.saturating_add(1));
         PROGRESS.tail_poll();
         let result = reply.map(|envelope| envelope.result);

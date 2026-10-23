@@ -1677,10 +1677,11 @@ async fn run_phase(
         stop();
         match failed {
             Some(error) => Err(error),
-            None => Ok((outcomes, run_start, run_start_epoch_ns)),
+            // The run's time is its callers': the tails it stops after them are not its writes.
+            None => Ok((outcomes, run_start.elapsed().as_nanos(), run_start_epoch_ns)),
         }
     };
-    let (mut outcomes, run_start, run_start_epoch_ns) = match (consumer, &tail_conns) {
+    let (mut outcomes, wall_ns, run_start_epoch_ns) = match (consumer, &tail_conns) {
         (Some(side), Some((consumer_tail, issuer_tail))) => {
             let (outcomes, consumer_tailed, issuer_tailed) = hyper_rt::combine::join3(
                 collect,
@@ -1746,7 +1747,7 @@ async fn run_phase(
     outcomes.sort_unstable_by_key(|(index, _)| *index);
     Ok((
         outcomes.into_iter().map(|(_, outcome)| outcome).collect(),
-        run_start.elapsed().as_nanos(),
+        wall_ns,
         run_start_epoch_ns,
     ))
 }

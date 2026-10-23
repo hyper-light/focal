@@ -15,9 +15,14 @@ pub const MAX_READS: u64 = 10_000_000;
 pub const MAX_CONCURRENCY: u16 = 64;
 /// The most of one caller's writes under way at once (`inflight`).
 pub const MAX_INFLIGHT: u16 = 256;
-/// The longest a side's inbox read is asked to wait at the node (`inbox_wait_ms`): under the
-/// node's request period (30 s by default), which a wait must end within.
-pub const MAX_INBOX_WAIT_MS: u32 = 10_000;
+/// The longest a side's inbox read is asked to wait at the node (`inbox_wait_ms`), and how long
+/// it waits by default: Amazon SQS's longest long poll (`WaitTimeSeconds` up to 20 s), two
+/// thirds of the 30 s a node and its client each hold a request for (RFC 6202 §5.5: a long poll's
+/// timeout "ought to be set to a high value", 30 s the safer one), the last third for the empty
+/// page's way back. A read waits the whole of it only while nothing comes for its side: a
+/// delivery ends the wait at once, so the wait costs no latency, only the empty pages a shorter
+/// one would have been answered with.
+pub const MAX_INBOX_WAIT_MS: u32 = 20_000;
 
 /// Which node the callers reach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -162,11 +167,13 @@ pub struct WorkloadShape {
     /// consumer that fetches has one.
     #[serde(default = "default_poll_ms")]
     pub poll_ms: u16,
-    /// `deliver`: how long a side's inbox read waits at the node for its next page before the
-    /// node answers it empty, in milliseconds (0..=MAX_INBOX_WAIT_MS, default 500): the side
-    /// asks the node to hold the read until a delivery to it applies (the waiting profile,
-    /// `Operation::NativeWait`) where it polled, as a Kafka consumer's fetch waits at the broker
-    /// `fetch.max.wait.ms`, 500 by default. Zero, or a node that does not wait, polls every
+    /// `deliver` and `work`: how long a side's inbox read waits at the node for its next page
+    /// before the node answers it empty, in milliseconds (0..=MAX_INBOX_WAIT_MS, default
+    /// MAX_INBOX_WAIT_MS): the side asks the node to hold the read until a delivery to it
+    /// applies (the waiting profile, `Operation::NativeWait`) where it polled. Kafka's consumer
+    /// waits `fetch.max.wait.ms`, 500 by default, sized for a fetch that usually finds data; an
+    /// agent's inbox is mostly idle, and 1,000 agents waiting 500 ms each read about 1,600 empty
+    /// pages a second (CI 39870118553). Zero, or a node that does not wait, polls every
     /// `poll_ms`.
     #[serde(default = "default_inbox_wait_ms")]
     pub inbox_wait_ms: u32,
@@ -229,7 +236,7 @@ fn default_poll_ms() -> u16 {
     2
 }
 fn default_inbox_wait_ms() -> u32 {
-    500
+    MAX_INBOX_WAIT_MS
 }
 
 /// The most agents a run goes among: the principals a session keeps a request generation window

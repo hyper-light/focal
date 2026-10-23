@@ -65,15 +65,22 @@ so two runs never collide and a run is reproducible.
 
 ```yaml
 lifecycle: deliver    # each message posted, received, answered with a testament and satisfied
-inbox_wait_ms: 500    # optional; how long an inbox read waits at the node (0 polls every poll_ms)
+inbox_wait_ms: 20000  # optional, the default and the most; how long an inbox read waits at the node (0 polls every poll_ms)
 agents: 1000          # optional; the messages go among this many agents (2..=4094)
 agent_enrollments: /client/agents   # `enrolled` only: the agents' client data directories
 ```
 
 A deliver side learns of the other's step only from its inbox. With `inbox_wait_ms`
 the read waits at the node until a delivery to the side applies, or the wait ends
-(the waiting profile, `Operation::NativeWait`; Kafka's consumer waits the same
-way, `fetch.max.wait.ms`, 500 ms by default); a node that cannot wait is polled.
+(the waiting profile, `Operation::NativeWait`); a node that cannot wait is polled.
+A delivery ends the wait at once, so its length costs no latency, only the empty
+pages a shorter wait would have been answered with: Kafka's consumer waits
+`fetch.max.wait.ms`, 500 ms, sized for fetches that usually find data, where an
+agent's inbox is mostly idle (1,000 agents waiting 500 ms each read about 1,600
+empty pages a second). The default is Amazon SQS's longest long poll, 20 s, two
+thirds of the 30 s a node and its client hold a request for (RFC 6202 §5.5: a long
+poll's timeout "ought to be set to a high value", 30 s the safer one). As a run
+stops, each tail lets go of the read it has out.
 With `agents` each agent is an identity of its own, on one connection of its own
 that carries both its writes and its inbox read: message `n` goes from agent
 `n mod agents` to agent `n + 1 mod agents`, so each agent issues to the next and
@@ -89,7 +96,7 @@ the agents' tails together (`agent_polls`, `agent_events`, `agent_waits`).
 ```yaml
 lifecycle: work       # each claim posted, worked, handed in, judged and settled among three agents
 agents: 16            # 3 at least: claim n's issuer is agent n, its worker n + 1, its evaluator n + 2, mod agents
-inbox_wait_ms: 500    # optional, as for deliver
+inbox_wait_ms: 20000  # optional, as for deliver
 ```
 
 `work` runs the authored lifecycle a team of agents runs (02 §3, §6), eleven writes a
