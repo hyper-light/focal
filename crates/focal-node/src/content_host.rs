@@ -14,7 +14,11 @@ use hyper_rt::sync::OneshotSender;
 use std::{
     future::Future,
     pin::Pin,
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread::JoinHandle,
     time::{Duration, Instant},
 };
@@ -26,9 +30,24 @@ const PASS_SLICES: usize = match focal_evidence::MAX_TRANSFER_MANIFEST_BYTES.che
     Some(chunks) => chunks.saturating_add(2),
     None => 2,
 };
+/// The calls held while the owner's queue is full, each by the word that admits it, oldest first,
+/// and how many were held and how many of those ran out of time held. Held, not refused: the
+/// owner drains its queue a call at a time, so a queue found full has room as soon as it takes
+/// the next, and a call refused for it was an artifact job refused `Capacity` for a moment's
+/// wait (1,612 in a work run with a content copy isolated, every job resent through the outage
+/// asking the owner to verify its payload again; compare/work-faults on cae493e6). What bounds
+/// the held is what each caller holds, charged before it calls, and each wait is bounded by the
+/// call's time (`crate::pace::Door`, the session's and the evidence coordinator's rule).
+#[derive(Default)]
+struct ContentDoor {
+    door: crate::pace::Door,
+    held: AtomicU64,
+    timed_out: AtomicU64,
+}
 #[derive(Clone)]
 pub struct ContentHost {
     sender: mpsc::SyncSender<Work>,
+    door: Arc<ContentDoor>,
     budget: MemoryBudget,
     timeout: Duration,
     max_frame_bytes: u32,
@@ -92,6 +111,9 @@ enum Command {
     /// restore of another backup is not carried on by it.
     RestoreAdvance(std::path::PathBuf, (focal_model::ContentHash, u64)),
     Stop,
+    /// The owner waits until the test lets it go: a queue filled behind it (test builds only).
+    #[cfg(test)]
+    Hold(mpsc::Receiver<()>),
 }
 /// A custody request whose answer waits on a pass over a whole object (the
 /// audit's F51): the pass, which the store keeps, and the reply it answers
@@ -207,6 +229,8 @@ impl ContentHost {
         scratch.resize(scratch_bytes, 0);
         let owner = CustodyStore::new(store, config, budget.clone())?;
         let (sender, receiver) = mpsc::sync_channel::<Work>(queue_items);
+        let door = Arc::new(ContentDoor::default());
+        let taking = door.clone();
         let timeout = limits.request_timeout;
         let max_frame_bytes = limits.max_frame_bytes;
         let worker_budget = budget.clone();
@@ -230,6 +254,8 @@ impl ContentHost {
                         .recv_timeout(next_expiry.saturating_duration_since(Instant::now()))
                     {
                         Ok(work) => {
+                            // A place in the queue is free: the oldest call held takes it.
+                            taking.door.wake_one();
                             let Work {
                                 command,
                                 result,
@@ -258,6 +284,7 @@ impl ContentHost {
         Ok((
             Self {
                 sender,
+                door,
                 budget,
                 timeout,
                 max_frame_bytes,
@@ -288,22 +315,92 @@ impl ContentHost {
             .map_err(|_| AccessError::Capacity)?
             .commit();
         let (send, receive) = hyper_rt::sync::oneshot().map_err(|_| AccessError::Capacity)?;
-        self.sender
-            .try_send(Work {
-                command,
-                result: send,
-                _allocation: allocation,
-            })
-            .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => AccessError::Capacity,
-                mpsc::TrySendError::Disconnected(_) => AccessError::Unavailable,
-            })?;
-        std::panic::AssertUnwindSafe(async { focal_rt::time::timeout(self.timeout, receive).await })
+        // The call's time bounds its wait for room as well as for its answer.
+        let deadline = focal_rt::time::Instant::now().saturating_add(self.timeout);
+        let mut work = Work {
+            command,
+            result: send,
+            _allocation: allocation,
+        };
+        let mut first = false;
+        let mut held = false;
+        // Each turn is a wake: the loop ends when the queue takes the call or its time runs out.
+        loop {
+            work = match self.sender.try_send(work) {
+                Ok(()) => break,
+                Err(mpsc::TrySendError::Full(work)) => work,
+                Err(mpsc::TrySendError::Disconnected(_)) => return Err(AccessError::Unavailable),
+            };
+            if deadline.remaining().is_zero() {
+                self.door.timed_out.fetch_add(1, Ordering::Relaxed);
+                return Err(AccessError::Capacity);
+            }
+            if !held {
+                held = true;
+                self.door.held.fetch_add(1, Ordering::Relaxed);
+            }
+            let (word, woken) = hyper_rt::sync::oneshot().map_err(|_| AccessError::Capacity)?;
+            self.door
+                .door
+                .hold(word, first)
+                .map_err(|refusal| match refusal {
+                    crate::pace::DoorRefusal::Memory => AccessError::Capacity,
+                    _ => AccessError::Unavailable,
+                })?;
+            // The owner may have taken a call between the queue found full and the word held,
+            // and woken none: the call is offered once more, and a word left held is let go by
+            // the wake that finds it unwaited.
+            work = match self.sender.try_send(work) {
+                Ok(()) => break,
+                Err(mpsc::TrySendError::Full(work)) => work,
+                Err(mpsc::TrySendError::Disconnected(_)) => return Err(AccessError::Unavailable),
+            };
+            match focal_rt::time::timeout_at(deadline, woken).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Err(AccessError::Unavailable),
+                Err(_) => {
+                    self.door.timed_out.fetch_add(1, Ordering::Relaxed);
+                    return Err(AccessError::Capacity);
+                }
+            }
+            // Woken to a queue full again, another call taken between: it was the oldest held,
+            // and is held first.
+            first = true;
+        }
+        std::panic::AssertUnwindSafe(async { focal_rt::time::timeout_at(deadline, receive).await })
             .catch_unwind()
             .await
             .map_err(|_| AccessError::OutcomeUnknown)?
             .map_err(|_| AccessError::OutcomeUnknown)?
             .map_err(|_| AccessError::OutcomeUnknown)?
+    }
+    /// Has the owner wait, once it takes this, until the sender returned is used or dropped: a test
+    /// fills the queue behind it.
+    #[cfg(test)]
+    pub(crate) fn hold_owner(&self) -> Result<mpsc::Sender<()>, AccessError> {
+        let (release, held) = mpsc::channel();
+        let (result, _) = hyper_rt::sync::oneshot().map_err(|_| AccessError::Capacity)?;
+        let allocation = self
+            .budget
+            .reserve(BudgetKind::Pending, BudgetLane::Completion, 4096)
+            .map_err(|_| AccessError::Capacity)?
+            .commit();
+        self.sender
+            .try_send(Work {
+                command: Command::Hold(held),
+                result,
+                _allocation: allocation,
+            })
+            .map_err(|_| AccessError::Capacity)?;
+        Ok(release)
+    }
+    /// The calls held while the owner's queue was full, and those whose time ran out held
+    /// ([`ContentDoor`]).
+    pub fn door_stats(&self) -> (u64, u64) {
+        (
+            self.door.held.load(Ordering::Relaxed),
+            self.door.timed_out.load(Ordering::Relaxed),
+        )
     }
     pub async fn install_policy(&self, policy: CustodyPolicy) -> Result<(), AccessError> {
         let charge = policy
@@ -901,6 +998,11 @@ fn execute(
                 .map_err(content_error)
         }
         Command::Stop => Ok(Output::Done),
+        #[cfg(test)]
+        Command::Hold(release) => {
+            let _ = release.recv();
+            Ok(Output::Done)
+        }
         Command::Verify(verification) => verification
             .advance(owner, budget)
             .map(Output::Verification),

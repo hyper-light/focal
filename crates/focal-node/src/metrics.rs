@@ -445,6 +445,10 @@ pub struct MetricsSnapshot {
     pub disk: Option<DiskStats>,
     pub staged_uploads: u64,
     pub staged_bytes: u64,
+    /// The content owner's door: calls held while its queue was full, and those whose time ran
+    /// out there (`ContentHost::door_stats`).
+    pub content_held: u64,
+    pub content_timed_out: u64,
     /// The evidence coordinator's door: participants' artifact jobs held while its queue was
     /// full, and those whose request time ran out there.
     pub evidence: crate::evidence_service::EvidenceDoorStats,
@@ -889,6 +893,16 @@ impl MetricsSnapshot {
             "focal_uploads_staged_bytes",
             "Bytes uploads in progress have staged.",
             self.staged_bytes,
+        );
+        text.counter(
+            "focal_content_requests_held_total",
+            "Calls to the content owner held while its queue was full, each until the owner took one before it.",
+            self.content_held,
+        );
+        text.counter(
+            "focal_content_requests_timed_out_total",
+            "Calls to the content owner whose time ran out while held at its full queue; each was refused for capacity.",
+            self.content_timed_out,
         );
         text.counter(
             "focal_evidence_requests_held_total",
@@ -2207,6 +2221,8 @@ mod tests {
             disk: None,
             staged_uploads: 0,
             staged_bytes: 0,
+            content_held: 0,
+            content_timed_out: 0,
             evidence: Default::default(),
             storage: None,
             fleet: FleetStatus {

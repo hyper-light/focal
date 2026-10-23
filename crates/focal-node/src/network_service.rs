@@ -1645,6 +1645,8 @@ impl NetworkService {
             disk,
             staged_uploads,
             staged_bytes,
+            content_held: self.handles.content.door_stats().0,
+            content_timed_out: self.handles.content.door_stats().1,
             evidence: self.handles.evidence.door_stats(),
             storage: match self.storage.backend() {
                 focal_consensus::StorageBackend::Wal(wal) => {

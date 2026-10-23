@@ -951,6 +951,45 @@ fn a_job_held_past_its_request_time_is_refused_and_counted() {
     .unwrap()
 }
 
+/// More calls at once than the content owner's queue holds are each served: those past it wait at
+/// its door for the owner to take one before them, where they were refused for capacity (1,612
+/// artifact jobs refused so in a work run with a content copy isolated; compare/work-faults on
+/// cae493e6). The owner is held while twice its queue's calls are asked, so those past the queue
+/// are held whatever the threads' timing; let go, it serves every one.
+#[test]
+fn calls_past_the_content_owners_queue_wait_at_its_door_and_are_each_served() {
+    focal_rt::block_on(async move {
+        let fixture = Fixture::new();
+        let release = fixture.host.hold_owner().unwrap();
+        let calls = 2 * 32;
+        let mut asked = focal_rt::Concurrent::new(calls).unwrap();
+        for _ in 0..calls {
+            asked.push(fixture.host.disk_stats()).ok().unwrap();
+        }
+        // Each call is asked once: queued, or held at the door.
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(asked.poll_next(cx).is_pending()))
+                .await
+        );
+        let (held, _) = fixture.host.door_stats();
+        assert!(
+            held >= 31,
+            "{held} held of {calls}, past a queue of 32 and the held owner's"
+        );
+        release.send(()).unwrap();
+        let mut served = 0;
+        while let Some(result) = asked.join_next().await {
+            result.unwrap();
+            served += 1;
+        }
+        assert_eq!(served, calls);
+        drop(asked);
+        assert_eq!(fixture.host.door_stats().1, 0);
+        fixture.close().await;
+    })
+    .unwrap()
+}
+
 /// A required copy the liveness view holds dead is not asked: its job is refused at once as
 /// `Unavailable`, an outcome its participant knows and asks again on, and counted, with no dial to
 /// the copy and nothing waiting out the pool's request time (one node of three killed left 406

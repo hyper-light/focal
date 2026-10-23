@@ -609,6 +609,8 @@ impl MetricsSnapshot {
             }),
             staged_uploads: wide,
             staged_bytes: wide,
+            content_held: wide,
+            content_timed_out: wide,
             evidence: crate::evidence_service::EvidenceDoorStats {
                 held: wide,
                 timed_out: wide,
