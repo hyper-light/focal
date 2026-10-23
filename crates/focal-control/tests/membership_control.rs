@@ -426,3 +426,84 @@ fn a_leader_that_has_not_applied_what_it_committed_waits_to_hand_over() {
     );
     assert!(!cluster.nodes[0].transfer_waits());
 }
+
+/// A leader just elected answers a read once it has committed in its term, where it refused the
+/// read `NotReady` until then: `transfer leader`, run on the node that had just taken the lead,
+/// read the configuration first and was refused `[not_ready] metadata leader is not ready` (macOS
+/// CI 39933447657 and 39961728611). The core holds a read until its leader has committed an entry
+/// of its term (Raft's read index, Ongaro's thesis §6.4), and the control host waits for what the
+/// read's index applies, so the refusal turned a moment both already wait out into an error.
+#[test]
+fn a_new_leader_holds_a_read_until_it_has_committed_in_its_term() {
+    let mut cluster = Cluster::new();
+    // Leader 1 hands over to node 2, and only what elects it is delivered: it leads, its term's
+    // first entry not yet sent.
+    let current = cluster.nodes[0].configuration();
+    cluster.nodes[0]
+        .transfer(&focal_control::ControlTransfer {
+            expected_configuration_index: current.configuration_index,
+            expected: current.configuration,
+            target: 2,
+        })
+        .unwrap();
+    let mut leads = false;
+    'elect: for _ in 0..200 {
+        let messages = cluster
+            .nodes
+            .iter_mut()
+            .flat_map(|node| node.drain(&NoEvidence).unwrap().messages)
+            .collect::<Vec<_>>();
+        for message in messages {
+            let (from, to) = (message.from, message.to);
+            if to == 4 || !cluster.nodes[(to - 1) as usize].accepts_peer(from) {
+                continue;
+            }
+            cluster.nodes[(to - 1) as usize]
+                .step_authenticated(from, &focal_consensus::encode_message(&message).unwrap())
+                .unwrap();
+            if cluster.nodes[1].status().role == StateRole::Leader {
+                leads = true;
+                break 'elect;
+            }
+        }
+    }
+    assert!(leads, "node 2 never took the lead");
+    assert!(
+        cluster.nodes[1].transfer_waits(),
+        "its term's entry is committed already"
+    );
+    cluster.nodes[1]
+        .read_index(b"after-election".to_vec())
+        .unwrap();
+    // The term's entry commits; the read comes back with an index at or past it.
+    let mut answered = None;
+    for _ in 0..200 {
+        let mut messages = Vec::new();
+        for (index, node) in cluster.nodes.iter_mut().enumerate() {
+            let drained = node.drain(&NoEvidence).unwrap();
+            if index == 1 {
+                for read in &drained.read_states {
+                    if read.context == b"after-election" {
+                        answered = Some(read.index);
+                    }
+                }
+            }
+            messages.extend(drained.messages);
+        }
+        if answered.is_some() || messages.is_empty() {
+            break;
+        }
+        for message in messages {
+            let (from, to) = (message.from, message.to);
+            if !cluster.nodes[(to - 1) as usize].accepts_peer(from) {
+                continue;
+            }
+            cluster.nodes[(to - 1) as usize]
+                .step_authenticated(from, &focal_consensus::encode_message(&message).unwrap())
+                .unwrap();
+        }
+    }
+    let index = answered.expect("the held read is answered once the term's entry commits");
+    assert!(index >= cluster.nodes[1].status().committed_index.min(index));
+    assert!(!cluster.nodes[1].transfer_waits());
+}

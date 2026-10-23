@@ -842,17 +842,20 @@ impl ControlReplica {
             return Err(ControlError::Capacity);
         }
         let status = self.node.status();
-        if status.role == StateRole::Leader {
-            self.check_ready()?;
-        } else {
-            if status.leader_id == 0 {
-                return Err(ControlError::Consensus(
-                    focal_consensus::ConsensusError::NotLeader { leader: 0 },
-                ));
-            }
-            if !self.drained {
-                return Err(ControlError::NotReady);
-            }
+        if status.role != StateRole::Leader && status.leader_id == 0 {
+            return Err(ControlError::Consensus(
+                focal_consensus::ConsensusError::NotLeader { leader: 0 },
+            ));
+        }
+        // A replica still draining its start answers nothing yet. A leader yet to commit an
+        // entry of its term, or to apply what it committed, is not refused: the core holds a
+        // read until its leader has committed in its term (Raft's read index, Ongaro's thesis
+        // §6.4), and the host serves it once the log has applied to its index. Refused for
+        // either (`check_ready`), an operator's read on a node that had just taken the lead was
+        // an error for a moment both already wait out (`transfer leader`'s configuration read,
+        // macOS CI 39933447657 and 39961728611).
+        if !self.drained {
+            return Err(ControlError::NotReady);
         }
         self.node.read_index(context)?;
         Ok(())

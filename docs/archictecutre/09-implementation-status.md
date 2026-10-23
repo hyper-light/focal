@@ -16267,17 +16267,29 @@ once it is let go).
 
 ### 2026-10-23 — A leader asked to hand over while it applies hands over once it has
 
-`cli_network`'s promote-and-transfer test failed on macOS CI (run 39933447657): `transfer leader`,
-asked just after the learner's promotion committed, was refused `[not_ready] metadata leader is
-not ready`. A control leader hands over only once it has drained its start, committed an entry of
-its term and applied all it committed (`ControlReplica::check_ready`), and a leader whose own
-agents keep proposing is often an entry from that at the moment a request comes; the host passed
-the refusal on, where every one of the three is reached by the leader's own progress. The host now
-holds such a transfer as it holds one that waits for the replica's proposal, within its request's
-time, and asks it once the leader is ready (`ControlReplica::transfer_waits`). Test:
+A control leader hands over only once it has drained its start, committed an entry of its term and
+applied all it committed (`ControlReplica::check_ready`), and the host passed a transfer asked
+before then back as `NotReady`, where each of the three is reached by the leader's own progress.
+The host now holds such a transfer as it holds one that waits for the replica's proposal, within
+its request's time, and asks it once the leader is ready (`ControlReplica::transfer_waits`). Test:
 `a_leader_that_has_not_applied_what_it_committed_waits_to_hand_over` (focal-control: committed and
-not applied, the transfer is refused `NotReady` and waits; applied, it waits no more).
+not applied, the transfer is refused `NotReady` and waits; applied, it waits no more). The macOS
+CI failure this was first taken for was a read's (below).
 
+### 2026-10-23 — A read asked of a leader that has just taken the lead waits for its term's commit
+
+`cli_network`'s promote-and-transfer test failed twice on macOS CI (runs 39933447657 and
+39961728611): `transfer leader`, asked on the node that had just taken the lead, was refused
+`[not_ready] metadata leader is not ready`. The refusal was the command's first step, a read of
+the configuration it compares the transfer with: a control leader refused a read before it had
+committed an entry of its term or applied what it committed (`check_ready`), where the core holds
+a read until its leader has committed in its term (Raft's read index, Ongaro's thesis §6.4; hyper-
+raft's `deferred_reads`, bounded) and the host serves it once what its index names has applied.
+A leader now refuses a read only while it drains its start, as a follower does, and every admin
+read on a new leader waits the moment out with it. Test:
+`a_new_leader_holds_a_read_until_it_has_committed_in_its_term` (focal-control: leader 1 hands over
+to node 2, delivered only to its election; its read, refused `NotReady` before, is held and
+answered once its term's entry commits).
 ### 2026-10-23 — An availability refusal is resent for the client's whole clock
 
 In the work runs with a content copy isolated for 20 s (above), the artifact submissions refused
