@@ -21,6 +21,15 @@
 #   AGENTS enrolled agents, 3 at least, an issuer, a worker and an evaluator, its eleven writes
 #   each learned of from the next agent's inbox (focal-load's `lifecycle: work`); RATE is
 #   claims a second.
+#   FAULTS (environment), focal: what the cluster suffers while the load runs, `;`-separated,
+#   each timed from the load's start (its warm-up included), every one undone by the run's end
+#   and logged with its time (`<report>.faults.txt`):
+#     netem=ARGS        `tc qdisc ... netem ARGS` on every node's interface for the whole run,
+#                       e.g. `netem=delay 80ms 30ms loss 3% reorder 5%`
+#     kill=NODE@S+D     NODE (focal1, focal2 or focal3) killed S seconds in, started again D later
+#     isolate=NODE@S+D  NODE cut off from every peer and client (all its datagrams lost) S seconds
+#                       in, for D seconds
+#   The report's file names the run as faulted (`-faults`).
 #   INFLIGHT (environment): the generator's window, the requests out at most
 #   (focal-compare's own default, 4096, where unset); a run given one names it
 #   in its report's file.
@@ -90,6 +99,73 @@ evidence() {
   echo "::endgroup::"
 }
 cleanup() { dc down -v --remove-orphans >/dev/null 2>&1 || true; }
+# The FAULTS a run suffers, applied as its load starts: the shaping every node keeps, and each
+# timed fault in a background job of its own whose PID is kept, so the load's end stops any not
+# yet done and undoes what it did. Each step is logged with the seconds since the load began.
+fault_pids=()
+fault_shaping=""
+fault_started=0
+fault_log() { echo "$(( $(date +%s) - fault_started ))s $*" >> "$out/$report.faults.txt"; }
+fault_shape() {
+  local node=$1 how=$2
+  if [ -n "$how" ]; then
+    dc exec -T "$node" tc qdisc replace dev eth0 root netem $how
+  else
+    dc exec -T "$node" tc qdisc del dev eth0 root 2>/dev/null || true
+  fi
+}
+faults_start() {
+  [ -n "${FAULTS:-}" ] || return 0
+  fault_started=$(date +%s)
+  : > "$out/$report.faults.txt"
+  local spec what node at down
+  IFS=';' read -ra specs <<< "$FAULTS"
+  for spec in "${specs[@]}"; do
+    case "$spec" in
+      netem=*)
+        fault_shaping=${spec#netem=}
+        for node in focal1 focal2 focal3; do fault_shape "$node" "$fault_shaping"; done
+        fault_log "netem on every node: $fault_shaping"
+        ;;
+      kill=*@*+* | isolate=*@*+*)
+        what=${spec%%=*}; node=${spec#*=}; node=${node%@*}
+        at=${spec#*@}; at=${at%+*}; down=${spec##*+}
+        case "$node" in focal1 | focal2 | focal3) ;; *) echo "FAULTS: no node $node" >&2; return 2 ;; esac
+        (
+          sleep "$at"
+          if [ "$what" = kill ]; then
+            dc kill "$node" >/dev/null 2>&1; fault_log "$node killed"
+            sleep "$down"
+            dc start "$node" >/dev/null 2>&1
+            [ -n "$fault_shaping" ] && fault_shape "$node" "$fault_shaping"
+            fault_log "$node started"
+          else
+            fault_shape "$node" "loss 100%"; fault_log "$node isolated"
+            sleep "$down"
+            fault_shape "$node" "$fault_shaping"; fault_log "$node rejoined"
+          fi
+        ) &
+        fault_pids+=("$!")
+        ;;
+      *) echo "FAULTS: no fault $spec" >&2; return 2 ;;
+    esac
+  done
+}
+# The load is over: a fault still waiting is stopped, a node it left down started again and one
+# it left cut off joined again, so the run's evidence reads every node.
+faults_end() {
+  [ -n "${FAULTS:-}" ] || return 0
+  local pid node
+  for pid in "${fault_pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+  wait "${fault_pids[@]}" 2>/dev/null || true
+  for node in focal1 focal2 focal3; do
+    if [ "$(docker inspect -f '{{.State.Running}}' "$(dc ps -a -q "$node")" 2>/dev/null)" != true ]; then
+      dc start "$node" >/dev/null 2>&1 || true; fault_log "$node started at the end"
+    fi
+    fault_shape "$node" ""
+  done
+  fault_log "every fault undone"
+}
 # Each of the run's containers' CPU as its cgroup (v2) counts it, read on the
 # host so nothing runs inside a container: the microseconds it ran, and those
 # and the times its CPU quota held it back. Taken before and after the load,
@@ -177,7 +253,7 @@ trap cleanup EXIT
 cleanup
 pull_images
 dc up -d
-report="$system-$rate-$payload$window$suffix.json"
+report="$system-$rate-$payload$window$suffix${FAULTS:+-faults}.json"
 
 case "$system" in
   focal)
@@ -250,12 +326,15 @@ EOF
     cpu_stat before > "$out/$report.cpu.txt"
     net_stat before > "$out/$report.net.txt"
     disk_stat before > "$out/$report.disk.txt"
+    faults_start
     if ! timeout "$bound" docker compose -f compose.yaml --profile focal \
       exec -T -e "FOCAL_LOAD_WRITES_CSV=/reports/$report.csv" focal-load \
       focal-load --shape /reports/shape.yaml --out "/reports/$report"; then
+      faults_end
       evidence
       exit 1
     fi
+    faults_end
     cpu_stat after >> "$out/$report.cpu.txt"
     net_stat after >> "$out/$report.net.txt"
     disk_stat after >> "$out/$report.disk.txt"

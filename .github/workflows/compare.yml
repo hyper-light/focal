@@ -42,6 +42,9 @@ on:
       agents:
         description: "deliver mode on focal: the messages go among this many enrolled agents, each a client of its own (focal-load's agents, 2..=4094); empty, one issuer and one consumer"
         default: ""
+      faults:
+        description: "focal: what the cluster suffers while each load runs (run.sh FAULTS), e.g. 'netem=delay 80ms 30ms loss 3%;kill=focal2@40+30;isolate=focal3@100+20'; empty, none"
+        default: ""
 
 permissions:
   contents: read
@@ -125,6 +128,7 @@ jobs:
           NODE_CPUS: "1"
           MODE: ${{ github.event.inputs.mode || (startsWith(github.ref_name, 'compare/deliver') && 'deliver' || (startsWith(github.ref_name, 'compare/work') && 'work' || 'append')) }}
           AGENTS: ${{ github.event.inputs.agents || (startsWith(github.ref_name, 'compare/work') && '500' || '') }}
+          FAULTS: ${{ github.event.inputs.faults || '' }}
           # The competitors' images from the repository's registry where the image
           # job copied them (compose.yaml's defaults are the public sources).
           BENCH_LIBRARY: ${{ needs.image.outputs.registry || 'public.ecr.aws/docker/library' }}
@@ -266,6 +270,20 @@ jobs:
               for row in delivered:
                   print("| " + " | ".join(f"{v:,.1f}" if isinstance(v, float) else str(v) for v in row) + " |")
           PY
+      - name: What each faulted run suffered
+        if: always()
+        run: |
+          for log in tools/compare/compose/reports/*.faults.txt; do
+            [ -f "$log" ] || continue
+            {
+              echo
+              echo "### Faults: $(basename "$log" .faults.txt)"
+              echo
+              echo '```'
+              cat "$log"
+              echo '```'
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+          done
       - name: Where each tail fell, beside the nodes' events
         if: always()
         run: |
