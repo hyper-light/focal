@@ -26,6 +26,11 @@
 #   and logged with its time (`<report>.faults.txt`):
 #     netem=ARGS        `tc qdisc ... netem ARGS` on every node's interface for the whole run,
 #                       e.g. `netem=delay 80ms 30ms loss 3% reorder 5%`
+#     netem-peers=ARGS  as netem, on only what each node sends the other nodes (replication,
+#                       content copies, liveness): a `prio` root whose first band is netem, the
+#                       peers' addresses filtered to it, the rest of the node's datagrams sent as
+#                       they come
+#     netem-clients=ARGS  as netem-peers, on only what each node sends the load's clients
 #     kill=NODE@S+D     NODE killed S seconds in, started again D later. NODE is focal1, focal2 or
 #                       focal3, or a role in the bench session's placement as the fault begins
 #                       (`focal inspect placement`): `copy`, a node holding one of its content
@@ -108,6 +113,9 @@ cleanup() { dc down -v --remove-orphans >/dev/null 2>&1 || true; }
 # yet done and undoes what it did. Each step is logged with the seconds since the load began.
 fault_pids=()
 fault_shaping=""
+# Which of a node's datagrams the shaping takes: all (empty), its peers' (netem-peers) or the
+# load's clients' (netem-clients).
+fault_directed=""
 fault_started=0
 fault_log() { echo "$(( $(date +%s) - fault_started ))s $*" >> "$out/$report.faults.txt"; }
 fault_shape() {
@@ -117,6 +125,51 @@ fault_shape() {
   else
     dc exec -T "$node" tc qdisc del dev eth0 root 2>/dev/null || true
   fi
+}
+# The addresses a directed shaping takes NODE's datagrams to, one a line: the other nodes', or the
+# load's.
+fault_targets() {
+  local node=$1 peer
+  if [ "$fault_directed" = netem-peers ]; then
+    for peer in focal1 focal2 focal3; do
+      [ "$peer" = "$node" ] || container_address "$peer"
+    done
+  else
+    container_address focal-load
+  fi
+}
+# NODE shaped as the run's shaping says again (after a restart or an isolation): all its datagrams,
+# or those to its directed targets; nothing where the run shapes none.
+fault_reshape() {
+  local node=$1
+  [ -n "$fault_shaping" ] || { fault_shape "$node" ""; return 0; }
+  if [ -n "$fault_directed" ]; then
+    local targets=()
+    mapfile -t targets < <(fault_targets "$node")
+    fault_shape_to "$node" "$fault_shaping" "${targets[@]}"
+  else
+    fault_shape "$node" "$fault_shaping"
+  fi
+}
+# A container's address on the compose network: what a directed shaping filters by.
+container_address() {
+  docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' \
+    "$(dc ps -q "$1")" 2>/dev/null | awk '{print $1}'
+}
+# netem on only the datagrams NODE sends the addresses given: a `prio` root of two bands, every
+# priority mapped to the second (sent as it comes), the first band's child netem HOW, and a u32
+# filter sending each address's datagrams to the first. Undone as the whole shaping is
+# (`fault_shape NODE ""`, the root deleted with its bands and filters).
+fault_shape_to() {
+  local node=$1 how=$2 address
+  shift 2
+  dc exec -T "$node" tc qdisc replace dev eth0 root handle 1: prio bands 2 \
+    priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1
+  dc exec -T "$node" tc qdisc add dev eth0 parent 1:1 handle 10: netem $how
+  for address in "$@"; do
+    dc exec -T "$node" tc filter add dev eth0 parent 1: protocol ip prio 1 u32 \
+      match ip dst "$address/32" flowid 1:1
+  done
 }
 # The container a fault's NODE names: itself, or the node that holds the role in the bench
 # session's placement now, by the zone it is configured in (focalN.yaml: a, b, c), read from the
@@ -158,6 +211,13 @@ faults_start() {
         for node in focal1 focal2 focal3; do fault_shape "$node" "$fault_shaping"; done
         fault_log "netem on every node: $fault_shaping"
         ;;
+      netem-peers=* | netem-clients=*)
+        fault_directed=${spec%%=*}; fault_shaping=${spec#*=}
+        for node in focal1 focal2 focal3; do
+          fault_reshape "$node"
+          fault_log "$fault_directed on $node to $(fault_targets "$node" | tr '\n' ' '): $fault_shaping"
+        done
+        ;;
       kill=*@*+* | isolate=*@*+*)
         what=${spec%%=*}; node=${spec#*=}; node=${node%@*}
         at=${spec#*@}; at=${at%+*}; down=${spec##*+}
@@ -175,12 +235,12 @@ faults_start() {
             dc kill "$node" >/dev/null 2>&1; fault_log "$node killed"
             sleep "$down"
             dc start "$node" >/dev/null 2>&1
-            [ -n "$fault_shaping" ] && fault_shape "$node" "$fault_shaping"
+            fault_reshape "$node"
             fault_log "$node started"
           else
             fault_shape "$node" "loss 100%"; fault_log "$node isolated"
             sleep "$down"
-            fault_shape "$node" "$fault_shaping"; fault_log "$node rejoined"
+            fault_reshape "$node"; fault_log "$node rejoined"
           fi
         ) &
         fault_pids+=("$!")
