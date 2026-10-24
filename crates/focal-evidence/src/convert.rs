@@ -80,7 +80,7 @@ pub struct Tally {
 }
 
 impl Tally {
-    fn add(&mut self, bytes: u64) {
+    pub(super) fn add(&mut self, bytes: u64) {
         self.files = self.files.saturating_add(1);
         self.bytes = self.bytes.saturating_add(bytes);
     }
@@ -148,17 +148,17 @@ impl ConversionStatus {
 /// What a store keeps of its conversion since this start, behind [`ConversionStatus`].
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct Progress {
-    resumed: bool,
-    started_ms: u64,
-    finished_ms: u64,
+    pub(super) resumed: bool,
+    pub(super) started_ms: u64,
+    pub(super) finished_ms: u64,
     /// Whether the count runs, or ran when the conversion stopped.
-    counting: bool,
-    counted: Tally,
-    converted: Tally,
-    gone: Tally,
-    held: bool,
-    held_steps: u64,
-    stopped: Option<ContentErrorKind>,
+    pub(super) counting: bool,
+    pub(super) counted: Tally,
+    pub(super) converted: Tally,
+    pub(super) gone: Tally,
+    pub(super) held: bool,
+    pub(super) held_steps: u64,
+    pub(super) stopped: Option<ContentErrorKind>,
 }
 
 impl Progress {
@@ -171,10 +171,26 @@ impl Progress {
             ..Self::default()
         }
     }
+
+    /// The status this progress gives, the store being in `form`.
+    pub(super) fn status(&self, form: StoreForm) -> ConversionStatus {
+        ConversionStatus {
+            form,
+            resumed: self.resumed,
+            started_ms: self.started_ms,
+            finished_ms: self.finished_ms,
+            counted: self.counted,
+            converted: self.converted,
+            gone: self.gone,
+            held: self.held,
+            held_steps: self.held_steps,
+            stopped: self.stopped,
+        }
+    }
 }
 
 /// Milliseconds since the Unix epoch, zero where the clock reads before it.
-fn now_ms() -> u64 {
+pub(super) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
@@ -436,10 +452,11 @@ fn clear_name(path: &Path) -> Option<(ContentHash, Kind)> {
 /// The length of a file the conversion converts: a file itself, not a link to one, no longer than
 /// its kind's bound, which no file the store writes exceeds. None for anything else, which was
 /// never an object's. `metadata` is the entry's own, its links not followed.
-fn convertible(kind: Kind, metadata: &fs::Metadata) -> Option<u64> {
+pub(super) fn convertible(kind: Kind, metadata: &fs::Metadata) -> Option<u64> {
     let bound = match kind {
         Kind::Chunk => MAX_TRANSFER_CHUNK_BYTES,
         Kind::Manifest => MAX_TRANSFER_MANIFEST_BYTES,
+        Kind::Seed => super::SEED_CHUNK_BYTES,
     };
     let length = metadata.len();
     (metadata.is_file() && usize::try_from(length).is_ok_and(|length| length <= bound))
@@ -521,28 +538,16 @@ impl ContentStore {
 
     /// The store's form and where its conversion stands since this start.
     pub fn conversion_status(&self) -> ConversionStatus {
-        let progress = &self.progress;
         let form = if !self.keys.seals() {
             StoreForm::Clear
         } else if !self.keys.clear_allowed() {
             StoreForm::Sealed
-        } else if progress.counting {
+        } else if self.progress.counting {
             StoreForm::Counting
         } else {
             StoreForm::Converting
         };
-        ConversionStatus {
-            form,
-            resumed: progress.resumed,
-            started_ms: progress.started_ms,
-            finished_ms: progress.finished_ms,
-            counted: progress.counted,
-            converted: progress.converted,
-            gone: progress.gone,
-            held: progress.held,
-            held_steps: progress.held_steps,
-            stopped: progress.stopped,
-        }
+        self.progress.status(form)
     }
 
     /// A restore about to move the file at `source`, of `domain` in the round named `round`, to
@@ -847,7 +852,7 @@ pub(super) fn remove_marker(root: &Path, name: &str) -> Result<(), ContentError>
 }
 
 /// A name in the clear removed; its directory is flushed as the conversion leaves it.
-fn remove_clear(path: &Path) -> Result<(), ContentError> {
+pub(super) fn remove_clear(path: &Path) -> Result<(), ContentError> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),

@@ -28,6 +28,8 @@ fn hosting_with(dir: &Path, id: u64, limits: NativeSessionLimits) -> NativeHosti
         seeds: focal_evidence::SeedStore::open(
             dir.join(format!("seeds-{id}")),
             focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default()).unwrap(),
+            &focal_seal::test_keys(content_dir(dir, id)).unwrap(),
+            focal_evidence::ContentForm::Sealed,
         )
         .unwrap(),
         cold: Some(crate::ColdSource {
@@ -2571,7 +2573,11 @@ fn a_backup_names_exactly_what_its_prefix_references_and_verifies_after_every_du
         focal_seal::test_keys(content_dir(cluster.dir.path(), 1)).unwrap(),
     )
     .unwrap();
-    let seeds = focal_evidence::SeedReader::open(cluster.dir.path().join("seeds-1")).unwrap();
+    let seeds = focal_evidence::SeedReader::open(
+        cluster.dir.path().join("seeds-1"),
+        focal_seal::test_keys(content_dir(cluster.dir.path(), 1)).unwrap(),
+    )
+    .unwrap();
     let decoder = backup::decoder_pair();
     let root = Path::new("/backup");
     // The complete write.
@@ -2728,7 +2734,11 @@ fn a_backup_of_a_seeded_root_carries_every_chunk_and_names_them_exactly() {
         focal_seal::test_keys(content_dir(cluster.dir.path(), 1)).unwrap(),
     )
     .unwrap();
-    let seeds = focal_evidence::SeedReader::open(cluster.dir.path().join("seeds-1")).unwrap();
+    let seeds = focal_evidence::SeedReader::open(
+        cluster.dir.path().join("seeds-1"),
+        focal_seal::test_keys(content_dir(cluster.dir.path(), 1)).unwrap(),
+    )
+    .unwrap();
     let decoder = backup::decoder_pair();
     let root = Path::new("/backup");
     let mut medium = focal_sim::disk::Disk::new(64 * 1024 * 1024);
@@ -2797,7 +2807,11 @@ fn a_backup_restores_into_a_new_incarnation_that_holds_the_prefix_and_continues(
         focal_seal::test_keys(content_dir(cluster.dir.path(), 1)).unwrap(),
     )
     .unwrap();
-    let seeds = focal_evidence::SeedReader::open(cluster.dir.path().join("seeds-1")).unwrap();
+    let seeds = focal_evidence::SeedReader::open(
+        cluster.dir.path().join("seeds-1"),
+        focal_seal::test_keys(content_dir(cluster.dir.path(), 1)).unwrap(),
+    )
+    .unwrap();
     let decoder = backup::decoder_pair();
     let target = tempfile::tempdir().unwrap();
     let dir = target.path().join("backup");
@@ -2829,6 +2843,8 @@ fn a_backup_restores_into_a_new_incarnation_that_holds_the_prefix_and_continues(
         let mut sink = focal_evidence::SeedStore::open(
             other.path().join(format!("seeds-{node}")),
             focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default()).unwrap(),
+            &focal_seal::test_keys(content_dir(other.path(), node)).unwrap(),
+            focal_evidence::ContentForm::Sealed,
         )
         .unwrap();
         let installed = backup::import_seeds(&files, &dir, manifest, &mut sink).unwrap();
@@ -3177,7 +3193,11 @@ fn a_sustained_workload_stays_within_its_budgets_and_keeps_every_outcome() {
         focal_seal::test_keys(content_dir(cluster.dir.path(), 1)).unwrap(),
     )
     .unwrap();
-    let seeds = focal_evidence::SeedReader::open(cluster.dir.path().join("seeds-1")).unwrap();
+    let seeds = focal_evidence::SeedReader::open(
+        cluster.dir.path().join("seeds-1"),
+        focal_seal::test_keys(content_dir(cluster.dir.path(), 1)).unwrap(),
+    )
+    .unwrap();
     let target = tempfile::tempdir().unwrap();
     let dir = target.path().join("backup");
     let mut files = backup::FileMedium;

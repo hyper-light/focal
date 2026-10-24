@@ -422,6 +422,31 @@ pub struct AdminSeedReport {
     pub visited: u64,
     pub removed: u64,
     pub bytes_removed: u64,
+    /// The replicas' seed directories at rest (29 §12), as the pass left them.
+    #[serde(default)]
+    pub conversion: AdminSeedConversion,
+}
+/// The forms of the seed directories of the replicas a node hosts (29 §12), and what the
+/// conversions of those still converting counted to convert, converted, found gone before they
+/// met them, and have left, in files and bytes; with how many wait for room and how many stopped
+/// (each resumes at the node's next start).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminSeedConversion {
+    pub clear: u64,
+    pub counting: u64,
+    pub converting: u64,
+    pub sealed: u64,
+    pub held: u64,
+    pub stopped: u64,
+    pub files_counted: u64,
+    pub bytes_counted: u64,
+    pub files_converted: u64,
+    pub bytes_converted: u64,
+    pub files_gone: u64,
+    pub bytes_gone: u64,
+    pub files_left: u64,
+    pub bytes_left: u64,
 }
 /// One collector pass on one node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

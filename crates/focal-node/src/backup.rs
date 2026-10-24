@@ -117,10 +117,10 @@ pub async fn create(
     let limits = crate::network_service::native_limits(domain, budget.limit(), budget.limit())
         .map_err(|_| AccessError::Unavailable)?;
     let seeds = backup::SessionSeeds {
-        seeds: focal_evidence::SeedReader::open(crate::custody::seed_directory(
-            &data_dir.join("seeds"),
-            ledger,
-        ))
+        seeds: focal_evidence::SeedReader::open(
+            crate::custody::seed_directory(&data_dir.join("seeds"), ledger),
+            reader.data_keys().clone(),
+        )
         .map_err(|_| AccessError::Unavailable)?,
         // The session's cold streams go with it whole (doc 31 M2, A2).
         cold: Some(crate::custody::seed_directory(

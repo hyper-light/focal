@@ -166,6 +166,23 @@ fn seed_files(root: &Path) -> Vec<String> {
     names.sort();
     names
 }
+/// The chunks a node's seed directories hold, by their hashes: a sealed directory names its
+/// chunks by keyed hashes of its own (29 §12.5), so two hosts' copies of one chunk are two names,
+/// and only the hashes compare.
+fn seed_chunks(root: &Path) -> Vec<focal_model::ContentHash> {
+    let mut chunks = Vec::new();
+    let Ok(sessions) = std::fs::read_dir(root.join("seeds")) else {
+        return chunks;
+    };
+    let keys = focal_seal::test_keys(root).unwrap();
+    for session in sessions.flatten() {
+        let reader = focal_evidence::SeedReader::open(session.path(), keys.clone()).unwrap();
+        chunks.extend(reader.chunks().unwrap());
+    }
+    chunks.sort_unstable();
+    chunks.dedup();
+    chunks
+}
 /// The operator's placement view, or `None` while the node's admin socket
 /// is not answering (during a restart).
 fn placement(root: &Path) -> Option<Value> {
@@ -589,10 +606,10 @@ fn a_seeded_native_checkpoint_carries_the_founder_session_to_new_hosts() {
     // added behind a compacted log can only be seeded by a snapshot that
     // names it), so every host holds a chunk the founder sealed, beside the
     // seeds of its own readiness checkpoints.
-    let sealed = seed_files(founder);
-    assert!(sealed.len() > founder_seeds.len(), "{sealed:?}");
+    assert!(seed_files(founder).len() > founder_seeds.len());
+    let sealed = seed_chunks(founder);
     for host in [dirs[1].path(), dirs[2].path()] {
-        let seeds = seed_files(host);
+        let seeds = seed_chunks(host);
         assert!(
             seeds.iter().any(|seed| sealed.contains(seed)),
             "{} holds {seeds:?}, the founder sealed {sealed:?}",

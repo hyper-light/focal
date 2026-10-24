@@ -982,14 +982,18 @@ fn seed_chunks_are_served_to_installed_peers_and_announced_pending_peers_only() 
     let dir = tempfile::tempdir().unwrap();
     let ledger = ledger(1, 9);
     let seed_root = dir.path().join("seeds");
+    let keys = focal_seal::test_keys(dir.path()).unwrap();
     let mut seeds = focal_evidence::SeedStore::open(
         crate::custody::seed_directory(&seed_root, ledger),
         focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default()).unwrap(),
+        &keys,
+        focal_evidence::ContentForm::Sealed,
     )
     .unwrap();
     let hash = seeds.install(b"seed chunk bytes").unwrap();
     let mut config = CustodyConfig::new(1);
     config.seed_root = Some(seed_root);
+    config.keys = Some(keys);
     let mut store = CustodyStore::new(
         ContentStore::open(
             dir.path().join("content"),

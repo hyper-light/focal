@@ -943,6 +943,7 @@ impl NetworkService {
                             seal: crate::storage_level::seal_rule(&root)?,
                             retire: crate::storage_level::retire_rule(&root)?,
                             share: crate::storage_level::native_share(&root)?,
+                            at_rest: crate::storage_level::at_rest_form(&root)?,
                         },
                     )
                     .map_err(NodeError::Content)?;
@@ -1096,6 +1097,7 @@ impl NetworkService {
         let mut custody_config = CustodyConfig::new(identity.node);
         custody_config.seed_root = Some(root.join("seeds"));
         custody_config.cold_root = Some(root.join("cold"));
+        custody_config.keys = Some(keys.clone());
         let (content, content_owner) = ContentHost::spawn(
             content,
             custody_config,
@@ -2350,6 +2352,7 @@ pub(crate) fn native_hosting(
         seal: seal_rule,
         retire: retire_rule,
         share,
+        at_rest,
     } = rules;
     let mut limits = native_limits(
         focal_model::ContentDomainId(identity.ledger.tenant.0),
@@ -2358,12 +2361,16 @@ pub(crate) fn native_hosting(
     )?;
     limits.seal_rule = seal_rule;
     limits.retire_rule = retire_rule;
+    let keys = reader.data_keys().clone();
     Ok(focal_ledger::NativeHosting {
         limits,
         reader,
+        // The session's seeds under the data directory's keys, in the form the fence asks (29 §12).
         seeds: focal_evidence::SeedStore::open(
             crate::custody::seed_directory(&root.join("seeds"), identity.ledger),
             disk.clone(),
+            &keys,
+            at_rest,
         )?,
         // Every binary at the cold level keeps the session's cold streams, whatever the fence:
         // it follows a leader that retires cold (doc 31 M2, A2).

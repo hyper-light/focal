@@ -33,6 +33,10 @@ test-support = []
 name = "content"
 harness = false
 
+[[bench]]
+name = "seeds"
+harness = false
+
 [dev-dependencies]
 tempfile.workspace = true
 focal-seal = { version = "0.1.0", path = "../focal-seal", features = ["test-support"] }

@@ -210,6 +210,14 @@ pub(super) enum RangeCall {
         max_items: usize,
         reply: OneshotSender<Result<focal_evidence::SeedReport, LedgerError>>,
     },
+    /// One step of the replica's seed conversion at rest (29 §12): the job handed before taken
+    /// back, where `done` gives its result, and the next handed out.
+    SeedConversion {
+        done: Option<Box<focal_evidence::SeedJobDone>>,
+        visits: usize,
+        chunks: usize,
+        reply: OneshotSender<Result<focal_ledger::SeedConversionReply, LedgerError>>,
+    },
 }
 impl RangeCall {
     /// What the owner was doing, for its slow steps (`SlowSteps`).
@@ -235,6 +243,7 @@ impl RangeCall {
             Self::Seal { .. } => "range: seal",
             Self::ContentRoots { .. } => "range: content roots",
             Self::CollectSeeds { .. } => "range: collect seeds",
+            Self::SeedConversion { .. } => "range: seed conversion",
         }
     }
 }
@@ -542,6 +551,23 @@ impl ReplicaHost {
         })
         .await
     }
+    /// One step of this replica's seed conversion at rest (29 §12): `done`, the result of the job
+    /// it handed before, taken back first; at most `visits` entries visited and a job of at most
+    /// `chunks` chunks handed out, to run off the owner's thread.
+    pub async fn seed_conversion(
+        &self,
+        done: Option<focal_evidence::SeedJobDone>,
+        visits: usize,
+        chunks: usize,
+    ) -> Result<focal_ledger::SeedConversionReply, LedgerError> {
+        self.range_call(|reply| RangeCall::SeedConversion {
+            done: done.map(Box::new),
+            visits,
+            chunks,
+            reply,
+        })
+        .await
+    }
 }
 
 impl Owner {
@@ -713,6 +739,18 @@ impl Owner {
                 let result = self
                     .session
                     .native_collect_seeds(grace_ms, now_ms, max_items);
+                drop(charge);
+                let _ = reply.send(result);
+            }
+            RangeCall::SeedConversion {
+                done,
+                visits,
+                chunks,
+                reply,
+            } => {
+                let result =
+                    self.session
+                        .native_seed_conversion(done.map(|done| *done), visits, chunks);
                 drop(charge);
                 let _ = reply.send(result);
             }

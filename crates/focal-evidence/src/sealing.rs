@@ -42,7 +42,7 @@ use hyper_block::file::{CachingRequest, DeviceFile};
 use hyper_seal::SealError;
 use hyper_seal::keys::{KeyId, RECORD, Wrapped, WrappingKey};
 use hyper_seal::name::Namer;
-use hyper_seal::sealed_file::{SealedFileError, SealedReader, seal_content};
+use hyper_seal::sealed_file::{SealedFileError, SealedReader, SealedWriter, seal_content};
 
 use super::ContentError;
 
@@ -70,6 +70,76 @@ const KEYED_NAME: usize = 32;
 /// where the store seals.
 pub(crate) type Mark = [u8; 32];
 
+/// Bytes and the BLAKE3 hash taken of exactly them: what a seed or a cold chunk is written from,
+/// so the hash its key is derived from and its name says is never a caller's word, where a wrong
+/// one would put two plaintexts under one key and nonce (`FileSealer::content_keyed`'s contract).
+#[derive(Clone, Copy)]
+pub(crate) struct Hashed<'a> {
+    bytes: &'a [u8],
+    hash: ContentHash,
+}
+
+impl<'a> Hashed<'a> {
+    pub(crate) fn of(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            hash: ContentHash(*blake3::hash(bytes).as_bytes()),
+        }
+    }
+    pub(crate) fn hash(&self) -> ContentHash {
+        self.hash
+    }
+    pub(crate) fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+}
+
+/// A seed's file on its way into place ([`DomainKey::seed_writer`]).
+pub(crate) struct SeedWriter<'a> {
+    seed: Hashed<'a>,
+    temporary: PathBuf,
+    sink: Sink,
+}
+
+enum Sink {
+    Clear(File),
+    /// Boxed: a writer is 704 bytes beside a file's handle, made once a seed.
+    Sealed(Box<SealedWriter<DeviceFile>>),
+}
+
+impl SeedWriter<'_> {
+    /// The seed's bytes written and its file finished, unflushed: the handle given back is the
+    /// caller's to flush before it renames the file into place, as a batch of a checkpoint's seeds
+    /// flushes its files together on threads of its own.
+    pub(crate) fn finish(self) -> Result<File, ContentError> {
+        match self.sink {
+            Sink::Clear(mut file) => {
+                file.write_all(self.seed.bytes)?;
+                Ok(file)
+            }
+            Sink::Sealed(mut writer) => {
+                writer.write(self.seed.bytes).map_err(sealed_error)?;
+                let file = writer.finish_unflushed().map_err(sealed_error)?;
+                // A handle of its own on the same file, for a flush on another thread.
+                Ok(file.std_file().try_clone()?)
+            }
+        }
+    }
+
+    /// The seed installed at `path`: written, flushed, renamed into place and the directory
+    /// flushed after (Pillai et al., OSDI 2014), so a crash leaves the old file or the new one
+    /// whole.
+    pub(crate) fn install(self, path: &Path) -> Result<(), ContentError> {
+        let temporary = self.temporary.clone();
+        let file = self.finish()?;
+        file.sync_all()?;
+        drop(file);
+        focal_platform::fs::atomic_replace(&temporary, path)?;
+        focal_platform::sync_dir(path.parent().ok_or(ContentError::Invalid)?)?;
+        Ok(())
+    }
+}
+
 /// The form a store's writer installs its object files in (29 §11).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentForm {
@@ -82,11 +152,13 @@ pub enum ContentForm {
     Sealed,
 }
 
-/// What a file of a domain is: a chunk or an object's manifest.
+/// What a file of a domain is: a chunk or an object's manifest, or a chunk of a session's
+/// checkpoint seeds or cold stream, each directory of which is a domain of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
     Chunk,
     Manifest,
+    Seed,
 }
 
 impl Kind {
@@ -94,6 +166,7 @@ impl Kind {
         match self {
             Self::Chunk => "chunk",
             Self::Manifest => "manifest",
+            Self::Seed => "seed",
         }
     }
 }
@@ -101,18 +174,26 @@ impl Kind {
 /// The keys a store's files are written and read under, and the forms they may lie in.
 pub(crate) struct ContentKeys<'a> {
     content: Content<'a>,
+    /// The data directory's key a domain's record is kept under: the content key for the content
+    /// store, the group key for a session's seeds and cold stream (`focal_seal::Store`).
+    store: focal_seal::Store,
     /// Whether a file may lie in the clear: until the store is marked sealed.
     clear: bool,
 }
 
-/// Where the node's content key comes from.
+/// Where the store's key comes from.
 enum Content<'a> {
     /// A writer that keeps its files in the clear holds none.
     Clear,
-    /// A writer that seals holds it for its life.
+    /// A writer that seals holds it for its life: the content store's one writer.
     Held(WrappingKey),
     /// A reader unwraps it from the data directory's keys as it opens a domain's record.
     Data(&'a focal_seal::DataKeys),
+    /// A writer of a store a node keeps one of for each session (its seeds, its cold stream): the
+    /// key unwrapped from the data directory's keys for each domain record it opens or makes and
+    /// dropped after it, so a node's sessions hold no key slot between their writes, where a writer
+    /// that held one would take a slot a session (`focal_seal::key_slots`).
+    Owned(focal_seal::DataKeys),
 }
 
 /// A domain's key and its namer, where its record stands.
@@ -136,6 +217,7 @@ impl ContentKeys<'static> {
     pub(crate) fn clear() -> Self {
         Self {
             content: Content::Clear,
+            store: focal_seal::Store::Content,
             clear: true,
         }
     }
@@ -146,8 +228,39 @@ impl ContentKeys<'static> {
         let content = keys.key(focal_seal::Store::Content).map_err(setup_error)?;
         Ok(Self {
             content: Content::Held(content),
+            store: focal_seal::Store::Content,
             clear,
         })
+    }
+
+    /// A writer's keys that seal under `store`'s key of the data directory `keys` names, unwrapped
+    /// for each domain record and never held ([`Content::Owned`]); `clear` while a file of the store
+    /// may still lie in the clear.
+    pub(crate) fn per_record(
+        keys: focal_seal::DataKeys,
+        store: focal_seal::Store,
+        clear: bool,
+    ) -> Self {
+        Self {
+            content: Content::Owned(keys),
+            store,
+            clear,
+        }
+    }
+
+    /// The same keys for another writer of the store, such as a batch filled on another thread:
+    /// a writer's that holds no key ([`Content::Clear`], [`Content::Owned`]); one that holds a key
+    /// for its life has no copy, its key held once.
+    pub(crate) fn owned_copy(&self) -> Result<ContentKeys<'static>, ContentError> {
+        match &self.content {
+            Content::Clear => Ok(ContentKeys::clear()),
+            Content::Owned(keys) => Ok(ContentKeys::per_record(
+                keys.clone(),
+                self.store,
+                self.clear,
+            )),
+            Content::Held(_) | Content::Data(_) => Err(ContentError::Invalid),
+        }
     }
 
     /// A sealed store's writer keys over `content`.
@@ -155,6 +268,7 @@ impl ContentKeys<'static> {
     pub(crate) fn new(content: WrappingKey) -> Self {
         Self {
             content: Content::Held(content),
+            store: focal_seal::Store::Content,
             clear: false,
         }
     }
@@ -164,8 +278,19 @@ impl<'a> ContentKeys<'a> {
     /// A reader's keys over the data directory `keys` names; `clear` where the store it reads is not
     /// marked sealed.
     pub(crate) fn reading(keys: &'a focal_seal::DataKeys, clear: bool) -> Self {
+        Self::reading_under(keys, focal_seal::Store::Content, clear)
+    }
+
+    /// A reader's keys over the data directory `keys` names, its domains' records kept under
+    /// `store`'s key; `clear` where the store it reads is not marked sealed.
+    pub(crate) fn reading_under(
+        keys: &'a focal_seal::DataKeys,
+        store: focal_seal::Store,
+        clear: bool,
+    ) -> Self {
         Self {
             content: Content::Data(keys),
+            store,
             clear,
         }
     }
@@ -271,7 +396,12 @@ impl<'a> ContentKeys<'a> {
         let secret = match &self.content {
             Content::Held(content) => content.unwrap(record).map_err(seal_error)?,
             Content::Data(keys) => keys
-                .key(focal_seal::Store::Content)
+                .key(self.store)
+                .map_err(setup_error)?
+                .unwrap(record)
+                .map_err(seal_error)?,
+            Content::Owned(keys) => keys
+                .key(self.store)
                 .map_err(setup_error)?
                 .unwrap(record)
                 .map_err(seal_error)?,
@@ -285,13 +415,17 @@ impl<'a> ContentKeys<'a> {
 
     /// A new domain key's record, written at `path` where none stands: its own temporary, flushed,
     /// then linked to the name no-clobber (`atomic_create_new`), the directory flushed after. A
-    /// record that stood first is the domain's, and read instead. Only a writer that holds the
-    /// content key makes one.
+    /// record that stood first is the domain's, and read instead. Only a writer makes one.
     fn make(&self, path: &Path) -> Result<Wrapped, ContentError> {
-        let Content::Held(content) = &self.content else {
-            return Err(ContentError::Invalid);
+        let (_secret, record) = match &self.content {
+            Content::Held(content) => content.make_child().map_err(seal_error)?,
+            Content::Owned(keys) => keys
+                .key(self.store)
+                .map_err(setup_error)?
+                .make_child()
+                .map_err(seal_error)?,
+            Content::Clear | Content::Data(_) => return Err(ContentError::Invalid),
         };
-        let (_secret, record) = content.make_child().map_err(seal_error)?;
         let temporary = path.with_extension("key-install");
         let _ = fs::remove_file(&temporary);
         let mut file = OpenOptions::new()
@@ -415,6 +549,41 @@ impl DomainKey {
         focal_platform::fs::atomic_replace(&temporary, path)?;
         focal_platform::sync_dir(path.parent().ok_or(ContentError::Invalid)?)?;
         Ok(())
+    }
+
+    /// A writer of `seed` into `temporary`, made under the domain's key, which the caller lets go
+    /// before the bytes are written: in the clear as they are, or sealed keyed by the seed's hash
+    /// (`SealedWriter::content_keyed`), the BLAKE3 hash the store names it by, so its bytes are
+    /// passed over once. The writer seals with a key of its own, derived as it is made, and holds
+    /// the seed itself, so what it writes is always the plaintext its key was derived for.
+    pub(crate) fn seed_writer<'a>(
+        &self,
+        temporary: &Path,
+        seed: Hashed<'a>,
+    ) -> Result<SeedWriter<'a>, ContentError> {
+        let sink = if self.seals {
+            let sealed = self.sealed.as_ref().ok_or(ContentError::Invalid)?;
+            let _ = fs::remove_file(temporary);
+            let file = DeviceFile::open(temporary, true, CachingRequest::Buffered, Alignment::BYTE)
+                .map_err(disk_error)?;
+            Sink::Sealed(Box::new(
+                SealedWriter::content_keyed(file, &sealed.key, &seed.hash.0, SEGMENT)
+                    .map_err(sealed_error)?,
+            ))
+        } else {
+            Sink::Clear(
+                OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .open(temporary)?,
+            )
+        };
+        Ok(SeedWriter {
+            seed,
+            temporary: temporary.to_path_buf(),
+            sink,
+        })
     }
 
     /// The file filed under `hash` in `directory` opened into the head of `scratch`, which must hold

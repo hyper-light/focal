@@ -85,11 +85,14 @@ log, the group files, the payload log (per-record AES-GCM), every data directory
 enrollment secrets are sealed; a sealed record is opened only when read. The content store's chunks
 and manifests are sealed under a key per domain and named by keyed hashes from the content level
 (level 9; doc 29 §12.4, "2026-10-23 — The content store seals its objects from the content level"),
-a store in the clear converted while it serves.
+a store in the clear converted while it serves. A session's checkpoint seeds are sealed under a key
+per seed directory and named by keyed hashes from the at-rest level (level 10; doc 29 §12.5,
+"2026-10-24 — A session's checkpoint seeds are sealed from the at-rest level"), a directory in the
+clear converted while it serves by jobs off the session's owner.
 
-**Open.** Still written in the clear (doc 29 §12's inventory): seeds, the cold stream, the content
-store's staging, transfer parts and custody records, session backups, client stores and several
-small node files.
+**Open.** Still written in the clear (doc 29 §12's inventory, taken again 2026-10-24): the cold
+stream, the content store's staging, transfer parts and custody records, session backups, the bus's
+identities and part images, client stores and the node's small files.
 
 ## 6. Adversarial batteries
 

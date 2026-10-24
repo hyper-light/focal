@@ -863,8 +863,14 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
         let reader = store
             .reader()
             .map_err(|error| NativeSessionError::Native(NativeEvidenceError::from(error).into()))?;
-        let seeds = SeedStore::open(store.root().join("seeds"), consensus.disk_budget())
-            .map_err(|error| NativeSessionError::Native(NativeEvidenceError::from(error).into()))?;
+        // Its seeds sealed as the store it opens over seals, under the same data directory's keys.
+        let seeds = SeedStore::open(
+            store.root().join("seeds"),
+            consensus.disk_budget(),
+            store.data_keys(),
+            store.form(),
+        )
+        .map_err(|error| NativeSessionError::Native(NativeEvidenceError::from(error).into()))?;
         let engine = NativeEngine::new(
             ledger,
             range,

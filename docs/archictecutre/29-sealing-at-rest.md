@@ -255,26 +255,53 @@ Tests owed with it:
 - erasing a domain's key record leaves its chunks unreadable while other domains read;
 - a crash cut at every step of the rewrite.
 
-## 12. Every other file focal writes (inventory, 2026-10-20)
+## 12. Every other file focal writes (inventory, 2026-10-20; taken again 2026-10-24)
 
 Steps 1, 2 and 5 sealed the node log and the group files. Every other file focal writes was
 listed from its writers (each `File::create`, `OpenOptions`, `create_private_new`, `fs::write`,
-`atomic_replace` and `install` outside tests):
+`atomic_replace`, `atomic_file` and `install` outside tests), first on 2026-10-20 and again on
+2026-10-24, when the at-rest level (`upgrade::AT_REST_LEVEL`, 10) began sealing what was left. The
+second listing found two rows of the first out of date: `CLUSTER.admin` and `CLIENT.contexts` are
+private journals (`focal_enrollment::PrivateJournal`), sealed with the private directories since
+§12.2, and a bus node's log has lived on hyper-log, sealed, since its replicated part did.
 
 | Store | Files | Holds | Writer | State |
 |---|---|---|---|---|
+| Node log and group files | the shell's log, group images and checkpoints | every record of every group | hyper-log, hyper-durable, focal-consensus `group_files` | sealed (steps 1, 2, 5) |
 | Payload log | `payloads/*.seg` | spilled rows' bytes: message payloads | focal-ledger `native_payloads` | sealed (§12.1) |
-| Checkpoint seeds | `seeds/<ledger>/` | a checkpoint's native rows, 1 MiB chunks | focal-evidence `seeds` | clear |
+| Checkpoint seeds | `seeds/<ledger>/` | a checkpoint's native rows, 1 MiB chunks | focal-evidence `seeds` | sealed from the at-rest level (§12.5) |
 | Cold stream | `cold/<ledger>/` | retired families' archive frames | focal-evidence `cold` | clear |
 | Content | `content/objects/…`, `content/quarantine/…` | artifacts' chunks and manifests | focal-evidence `store`, `transfer`, `gc`, `native_artifact` | sealed from the content level (§12.4) |
-| Content staging and custody | `content/staging/`, `objects/<domain>/*.part`, `content/{custody,checkpoints,receipts}/` | uploads and transfers being received; custody records | focal-evidence `store`, `transfer`, `upload_terminal` | clear |
+| Content staging and custody | `content/staging/`, `objects/<domain>/*.part`, `content/{custody,checkpoints,receipts}/` | uploads and transfers being received; custody records | focal-evidence `store`, `transfer`, `upload_terminal`, `custody_receipt` | clear |
 | Session backups | a backup's directory | checkpoint, seeds, content, cold | focal-ledger `session_backup` | clear |
-| Enrollment | private directories | the cluster CA's key, nodes' and clients' keys, invitations, the signer's journal | focal-enrollment `files::PrivateDirectory` | sealed (§12.2) |
+| Private directories and journals | `JOIN/`, `cluster/authority/`, `cluster/invitations/`, `cluster/network/`, `CLUSTER.admin/`, `CLIENT.contexts/`, the placement and admission journals (`cluster/<name>/journal.bin`) | the cluster CA's key, nodes' and clients' keys, invitations, the signer's and every agent's journal, the admin's and contexts' catalogues | focal-enrollment `files::PrivateDirectory`, `PrivateJournal` | sealed (§12.2) |
 | Embedded node log | the shell's log of a node that is its own cluster (`wal/` before) | every record of its session and its root's control group | focal-node `EmbeddedNode` through `storage_start`, as a networked node | sealed (§12.3) |
+| Bus log | a bus node's `bus.log` | its part's records | focal-bus `member` over hyper-log | sealed (its data directory's keys) |
 | Bus identities | the bus's identity directory | its local CA's and members' keys | focal-bus `pki` | clear |
-| Bus part | a part's image, the node's run | streams' floors, producers' sessions | focal-bus `group`, `member` | clear |
-| Client stores | a client's data directory | requests, receipts, pending writes, artifact uploads | focal-client `operation_store`, `native_store`, `pending`, `artifact_transfer` | clear |
-| Node files | `CLUSTER.admin`, `CLIENT.contexts`, `MCP.operations`, `trust-adopted.bin`, `IDENTITY`, `POLICY`, `STORAGE.level`, `cluster/partitions` | the node's journals, catalogue, trust and identity | focal-node | clear |
+| Bus part | a part's `part.image`, the node's `run` | streams' floors, producers' sessions; the node's run | focal-bus `group`, `member` | clear |
+| Client stores | a client's data directory (`client/…`), `MCP.operations/` | requests, receipts, pending writes, artifact uploads | focal-client `operation_store`, `native_store`, `pending`, `artifact_transfer`, `managed_store` | clear |
+| Node files | `IDENTITY`, `POLICY`, `NETWORK`, `SESSION.memory`, `trust-adopted.bin`, `cluster/partitions/*.partition`, `cluster/BOOTSTRAP`, `cluster/apply/<plan>/{PLAN,JOURNAL}`, `cluster/pending-retires/` | the node's identity, policy, network state, founded allowance, adopted trust, partition records, the root's genesis, deployment journals, retirements to finish | focal-node | clear |
+
+**In the clear by design**, each for what it is:
+
+- `SEAL.node` and `SEAL.root`: the wrapped store keys and the root key's ID, by which every sealed
+  file is opened; what opens the seal cannot lie under it.
+- Key records (`DOMAIN.key` of a content domain or a seed directory): each a key wrapped under a
+  store key, nothing in the clear.
+- `STORAGE.level`: the fence's level, which a start reads to choose every store's form before it
+  opens one; a level and its CRC.
+- Locks (`LOCK`, `*.lock`) and markers: empty files held for their locks, `*.initialized` files a
+  writer leaves to say its store was made (a fixed sentence each), and the empty `SEALING` and
+  `SEALED` of a store converting and converted.
+- What an operator asks for in the clear, outside any data directory: an artifact downloaded to a
+  file it names, a trace written where it says, a deployment plan's output, and an invitation
+  bundle handed to a joiner, a bearer credential kept owner-only and spent once.
+- focal-log's WAL of a node below the storage level, which a binary below that level reads alone,
+  converted to the sealed shell at the level (27 §15.8, §12.3).
+- The measurement tools' reports (`tools/load`, `tools/compare`): a run's results, not focal's data.
+
+A store's temporaries are written in its form (a sealed store's sealed), and what a crash leaves of
+them goes with the store's sweep past its grace or at its next open, as before.
 
 They are sealed in this order, the message data first (the payload log, then seeds, cold and
 content as step 4 designs it), then the keys (enrollment, the bus's identities), then the journals
@@ -437,7 +464,99 @@ open is what the fence forbids.
 - **Still in the clear** (this inventory's next rows): parts of chunks a transfer is receiving
   (`objects/<domain>/*.part`, named by the chunk's hash), uploads being staged (`staging/`), and the
   custody records (`custody/`, `checkpoints/`, `receipts/`).
-- **Owed.** An operator sees a conversion only by its failure (the node's error stream, "the
-  content store's conversion stopped"); its progress belongs in the collector's view
-  (`inspect node --gc`). A reader made while its store converted keeps looking in the clear first
-  for its life, one missed open a file, until the node's next start.
+- **Owed.** A reader made while its store converted keeps looking in the clear first for its life,
+  one missed open a file, until the node's next start. (An operator's view of the conversion,
+  owed here at first, is in `inspect node --gc` and on the metrics page since 2026-10-24: "What
+  an operator reads" above.)
+
+### 12.5 Checkpoint seeds, sealed (2026-10-24)
+
+A session's checkpoint seeds (25 §5) are sealed once the fence a node last recorded opens the
+at-rest level (`upgrade::AT_REST_LEVEL`, 10; `storage_level::at_rest_form`), read as each seed
+directory is opened: by a hosted session (`network_service::native_hosting`, the networked and
+embedded node alike), by a placement's restore, and by a session opened over a content store
+(`NativeSession`, which takes the store's form). Below the level a directory is written byte for
+byte as before, so a node can still be rolled back while the fence is below it.
+
+- **As the content store, a directory a domain.** A seed directory has a key of its own, random,
+  kept beside its chunks as its record under the data directory's group key (`DOMAIN.key`,
+  `focal_seal::Store::Group`: seeds are a checkpoint's rows), made with the directory's first
+  sealed chunk. A chunk is sealed whole, keyed by the BLAKE3 hash it is named by
+  (`hyper_seal::sealed_file::SealedWriter::content_keyed`, hyper-raft 8c6b4fa): its data key and
+  file ID derive from the directory's key and that hash, which the writer takes of exactly the
+  bytes it seals (`sealing::Hashed`), so its bytes are passed over once, where a SHA-256 of them
+  (`seal_content`) would be a second pass; equal bytes seal to equal files, so a chunk installed
+  twice or by a peer is the same file. A name is the directory's keyed name of the hash
+  (HMAC-SHA-256 under a child of its key), so no name or byte of a directory holds a hash or a
+  chunk's plaintext, two sessions' same chunk lie in two different files, and destroying a
+  directory's record erases every chunk of it.
+- **A batch's flushes still overlap.** A checkpoint's batch writes each chunk sealed into a file of
+  its own as it is added, unflushed (`SealedWriter::finish_unflushed`, hyper-raft 8c6b4fa), and its
+  commit flushes them together on its sync threads, renames them and flushes the directory once, as
+  before; `finish` would have flushed each in turn on the adding thread.
+- **Key slots.** The process's locked region is a hard bound (`focal_seal::key_slots`, 128 slots
+  in a 4 KiB page; hyper-seal §8 asks a consumer of many keys to bound its own). A writer or reader
+  unwraps a directory's key for the one chunk it writes or reads, and a writer lets it go before it
+  writes the chunk's bytes (the sealed writer holds a derived key of its own, outside the region),
+  so a node's sessions hold no slot between their writes and a chunk's claim lasts its key's
+  derivation. A reader's pass over many chunks' names (which of a checkpoint's chunks are local)
+  unwraps it once (`SeedReader::opened`).
+- **The way between the forms.** A directory asked to seal that holds chunks in the clear is marked
+  converting (`SEALING`) and converted while it serves; one that holds none is sealed as it opens.
+  The conversion counts its chunks in the clear first, then hands out jobs of at most
+  `SEED_JOB_CHUNKS` chunks (the batch's sync threads, 8) which the node's collector runs on the
+  blocking pool (`focal_rt::FILES`), at most `MAX_STEPS` steps a replica a pass: each chunk read,
+  sealed beside itself under its keyed name into a temporary of the job's own (`*.<job>.convert`),
+  the files flushed together, renamed, the directory flushed once. The session's owner only lists,
+  tallies and lets a converted chunk's name in the clear go when the job's result comes back
+  (`SeedStore::conversion_job`, `conversion_done`): a checkpoint never waits behind a conversion's
+  flushes. A job whose result never comes back (a pass cut short) has its chunks taken again, first;
+  if it finishes late it renames the very bytes the next job did, under the same names, and its
+  result counts nothing twice. A chunk sealed already when a cut left its name in the clear is
+  verified and kept; a damaged sealed form beside its bytes in the clear is sealed over. The pass
+  ended with no job out, the directory is flushed and marked sealed (`SEALED`), and nothing in the
+  clear is looked for after.
+- **The sweep.** The seed sweep keeps a protected chunk under either name (the protected hashes'
+  keyed names taken once a call where the directory has its key), removes nothing in the clear while
+  the conversion counts, and tallies a chunk in the clear it removes after as gone; it removes a
+  job's crash-left temporaries past its grace, as a batch's.
+- **What an operator reads.** `inspect node --gc` gives, in the last pass's seeds, the replicas'
+  seed directories by form (`clear`, `counting`, `converting`, `sealed`), how many wait for room
+  and how many stopped, and what the conversions counted, converted, found gone and have left
+  (`AdminSeedConversion`).
+- **Bounded.** A job holds at most `SEED_JOB_CHUNKS` chunks' names and the collector one chunk of
+  scratch, charged to its budget; the chunks held for room are at most a job's; the conversion's
+  state and progress are boxed, a session holding its stores inline (`Session`'s size bound).
+- **Measured** (`benches/seeds.rs` on fedora, 32 cores, NVMe btrfs, 16 interleaved rounds of a
+  checkpoint's batch of 64 chunks of 1 MiB, ms a MiB, medians): the batch's writing 0.487 in the
+  clear and 0.761 sealed (its sealing, its key's derivation, the directory key's unwrap and the
+  sealed file's segments, a chunk), its commit 0.937 and 0.956 (the same flushes, renames and
+  directory flush), the whole batch 1.424 and 1.717 (+20.6%); a chunk read back verified 0.373 and
+  0.540; a directory in the clear converted by jobs at 2.444. On this Mac, under a load of 45 to 93
+  from other sessions, the same rounds spread 3.9 times from one run to the next, the commit's full
+  flushes most: only the host that holds still measures the difference.
+- **Tests:** the batch, a detached commit, and install, read and removal in both forms; the clear
+  layout an earlier binary wrote (`the_clear_form_writes_the_layout_earlier_binaries_wrote`); a
+  flipped byte, a cut, another chunk's file under a name and a chunk carried into another session's
+  directory refused, no name or byte holding a hash or plaintext, a directory erased by its record
+  while another reads
+  (`a_sealed_seed_is_refused_changed_cut_renamed_or_moved_and_erased_with_its_record`); a directory
+  in the clear converted while a batch commits and a peer's chunk is installed, read at every step
+  through the store, a reader made before and one made during, a chunk planted in the clear after
+  the mark not looked for, an empty directory sealed as it opens
+  (`a_directory_in_the_clear_is_converted_while_it_serves`); a cut after every step with a name put
+  back and a sealed form damaged (`a_conversion_cut_at_any_step_resumes_and_loses_nothing`); jobs
+  run on another thread, a lost job's chunks retaken and its late result, a job held for room
+  (`a_job_seals_its_chunks_off_the_owner_and_its_result_removes_their_clear_names`,
+  `a_lost_jobs_chunks_are_taken_again_and_its_late_result_counts_nothing_twice`,
+  `a_job_without_room_holds_and_its_chunks_go_first_next`); the sweep in both forms and during the
+  count (`the_sweep_keeps_what_is_protected_in_either_form_and_holds_the_clear_while_counting`, which
+  fails without the count's hold); the level's rule
+  (`the_stores_beside_the_log_seal_once_the_recorded_fence_opens_the_at_rest_level`). The real
+  binary: a node founded below the level seeds three checkpoints in the clear, each chunk's bytes
+  hashing to its name; the fence recorded and the node restarted, its collector converts the
+  directory while the session takes writes, every look at `inspect node --gc` agreeing with itself,
+  every chunk held sealed after, nothing named in the clear, and a checkpoint after sealing its own
+  (`cli_seeds_at_rest`); a placement's hosts compare their seeds by hash, two hosts naming one chunk
+  two ways (`placement_binary`, through `SeedReader::chunks`). Every node and ledger test that seeds a
+  checkpoint runs sealed: a cluster founded at the compiled level records the at-rest level.

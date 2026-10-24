@@ -81,13 +81,15 @@ pub fn member_wire(root: &Path) -> Result<focal_consensus::Wire, NodeError> {
     )
 }
 
-/// What a session's hosting follows at the node's level: when it seals, how it retires, and its
-/// native share (`crate::network_service::native_hosting`).
+/// What a session's hosting follows at the node's level: when it seals, how it retires, its
+/// native share, and the form its stores beside the log keep at rest
+/// (`crate::network_service::native_hosting`).
 #[derive(Debug, Clone, Copy)]
 pub struct Rules {
     pub seal: focal_ledger::SealRule,
     pub retire: focal_ledger::RetireRule,
     pub share: focal_ledger::NativeShare,
+    pub at_rest: focal_evidence::ContentForm,
 }
 
 /// How the sessions a node hosts seal (F12, 26 §4a): by the anchored rule once the fence it last
@@ -141,6 +143,24 @@ pub fn content_form(root: &Path) -> Result<focal_evidence::ContentForm, NodeErro
 /// The content form a fence at `level` opens.
 pub fn content_form_at(level: u32) -> focal_evidence::ContentForm {
     if level >= crate::upgrade::CONTENT_LEVEL {
+        focal_evidence::ContentForm::Sealed
+    } else {
+        focal_evidence::ContentForm::Clear
+    }
+}
+
+/// The form a node's stores beside its log and content keep at rest (29 §12), its sessions' seeds
+/// first: sealed once the fence it last knew opens `AT_REST_LEVEL`, as a node founded there does
+/// from its first start; in the clear below it, where a binary that cannot open a sealed file may
+/// still be rolled back to. Read as each store is opened: a store opened after the fence rose
+/// seals from then on, converting what it holds in the clear as it serves.
+pub fn at_rest_form(root: &Path) -> Result<focal_evidence::ContentForm, NodeError> {
+    Ok(at_rest_form_at(known(root)?.unwrap_or(0)))
+}
+
+/// The at-rest form a fence at `level` opens.
+pub fn at_rest_form_at(level: u32) -> focal_evidence::ContentForm {
+    if level >= crate::upgrade::AT_REST_LEVEL {
         focal_evidence::ContentForm::Sealed
     } else {
         focal_evidence::ContentForm::Clear
@@ -283,5 +303,40 @@ mod tests {
         assert_eq!(content_form_at(0), focal_evidence::ContentForm::Clear);
         std::fs::write(dir.path().join(FILE), b"short").unwrap();
         assert!(content_form(dir.path()).is_err());
+    }
+
+    /// A node's stores beside its log and content keep the clear until the fence it last recorded
+    /// opens the at-rest level, and seal from it (29 §12): the content level opens nothing of them.
+    #[test]
+    fn the_stores_beside_the_log_seal_once_the_recorded_fence_opens_the_at_rest_level() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            at_rest_form(dir.path()).unwrap(),
+            focal_evidence::ContentForm::Clear
+        );
+        record(dir.path(), crate::upgrade::CONTENT_LEVEL).unwrap();
+        assert_eq!(
+            content_form(dir.path()).unwrap(),
+            focal_evidence::ContentForm::Sealed
+        );
+        assert_eq!(
+            at_rest_form(dir.path()).unwrap(),
+            focal_evidence::ContentForm::Clear
+        );
+        record(dir.path(), crate::upgrade::AT_REST_LEVEL).unwrap();
+        assert_eq!(
+            at_rest_form(dir.path()).unwrap(),
+            focal_evidence::ContentForm::Sealed
+        );
+        assert_eq!(
+            at_rest_form_at(crate::upgrade::CAPABILITY_LEVEL),
+            focal_evidence::ContentForm::Sealed
+        );
+        assert_eq!(
+            at_rest_form_at(crate::upgrade::AT_REST_LEVEL - 1),
+            focal_evidence::ContentForm::Clear
+        );
+        std::fs::write(dir.path().join(FILE), b"short").unwrap();
+        assert!(at_rest_form(dir.path()).is_err());
     }
 }

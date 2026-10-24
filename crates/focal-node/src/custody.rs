@@ -48,6 +48,9 @@ pub struct CustodyConfig {
     /// Where this node keeps every ledger's cold streams (doc 31 M2, A2): their chunks are served
     /// as seeds are, to a replica installing a checkpoint that names them.
     pub cold_root: Option<std::path::PathBuf>,
+    /// The data directory's keys, under which its seeds are sealed at rest (29 §12): a node that
+    /// serves seeds has them.
+    pub keys: Option<focal_seal::DataKeys>,
 }
 impl CustodyConfig {
     pub fn new(node: u64) -> Self {
@@ -59,6 +62,7 @@ impl CustodyConfig {
             transfer_ttl: Duration::from_secs(60),
             seed_root: None,
             cold_root: None,
+            keys: None,
         }
     }
 }
@@ -1133,8 +1137,12 @@ impl CustodyStore {
                     .seed_root
                     .as_ref()
                     .ok_or(AccessError::Unavailable)?;
-                let reader = focal_evidence::SeedReader::open(seed_directory(root, scope.ledger))
-                    .map_err(|_| AccessError::Unavailable)?;
+                let keys = self.config.keys.as_ref().ok_or(AccessError::Unavailable)?;
+                let reader = focal_evidence::SeedReader::open(
+                    seed_directory(root, scope.ledger),
+                    keys.clone(),
+                )
+                .map_err(|_| AccessError::Unavailable)?;
                 let limit = usize::try_from(*max_bytes).map_err(|_| AccessError::Capacity)?;
                 let _scan = self.reserve(BudgetKind::Payload, BudgetLane::Ordinary, limit)?;
                 let absent = |error: &ContentError| matches!(error, ContentError::Io(io) if io.kind() == std::io::ErrorKind::NotFound);

@@ -323,6 +323,8 @@ fn a_populated_ledger_is_imported_through_the_node_after_its_host_seals_the_payl
                     content_dir.join("seeds"),
                     focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default())
                         .unwrap(),
+                    &focal_seal::test_keys_beside(&content_dir).unwrap(),
+                    focal_evidence::ContentForm::Sealed,
                 )
                 .unwrap(),
                 cold: Some(focal_ledger::ColdSource {

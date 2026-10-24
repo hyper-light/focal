@@ -34,6 +34,17 @@ struct SnapshotEnvelopeV7 {
     slot_generation: u64,
 }
 
+/// What a replica's owner answers a step of its seed conversion with
+/// (`Session::native_seed_conversion`, 29 §12).
+pub struct SeedConversionReply {
+    /// What the job handed before was, as a step of the conversion, where its result was given.
+    pub taken: Option<focal_evidence::Conversion>,
+    /// The next piece: a job to run off the owner's thread, entries visited, or done.
+    pub next: focal_evidence::SeedStep,
+    /// Where the conversion stands since the replica's store opened.
+    pub status: focal_evidence::ConversionStatus,
+}
+
 /// Physical resources and limits a node supplies so this Session can host the
 /// native engine once activation commits. Without it, a native activation is
 /// refused at ingress and this replica never persists native history.
@@ -1288,6 +1299,36 @@ impl Session {
                     focal_evidence::NativeEvidenceError::from(error).into(),
                 ))
             })
+    }
+    /// The next piece of this replica's seed conversion at rest (29 §12), the result of the job
+    /// handed before taken back first where `done` gives it: the step that result was, the next
+    /// piece (a job to run off this owner's thread, entries visited, or done), and where the
+    /// conversion stands.
+    pub fn native_seed_conversion(
+        &mut self,
+        done: Option<focal_evidence::SeedJobDone>,
+        visits: usize,
+        chunks: usize,
+    ) -> Result<SeedConversionReply, LedgerError> {
+        let hosting = self.hosting.as_mut().ok_or(LedgerError::NativeUnsupported)?;
+        let native = |error: focal_evidence::ContentError| {
+            LedgerError::Native(NativeSessionError::Native(
+                focal_evidence::NativeEvidenceError::from(error).into(),
+            ))
+        };
+        let taken = match done {
+            Some(done) => Some(hosting.seeds.conversion_done(done).map_err(native)?),
+            None => None,
+        };
+        let next = hosting
+            .seeds
+            .conversion_job(visits, chunks)
+            .map_err(native)?;
+        Ok(SeedConversionReply {
+            taken,
+            next,
+            status: hosting.seeds.conversion_status(),
+        })
     }
     /// Whether this authority could propose a retirement now (26 §4): the
     /// gates `native_propose_retirement` applies before it derives a

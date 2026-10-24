@@ -341,41 +341,59 @@ fn custody_records_keep_the_newest_and_the_protected() {
     );
 }
 
-/// Seeds nothing protects leave once past the grace; a sweep resumes
-/// across bounded calls.
+/// The seed directory `root` of the data directory `data`, opened in `form`.
+fn seed_store(data: &Path, root: &Path, form: ContentForm) -> SeedStore {
+    SeedStore::open(
+        root,
+        DiskBudget::new(DiskBudgetConfig::default()).unwrap(),
+        &crate::store::test_keys(data),
+        form,
+    )
+    .unwrap()
+}
+
+/// Seeds nothing protects leave once past the grace, in the clear or sealed and named by keyed
+/// hashes (29 §12); a sweep resumes across bounded calls.
 #[test]
 fn unprotected_seeds_are_removed_past_the_grace() {
-    let directory = tempfile::tempdir().unwrap();
-    let root = directory.path().join("seeds");
-    let mut seeds =
-        SeedStore::open(&root, DiskBudget::new(DiskBudgetConfig::default()).unwrap()).unwrap();
-    let keep = seeds.install(b"keep").unwrap();
-    let old = seeds.install(b"old").unwrap();
-    let young = seeds.install(b"young").unwrap();
-    for hash in [keep, old] {
-        File::options()
-            .write(true)
-            .open(root.join(format!("{hash}.seed")))
-            .unwrap()
-            .set_modified(SystemTime::now() - Duration::from_millis(2 * DAY))
-            .unwrap();
-    }
-    let protected = [keep];
-    let mut removed = 0;
-    let mut complete = false;
-    for _ in 0..16 {
-        let report = seeds.collect(&protected, DAY, now_ms(), 1).unwrap();
-        removed += report.removed;
-        if report.complete {
-            complete = true;
-            break;
+    for form in [ContentForm::Clear, ContentForm::Sealed] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("seeds");
+        let mut seeds = seed_store(directory.path(), &root, form);
+        let keep = seeds.install(b"keep").unwrap();
+        let old = seeds.install(b"old").unwrap();
+        let young = seeds.install(b"young").unwrap();
+        for hash in [keep, old] {
+            let path = seeds
+                .key()
+                .unwrap()
+                .existing(&root, hash, sealing::Kind::Seed)
+                .unwrap()
+                .unwrap();
+            File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(SystemTime::now() - Duration::from_millis(2 * DAY))
+                .unwrap();
         }
+        let protected = [keep];
+        let mut removed = 0;
+        let mut complete = false;
+        for _ in 0..16 {
+            let report = seeds.collect(&protected, DAY, now_ms(), 1).unwrap();
+            removed += report.removed;
+            if report.complete {
+                complete = true;
+                break;
+            }
+        }
+        assert!(complete, "{form:?}");
+        assert_eq!(removed, 1, "{form:?}");
+        assert!(seeds.contains(keep), "{form:?}");
+        assert!(!seeds.contains(old), "{form:?}");
+        assert!(seeds.contains(young), "{form:?}");
     }
-    assert!(complete);
-    assert_eq!(removed, 1);
-    assert!(seeds.contains(keep));
-    assert!(!seeds.contains(old));
-    assert!(seeds.contains(young));
 }
 
 /// What a crash left unnamed (an install's or a batch's unsynced file) leaves
@@ -384,15 +402,16 @@ fn unprotected_seeds_are_removed_past_the_grace() {
 fn unnamed_files_a_crash_left_are_removed_past_the_grace() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("seeds");
-    let mut seeds =
-        SeedStore::open(&root, DiskBudget::new(DiskBudgetConfig::default()).unwrap()).unwrap();
+    let mut seeds = seed_store(directory.path(), &root, ContentForm::Clear);
     let stale_install = root.join(format!("{}.install", ContentHash([3; 32])));
     let stale_batch = root.join(format!("{}.7.batch", ContentHash([4; 32])));
     let young_batch = root.join(format!("{}.8.batch", ContentHash([5; 32])));
-    for path in [&stale_install, &stale_batch, &young_batch] {
+    // A conversion job's, named by a keyed name (29 §12).
+    let stale_convert = root.join(format!("{}.9.convert", "ab".repeat(16)));
+    for path in [&stale_install, &stale_batch, &young_batch, &stale_convert] {
         std::fs::write(path, b"partial").unwrap();
     }
-    for path in [&stale_install, &stale_batch] {
+    for path in [&stale_install, &stale_batch, &stale_convert] {
         File::options()
             .write(true)
             .open(path)
@@ -410,6 +429,7 @@ fn unnamed_files_a_crash_left_are_removed_past_the_grace() {
     assert!(complete);
     assert!(!stale_install.exists());
     assert!(!stale_batch.exists());
+    assert!(!stale_convert.exists());
     assert!(young_batch.exists());
 }
 
@@ -421,8 +441,7 @@ fn unnamed_files_a_crash_left_are_removed_past_the_grace() {
 fn a_seed_the_sweep_listed_that_is_gone_when_it_looks_fails_nothing() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("seeds");
-    let mut seeds =
-        SeedStore::open(&root, DiskBudget::new(DiskBudgetConfig::default()).unwrap()).unwrap();
+    let mut seeds = seed_store(directory.path(), &root, ContentForm::Clear);
     let name = |n: u32| {
         let mut hash = [0u8; 32];
         hash[..4].copy_from_slice(&n.to_be_bytes());

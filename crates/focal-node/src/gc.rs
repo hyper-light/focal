@@ -603,6 +603,9 @@ impl GcAgent {
     }
     async fn seeds(&mut self, handles: &NetworkHandles) -> Result<AdminSeedReport, AccessError> {
         let mut report = AdminSeedReport::default();
+        // The conversion's chunk of scratch, made and charged when a job first needs it and let go
+        // with the pass.
+        let mut scratch: Option<(Vec<u8>, focal_memory::Allocation)> = None;
         let mut after = None;
         while let Some((ledger, host)) = handles.fleet.next_host(after) {
             after = Some(ledger);
@@ -626,9 +629,104 @@ impl GcAgent {
                 }
                 hyper_rt::futures::yield_now().await;
             }
+            // The replica's seeds at rest (29 §12): converted a job at a time, at most MAX_STEPS
+            // steps a pass, each job's chunks read, sealed and flushed on the blocking pool, so the
+            // replica's owner only lists, tallies and lets names in the clear go. The last job's
+            // result goes back before the next replica's turn.
+            let mut done = None;
+            let mut status = None;
+            for _ in 0..MAX_STEPS {
+                let Ok(reply) = host
+                    .seed_conversion(done.take(), PAGE, focal_evidence::SEED_JOB_CHUNKS)
+                    .await
+                else {
+                    break;
+                };
+                status = Some(reply.status);
+                match reply.next {
+                    focal_evidence::SeedStep::Done => break,
+                    focal_evidence::SeedStep::Visited => {}
+                    focal_evidence::SeedStep::Job(job) => {
+                        let Some((buffer, charge)) = scratch.take().or_else(|| self.scratch())
+                        else {
+                            break;
+                        };
+                        let ran = focal_rt::on_pool(&focal_rt::FILES, move || {
+                            let mut buffer = buffer;
+                            let done = job.run(&mut buffer);
+                            (done, buffer)
+                        })
+                        .await;
+                        // A job the pool refused or lost leaves its chunks in the clear: the
+                        // replica's owner takes them again at its next step.
+                        let Ok((result, buffer)) = ran else {
+                            break;
+                        };
+                        scratch = Some((buffer, charge));
+                        done = Some(result);
+                    }
+                }
+                hyper_rt::futures::yield_now().await;
+            }
+            if let Some(done) = done
+                && let Ok(reply) = host.seed_conversion(Some(done), 0, 0).await
+            {
+                status = Some(reply.status);
+            }
+            if let Some(status) = status {
+                add_conversion(&mut report.conversion, &status);
+            }
         }
         Ok(report)
     }
+    /// A chunk of scratch for the seed conversion's jobs, charged to the agent's budget; none where
+    /// the budget has not the room, and the conversion waits for the next pass.
+    fn scratch(&self) -> Option<(Vec<u8>, focal_memory::Allocation)> {
+        let bytes = focal_evidence::SEED_CHUNK_BYTES;
+        let charge = self
+            .budget
+            .reserve(
+                focal_memory::BudgetKind::Payload,
+                focal_memory::BudgetLane::Ordinary,
+                bytes,
+            )
+            .ok()?
+            .commit();
+        let mut buffer = Vec::new();
+        buffer.try_reserve_exact(bytes).ok()?;
+        buffer.resize(bytes, 0);
+        Some((buffer, charge))
+    }
+}
+/// One replica's seed directory at rest added to the node's view (29 §12): its form counted, and
+/// what its conversion counted, converted, found gone and has left.
+fn add_conversion(
+    view: &mut focal_client::admin::AdminSeedConversion,
+    status: &focal_evidence::ConversionStatus,
+) {
+    use focal_evidence::StoreForm;
+    let form = match status.form {
+        StoreForm::Clear => &mut view.clear,
+        StoreForm::Counting => &mut view.counting,
+        StoreForm::Converting => &mut view.converting,
+        StoreForm::Sealed => &mut view.sealed,
+    };
+    *form = form.saturating_add(1);
+    if status.held {
+        view.held = view.held.saturating_add(1);
+    }
+    if status.stopped.is_some() {
+        view.stopped = view.stopped.saturating_add(1);
+    }
+    let left = status.left();
+    view.files_counted = view.files_counted.saturating_add(status.counted.files);
+    view.bytes_counted = view.bytes_counted.saturating_add(status.counted.bytes);
+    view.files_converted = view.files_converted.saturating_add(status.converted.files);
+    view.bytes_converted = view.bytes_converted.saturating_add(status.converted.bytes);
+    view.files_gone = view.files_gone.saturating_add(status.gone.files);
+    view.bytes_gone = view.bytes_gone.saturating_add(status.gone.bytes);
+    view.files_left = view.files_left.saturating_add(left.files);
+    view.bytes_left = view.bytes_left.saturating_add(left.bytes);
 }
 fn content(_: focal_evidence::ContentError) -> AccessError {
     AccessError::Capacity

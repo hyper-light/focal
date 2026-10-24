@@ -27,6 +27,7 @@ fn hash(bytes: &[u8]) -> ContentHash {
 fn converting(content: WrappingKey) -> ContentKeys<'static> {
     ContentKeys {
         content: Content::Held(content),
+        store: focal_seal::Store::Content,
         clear: true,
     }
 }

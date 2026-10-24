@@ -9,7 +9,7 @@ use focal_enrollment::UpgradeFence;
 /// The capability level this binary implements. Raised by a release that
 /// activates behaviour older binaries cannot follow; the fence gates that
 /// behaviour until every node runs such a binary.
-pub const CAPABILITY_LEVEL: u32 = 9;
+pub const CAPABILITY_LEVEL: u32 = 10;
 /// The level at which the issuer succeeds itself (24 §11): a credential
 /// issued under a successor issuer is presented with the predecessor's
 /// endorsement, which a binary below this level cannot verify.
@@ -58,6 +58,14 @@ pub const SHARE_LEVEL: u32 = 8;
 /// rollback below the fence still finds its content; from it the store seals what it installs and
 /// converts what it holds in the clear as it serves, from genesis in a cluster founded there.
 pub const CONTENT_LEVEL: u32 = 9;
+/// The level at which every store a node keeps beside its log and content is sealed at rest (29
+/// §12), beginning with a session's checkpoint seeds: each directory under a key of its own, each
+/// chunk sealed whole and named by a keyed hash, which a binary below this level cannot open. A
+/// node takes the form from the fence it last recorded (`storage_level::at_rest_form`) as each
+/// store is opened: below the level every store keeps the clear layout every earlier binary reads,
+/// so a rollback below the fence still finds it; from it each seals what it writes and converts
+/// what it holds in the clear as it serves, from genesis in a cluster founded there.
+pub const AT_REST_LEVEL: u32 = 10;
 /// The environment variable that lowers the announced level for a staged
 /// rollout or a rehearsal; it can never raise it.
 pub const ANNOUNCED_LEVEL_ENV: &str = "FOCAL_CAPABILITY_LEVEL";

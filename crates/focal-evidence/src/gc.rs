@@ -1226,6 +1226,12 @@ impl SeedStore {
     /// Remove seeds nothing protects that stood past the grace, at most
     /// `max_items` visits; seeds are copies of checkpoint bytes a peer can
     /// serve again, so they need no quarantine. `protected` must be sorted.
+    ///
+    /// A chunk lies under its hash in the clear or under the directory's keyed name of it sealed
+    /// (29 §12), and is protected by either: the keyed names of `protected` are taken once a call,
+    /// where the directory has its key. While the conversion counts the chunks in the clear, none
+    /// of them is removed, so the count is exact; one removed once it has counted is tallied as
+    /// gone ([`SeedStore::removed_clear`]).
     pub fn collect(
         &mut self,
         protected: &[ContentHash],
@@ -1234,6 +1240,8 @@ impl SeedStore {
         max_items: usize,
     ) -> Result<SeedReport, ContentError> {
         self.check()?;
+        let marks = self.protected_marks(protected)?;
+        let counting = self.conversion_counting();
         let mut report = SeedReport::default();
         let mut walk = match self.sweep.take() {
             Some(walk) => walk,
@@ -1258,19 +1266,28 @@ impl SeedStore {
             let Some((stem, extension)) = split_name(&entry) else {
                 continue;
             };
-            // An unnamed file a crash left behind (an install's or a batch's,
-            // never synced into a chunk) is removed past the same grace; a live
-            // batch commits in far less than it, so nothing in use is taken.
-            let unnamed = matches!(extension.as_str(), "install" | "batch");
+            // An unnamed file a crash left behind (an install's, a batch's or a
+            // conversion job's, never synced into a chunk) is removed past the
+            // same grace; a live batch or job commits in far less than it, so
+            // nothing in use is taken.
+            let unnamed = matches!(extension.as_str(), "install" | "batch" | "convert");
             if extension != "seed" && !unnamed {
                 continue;
             }
+            let mut clear = false;
             if !unnamed {
-                let Some(hash) = parse_hash(&stem) else {
-                    continue;
-                };
-                if protected.binary_search(&hash).is_ok() {
-                    continue;
+                if let Some(hash) = sealing::parse_hash(&stem) {
+                    if protected.binary_search(&hash).is_ok() || counting {
+                        continue;
+                    }
+                    clear = true;
+                } else {
+                    let Some(mark) = self.keys.mark_of(&stem) else {
+                        continue;
+                    };
+                    if marks.binary_search(&mark).is_ok() {
+                        continue;
+                    }
                 }
             }
             // Gone since the walk listed it (`still_there`): here a checkpoint's commit, on its
@@ -1296,6 +1313,9 @@ impl SeedStore {
                     return Err(ContentError::Io(error));
                 }
                 continue;
+            }
+            if clear {
+                self.removed_clear(metadata.len());
             }
             changed = true;
             report.removed = report.removed.saturating_add(1);

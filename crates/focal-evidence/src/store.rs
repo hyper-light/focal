@@ -69,7 +69,10 @@ mod gc;
 pub use gc::{CollectorConfig, CollectorReport, ProtectionSet, SeedReport};
 #[path = "seeds.rs"]
 mod seeds;
-pub use seeds::{SEED_CHUNK_BYTES, SeedBatch, SeedCommit, SeedReader, SeedStore};
+pub use seeds::{
+    OpenedSeeds, SEED_CHUNK_BYTES, SEED_JOB_CHUNKS, SeedBatch, SeedCommit, SeedJob, SeedJobDone,
+    SeedReader, SeedStep, SeedStore,
+};
 #[path = "cold.rs"]
 mod cold;
 pub use cold::{
@@ -1404,6 +1407,19 @@ impl ContentStore {
     pub fn root(&self) -> &Path {
         &self.root
     }
+    /// The data directory's keys the store seals under, which the stores a session keeps beside
+    /// it (its seeds) take theirs from.
+    pub fn data_keys(&self) -> &focal_seal::DataKeys {
+        &self.data_keys
+    }
+    /// The form the store installs its files in: sealed once its writer seals (29 §11).
+    pub fn form(&self) -> ContentForm {
+        if self.keys.seals() {
+            ContentForm::Sealed
+        } else {
+            ContentForm::Clear
+        }
+    }
     /// A lock-free reader of this store, opening what it installed under the same data
     /// directory's keys.
     pub fn reader(&self) -> Result<ContentReader, ContentError> {
@@ -1784,6 +1800,11 @@ impl ContentReader {
     }
     fn keys(&self) -> sealing::ContentKeys<'_> {
         sealing::ContentKeys::reading(&self.keys, self.clear)
+    }
+    /// The data directory's keys the reader opens files under, which the stores a session keeps
+    /// beside the content store (its seeds) take theirs from.
+    pub fn data_keys(&self) -> &focal_seal::DataKeys {
+        &self.keys
     }
     /// Where the manifest of `domain` whose root is `root` lies, in whichever form, if anywhere:
     /// what a test that removes, damages or looks for a stored object's file names it by.

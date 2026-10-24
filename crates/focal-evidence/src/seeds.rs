@@ -6,10 +6,37 @@
 //! hash on every read, retained across reopen and removed only by an
 //! explicit retention decision. One writer holds the directory; readers
 //! share it, since every install is a durable atomic rename.
+//!
+//! At rest (29 §12): below the at-rest level a chunk lies in the clear, named by its hash, byte for
+//! byte as every earlier binary wrote it, so a node can still be rolled back while the fence is
+//! below the level. From the level the directory has a key of its own, random, kept as its record
+//! under the data directory's group key (`DOMAIN.key`); each chunk is sealed whole, keyed by its
+//! hash (`SealedWriter::content_keyed`, the BLAKE3 hash it is named by, so its bytes are passed over
+//! once), and named by the directory's keyed name of that hash: no name or byte of the directory
+//! holds a chunk's hash or plaintext, and destroying the record erases every chunk of it. A
+//! directory that holds chunks in the clear when its writer is asked to seal is marked as
+//! converting (`SEALING`) and converted a chunk a step while it serves ([`SeedStore::convert_step`],
+//! driven by the node's collector), then marked sealed (`SEALED`). Until then every lookup looks in
+//! the clear first and then under the keyed name, so a reader finds a chunk whatever the conversion
+//! does between; a directory that holds nothing in the clear is sealed as it opens.
+//!
+//! Key slots (`focal_seal::key_slots`, a hard bound for the whole process): a writer or reader
+//! unwraps the directory's key for the one chunk it writes or reads, and a writer lets it go before
+//! it writes the chunk's bytes, so a node's sessions hold no slot between their writes.
+use super::convert::{self, Conversion, ConversionStatus, Progress, StoreForm};
+use super::sealing::{self, ContentForm, ContentKeys, Hashed, Kind};
 use super::*;
 
 /// The most bytes one seed chunk holds.
 pub const SEED_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// The most chunks a conversion job seals ([`SeedStore::conversion_job`]): as many as a batch
+/// flushes at once, on its sync threads.
+pub const SEED_JOB_CHUNKS: usize = SYNC_THREADS;
+
+/// The identity every seed directory's key and names are made under: each directory has a key of
+/// its own, so one identity serves them all, and a directory's names depend on nothing of its path.
+const SEED_DOMAIN: ContentDomainId = ContentDomainId(*b"focal seed chunk");
 
 /// The one writer of a seed directory.
 pub struct SeedStore {
@@ -21,6 +48,15 @@ pub struct SeedStore {
     /// Batches begun by this writer: what names a batch's unsynced files, so
     /// that two batches, or a batch and a single install, never share one.
     batches: u64,
+    /// The directory's keys and the forms its chunks may lie in (29 §12).
+    pub(super) keys: ContentKeys<'static>,
+    /// The data directory's keys, which every reader this store makes takes.
+    data_keys: focal_seal::DataKeys,
+    /// The conversion of the chunks in the clear, while one runs ([`Self::conversion_job`]), and
+    /// its progress since this open, where one ran: boxed, as a session holds its stores inline
+    /// and moves by value through its hosts' frames (`Session`'s inline bound).
+    pub(super) conversion: Option<Box<SeedConversion>>,
+    progress: Option<Box<Progress>>,
     _writer_lock: focal_platform::FileLock,
 }
 
@@ -28,11 +64,90 @@ pub struct SeedStore {
 #[derive(Clone)]
 pub struct SeedReader {
     root: PathBuf,
+    keys: focal_seal::DataKeys,
+    /// Whether a chunk may lie in the clear: the directory was not marked sealed when the reader
+    /// was made.
+    clear: bool,
+}
+
+/// Where a seed directory's conversion stands: the count of its chunks in the clear, then the pass
+/// that seals them, a job at a time.
+pub(super) enum SeedConversion {
+    /// Counting, the listing so far: none before the count begins.
+    Counting(Option<std::fs::ReadDir>),
+    Sealing(Sealing),
+}
+
+/// The pass that seals a directory's chunks in the clear.
+#[derive(Default)]
+pub(super) struct Sealing {
+    /// The pass's listing: none before it begins.
+    pass: Option<std::fs::ReadDir>,
+    /// Whether the listing has ended.
+    listed: bool,
+    /// Chunks a job had no room for, taken before the listing's next (the first held last).
+    /// Bounded by a job's chunks.
+    queued: Vec<ClearChunk>,
+    /// The chunks of the job handed last, until its result comes back, and its number.
+    out: Vec<ClearChunk>,
+    number: u64,
+    /// Whether a name in the clear went since the directory was last flushed.
+    removed: bool,
+}
+
+/// A chunk in the clear the conversion seals: where it lies, the hash it is filed under, its bytes.
+#[derive(Clone, Debug)]
+struct ClearChunk {
+    path: PathBuf,
+    hash: ContentHash,
+    bytes: u64,
+}
+
+/// What the next piece of a seed directory's conversion is ([`SeedStore::conversion_job`]).
+pub enum SeedStep {
+    /// Chunks in the clear to seal off the owner's thread.
+    Job(SeedJob),
+    /// Entries visited: the count went on, or the listing passed only what is left as it is.
+    Visited,
+    /// Every chunk is sealed and the directory marked so; or no conversion runs.
+    Done,
+}
+
+/// Chunks in the clear of one seed directory, to seal off its owner's thread ([`SeedJob::run`]):
+/// it owns what it writes with, so it runs on any thread.
+pub struct SeedJob {
+    root: PathBuf,
+    keys: ContentKeys<'static>,
+    disk: DiskBudget,
+    /// What names its unsynced files, so that no two jobs or batches share one.
+    number: u64,
+    chunks: Vec<ClearChunk>,
+}
+
+/// What a [`SeedJob`] did, for its store's owner to take back ([`SeedStore::conversion_done`]).
+pub struct SeedJobDone {
+    number: u64,
+    /// The chunks whose sealed forms are durable: their names in the clear may go.
+    sealed: Vec<ClearChunk>,
+    /// The chunk the volume had no room for and those after it, in order.
+    held: Vec<ClearChunk>,
+    /// What stopped the job: nothing it wrote is taken as sealed.
+    failed: Option<ContentError>,
 }
 
 impl SeedStore {
-    /// Open or create the directory, holding its writer lock.
-    pub fn open(root: impl AsRef<Path>, disk: DiskBudget) -> Result<Self, ContentError> {
+    /// Open or create the directory, holding its writer lock, its chunks installed in `form`: in
+    /// the clear below the at-rest level, sealed from it (29 §12). A directory marked sealed stays
+    /// sealed, and one whose conversion began finishes it, whatever `form` asks; one asked to seal
+    /// that holds chunks in the clear is marked as converting and converted as it serves
+    /// ([`Self::convert_step`]), and one that holds none is sealed at once. `keys` are the data
+    /// directory's, under whose group key the directory's own key is kept.
+    pub fn open(
+        root: impl AsRef<Path>,
+        disk: DiskBudget,
+        keys: &focal_seal::DataKeys,
+        form: ContentForm,
+    ) -> Result<Self, ContentError> {
         let root = root.as_ref().to_path_buf();
         durable_directory(&root)?;
         let lock = OpenOptions::new()
@@ -48,12 +163,44 @@ impl SeedStore {
                 ContentError::Io(error)
             }
         })?;
+        let sealed = root.join(sealing::SEALED).try_exists()?;
+        let begun = root.join(sealing::SEALING).try_exists()?;
+        let group = focal_seal::Store::Group;
+        let mut conversion = None;
+        let mut progress = None;
+        let directory_keys = if sealed {
+            // A conversion that ended before its marker went.
+            convert::remove_marker(&root, sealing::SEALING)?;
+            ContentKeys::per_record(keys.clone(), group, false)
+        } else if begun || form == ContentForm::Sealed {
+            if !begun && !holds_clear(&root)? {
+                // Nothing in the clear to convert: sealed as it opens, no reader having been
+                // told it may find a chunk in the clear.
+                convert::write_marker(&root, sealing::SEALED)?;
+                ContentKeys::per_record(keys.clone(), group, false)
+            } else {
+                // Marked before anything is sealed: from here the directory holds chunks in either
+                // form, and only a writer that reads both may open it.
+                if !begun {
+                    convert::write_marker(&root, sealing::SEALING)?;
+                }
+                conversion = Some(Box::new(SeedConversion::Counting(None)));
+                progress = Some(Box::new(Progress::begun(begun)));
+                ContentKeys::per_record(keys.clone(), group, true)
+            }
+        } else {
+            ContentKeys::clear()
+        };
         Ok(Self {
             root,
             disk,
             failed: false,
             sweep: None,
             batches: 0,
+            keys: directory_keys,
+            data_keys: keys.clone(),
+            conversion,
+            progress,
             _writer_lock: lock,
         })
     }
@@ -63,6 +210,8 @@ impl SeedStore {
     pub fn reader(&self) -> SeedReader {
         SeedReader {
             root: self.root.clone(),
+            keys: self.data_keys.clone(),
+            clear: self.keys.clear_allowed(),
         }
     }
     pub(super) fn check(&self) -> Result<(), ContentError> {
@@ -70,6 +219,11 @@ impl SeedStore {
             return Err(ContentError::Failed);
         }
         Ok(())
+    }
+    /// The directory's key for one chunk: unwrapped from its record, which a writer that seals
+    /// makes where none stands only once it has promised its bytes ([`Self::writable`]).
+    pub(super) fn key(&self) -> Result<sealing::DomainKey, ContentError> {
+        self.keys.domain(&self.root, SEED_DOMAIN, false)
     }
     /// Seal one chunk under its hash. Disk is promised before the write; an
     /// identical chunk already present is complete; a differing file under
@@ -80,23 +234,35 @@ impl SeedStore {
         if bytes.is_empty() || bytes.len() > SEED_CHUNK_BYTES {
             return Err(ContentError::Capacity);
         }
-        let hash = ContentHash(*blake3::hash(bytes).as_bytes());
-        let path = seed_path(&self.root, hash);
+        let seed = Hashed::of(bytes);
+        let result = self.install_hashed(&seed);
+        if let Err(ContentError::Io(_)) = &result {
+            self.failed = true;
+        }
+        result.map(|()| seed.hash())
+    }
+    fn install_hashed(&mut self, seed: &Hashed<'_>) -> Result<(), ContentError> {
+        let key = self.key()?;
+        if present(&key, &self.root, seed)? {
+            return Ok(());
+        }
         let record = disk_reserve(
             &self.disk,
             &self.root,
             DiskKind::Checkpoint,
             BudgetLane::Completion,
-            u64::try_from(bytes.len()).map_err(|_| ContentError::Capacity)?,
+            key.file_bytes(seed.bytes().len())?
+                .checked_add(key.record_bytes())
+                .ok_or(ContentError::Capacity)?,
         )?;
-        if let Err(error) = install_verified_chunk(&path, bytes, hash) {
-            if matches!(error, ContentError::Io(_)) {
-                self.failed = true;
-            }
-            return Err(error);
-        }
+        let key = self.keys.writable(&self.root, SEED_DOMAIN, key)?;
+        let path = key.path(&self.root, seed.hash(), Kind::Seed)?;
+        let writer = key.seed_writer(&path.with_extension("install"), *seed)?;
+        // The directory's key goes before the chunk's bytes are written.
+        drop(key);
+        writer.install(&path)?;
         record.commit();
-        Ok(hash)
+        Ok(())
     }
     /// Seal the chunks of one checkpoint as one batch (25 §5). Each chunk is
     /// written as it is added, to a file of its own and unsynced; `commit`
@@ -109,7 +275,7 @@ impl SeedStore {
     /// before `commit` returns; an IO failure fails the store, as `install`
     /// does.
     ///
-    /// The batch owns what it writes with (the directory and its disk
+    /// The batch owns what it writes with (the directory, its keys and its disk
     /// envelope), so it may be filled on another thread while this store's
     /// owner goes on. Its IO failure is the store's: whoever receives a
     /// batch's error fails the store ([`Self::fail`]), as `commit` here does.
@@ -119,6 +285,7 @@ impl SeedStore {
         Ok(SeedBatch {
             root: self.root.clone(),
             disk: self.disk.clone(),
+            keys: self.keys.owned_copy()?,
             number: self.batches,
             failed: false,
             pending: PendingFiles::default(),
@@ -138,17 +305,31 @@ impl SeedStore {
         self.install(bytes).map(|_| ())
     }
     pub fn contains(&self, hash: ContentHash) -> bool {
-        seed_path(&self.root, hash).is_file()
+        self.key()
+            .and_then(|key| key.exists(&self.root, hash, Kind::Seed))
+            .unwrap_or(false)
     }
     pub fn read(&self, hash: ContentHash, max_bytes: usize) -> Result<Vec<u8>, ContentError> {
         self.check()?;
-        read_seed(&self.root, hash, max_bytes)
+        self.key()?.read_sized(
+            &self.root,
+            hash,
+            Kind::Seed,
+            max_bytes.min(SEED_CHUNK_BYTES),
+        )
     }
     /// Remove one chunk; absent is complete. A retention decision, never a
-    /// side effect of a read or an install.
+    /// side effect of a read or an install. While the conversion counts, a
+    /// chunk in the clear it removes sets the count going again from the
+    /// start, so the count stays exact; once it has counted, it is tallied as
+    /// gone.
     pub fn remove(&mut self, hash: ContentHash) -> Result<(), ContentError> {
         self.check()?;
-        let path = seed_path(&self.root, hash);
+        let key = self.key()?;
+        let Some(path) = key.existing(&self.root, hash, Kind::Seed)? else {
+            return Ok(());
+        };
+        let clear = clear_seed(&path)?;
         match fs::remove_file(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -157,30 +338,429 @@ impl SeedStore {
                 return Err(ContentError::Io(error));
             }
         }
+        if let Some(bytes) = clear {
+            self.removed_clear(bytes);
+        }
         if let Err(error) = sync_directory(&self.root) {
             self.failed = true;
             return Err(ContentError::Io(error));
         }
         Ok(())
     }
+    /// A chunk in the clear of `bytes` left the directory other than by the conversion: counted
+    /// again from the start while the count runs (whether the count met it is not known), tallied
+    /// as gone once it has counted.
+    pub(super) fn removed_clear(&mut self, bytes: u64) {
+        match self.conversion.as_deref_mut() {
+            Some(SeedConversion::Counting(listing)) => {
+                *listing = None;
+                let resumed = progress(&mut self.progress).resumed;
+                self.progress = Some(Box::new(Progress::begun(resumed)));
+            }
+            Some(SeedConversion::Sealing(_)) => progress(&mut self.progress).gone.add(bytes),
+            None => {}
+        }
+    }
+    /// The keyed marks of `protected`, sorted: what the seed sweep keeps a sealed chunk by. None
+    /// where the directory holds no sealed chunk (its writer keeps the clear, or its key's record
+    /// does not stand).
+    pub(super) fn protected_marks(
+        &self,
+        protected: &[ContentHash],
+    ) -> Result<Vec<sealing::Mark>, ContentError> {
+        let mut marks = Vec::new();
+        if !self.keys.seals() {
+            return Ok(marks);
+        }
+        let key = self.key()?;
+        if key.record_bytes() != 0 {
+            return Ok(marks);
+        }
+        marks
+            .try_reserve_exact(protected.len())
+            .map_err(|_| ContentError::Capacity)?;
+        for hash in protected {
+            marks.push(key.mark(*hash)?);
+        }
+        marks.sort_unstable();
+        Ok(marks)
+    }
+    /// Whether the conversion is counting the chunks in the clear: the seed sweep removes none of
+    /// them meanwhile, so the count is exact.
+    pub(super) fn conversion_counting(&self) -> bool {
+        matches!(
+            self.conversion.as_deref(),
+            Some(SeedConversion::Counting(_))
+        )
+    }
+    /// The form the directory is in and its conversion's progress since this open (29 §12), as
+    /// [`ContentStore::conversion_status`] gives the content store's.
+    pub fn conversion_status(&self) -> ConversionStatus {
+        let form = if !self.keys.seals() {
+            StoreForm::Clear
+        } else if !self.keys.clear_allowed() {
+            StoreForm::Sealed
+        } else if self.conversion_counting() {
+            StoreForm::Counting
+        } else {
+            StoreForm::Converting
+        };
+        self.progress
+            .as_deref()
+            .copied()
+            .unwrap_or_default()
+            .status(form)
+    }
+    /// The next piece of the directory's conversion, at most `visits` entries visited. While it
+    /// counts the chunks in the clear, the count goes on ([`SeedStep::Visited`]); once counted, the
+    /// next at most `chunks` chunks in the clear are handed out as a job ([`SeedStep::Job`]) whose
+    /// heavy part (each chunk read, sealed beside itself under its keyed name, the files flushed
+    /// together, renamed, the directory flushed) runs off the owner's thread ([`SeedJob::run`]),
+    /// and whose result the owner takes back ([`Self::conversion_done`]), removing the converted
+    /// chunks' names in the clear. A job handed before whose result never came back has its chunks
+    /// taken again, first: they are still in the clear, and a sealed form it left is found and
+    /// kept. The pass ended with no chunk out, the directory is flushed and marked sealed
+    /// ([`SeedStep::Done`]).
+    pub fn conversion_job(
+        &mut self,
+        visits: usize,
+        chunks: usize,
+    ) -> Result<SeedStep, ContentError> {
+        self.check()?;
+        let Some(state) = self.conversion.as_deref_mut() else {
+            return Ok(SeedStep::Done);
+        };
+        if let SeedConversion::Counting(listing) = state {
+            let listing = match listing {
+                Some(listing) => listing,
+                None => listing.insert(fs::read_dir(&self.root)?),
+            };
+            let mut counted = false;
+            for _ in 0..visits {
+                let Some(entry) = listing.next() else {
+                    counted = true;
+                    break;
+                };
+                if let Some(bytes) = clear_seed(&entry?.path())? {
+                    progress(&mut self.progress).counted.add(bytes);
+                }
+            }
+            if counted {
+                progress(&mut self.progress).counting = false;
+                *state = SeedConversion::Sealing(Sealing::default());
+            }
+            return Ok(SeedStep::Visited);
+        }
+        let SeedConversion::Sealing(sealing) = state else {
+            return Err(ContentError::Invalid);
+        };
+        // A job out whose result never came back: its chunks are taken again, first.
+        let lost = std::mem::take(&mut sealing.out);
+        let mut taken: Vec<ClearChunk> = Vec::new();
+        taken
+            .try_reserve_exact(chunks.max(lost.len()))
+            .map_err(|_| ContentError::Capacity)?;
+        taken.extend(lost);
+        while taken.len() < chunks {
+            let Some(chunk) = sealing.queued.pop() else {
+                break;
+            };
+            taken.push(chunk);
+        }
+        if !sealing.listed {
+            let listing = match &mut sealing.pass {
+                Some(listing) => listing,
+                None => sealing.pass.insert(fs::read_dir(&self.root)?),
+            };
+            for _ in 0..visits {
+                if taken.len() >= chunks {
+                    break;
+                }
+                let Some(entry) = listing.next() else {
+                    sealing.listed = true;
+                    break;
+                };
+                let path = entry?.path();
+                if let Some(bytes) = clear_seed(&path)?
+                    && let Some(hash) = clear_hash(&path)
+                {
+                    taken.push(ClearChunk { path, hash, bytes });
+                }
+            }
+        }
+        if taken.is_empty() {
+            if !sealing.listed || !sealing.queued.is_empty() {
+                return Ok(SeedStep::Visited);
+            }
+            if sealing.removed {
+                sync_directory(&self.root)?;
+            }
+            self.mark_sealed()?;
+            return Ok(SeedStep::Done);
+        }
+        let mut out = Vec::new();
+        out.try_reserve_exact(taken.len())
+            .map_err(|_| ContentError::Capacity)?;
+        out.extend(taken.iter().cloned());
+        sealing.out = out;
+        self.batches = self.batches.wrapping_add(1);
+        sealing.number = self.batches;
+        Ok(SeedStep::Job(SeedJob {
+            root: self.root.clone(),
+            keys: self.keys.owned_copy()?,
+            disk: self.disk.clone(),
+            number: self.batches,
+            chunks: taken,
+        }))
+    }
+    /// A job's result taken back ([`Self::conversion_job`]): the name in the clear of every chunk
+    /// whose sealed form it made durable removed, each such chunk tallied converted once (one the
+    /// sweep removed first was tallied gone then); the chunks it had no room for taken first next;
+    /// a job that failed ends this conversion with its cause, and an IO failure fails the store, as
+    /// a batch's does. What it did, as a step of the conversion.
+    pub fn conversion_done(&mut self, done: SeedJobDone) -> Result<Conversion, ContentError> {
+        self.check()?;
+        let SeedJobDone {
+            number,
+            sealed,
+            held,
+            failed,
+        } = done;
+        let Some(SeedConversion::Sealing(sealing)) = self.conversion.as_deref_mut() else {
+            return Ok(Conversion::Done);
+        };
+        if sealing.number == number {
+            sealing.out.clear();
+        }
+        let mut converted = 0usize;
+        for chunk in sealed {
+            match fs::remove_file(&chunk.path) {
+                Ok(()) => {
+                    sealing.removed = true;
+                    converted = converted.saturating_add(1);
+                    progress(&mut self.progress).converted.add(chunk.bytes);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    let error = ContentError::Io(error);
+                    self.failed = true;
+                    progress(&mut self.progress).stopped = Some(error.kind());
+                    self.conversion = None;
+                    return Err(error);
+                }
+            }
+        }
+        let was_held = !held.is_empty();
+        sealing
+            .queued
+            .try_reserve(held.len())
+            .map_err(|_| ContentError::Capacity)?;
+        // Taken from the back: the first held goes first.
+        sealing.queued.extend(held.into_iter().rev());
+        if let Some(error) = failed {
+            progress(&mut self.progress).stopped = Some(error.kind());
+            self.conversion = None;
+            if matches!(error, ContentError::Io(_)) {
+                self.failed = true;
+            }
+            return Err(error);
+        }
+        let progress = progress(&mut self.progress);
+        if converted > 0 {
+            progress.held = false;
+            Ok(Conversion::Converted)
+        } else if was_held {
+            progress.held = true;
+            progress.held_steps = progress.held_steps.saturating_add(1);
+            Ok(Conversion::Held)
+        } else {
+            Ok(Conversion::Visited)
+        }
+    }
+    /// One step of the directory's conversion run here, on the owner's thread: at most `visits`
+    /// entries visited and at most one chunk converted, read into the head of `scratch`, which must
+    /// hold a chunk ([`SEED_CHUNK_BYTES`]). What a caller with no other thread to run a job on does
+    /// ([`Self::conversion_job`] says what a step is).
+    pub fn convert_step(
+        &mut self,
+        scratch: &mut [u8],
+        visits: usize,
+    ) -> Result<Conversion, ContentError> {
+        match self.conversion_job(visits, 1)? {
+            SeedStep::Done => Ok(Conversion::Done),
+            SeedStep::Visited => Ok(Conversion::Visited),
+            SeedStep::Job(job) => {
+                let done = job.run(scratch);
+                self.conversion_done(done)
+            }
+        }
+    }
+    /// Every chunk is sealed: the directory is marked so, its marker of the conversion removed,
+    /// and nothing in the clear is looked for from here on.
+    fn mark_sealed(&mut self) -> Result<(), ContentError> {
+        convert::write_marker(&self.root, sealing::SEALED)?;
+        convert::remove_marker(&self.root, sealing::SEALING)?;
+        self.keys.mark_sealed();
+        self.conversion = None;
+        let progress = progress(&mut self.progress);
+        progress.counting = false;
+        progress.finished_ms = convert::now_ms();
+        Ok(())
+    }
+}
+
+/// Whether a file filed under `seed`'s hash already opens, in either form, to its bytes: kept
+/// then, its freshness refreshed, so the sweep's grace counts from this install. One that opens to
+/// anything else, or not at all, is corrupt under a content-addressed name and refused.
+fn present(key: &sealing::DomainKey, root: &Path, seed: &Hashed<'_>) -> Result<bool, ContentError> {
+    if !key.exists(root, seed.hash(), Kind::Seed)? {
+        return Ok(false);
+    }
+    let mut previous = zeroed_buffer(seed.bytes().len())?;
+    let (path, opened) = key.opened(
+        root,
+        seed.hash(),
+        Kind::Seed,
+        seed.bytes().len(),
+        &mut previous,
+    )?;
+    if opened != seed.bytes() {
+        return Err(ContentError::Corrupt);
+    }
+    refresh_mtime(&path)?;
+    Ok(true)
+}
+
+/// The bytes of the entry at `path` where it is a chunk in the clear: named by its hash, a file
+/// itself (a link to one is left as it is), no longer than a chunk. None for anything else, and
+/// for an entry gone since it was listed.
+fn clear_seed(path: &Path) -> Result<Option<u64>, ContentError> {
+    if path.extension().and_then(|extension| extension.to_str()) != Some(Kind::Seed.extension()) {
+        return Ok(None);
+    }
+    if path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(sealing::parse_hash)
+        .is_none()
+    {
+        return Ok(None);
+    }
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(convert::convertible(Kind::Seed, &metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// A store's conversion progress, made where none was kept (a store that ran no conversion keeps
+/// none).
+fn progress(progress: &mut Option<Box<Progress>>) -> &mut Progress {
+    progress.get_or_insert_with(Box::default)
+}
+
+/// The hash a chunk in the clear at `path` is filed under: its name's.
+fn clear_hash(path: &Path) -> Option<ContentHash> {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(sealing::parse_hash)
+}
+
+/// Whether the directory at `root` holds a chunk in the clear: listed until the first one.
+fn holds_clear(root: &Path) -> Result<bool, ContentError> {
+    for entry in fs::read_dir(root)? {
+        if clear_seed(&entry?.path())?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 impl SeedReader {
-    pub fn open(root: impl AsRef<Path>) -> Result<Self, ContentError> {
+    /// A reader of the seed directory at `root`, its chunks' keys under the data directory's
+    /// `keys`.
+    pub fn open(root: impl AsRef<Path>, keys: focal_seal::DataKeys) -> Result<Self, ContentError> {
         let root = root.as_ref().to_path_buf();
         if !root.is_dir() {
             return Err(ContentError::Invalid);
         }
-        Ok(Self { root })
+        let clear = !root.join(sealing::SEALED).try_exists()?;
+        Ok(Self { root, keys, clear })
     }
     pub fn root(&self) -> &Path {
         &self.root
     }
+    fn keys(&self) -> ContentKeys<'_> {
+        ContentKeys::reading_under(&self.keys, focal_seal::Store::Group, self.clear)
+    }
     pub fn contains(&self, hash: ContentHash) -> bool {
-        seed_path(&self.root, hash).is_file()
+        self.opened()
+            .and_then(|opened| opened.contains(hash))
+            .unwrap_or(false)
     }
     pub fn read(&self, hash: ContentHash, max_bytes: usize) -> Result<Vec<u8>, ContentError> {
-        read_seed(&self.root, hash, max_bytes)
+        self.keys()
+            .domain(&self.root, SEED_DOMAIN, false)?
+            .read_sized(
+                &self.root,
+                hash,
+                Kind::Seed,
+                max_bytes.min(SEED_CHUNK_BYTES),
+            )
+    }
+    /// The hash of every chunk the directory holds, in either form, sorted: a name in the clear is
+    /// its hash (while the directory may hold one); a sealed file is opened and its bytes hashed,
+    /// and refused where its name is not the directory's keyed name of that hash. Every chunk is
+    /// read whole, one at a time: an operator's or a test's look at a directory, never a session's
+    /// path.
+    pub fn chunks(&self) -> Result<Vec<ContentHash>, ContentError> {
+        let keys = self.keys();
+        let key = keys.domain(&self.root, SEED_DOMAIN, false)?;
+        let mut chunks = Vec::new();
+        for entry in fs::read_dir(&self.root)? {
+            let path = entry?.path();
+            if path.extension().and_then(|extension| extension.to_str())
+                != Some(Kind::Seed.extension())
+            {
+                continue;
+            }
+            let hash = match clear_hash(&path) {
+                Some(hash) if self.clear => Some(hash),
+                Some(_) => None,
+                None if key.record_bytes() == 0 => key
+                    .open_listed(&path, SEED_CHUNK_BYTES)?
+                    .map(|(_, hash)| hash),
+                None => None,
+            };
+            if let Some(hash) = hash {
+                chunks.try_reserve(1).map_err(|_| ContentError::Capacity)?;
+                chunks.push(hash);
+            }
+        }
+        chunks.sort_unstable();
+        chunks.dedup();
+        Ok(chunks)
+    }
+    /// The directory with its key unwrapped once, for a pass over many chunks' names (which of a
+    /// checkpoint's chunks are local): it holds a key slot until it is let go.
+    pub fn opened(&self) -> Result<OpenedSeeds<'_>, ContentError> {
+        Ok(OpenedSeeds {
+            root: &self.root,
+            key: self.keys().domain(&self.root, SEED_DOMAIN, false)?,
+        })
+    }
+}
+
+/// A seed directory with its key unwrapped ([`SeedReader::opened`]).
+pub struct OpenedSeeds<'r> {
+    root: &'r Path,
+    key: sealing::DomainKey,
+}
+
+impl OpenedSeeds<'_> {
+    /// Whether a chunk filed under `hash` lies in the directory, in either form.
+    pub fn contains(&self, hash: ContentHash) -> Result<bool, ContentError> {
+        self.key.exists(self.root, hash, Kind::Seed)
     }
 }
 
@@ -190,6 +770,8 @@ impl SeedReader {
 pub struct SeedBatch {
     root: PathBuf,
     disk: DiskBudget,
+    /// The directory's keys, for each chunk it seals.
+    keys: ContentKeys<'static>,
     number: u64,
     /// An IO failure of this batch: it adds nothing more.
     failed: bool,
@@ -221,6 +803,7 @@ impl Drop for PendingFiles {
 }
 
 struct PendingSeedFile {
+    hash: ContentHash,
     temp: PathBuf,
     path: PathBuf,
     file: File,
@@ -235,8 +818,9 @@ const SYNC_THREADS: usize = 8;
 
 impl SeedBatch {
     /// Add one chunk: its hash, the bytes written to a file of their own (not
-    /// yet durable). An identical chunk already present costs no write; a
-    /// different file under the same name is corruption.
+    /// yet durable), sealed where the directory seals. An identical chunk
+    /// already present costs no write; a different file under the same name
+    /// is corruption.
     pub fn add(&mut self, bytes: &[u8]) -> Result<ContentHash, ContentError> {
         if self.failed {
             return Err(ContentError::Failed);
@@ -244,47 +828,47 @@ impl SeedBatch {
         if bytes.is_empty() || bytes.len() > SEED_CHUNK_BYTES {
             return Err(ContentError::Capacity);
         }
-        let hash = ContentHash(*blake3::hash(bytes).as_bytes());
-        let path = seed_path(&self.root, hash);
-        if self.pending.0.iter().any(|p| p.path == path) {
-            return Ok(hash);
-        }
-        let result = self.write(bytes, hash, path);
+        let seed = Hashed::of(bytes);
+        let result = self.write(seed);
         if let Err(ContentError::Io(_)) = &result {
             self.failed = true;
         }
-        result.map(|()| hash)
+        result.map(|()| seed.hash())
     }
 
-    fn write(
-        &mut self,
-        bytes: &[u8],
-        hash: ContentHash,
-        path: PathBuf,
-    ) -> Result<(), ContentError> {
-        if path.exists() {
-            // As `install`: identical bytes are complete, anything else is corrupt.
-            return install_verified_chunk(&path, bytes, hash);
+    fn write(&mut self, seed: Hashed<'_>) -> Result<(), ContentError> {
+        if self.pending.0.iter().any(|p| p.hash == seed.hash()) {
+            return Ok(());
+        }
+        let key = self.keys.domain(&self.root, SEED_DOMAIN, false)?;
+        // As `install`: identical bytes are complete, anything else is corrupt.
+        if present(&key, &self.root, &seed)? {
+            return Ok(());
         }
         let record = disk_reserve(
             &self.disk,
             &self.root,
             DiskKind::Checkpoint,
             BudgetLane::Completion,
-            u64::try_from(bytes.len()).map_err(|_| ContentError::Capacity)?,
+            key.file_bytes(seed.bytes().len())?
+                .checked_add(key.record_bytes())
+                .ok_or(ContentError::Capacity)?,
         )?;
-        let temp = path.with_extension(format!("{}.batch", self.number));
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&temp)?;
-        file.write_all(bytes)?;
         self.pending
             .0
             .try_reserve(1)
             .map_err(|_| ContentError::Capacity)?;
+        // The directory's record made first where it seals and none stands: a keyed name needs it.
+        let key = self.keys.writable(&self.root, SEED_DOMAIN, key)?;
+        let path = key.path(&self.root, seed.hash(), Kind::Seed)?;
+        let temp = path.with_extension(format!("{}.batch", self.number));
+        let writer = key.seed_writer(&temp, seed)?;
+        // The directory's key goes before the chunk's bytes are written: the writer seals with a
+        // key of its own, derived as it was made, and a session holds no slot while it writes.
+        drop(key);
+        let file = writer.finish()?;
         self.pending.0.push(PendingSeedFile {
+            hash: seed.hash(),
             temp,
             path,
             file,
@@ -375,16 +959,133 @@ impl SeedCommit {
     }
 }
 
-fn seed_path(root: &Path, hash: ContentHash) -> PathBuf {
-    root.join(format!("{hash}.seed"))
-}
-
-fn read_seed(root: &Path, hash: ContentHash, max_bytes: usize) -> Result<Vec<u8>, ContentError> {
-    let bytes = read_bounded(&seed_path(root, hash), max_bytes.min(SEED_CHUNK_BYTES))?;
-    if ContentHash(*blake3::hash(&bytes).as_bytes()) != hash {
-        return Err(ContentError::Corrupt);
+impl SeedJob {
+    /// Seal the job's chunks, on whatever thread runs it: each chunk in the clear read into the
+    /// head of `scratch` (a chunk long) and sealed beside itself under its keyed name into a file of
+    /// its own, unflushed; the files then flushed together, renamed, and the directory flushed
+    /// once, as a batch is made durable ([`SeedBatch::commit`]). A chunk whose sealed form stands
+    /// already and opens to its bytes (a conversion cut before its removal) is taken as it is; one
+    /// gone from the clear is passed over. The volume without room for a chunk's sealed form, that
+    /// chunk and those after it are handed back held. A failure takes nothing the job wrote as
+    /// sealed.
+    pub fn run(self, scratch: &mut [u8]) -> SeedJobDone {
+        let SeedJob {
+            root,
+            keys,
+            disk,
+            number,
+            chunks,
+        } = self;
+        let mut done = SeedJobDone {
+            number,
+            sealed: Vec::new(),
+            held: Vec::new(),
+            failed: None,
+        };
+        if let Err(error) = Self::seal(&root, &keys, &disk, number, chunks, scratch, &mut done) {
+            done.sealed.clear();
+            done.failed = Some(error);
+        }
+        done
     }
-    Ok(bytes)
+
+    fn seal(
+        root: &Path,
+        keys: &ContentKeys<'static>,
+        disk: &DiskBudget,
+        number: u64,
+        chunks: Vec<ClearChunk>,
+        scratch: &mut [u8],
+        done: &mut SeedJobDone,
+    ) -> Result<(), ContentError> {
+        let mut pending = PendingFiles::default();
+        pending
+            .0
+            .try_reserve_exact(chunks.len())
+            .map_err(|_| ContentError::Capacity)?;
+        let mut sealed = Vec::new();
+        sealed
+            .try_reserve_exact(chunks.len())
+            .map_err(|_| ContentError::Capacity)?;
+        let mut chunks = chunks.into_iter();
+        while let Some(chunk) = chunks.next() {
+            let key = keys.domain(root, SEED_DOMAIN, false)?;
+            if key.record_bytes() == 0
+                && key.holds_sealed(
+                    &key.path(root, chunk.hash, Kind::Seed)?,
+                    chunk.hash,
+                    scratch,
+                )?
+            {
+                sealed.push(chunk);
+                continue;
+            }
+            let mut file = match File::open(&chunk.path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let length =
+                usize::try_from(file.metadata()?.len()).map_err(|_| ContentError::Capacity)?;
+            if length > SEED_CHUNK_BYTES {
+                // Grown past a chunk since it was listed: not a chunk any writer installed.
+                return Err(ContentError::Corrupt);
+            }
+            let room = match disk_reserve(
+                disk,
+                root,
+                DiskKind::Checkpoint,
+                BudgetLane::Ordinary,
+                key.file_bytes(length)?
+                    .checked_add(key.record_bytes())
+                    .ok_or(ContentError::Capacity)?,
+            ) {
+                Ok(room) => room,
+                Err(ContentError::Capacity) => {
+                    done.held
+                        .try_reserve_exact(chunks.len().saturating_add(1))
+                        .map_err(|_| ContentError::Capacity)?;
+                    done.held.push(chunk);
+                    done.held.extend(chunks);
+                    break;
+                }
+                Err(error) => return Err(error),
+            };
+            let block = scratch.get_mut(..length).ok_or(ContentError::Capacity)?;
+            file.read_exact(block)?;
+            // The file is exactly the length it was opened at: one written into since is not a
+            // chunk the writer installed (every install renames a whole file into place).
+            let mut extra = [0u8; 1];
+            if file.read(&mut extra)? != 0 {
+                return Err(ContentError::Corrupt);
+            }
+            drop(file);
+            let key = keys.writable(root, SEED_DOMAIN, key)?;
+            let path = key.path(root, chunk.hash, Kind::Seed)?;
+            let temp = path.with_extension(format!("{number}.convert"));
+            // Sealed as the bytes are, under the name the chunk is filed by: a chunk that does not
+            // hash to its name is refused as corrupt by every read in either form, so it is
+            // converted as it is, never judged here; its key is derived from the hash of exactly
+            // these bytes.
+            let writer = key.seed_writer(&temp, Hashed::of(block))?;
+            drop(key);
+            let file = writer.finish()?;
+            pending.0.push(PendingSeedFile {
+                hash: chunk.hash,
+                temp,
+                path,
+                file,
+                record: room,
+            });
+            sealed.push(chunk);
+        }
+        SeedCommit::durable(root, &pending.0)?;
+        for file in pending.0.drain(..) {
+            file.record.commit();
+        }
+        done.sealed = sealed;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -395,153 +1096,727 @@ mod tests {
         DiskBudget::new(DiskBudgetConfig::default()).unwrap()
     }
 
+    const FORMS: [ContentForm; 2] = [ContentForm::Clear, ContentForm::Sealed];
+
+    fn keys(data: &Path) -> focal_seal::DataKeys {
+        crate::store::test_keys(data)
+    }
+
+    /// The seed directory `name` of the data directory `data`, opened in `form`.
+    fn open(data: &Path, name: &str, form: ContentForm) -> (PathBuf, SeedStore) {
+        let root = data.join(name);
+        let store = SeedStore::open(&root, disk(), &keys(data), form).unwrap();
+        (root, store)
+    }
+
+    /// The file the chunk filed under `hash` lies in, in whichever form.
+    fn file_of(store: &SeedStore, hash: ContentHash) -> PathBuf {
+        store
+            .key()
+            .unwrap()
+            .existing(&store.root, hash, Kind::Seed)
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Plaintext no stored byte may repeat: long and patterned, so a copy of any 16 bytes shows.
+    fn plaintext(seed: u8, len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i.wrapping_mul(31) ^ (i >> 8)) as u8 ^ seed)
+            .collect()
+    }
+
+    fn names(root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The chunks in the clear a directory holds, by name.
+    fn clear_names(root: &Path) -> usize {
+        names(root)
+            .iter()
+            .filter(|name| {
+                name.strip_suffix(".seed")
+                    .is_some_and(|stem| sealing::parse_hash(stem).is_some())
+            })
+            .count()
+    }
+
     #[test]
     fn a_batch_promises_its_chunks_only_once_committed_and_skips_what_is_there() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("seeds");
-        let mut store = SeedStore::open(&root, disk()).unwrap();
-        let present = vec![1u8; 4096];
-        let present_hash = store.install(&present).unwrap();
-        let chunks: Vec<Vec<u8>> = (0..20u8).map(|n| vec![n.wrapping_add(2); 8192]).collect();
-        // Uncommitted: nothing is named, so nothing is promised.
-        {
-            let mut batch = store.batch().unwrap();
-            for chunk in &chunks {
-                batch.add(chunk).unwrap();
+        for form in FORMS {
+            let directory = tempfile::tempdir().unwrap();
+            let (root, mut store) = open(directory.path(), "seeds", form);
+            let present = vec![1u8; 4096];
+            let present_hash = store.install(&present).unwrap();
+            let chunks: Vec<Vec<u8>> = (0..20u8).map(|n| vec![n.wrapping_add(2); 8192]).collect();
+            // Uncommitted: nothing is named, so nothing is promised.
+            {
+                let mut batch = store.batch().unwrap();
+                for chunk in &chunks {
+                    batch.add(chunk).unwrap();
+                }
             }
+            for chunk in &chunks {
+                assert!(!store.contains(ContentHash(*blake3::hash(chunk).as_bytes())));
+            }
+            // Committed: every chunk named and verified on read, the one already
+            // present taken as it is, the same chunk twice in a batch once.
+            let mut batch = store.batch().unwrap();
+            let mut hashes = Vec::new();
+            for chunk in &chunks {
+                hashes.push(batch.add(chunk).unwrap());
+            }
+            assert_eq!(batch.add(&present).unwrap(), present_hash);
+            assert_eq!(batch.add(&chunks[0]).unwrap(), hashes[0]);
+            assert!(matches!(batch.add(&[]), Err(ContentError::Capacity)));
+            // Filled anywhere: the batch owns what it writes with.
+            fn sendable<T: Send>() {}
+            sendable::<SeedBatch>();
+            batch.commit(&mut store).unwrap();
+            for (chunk, hash) in chunks.iter().zip(&hashes) {
+                assert_eq!(store.read(*hash, SEED_CHUNK_BYTES).unwrap(), *chunk);
+            }
+            assert_eq!(store.read(present_hash, 4096).unwrap(), present);
+            // No unnamed file is left beside the chunks.
+            let leftovers = names(&root)
+                .iter()
+                .filter(|name| name.ends_with(".install") || name.ends_with(".batch"))
+                .count();
+            assert_eq!(leftovers, 0, "{form:?}");
+            // A different file under a chunk's name is corruption, as for `install`.
+            std::fs::write(file_of(&store, hashes[1]), b"not the chunk").unwrap();
+            let mut batch = store.batch().unwrap();
+            assert!(
+                matches!(batch.add(&chunks[1]), Err(ContentError::Corrupt)),
+                "{form:?}"
+            );
         }
-        for chunk in &chunks {
-            assert!(!store.contains(ContentHash(*blake3::hash(chunk).as_bytes())));
-        }
-        // Committed: every chunk named and verified on read, the one already
-        // present taken as it is, the same chunk twice in a batch once.
-        let mut batch = store.batch().unwrap();
-        let mut hashes = Vec::new();
-        for chunk in &chunks {
-            hashes.push(batch.add(chunk).unwrap());
-        }
-        assert_eq!(batch.add(&present).unwrap(), present_hash);
-        assert_eq!(batch.add(&chunks[0]).unwrap(), hashes[0]);
-        assert!(matches!(batch.add(&[]), Err(ContentError::Capacity)));
-        // Filled anywhere: the batch owns what it writes with.
-        fn sendable<T: Send>() {}
-        sendable::<SeedBatch>();
-        batch.commit(&mut store).unwrap();
-        for (chunk, hash) in chunks.iter().zip(&hashes) {
-            assert_eq!(store.read(*hash, SEED_CHUNK_BYTES).unwrap(), *chunk);
-        }
-        assert_eq!(store.read(present_hash, 4096).unwrap(), present);
-        // No unnamed file is left beside the chunks.
-        let leftovers = std::fs::read_dir(&root)
-            .unwrap()
-            .filter(|e| {
-                let path = e.as_ref().unwrap().path();
-                path.extension()
-                    .is_some_and(|x| x == "install" || x == "batch")
-            })
-            .count();
-        assert_eq!(leftovers, 0);
-        // A different file under a chunk's name is corruption, as for `install`.
-        let path = seed_path(&root, hashes[1]);
-        std::fs::write(&path, b"not the chunk").unwrap();
-        let mut batch = store.batch().unwrap();
-        assert!(matches!(batch.add(&chunks[1]), Err(ContentError::Corrupt)));
     }
 
     #[test]
     fn a_detached_commit_runs_on_another_thread_and_promises_only_when_done() {
         fn sendable<T: Send>(_: &T) {}
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("seeds");
-        let mut store = SeedStore::open(&root, disk()).unwrap();
-        let chunks: Vec<Vec<u8>> = (0..6u8)
-            .map(|n| vec![n.wrapping_mul(3); 16 * 1024])
-            .collect();
-        let mut batch = store.batch().unwrap();
-        let hashes: Vec<ContentHash> = chunks.iter().map(|c| batch.add(c).unwrap()).collect();
-        let commit = batch.detach();
-        sendable(&commit);
-        assert_eq!(commit.chunks(), chunks.len());
-        // Before the commit returns nothing is named; the owner may go on.
-        assert!(hashes.iter().all(|h| !store.contains(*h)));
-        let done = std::thread::scope(|scope| scope.spawn(move || commit.run()).join().unwrap());
-        done.unwrap();
-        for (chunk, hash) in chunks.iter().zip(&hashes) {
-            assert_eq!(store.read(*hash, SEED_CHUNK_BYTES).unwrap(), *chunk);
+        for form in FORMS {
+            let directory = tempfile::tempdir().unwrap();
+            let (_, mut store) = open(directory.path(), "seeds", form);
+            let chunks: Vec<Vec<u8>> = (0..6u8)
+                .map(|n| vec![n.wrapping_mul(3); 16 * 1024])
+                .collect();
+            let mut batch = store.batch().unwrap();
+            let hashes: Vec<ContentHash> = chunks.iter().map(|c| batch.add(c).unwrap()).collect();
+            let commit = batch.detach();
+            sendable(&commit);
+            assert_eq!(commit.chunks(), chunks.len());
+            // Before the commit returns nothing is named; the owner may go on.
+            assert!(hashes.iter().all(|h| !store.contains(*h)));
+            let done =
+                std::thread::scope(|scope| scope.spawn(move || commit.run()).join().unwrap());
+            done.unwrap();
+            for (chunk, hash) in chunks.iter().zip(&hashes) {
+                assert_eq!(store.read(*hash, SEED_CHUNK_BYTES).unwrap(), *chunk);
+            }
+            // A commit that failed away from the store fails it through its owner.
+            store.fail();
+            assert!(matches!(store.batch(), Err(ContentError::Failed)));
         }
-        // A commit that failed away from the store fails it through its owner.
-        store.fail();
-        assert!(matches!(store.batch(), Err(ContentError::Failed)));
     }
 
     #[test]
     fn seeds_are_sealed_read_back_verified_and_removed_only_on_purpose() {
+        for form in FORMS {
+            let directory = tempfile::tempdir().unwrap();
+            let (root, mut store) = open(directory.path(), "seeds", form);
+            assert!(matches!(
+                SeedStore::open(&root, disk(), &keys(directory.path()), form),
+                Err(ContentError::Locked)
+            ));
+            let chunk = vec![7u8; 4096];
+            let hash = store.install(&chunk).unwrap();
+            assert_eq!(hash, ContentHash(*blake3::hash(&chunk).as_bytes()));
+            assert!(store.contains(hash));
+            assert_eq!(store.read(hash, 4096).unwrap(), chunk);
+            // Too small a read allowance, an empty chunk and an oversized one.
+            assert!(matches!(
+                store.read(hash, 4095),
+                Err(ContentError::Capacity)
+            ));
+            assert!(matches!(store.install(&[]), Err(ContentError::Capacity)));
+            assert!(matches!(
+                store.install(&vec![1u8; SEED_CHUNK_BYTES + 1]),
+                Err(ContentError::Capacity)
+            ));
+            // The same chunk again is complete; another owner's copy is taken
+            // only when it hashes right.
+            assert_eq!(store.install(&chunk).unwrap(), hash);
+            assert!(matches!(
+                store.install_as(hash, &[1, 2, 3]),
+                Err(ContentError::Corrupt)
+            ));
+            store.install_as(hash, &chunk).unwrap();
+            // A reader shares the directory and verifies every byte.
+            let reader = store.reader();
+            assert!(reader.contains(hash));
+            assert_eq!(reader.read(hash, SEED_CHUNK_BYTES).unwrap(), chunk);
+            let missing = ContentHash([9; 32]);
+            assert!(!reader.contains(missing));
+            assert!(matches!(
+                reader.read(missing, SEED_CHUNK_BYTES),
+                Err(ContentError::Io(_))
+            ));
+            // A corrupted file is refused, never returned.
+            std::fs::write(file_of(&store, hash), b"corrupt").unwrap();
+            assert!(matches!(
+                reader.read(hash, SEED_CHUNK_BYTES),
+                Err(ContentError::Corrupt)
+            ));
+            assert!(matches!(store.install(&chunk), Err(ContentError::Corrupt)));
+            // Removal is explicit and idempotent; the chunk survives reopen until then.
+            drop(store);
+            let mut reopened =
+                SeedStore::open(&root, disk(), &keys(directory.path()), form).unwrap();
+            assert!(reopened.contains(hash));
+            reopened.remove(hash).unwrap();
+            assert!(!reopened.contains(hash));
+            reopened.remove(hash).unwrap();
+            let again = reopened.install(&chunk).unwrap();
+            assert_eq!(again, hash);
+            assert_eq!(
+                SeedReader::open(&root, keys(directory.path()))
+                    .unwrap()
+                    .read(hash, SEED_CHUNK_BYTES)
+                    .unwrap(),
+                chunk
+            );
+            assert!(matches!(
+                SeedReader::open(directory.path().join("absent"), keys(directory.path())),
+                Err(ContentError::Invalid)
+            ));
+        }
+    }
+
+    /// Below the at-rest level a seed directory is byte for byte what every earlier binary wrote: a
+    /// chunk under its hash holding its bytes, no key record and no marker (29 §12).
+    #[test]
+    fn the_clear_form_writes_the_layout_earlier_binaries_wrote() {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("seeds");
-        let mut store = SeedStore::open(&root, disk()).unwrap();
-        assert!(matches!(
-            SeedStore::open(&root, disk()),
-            Err(ContentError::Locked)
-        ));
-        let chunk = vec![7u8; 4096];
-        let hash = store.install(&chunk).unwrap();
-        assert_eq!(hash, ContentHash(*blake3::hash(&chunk).as_bytes()));
-        assert!(store.contains(hash));
-        assert_eq!(store.read(hash, 4096).unwrap(), chunk);
-        // Too small a read allowance, an empty chunk and an oversized one.
-        assert!(matches!(
-            store.read(hash, 4095),
-            Err(ContentError::Capacity)
-        ));
-        assert!(matches!(store.install(&[]), Err(ContentError::Capacity)));
-        assert!(matches!(
-            store.install(&vec![1u8; SEED_CHUNK_BYTES + 1]),
-            Err(ContentError::Capacity)
-        ));
-        // The same chunk again is complete; another owner's copy is taken
-        // only when it hashes right.
-        assert_eq!(store.install(&chunk).unwrap(), hash);
-        assert!(matches!(
-            store.install_as(hash, &[1, 2, 3]),
-            Err(ContentError::Corrupt)
-        ));
-        store.install_as(hash, &chunk).unwrap();
-        // A reader shares the directory and verifies every byte.
-        let reader = store.reader();
-        assert!(reader.contains(hash));
-        assert_eq!(reader.read(hash, SEED_CHUNK_BYTES).unwrap(), chunk);
-        let missing = ContentHash([9; 32]);
-        assert!(!reader.contains(missing));
-        assert!(matches!(
-            reader.read(missing, SEED_CHUNK_BYTES),
-            Err(ContentError::Io(_))
-        ));
-        // A corrupted file is refused, never returned.
-        std::fs::write(root.join(format!("{hash}.seed")), b"corrupt").unwrap();
-        assert!(matches!(
-            reader.read(hash, SEED_CHUNK_BYTES),
-            Err(ContentError::Corrupt)
-        ));
-        assert!(matches!(store.install(&chunk), Err(ContentError::Corrupt)));
-        // Removal is explicit and idempotent; the chunk survives reopen until then.
-        drop(store);
-        let mut reopened = SeedStore::open(&root, disk()).unwrap();
-        assert!(reopened.contains(hash));
-        reopened.remove(hash).unwrap();
-        assert!(!reopened.contains(hash));
-        reopened.remove(hash).unwrap();
-        let again = reopened.install(&chunk).unwrap();
-        assert_eq!(again, hash);
+        let (root, mut store) = open(directory.path(), "seeds", ContentForm::Clear);
+        let one = plaintext(1, 5000);
+        let two = plaintext(2, 9000);
+        let hash = store.install(&one).unwrap();
+        let mut batch = store.batch().unwrap();
+        let other = batch.add(&two).unwrap();
+        batch.commit(&mut store).unwrap();
         assert_eq!(
-            SeedReader::open(&root)
-                .unwrap()
-                .read(hash, SEED_CHUNK_BYTES)
-                .unwrap(),
-            chunk
+            std::fs::read(root.join(format!("{hash}.seed"))).unwrap(),
+            one
         );
+        assert_eq!(
+            std::fs::read(root.join(format!("{other}.seed"))).unwrap(),
+            two
+        );
+        let mut expected = vec![
+            "LOCK".to_owned(),
+            format!("{hash}.seed"),
+            format!("{other}.seed"),
+        ];
+        expected.sort();
+        assert_eq!(names(&root), expected);
+        assert_eq!(store.conversion_status().form, StoreForm::Clear);
+    }
+
+    /// From the level, no name or byte of a seed directory holds a chunk's hash or plaintext; a
+    /// flipped byte, a cut, a chunk under another chunk's name and a chunk carried into another
+    /// session's directory are refused; and destroying a directory's key record erases its chunks
+    /// while another directory's still read (29 §11's battery, on seeds).
+    #[test]
+    fn a_sealed_seed_is_refused_changed_cut_renamed_or_moved_and_erased_with_its_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let (root, mut store) = open(directory.path(), "one", ContentForm::Sealed);
+        let (other_root, mut other) = open(directory.path(), "two", ContentForm::Sealed);
+        let first = plaintext(3, 150_000);
+        let second = plaintext(4, 70_000);
+        let a = store.install(&first).unwrap();
+        let mut batch = store.batch().unwrap();
+        let b = batch.add(&second).unwrap();
+        batch.commit(&mut store).unwrap();
+        let c = other.install(&first).unwrap();
+        assert_eq!(a, c);
+        // No name or byte holds a hash or plaintext.
+        for (root, chunks) in [(&root, [&first, &second]), (&other_root, [&first, &first])] {
+            for name in names(root) {
+                for hash in [a, b] {
+                    assert!(!name.contains(&hash.to_string()), "{name} names a hash");
+                }
+                let stored = std::fs::read(root.join(&name)).unwrap();
+                for chunk in chunks {
+                    for probe in chunk.chunks(4096).map(|piece| &piece[..16]) {
+                        assert!(
+                            !stored.windows(16).any(|w| w == probe),
+                            "{name} holds plaintext"
+                        );
+                    }
+                }
+                for hash in [a, b] {
+                    assert!(
+                        !stored.windows(32).any(|w| w == hash.0),
+                        "{name} holds a hash"
+                    );
+                }
+            }
+        }
+        // The same chunk in two directories: two names, two files.
+        assert_ne!(
+            file_of(&store, a).file_name(),
+            file_of(&other, c).file_name()
+        );
+        assert_ne!(
+            std::fs::read(file_of(&store, a)).unwrap(),
+            std::fs::read(file_of(&other, c)).unwrap()
+        );
+        let reader = store.reader();
+        let original = std::fs::read(file_of(&store, a)).unwrap();
+        // A flipped byte anywhere a reader opens is refused.
+        for at in [0, 200, original.len() / 2, original.len() - 9] {
+            let mut flipped = original.clone();
+            flipped[at] ^= 1;
+            std::fs::write(file_of(&store, a), &flipped).unwrap();
+            assert!(
+                matches!(reader.read(a, SEED_CHUNK_BYTES), Err(ContentError::Corrupt)),
+                "flipped at {at}"
+            );
+        }
+        // A cut.
+        std::fs::write(file_of(&store, a), &original[..original.len() - 4096]).unwrap();
         assert!(matches!(
-            SeedReader::open(directory.path().join("absent")),
-            Err(ContentError::Invalid)
+            reader.read(a, SEED_CHUNK_BYTES),
+            Err(ContentError::Corrupt)
         ));
+        std::fs::write(file_of(&store, a), &original).unwrap();
+        assert_eq!(reader.read(a, SEED_CHUNK_BYTES).unwrap(), first);
+        // Another chunk's file under this chunk's name.
+        let b_path = file_of(&store, b);
+        let b_bytes = std::fs::read(&b_path).unwrap();
+        std::fs::copy(file_of(&store, a), &b_path).unwrap();
+        assert!(matches!(
+            reader.read(b, SEED_CHUNK_BYTES),
+            Err(ContentError::Corrupt)
+        ));
+        std::fs::write(&b_path, &b_bytes).unwrap();
+        // A chunk carried into another session's directory, under the name that directory gives
+        // its hash: sealed under another key, it opens to nothing there.
+        let carried = second_name(&other, b);
+        std::fs::copy(&b_path, &carried).unwrap();
+        assert!(matches!(
+            other.reader().read(b, SEED_CHUNK_BYTES),
+            Err(ContentError::Corrupt)
+        ));
+        std::fs::remove_file(&carried).unwrap();
+        // The directory's record destroyed: its chunks read no more, the other's still do.
+        std::fs::remove_file(root.join(sealing::DOMAIN_KEY)).unwrap();
+        assert!(store.reader().read(a, SEED_CHUNK_BYTES).is_err());
+        assert!(store.read(b, SEED_CHUNK_BYTES).is_err());
+        assert_eq!(other.reader().read(c, SEED_CHUNK_BYTES).unwrap(), first);
+    }
+
+    /// The path the directory of `store` files a chunk filed under `hash` at.
+    fn second_name(store: &SeedStore, hash: ContentHash) -> PathBuf {
+        store
+            .key()
+            .unwrap()
+            .path(&store.root, hash, Kind::Seed)
+            .unwrap()
+    }
+
+    /// A directory of `count` chunks in the clear, as a binary below the at-rest level left it,
+    /// with their bytes.
+    fn clear_directory(
+        data: &Path,
+        name: &str,
+        count: u8,
+    ) -> (PathBuf, Vec<(ContentHash, Vec<u8>)>) {
+        let (root, mut store) = open(data, name, ContentForm::Clear);
+        let mut chunks = Vec::new();
+        for n in 0..count {
+            let bytes = plaintext(n.wrapping_mul(17), 3000 + usize::from(n) * 101);
+            chunks.push((store.install(&bytes).unwrap(), bytes));
+        }
+        (root, chunks)
+    }
+
+    /// A directory in the clear asked to seal converts a chunk a step while it serves: every chunk
+    /// reads back at every step through the store, through a reader made before the conversion and
+    /// through one made during it; a batch commits and a peer's chunk is installed meanwhile, both
+    /// sealed; it ends marked sealed with nothing named in the clear, every chunk counted converted.
+    #[test]
+    fn a_directory_in_the_clear_is_converted_while_it_serves() {
+        let directory = tempfile::tempdir().unwrap();
+        let (root, mut chunks) = clear_directory(directory.path(), "seeds", 12);
+        let before = SeedReader::open(&root, keys(directory.path())).unwrap();
+        let mut store =
+            SeedStore::open(&root, disk(), &keys(directory.path()), ContentForm::Sealed).unwrap();
+        assert!(root.join(sealing::SEALING).exists());
+        assert_eq!(store.conversion_status().form, StoreForm::Counting);
+        let mut scratch = vec![0u8; SEED_CHUNK_BYTES];
+        let mut steps = 0;
+        let mut converted = 0;
+        loop {
+            let during = store.reader();
+            for (hash, bytes) in &chunks {
+                assert_eq!(
+                    &store.read(*hash, SEED_CHUNK_BYTES).unwrap(),
+                    bytes,
+                    "step {steps}"
+                );
+                assert_eq!(
+                    &before.read(*hash, SEED_CHUNK_BYTES).unwrap(),
+                    bytes,
+                    "step {steps}"
+                );
+                assert_eq!(
+                    &during.read(*hash, SEED_CHUNK_BYTES).unwrap(),
+                    bytes,
+                    "step {steps}"
+                );
+            }
+            if steps == 3 {
+                let peer = plaintext(99, 4321);
+                let hash = ContentHash(*blake3::hash(&peer).as_bytes());
+                store.install_as(hash, &peer).unwrap();
+                chunks.push((hash, peer));
+                let fresh = plaintext(77, 6543);
+                let mut batch = store.batch().unwrap();
+                let hash = batch.add(&fresh).unwrap();
+                batch.commit(&mut store).unwrap();
+                chunks.push((hash, fresh));
+            }
+            match store.convert_step(&mut scratch, 2).unwrap() {
+                Conversion::Done => break,
+                Conversion::Converted => converted += 1,
+                Conversion::Visited => {}
+                Conversion::Held => panic!("held without a disk bound"),
+            }
+            steps += 1;
+            assert!(steps < 1000, "the conversion ended");
+        }
+        let status = store.conversion_status();
+        assert_eq!(status.form, StoreForm::Sealed);
+        assert_eq!(status.counted.files, 12);
+        assert_eq!(status.converted.files, 12);
+        assert_eq!(converted, 12);
+        assert_eq!(status.left().files, 0);
+        assert!(root.join(sealing::SEALED).exists());
+        assert!(!root.join(sealing::SEALING).exists());
+        assert_eq!(clear_names(&root), 0);
+        let after = SeedReader::open(&root, keys(directory.path())).unwrap();
+        for (hash, bytes) in &chunks {
+            assert_eq!(&after.read(*hash, SEED_CHUNK_BYTES).unwrap(), bytes);
+            assert_eq!(&before.read(*hash, SEED_CHUNK_BYTES).unwrap(), bytes);
+        }
+        // A chunk planted in the clear after the mark is not looked for.
+        let planted = plaintext(200, 1234);
+        let hash = ContentHash(*blake3::hash(&planted).as_bytes());
+        std::fs::write(root.join(format!("{hash}.seed")), &planted).unwrap();
+        assert!(!after.contains(hash));
+        assert!(after.read(hash, SEED_CHUNK_BYTES).is_err());
+        assert!(!store.contains(hash));
+        // Its chunks listed by their hashes, sealed as they are now: the planted file is not one.
+        let mut hashes: Vec<ContentHash> = chunks.iter().map(|(hash, _)| *hash).collect();
+        hashes.sort_unstable();
+        assert_eq!(after.chunks().unwrap(), hashes);
+        // An empty directory asked to seal is sealed as it opens.
+        let (empty, store) = open(directory.path(), "empty", ContentForm::Sealed);
+        assert!(empty.join(sealing::SEALED).exists());
+        assert_eq!(store.conversion_status().form, StoreForm::Sealed);
+    }
+
+    /// A conversion cut after any step, a name in the clear put back beside its sealed form and a
+    /// sealed form damaged beside its bytes in the clear, resumes at the next open, whatever form
+    /// that open asks, and loses nothing.
+    #[test]
+    fn a_conversion_cut_at_any_step_resumes_and_loses_nothing() {
+        let mut scratch = vec![0u8; SEED_CHUNK_BYTES];
+        let mut cut = 0;
+        loop {
+            let directory = tempfile::tempdir().unwrap();
+            let (root, chunks) = clear_directory(directory.path(), "seeds", 6);
+            let originals: Vec<(String, Vec<u8>)> = names(&root)
+                .into_iter()
+                .filter(|name| name.ends_with(".seed"))
+                .map(|name| {
+                    let bytes = std::fs::read(root.join(&name)).unwrap();
+                    (name, bytes)
+                })
+                .collect();
+            let mut store =
+                SeedStore::open(&root, disk(), &keys(directory.path()), ContentForm::Sealed)
+                    .unwrap();
+            let mut finished = false;
+            for _ in 0..cut {
+                if store.convert_step(&mut scratch, 1).unwrap() == Conversion::Done {
+                    finished = true;
+                    break;
+                }
+            }
+            drop(store);
+            if finished {
+                break;
+            }
+            // Where a chunk's sealed form stands (the directory's record made by then).
+            let reader = SeedReader::open(&root, keys(directory.path())).unwrap();
+            let sealed_path = |name: &str| -> Option<PathBuf> {
+                let hash = sealing::parse_hash(name.strip_suffix(".seed")?)?;
+                let key = ContentKeys::reading_under(&reader.keys, focal_seal::Store::Group, true)
+                    .domain(&root, SEED_DOMAIN, false)
+                    .ok()?;
+                let path = key.path(&root, hash, Kind::Seed).ok()?;
+                path.exists().then_some(path)
+            };
+            // A crash between a chunk's sealed form and its name's removal: the name in the clear
+            // stands beside the sealed form again.
+            if let Some((name, bytes)) = originals.first()
+                && sealed_path(name).is_some()
+            {
+                std::fs::write(root.join(name), bytes).unwrap();
+            }
+            // And a chunk's sealed form damaged while its bytes still lie in the clear.
+            if let Some((name, bytes)) = originals.get(1)
+                && let Some(sealed) = sealed_path(name)
+            {
+                std::fs::write(root.join(name), bytes).unwrap();
+                std::fs::write(&sealed, b"damaged").unwrap();
+            }
+            let mut store =
+                SeedStore::open(&root, disk(), &keys(directory.path()), ContentForm::Clear)
+                    .unwrap();
+            assert!(store.conversion_status().resumed || cut == 0, "cut {cut}");
+            for _ in 0..1000 {
+                if store.convert_step(&mut scratch, 1).unwrap() == Conversion::Done {
+                    break;
+                }
+            }
+            assert_eq!(
+                store.conversion_status().form,
+                StoreForm::Sealed,
+                "cut {cut}"
+            );
+            assert_eq!(clear_names(&root), 0, "cut {cut}");
+            for (hash, bytes) in &chunks {
+                assert_eq!(
+                    &store.read(*hash, SEED_CHUNK_BYTES).unwrap(),
+                    bytes,
+                    "cut {cut}"
+                );
+            }
+            cut += 1;
+            assert!(cut < 200, "a conversion of six chunks ended");
+        }
+    }
+
+    /// The seed sweep keeps a protected chunk by either of its names and removes an unprotected one
+    /// past the grace in either form; while the conversion counts it removes nothing in the clear,
+    /// and a chunk in the clear it removes once the count is taken is tallied as gone.
+    #[test]
+    fn the_sweep_keeps_what_is_protected_in_either_form_and_holds_the_clear_while_counting() {
+        let directory = tempfile::tempdir().unwrap();
+        let (root, chunks) = clear_directory(directory.path(), "seeds", 4);
+        let mut store =
+            SeedStore::open(&root, disk(), &keys(directory.path()), ContentForm::Sealed).unwrap();
+        let sealed_kept = store.install(&plaintext(50, 2000)).unwrap();
+        let sealed_gone = store.install(&plaintext(51, 2000)).unwrap();
+        let mut protected = vec![chunks[0].0, sealed_kept];
+        protected.sort();
+        // Counting: nothing in the clear leaves, though every chunk stood past the grace.
+        assert!(store.conversion_counting());
+        let report = store.collect(&protected, 0, u64::MAX, 64).unwrap();
+        assert!(report.complete);
+        assert_eq!(clear_names(&root), 4);
+        assert!(!store.contains(sealed_gone));
+        assert!(store.contains(sealed_kept));
+        // The count taken, an unprotected chunk in the clear leaves and is tallied as gone.
+        let mut scratch = vec![0u8; SEED_CHUNK_BYTES];
+        while store.conversion_counting() {
+            store.convert_step(&mut scratch, 1).unwrap();
+        }
+        let report = store.collect(&protected, 0, u64::MAX, 64).unwrap();
+        assert!(report.complete);
+        assert!(store.contains(chunks[0].0));
+        for (hash, _) in &chunks[1..] {
+            assert!(!store.contains(*hash));
+        }
+        loop {
+            if store.convert_step(&mut scratch, 1).unwrap() == Conversion::Done {
+                break;
+            }
+        }
+        let status = store.conversion_status();
+        assert_eq!(status.counted.files, 4);
+        assert_eq!(status.gone.files, 3);
+        assert_eq!(status.converted.files, 1);
+        assert_eq!(status.left().files, 0);
+        // Sealed: the protected chunk is kept by its keyed name.
+        let report = store.collect(&protected, 0, u64::MAX, 64).unwrap();
+        assert!(report.complete);
+        assert!(store.contains(chunks[0].0));
+        assert!(store.contains(sealed_kept));
+    }
+
+    /// A job seals several chunks on another thread while the owner goes on, their files flushed
+    /// together; its result taken back removes their names in the clear, each tallied once.
+    #[test]
+    fn a_job_seals_its_chunks_off_the_owner_and_its_result_removes_their_clear_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let (root, chunks) = clear_directory(directory.path(), "seeds", 9);
+        let mut store =
+            SeedStore::open(&root, disk(), &keys(directory.path()), ContentForm::Sealed).unwrap();
+        while store.conversion_counting() {
+            store.conversion_job(4, SYNC_THREADS).unwrap();
+        }
+        let mut jobs = 0;
+        loop {
+            match store.conversion_job(64, 4).unwrap() {
+                SeedStep::Done => break,
+                SeedStep::Visited => {}
+                SeedStep::Job(job) => {
+                    fn sendable<T: Send>(_: &T) {}
+                    sendable(&job);
+                    assert!(job.chunks.len() <= 4);
+                    let done = std::thread::scope(|scope| {
+                        scope
+                            .spawn(move || {
+                                let mut scratch = vec![0u8; SEED_CHUNK_BYTES];
+                                job.run(&mut scratch)
+                            })
+                            .join()
+                            .unwrap()
+                    });
+                    // Until its result comes back, every chunk still reads, in either form.
+                    for (hash, bytes) in &chunks {
+                        assert_eq!(&store.read(*hash, SEED_CHUNK_BYTES).unwrap(), bytes);
+                    }
+                    assert_eq!(store.conversion_done(done).unwrap(), Conversion::Converted);
+                    jobs += 1;
+                }
+            }
+        }
+        assert_eq!(jobs, 3);
+        let status = store.conversion_status();
+        assert_eq!(status.form, StoreForm::Sealed);
+        assert_eq!(status.converted.files, 9);
+        assert_eq!(status.left().files, 0);
+        assert_eq!(clear_names(&root), 0);
+        let leftovers = names(&root)
+            .iter()
+            .filter(|name| name.ends_with(".convert"))
+            .count();
+        assert_eq!(leftovers, 0);
+        for (hash, bytes) in &chunks {
+            assert_eq!(&store.read(*hash, SEED_CHUNK_BYTES).unwrap(), bytes);
+        }
+    }
+
+    /// A job whose result never comes back has its chunks taken again, first, by the next; the
+    /// lost job finishing late renames the same bytes under the same names, and its result taken
+    /// back after the other's counts nothing twice.
+    #[test]
+    fn a_lost_jobs_chunks_are_taken_again_and_its_late_result_counts_nothing_twice() {
+        let directory = tempfile::tempdir().unwrap();
+        let (root, chunks) = clear_directory(directory.path(), "seeds", 3);
+        let mut store =
+            SeedStore::open(&root, disk(), &keys(directory.path()), ContentForm::Sealed).unwrap();
+        while store.conversion_counting() {
+            store.conversion_job(64, 3).unwrap();
+        }
+        let SeedStep::Job(lost) = store.conversion_job(64, 3).unwrap() else {
+            panic!("a job");
+        };
+        let SeedStep::Job(again) = store.conversion_job(64, 3).unwrap() else {
+            panic!("the lost job's chunks again");
+        };
+        let lost_hashes: Vec<ContentHash> = lost.chunks.iter().map(|c| c.hash).collect();
+        let again_hashes: Vec<ContentHash> = again.chunks.iter().map(|c| c.hash).collect();
+        assert_eq!(lost_hashes, again_hashes);
+        let mut scratch = vec![0u8; SEED_CHUNK_BYTES];
+        let late = lost.run(&mut scratch);
+        let done = again.run(&mut scratch);
+        assert_eq!(store.conversion_done(done).unwrap(), Conversion::Converted);
+        assert_eq!(store.conversion_done(late).unwrap(), Conversion::Visited);
+        loop {
+            if let SeedStep::Done = store.conversion_job(64, 3).unwrap() {
+                break;
+            }
+        }
+        let status = store.conversion_status();
+        assert_eq!(status.counted.files, 3);
+        assert_eq!(status.converted.files, 3);
+        assert_eq!(status.left().files, 0);
+        for (hash, bytes) in &chunks {
+            assert_eq!(&store.read(*hash, SEED_CHUNK_BYTES).unwrap(), bytes);
+        }
+    }
+
+    /// A volume without room for a chunk's sealed form holds the job's chunks, writes nothing, and
+    /// takes the same chunk first once there is room.
+    #[test]
+    fn a_job_without_room_holds_and_its_chunks_go_first_next() {
+        let directory = tempfile::tempdir().unwrap();
+        let (root, chunks) = clear_directory(directory.path(), "seeds", 4);
+        let tight = DiskBudget::new(DiskBudgetConfig {
+            headroom: 0,
+            completion_reserve: 0,
+            sample_interval: 64,
+        })
+        .unwrap();
+        tight.observe(0);
+        let mut store = SeedStore::open(
+            &root,
+            tight.clone(),
+            &keys(directory.path()),
+            ContentForm::Sealed,
+        )
+        .unwrap();
+        while store.conversion_counting() {
+            store.conversion_job(64, 2).unwrap();
+        }
+        let mut scratch = vec![0u8; SEED_CHUNK_BYTES];
+        let SeedStep::Job(job) = store.conversion_job(64, 2).unwrap() else {
+            panic!("a job");
+        };
+        let first: Vec<ContentHash> = job.chunks.iter().map(|c| c.hash).collect();
+        assert_eq!(
+            store.conversion_done(job.run(&mut scratch)).unwrap(),
+            Conversion::Held
+        );
+        let status = store.conversion_status();
+        assert!(status.held);
+        assert_eq!(status.held_steps, 1);
+        assert_eq!(status.converted.files, 0);
+        assert_eq!(clear_names(&root), 4);
+        assert_eq!(tight.stats().outstanding, 0);
+        tight.observe(u64::MAX / 4);
+        let SeedStep::Job(job) = store.conversion_job(64, 2).unwrap() else {
+            panic!("the held chunks");
+        };
+        let next: Vec<ContentHash> = job.chunks.iter().map(|c| c.hash).collect();
+        assert_eq!(next, first);
+        assert_eq!(
+            store.conversion_done(job.run(&mut scratch)).unwrap(),
+            Conversion::Converted
+        );
+        assert!(!store.conversion_status().held);
+        for _ in 0..64 {
+            if store.convert_step(&mut scratch, 64).unwrap() == Conversion::Done {
+                break;
+            }
+        }
+        assert_eq!(store.conversion_status().form, StoreForm::Sealed);
+        assert_eq!(store.conversion_status().converted.files, 4);
+        for (hash, bytes) in &chunks {
+            assert_eq!(&store.read(*hash, SEED_CHUNK_BYTES).unwrap(), bytes);
+        }
     }
 }

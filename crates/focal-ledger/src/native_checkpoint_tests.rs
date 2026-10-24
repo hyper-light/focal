@@ -323,6 +323,8 @@ fn seed_store(directory: &std::path::Path) -> focal_evidence::SeedStore {
     focal_evidence::SeedStore::open(
         directory.join("seeds"),
         focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default()).unwrap(),
+        &focal_seal::test_keys(directory).unwrap(),
+        focal_evidence::ContentForm::Sealed,
     )
     .unwrap()
 }
@@ -404,14 +406,16 @@ fn a_root_beyond_the_inline_bound_is_seeded_and_assembled_back_exactly() {
         manifest.assemble(&elsewhere.reader(), &budget()),
         Err(SeedError::Missing(hash)) if hash == chunk.hash
     ));
-    std::fs::write(
-        directory
-            .path()
-            .join("seeds")
-            .join(format!("{}.seed", chunk.hash)),
-        b"not the chunk",
-    )
-    .unwrap();
+    // Every chunk's file, sealed under its keyed name (29 §12.5), made not the chunk.
+    for entry in std::fs::read_dir(directory.path().join("seeds")).unwrap() {
+        let path = entry.unwrap().path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "seed")
+        {
+            std::fs::write(path, b"not the chunk").unwrap();
+        }
+    }
     assert!(matches!(
         manifest.assemble(&seeds.reader(), &budget()),
         Err(SeedError::Seeds(focal_evidence::ContentError::Corrupt))
@@ -487,11 +491,15 @@ fn a_frozen_root_encoded_in_one_walk_is_the_measured_encoding() {
         .expect("seeded form");
     let chunk = manifest.chunks().next().unwrap().unwrap();
     assert!(!elsewhere.contains(chunk.hash));
+    // Nothing but the directory's own files: its lock, its mark of a sealed directory and its
+    // key's record, made with its first sealed chunk (29 §12.5).
     assert!(
         std::fs::read_dir(empty.path().join("seeds"))
             .unwrap()
             .filter_map(Result::ok)
-            .all(|entry| entry.file_name() == "LOCK"),
+            .all(|entry| ["LOCK", "SEALED", "DOMAIN.key"]
+                .iter()
+                .any(|own| entry.file_name() == *own)),
         "an abandoned batch leaves no files"
     );
 }

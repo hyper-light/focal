@@ -202,6 +202,7 @@ impl EmbeddedNode {
                 seal: rule,
                 retire,
                 share: crate::storage_level::native_share_at(level),
+                at_rest: crate::storage_level::at_rest_form_at(level),
             },
         )?;
         let mut session = Session::from_node_hosted(identity.ledger, consensus, limits, hosting)?;

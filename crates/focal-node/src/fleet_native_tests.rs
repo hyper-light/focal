@@ -148,6 +148,8 @@ fn a_fresh_replicated_ledger_activates_admits_frames_and_serves_linearizable_rea
                 seeds: focal_evidence::SeedStore::open(
                     content_dir.join("seeds"),
                     focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default()).unwrap(),
+                    &focal_seal::test_keys_beside(&content_dir).unwrap(),
+                    focal_evidence::ContentForm::Sealed,
                 )
                 .unwrap(),
                 cold: Some(focal_ledger::ColdSource {
@@ -687,6 +689,8 @@ async fn active_host(
             seeds: focal_evidence::SeedStore::open(
                 content_dir.join("seeds"),
                 focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default()).unwrap(),
+                &focal_seal::test_keys_beside(&content_dir).unwrap(),
+                focal_evidence::ContentForm::Sealed,
             )
             .unwrap(),
             cold: Some(focal_ledger::ColdSource {

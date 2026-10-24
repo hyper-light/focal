@@ -1737,6 +1737,8 @@ impl PlacementAgent {
                     .map_err(|error| AgentError::Level(Box::new(error)))?,
                 share: crate::storage_level::native_share(&self.root)
                     .map_err(|error| AgentError::Level(Box::new(error)))?,
+                at_rest: crate::storage_level::at_rest_form(&self.root)
+                    .map_err(|error| AgentError::Level(Box::new(error)))?,
             },
         )?;
         let session = Session::from_node_in_hosted(ledger, consensus, limits, tenant, hosting)?;
@@ -2682,6 +2684,8 @@ impl PlacementAgent {
         let manifest_for_rewrite = manifest.clone();
         let work = tenant.clone();
         let keys = self.keys.clone();
+        let at_rest = crate::storage_level::at_rest_form(&self.root)
+            .map_err(|error| AgentError::Level(Box::new(error)))?;
         let (rewritten, seeds_installed) = focal_rt::on_pool(&focal_rt::WORK, move || {
             use focal_ledger::backup::{
                 BackupContent, BackupMedium as _, BackupSeeds, FileMedium, Incarnation,
@@ -2695,7 +2699,7 @@ impl PlacementAgent {
                 &cold_root,
                 &disk,
             )?;
-            let mut sink = focal_evidence::SeedStore::open(seed_root, disk)?;
+            let mut sink = focal_evidence::SeedStore::open(seed_root, disk, &keys, at_rest)?;
             let seeds_installed = focal_ledger::backup::import_seeds(
                 &FileMedium,
                 &input,

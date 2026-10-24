@@ -414,6 +414,8 @@ impl Fleet {
                                     focal_memory::DiskBudgetConfig::default(),
                                 )
                                 .unwrap(),
+                                &focal_seal::test_keys_beside(&content_dir).unwrap(),
+                                focal_evidence::ContentForm::Sealed,
                             )
                             .unwrap(),
                             cold: Some(focal_ledger::ColdSource {
