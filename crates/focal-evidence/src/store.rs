@@ -69,15 +69,18 @@ mod gc;
 pub use gc::{CollectorConfig, CollectorReport, ProtectionSet, SeedReport};
 #[path = "seeds.rs"]
 mod seeds;
-pub use seeds::{
-    OpenedSeeds, SEED_CHUNK_BYTES, SEED_JOB_CHUNKS, SeedBatch, SeedCommit, SeedJob, SeedJobDone,
-    SeedReader, SeedStep, SeedStore,
-};
+pub use seeds::{OpenedSeeds, SEED_CHUNK_BYTES, SeedBatch, SeedCommit, SeedReader, SeedStore};
+#[path = "chunk_convert.rs"]
+mod chunk_convert;
+pub use chunk_convert::{SEED_JOB_CHUNKS, SeedJob, SeedJobDone, SeedStep};
 #[path = "cold.rs"]
 mod cold;
 pub use cold::{
-    ColdGeometry, ColdReader, ColdRoom, ColdState, ColdStore, ColdStreams, install_cold_chunk,
+    ColdGeometry, ColdPending, ColdReader, ColdRoom, ColdState, ColdStore, ColdStreams,
+    install_cold_chunk,
 };
+#[path = "cold_records.rs"]
+mod cold_records;
 #[path = "native_artifact.rs"]
 mod native_artifact;
 #[path = "sealing.rs"]

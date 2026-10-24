@@ -2698,6 +2698,8 @@ impl PlacementAgent {
                 &manifest_for_rewrite,
                 &cold_root,
                 &disk,
+                &keys,
+                at_rest,
             )?;
             let mut sink = focal_evidence::SeedStore::open(seed_root, disk, &keys, at_rest)?;
             let seeds_installed = focal_ledger::backup::import_seeds(

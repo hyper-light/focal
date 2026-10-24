@@ -3606,14 +3606,8 @@ fn a_lagging_replica_installs_cold_streams_once_their_chunks_are_pulled() {
     let streams = cold_streams(&mut cluster, 1).unwrap();
     cluster.retry_ok = vec![3];
     cluster.settle(&[]);
-    let root = cluster
-        .node(1)
-        .engine
-        .cold_source
-        .as_ref()
-        .unwrap()
-        .root
-        .clone();
+    let source = cluster.node(1).engine.cold_source.as_ref().unwrap().clone();
+    let root = source.root.clone();
     // The manifest chunks are named first, then the chunks behind them once they are local.
     let mut rounds = 0;
     while let Some(pending) = cluster.node(3).pending_seed() {
@@ -3628,7 +3622,7 @@ fn a_lagging_replica_installs_cold_streams_once_their_chunks_are_pulled() {
             let bytes = ["data", "marks"]
                 .iter()
                 .find_map(|part| {
-                    focal_evidence::ColdReader::open(root.join(part))
+                    focal_evidence::ColdReader::open(root.join(part), source.keys.clone())
                         .unwrap()
                         .read(*hash, focal_evidence::SEED_CHUNK_BYTES)
                         .ok()

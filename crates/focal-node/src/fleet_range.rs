@@ -218,6 +218,15 @@ pub(super) enum RangeCall {
         chunks: usize,
         reply: OneshotSender<Result<focal_ledger::SeedConversionReply, LedgerError>>,
     },
+    /// One step of a cold stream's conversion at rest (29 §12.6), the data stream's where `data`
+    /// is set and the marks' otherwise.
+    ColdConversion {
+        data: bool,
+        done: Option<Box<focal_evidence::SeedJobDone>>,
+        visits: usize,
+        chunks: usize,
+        reply: OneshotSender<Result<Option<focal_ledger::SeedConversionReply>, LedgerError>>,
+    },
 }
 impl RangeCall {
     /// What the owner was doing, for its slow steps (`SlowSteps`).
@@ -244,6 +253,7 @@ impl RangeCall {
             Self::ContentRoots { .. } => "range: content roots",
             Self::CollectSeeds { .. } => "range: collect seeds",
             Self::SeedConversion { .. } => "range: seed conversion",
+            Self::ColdConversion { .. } => "range: cold conversion",
         }
     }
 }
@@ -568,6 +578,25 @@ impl ReplicaHost {
         })
         .await
     }
+    /// One step of a cold stream's conversion at rest (29 §12.6), as [`Self::seed_conversion`]
+    /// steps the seeds': the data stream's where `data` is set, the marks' otherwise; none where
+    /// the replica keeps no cold streams.
+    pub async fn cold_conversion(
+        &self,
+        data: bool,
+        done: Option<focal_evidence::SeedJobDone>,
+        visits: usize,
+        chunks: usize,
+    ) -> Result<Option<focal_ledger::SeedConversionReply>, LedgerError> {
+        self.range_call(|reply| RangeCall::ColdConversion {
+            data,
+            done: done.map(Box::new),
+            visits,
+            chunks,
+            reply,
+        })
+        .await
+    }
 }
 
 impl Owner {
@@ -751,6 +780,22 @@ impl Owner {
                 let result =
                     self.session
                         .native_seed_conversion(done.map(|done| *done), visits, chunks);
+                drop(charge);
+                let _ = reply.send(result);
+            }
+            RangeCall::ColdConversion {
+                data,
+                done,
+                visits,
+                chunks,
+                reply,
+            } => {
+                let result = self.session.native_cold_conversion(
+                    data,
+                    done.map(|done| *done),
+                    visits,
+                    chunks,
+                );
                 drop(charge);
                 let _ = reply.send(result);
             }

@@ -1154,7 +1154,9 @@ impl CustodyStore {
                 {
                     let directory = seed_directory(cold, scope.ledger);
                     for part in ["data", "marks"] {
-                        if let Ok(stream) = focal_evidence::ColdReader::open(directory.join(part)) {
+                        if let Ok(stream) =
+                            focal_evidence::ColdReader::open(directory.join(part), keys.clone())
+                        {
                             read = stream.read(*hash, limit);
                             if !read.as_ref().is_err_and(absent) {
                                 break;

@@ -270,7 +270,7 @@ private journals (`focal_enrollment::PrivateJournal`), sealed with the private d
 | Node log and group files | the shell's log, group images and checkpoints | every record of every group | hyper-log, hyper-durable, focal-consensus `group_files` | sealed (steps 1, 2, 5) |
 | Payload log | `payloads/*.seg` | spilled rows' bytes: message payloads | focal-ledger `native_payloads` | sealed (§12.1) |
 | Checkpoint seeds | `seeds/<ledger>/` | a checkpoint's native rows, 1 MiB chunks | focal-evidence `seeds` | sealed from the at-rest level (§12.5) |
-| Cold stream | `cold/<ledger>/` | retired families' archive frames | focal-evidence `cold` | clear |
+| Cold stream | `cold/<ledger>/` | retired families' archive frames | focal-evidence `cold`, `cold_records` | sealed from the at-rest level (§12.6) |
 | Content | `content/objects/…`, `content/quarantine/…` | artifacts' chunks and manifests | focal-evidence `store`, `transfer`, `gc`, `native_artifact` | sealed from the content level (§12.4) |
 | Content staging and custody | `content/staging/`, `objects/<domain>/*.part`, `content/{custody,checkpoints,receipts}/` | uploads and transfers being received; custody records | focal-evidence `store`, `transfer`, `upload_terminal`, `custody_receipt` | clear |
 | Session backups | a backup's directory | checkpoint, seeds, content, cold | focal-ledger `session_backup` | clear |
@@ -560,3 +560,118 @@ byte as before, so a node can still be rolled back while the fence is below it.
   (`cli_seeds_at_rest`); a placement's hosts compare their seeds by hash, two hosts naming one chunk
   two ways (`placement_binary`, through `SeedReader::chunks`). Every node and ledger test that seeds a
   checkpoint runs sealed: a cluster founded at the compiled level records the at-rest level.
+
+### 12.6 The cold stream, sealed (2026-10-24)
+
+A session's cold streams (doc 31 M2, A2: the data stream of retired families' archive frames, and
+the marks stream that finds a record's batch in it) are sealed once the fence a node last recorded
+opens the at-rest level (`storage_level::at_rest_form`), read as each stream's directory opens: by
+a hosted session and by a placement's restore of a backup's streams; a session opened over a
+content store takes the store's form. Below the level each stream is written byte for byte as
+before.
+
+- **A directory a domain, as seeds.** Each stream's directory (`cold/<ledger>/data`, `…/marks`)
+  has a key of its own, random, kept as its record under the data directory's group key
+  (`DOMAIN.key`, `focal_seal::Store::Group`) and made with its first sealed file. A whole chunk and
+  a manifest chunk are filed under the directory's keyed name of the BLAKE3 hash the stream names
+  them by, so no name holds a hash, and destroying the record erases the stream.
+- **The open chunk, a record file.** The stream past its last whole chunk is appended in place and
+  never synced on its own (a checkpoint carries its bytes), so it is sealed an append at a time
+  (`cold_records`): a file is its header (the format's magic and a random 128-bit file ID, in the
+  clear) and its records, each a block of its length and a block of its bytes, both sealed with
+  AES-256-GCM under the file's key, derived from the directory's key and the file's ID
+  (`DomainKey::record_key`), at the nonce of the block's place among the file's blocks. A record
+  holds at most 64 KiB, an append longer being several; each is sealed whole in a buffer of its own
+  and written with one write, as the clear form writes an append once. A read begins at the
+  nearest of the places the writer keeps, one for each 64 KiB of plaintext.
+- **A cut writes nothing again.** A whole chunk is its record file renamed as it is under its keyed
+  name (`.pending` until a checkpoint makes it durable, as before), checked against its name when it
+  is read; a reader tells a record file from a sealed file by its first bytes. A manifest chunk is
+  sealed whole keyed by its hash (`SealedWriter::content_keyed`), and so is a chunk installed from
+  a peer (its plaintext inside TLS, its hash checked) or converted: there equal bytes are equal
+  files.
+- **No key and nonce seal two plaintexts.** A record file's key is its own, its ID random; a block's
+  nonce is its place, and a writer only appends. A writer that fails fails its stream until the
+  stream opens again, and every open removes the open chunk and whatever a crash left unnamed and
+  writes the checkpoint's open bytes into a new file under a new ID. A manifest's, an install's or a
+  conversion's key derives from its plaintext's hash. Tested across every file a stream writes
+  through appends, cuts, a checkpoint and a crash whose reopen appends other bytes at the same
+  offsets of the stream: each ID's bytes only ever grow
+  (`no_record_files_key_and_nonce_seal_two_plaintexts`, which fails, its keystream showing, when
+  an open chunk's ID is derived from its index).
+- **Where this departs from the plan.** The plan's step sealed the open chunk under a key of the
+  process's (the payload log's `focal_seal::Cache`) and sealed each chunk again whole,
+  content-keyed, at its cut. A cut that seals again reads its mebibyte back, opens it and seals it
+  again: every byte passed through AES-GCM three times and written twice where it is now once each.
+  At the costs measured on the bench's core below (a 4 KiB page's AES-GCM 0.76 µs, its write
+  1.85 µs), the two passes and the second write come to about 0.9 ms a MiB more, an estimate that
+  takes every row of the table from 2 KiB batches up past the +50% an append is allowed. A key that
+  outlives the process lets the cut rename the file instead. What
+  a crash leaves is then ciphertext under the directory's key rather than under none, removed at the
+  next open as before: the same bytes lie under the same key hierarchy in the checkpoint that
+  carries them and in the chunk they become, and destroying the directory's record erases all of
+  it.
+- **The way between the forms.** As a seed directory's (§12.5), the conversion shared with it
+  (`chunk_convert`): a directory asked to seal that holds whole chunks or manifests in the clear is
+  marked converting and converted while the stream goes on, counted first, then by jobs of at most
+  `SEED_JOB_CHUNKS` chunks the node's collector runs off the owner; its open chunk is sealed as the
+  stream opens. One that holds none is sealed as it opens.
+- **What an operator reads.** `inspect node --gc` gives the cold directories by form and their
+  conversions' tallies beside the seeds' (`AdminSeedReport::cold`).
+- **A frame this replica cannot read is unavailable.** A sealed open chunk is checked as a whole
+  chunk always was, so a changed byte in it is now refused where the stream is read rather than
+  where the frame is parsed. Such a refusal answered a participant's read of a retired family
+  `outcome unknown`, which a client retries as it would a write's, until its transport gave up
+  (`cli_archive`); a cold frame this replica holds and cannot read back is now `unavailable`, as a
+  custody bundle it holds corrupt is, and a read refused for room `capacity`.
+- **Bounded and charged.** An idle stream holds, beyond its names, its open chunk's key (aws-lc's
+  context, 592 bytes) and where its reads begin (17 places of 16 bytes for a 1 MiB chunk): 864
+  bytes, charged (`an_idle_streams_writer_holds_less_than_a_kibibyte`). An append's room promises
+  its records' overhead (36 bytes a record) and a sealed manifest chunk's bound, and the append
+  spends it exactly (`a_sealed_append_spends_exactly_what_its_room_promised`); a record's buffer,
+  at most 64 KiB and its overhead, is held only while it is written. A whole chunk is read by
+  opening its records in place in its own buffer, taken once (the chunk and a tag's room: a marks
+  chunk is 65,536 records), and a capture reads the open chunk so; a range of the open chunk is
+  read a record at a time; each as a read and a capture are charged
+  (`a_chunk_of_small_records_is_read_in_place_within_its_charge`).
+- **Measured** (`benches/cold.rs` on fedora, an i9-14900HX, NVMe btrfs, pinned to one P-core, 12
+  interleaved rounds of 64 MiB of batches with a 16-byte mark each, the thread's CPU time from
+  `/proc/thread-self/schedstat`, medians; the host loaded by other work, 7 to 15):
+
+  | Batches | Clear, CPU ms a MiB | Sealed | Sealed / clear | Bytes stored a byte, sealed |
+  |---|---|---|---|---|
+  | 256 to 768 bytes | 5.118 | 6.472 | 1.265 | 1.1365 |
+  | 512 bytes | 6.345 | 7.419 | 1.169 | 1.1364 |
+  | 2 to 6 KiB | 1.654 | 1.994 | 1.205 | 1.0176 |
+  | 4 KiB | 1.151 | 1.996 | 1.735 | 1.0175 |
+  | 32 to 96 KiB | 0.847 | 1.134 | 1.339 | 1.0014 |
+  | 64 KiB | 0.648 | 0.874 | 1.348 | 1.0011 |
+
+  Batches whose sizes vary, as a retirement's batch of up to 64 families' encodings does, cost
+  +21% to +34%, the most where batches are largest and AES-GCM is most of the work. Batches all
+  of one page, which no retirement writes, cost +74%: the clear stream's appends then each fill one
+  page exactly, aligned, while a record's 36 bytes put every sealed one across two, and btrfs pays
+  its buffered write by the page (on the same core: a page-aligned 4 KiB write 1.85 µs, the same
+  with 36 bytes more 3.8 µs, its AES-GCM 0.76 µs). An earlier run of the same code, the host at 26
+  to 36, put every ratio within 0.14 of these (512-byte batches the farthest, at 1.301). On this
+  Mac (APFS) the fixed sizes cost +16%
+  to +34%. A record's two blocks were written apart at first, at 2.94 times the clear's time at
+  4 KiB: macOS's `sample` put 98% of a sealed append in `write` and 1% in AES-GCM, so a record is
+  now one write.
+- **Tests:** every cold test in both forms (the cut alike however the stream is appended, and a
+  sealed replica's chunks named as a clear one's, a
+  checkpoint's durability and a reopen, an install through the manifests, a state that does not add
+  up, any range read back, room promised and spent); no name or byte of a sealed directory holding
+  a hash or plaintext, and refused: a flipped byte in a whole chunk's header, length block and
+  bytes, a whole chunk under another's name, a flipped byte and two records swapped in the open
+  chunk, another stream's open chunk in its place, a directory erased by its record while another
+  reads, and what a crash left gone at the next open with the open chunk under a new key
+  (`a_sealed_stream_holds_no_plaintext_and_refuses_what_was_changed`); the nonce test above; a
+  whole chunk of 65,536 records read in place within its charge; a
+  directory in the clear converted while the stream appends and cuts, every range read at every
+  step (`a_cold_directory_in_the_clear_is_converted_while_the_stream_goes_on`); a conversion cut
+  after every step, resumed by an open that asks for the clear
+  (`a_cold_conversion_cut_at_any_step_resumes_and_loses_nothing`); the real binary reading a
+  retired family from its own sealed stream and refusing a changed byte in it as `unavailable`
+  (`cli_archive`), with the node tests that retire to cold, back up and restore a session's
+  streams, and install them from peers (`cli_retention`, `cli_backup`, `cli_gc`, `fleet_quic`).

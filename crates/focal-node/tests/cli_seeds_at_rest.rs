@@ -16,8 +16,9 @@
 //! seed directory a job at a time, off the session's owner, while the session takes writes, and
 //! `inspect node --gc` shows the directory counting or converting and then sealed. Every chunk the
 //! clear directory held is held sealed after, nothing is named in the clear, and a checkpoint taken
-//! after seals its seeds too. Unix-only, as the other real-binary content tests (`cli_gc.rs`): the
-//! data directory is kept private by its mode bits.
+//! after seals its seeds too. The session's cold streams (29 §12.6) go the same way: reported in
+//! the clear below the fence, then sealed, each open chunk a record file. Unix-only, as the other
+//! real-binary content tests (`cli_gc.rs`): the data directory is kept private by its mode bits.
 use serde_json::Value;
 use std::{
     io::{BufRead, BufReader},
@@ -241,6 +242,44 @@ fn conversion(root: &Path) -> Option<Value> {
     let conversion = shown["result"]["gc"]["last"]["seeds"]["conversion"].clone();
     (!conversion.is_null()).then_some(conversion)
 }
+/// The cold streams' directories at rest (29 §12.6) as the same pass left them, and how many
+/// replicas it visited: each keeps a data stream and a marks stream.
+fn cold(root: &Path) -> Option<(Value, u64)> {
+    let output = run(root, &["inspect", "node", "--gc"]);
+    if !output.status.success() {
+        return None;
+    }
+    let shown: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let seeds = &shown["result"]["gc"]["last"]["seeds"];
+    let replicas = seeds["replicas"].as_u64()?;
+    (!seeds["cold"].is_null() && replicas > 0).then(|| (seeds["cold"].clone(), replicas))
+}
+/// Every open chunk of the cold streams under `root`: each stream's directory under `cold/`.
+fn cold_open_chunks(root: &Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let Ok(sessions) = std::fs::read_dir(root.join("cold")) else {
+        return found;
+    };
+    for session in sessions {
+        for stream in ["data", "marks"] {
+            let Ok(entries) = std::fs::read_dir(session.as_ref().unwrap().path().join(stream))
+            else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("open."))
+                {
+                    found.push(path);
+                }
+            }
+        }
+    }
+    found
+}
 fn field(view: &Value, name: &str) -> u64 {
     view[name]
         .as_u64()
@@ -378,6 +417,28 @@ fn a_seed_directory_in_the_clear_converts_while_the_session_serves() {
         assert!(deadline.open(), "the node never recorded the fence");
         std::thread::sleep(Duration::from_millis(100));
     }
+    // The session's cold streams opened in the clear too, and the collector says so: each
+    // replica's two directories.
+    let mut deadline = Deadline::after(Duration::from_secs(60));
+    loop {
+        if let Some((view, replicas)) = cold(root)
+            && field(&view, "clear") == 2 * replicas
+        {
+            assert_eq!(field(&view, "sealed"), 0, "{view}");
+            break;
+        }
+        assert!(
+            deadline.open(),
+            "the collector never reported the cold streams in the clear"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        cold_open_chunks(root)
+            .iter()
+            .all(|path| !std::fs::read(path).unwrap().starts_with(b"FCLCOLD1")),
+        "a cold stream sealed below the fence"
+    );
     drop(server);
     let clear = seed_files(root);
     assert!(clear.iter().all(|(_, stem)| clear_name(stem)));
@@ -444,6 +505,24 @@ fn a_seed_directory_in_the_clear_converts_while_the_session_serves() {
     let now = seed_chunks(root);
     for chunk in &held {
         assert!(now.contains(chunk), "{chunk} not held sealed");
+    }
+
+    // The cold streams opened sealed: every directory reported sealed, every open chunk a record
+    // file under a key of its own.
+    let (view, replicas) = cold(root).expect("the collector reported the cold streams");
+    consistent(&view);
+    assert_eq!(field(&view, "sealed"), 2 * replicas, "{view}");
+    for form in ["clear", "counting", "converting", "stopped"] {
+        assert_eq!(field(&view, form), 0, "{view}");
+    }
+    let open = cold_open_chunks(root);
+    assert!(!open.is_empty(), "no cold stream open");
+    for path in &open {
+        assert!(
+            std::fs::read(path).unwrap().starts_with(b"FCLCOLD1"),
+            "{} is not a record file",
+            path.display()
+        );
     }
 
     // A checkpoint taken now seals its seeds too.

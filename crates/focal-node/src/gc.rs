@@ -629,55 +629,72 @@ impl GcAgent {
                 }
                 hyper_rt::futures::yield_now().await;
             }
-            // The replica's seeds at rest (29 §12): converted a job at a time, at most MAX_STEPS
-            // steps a pass, each job's chunks read, sealed and flushed on the blocking pool, so the
-            // replica's owner only lists, tallies and lets names in the clear go. The last job's
-            // result goes back before the next replica's turn.
-            let mut done = None;
-            let mut status = None;
-            for _ in 0..MAX_STEPS {
-                let Ok(reply) = host
-                    .seed_conversion(done.take(), PAGE, focal_evidence::SEED_JOB_CHUNKS)
-                    .await
-                else {
-                    break;
-                };
-                status = Some(reply.status);
-                match reply.next {
-                    focal_evidence::SeedStep::Done => break,
-                    focal_evidence::SeedStep::Visited => {}
-                    focal_evidence::SeedStep::Job(job) => {
-                        let Some((buffer, charge)) = scratch.take().or_else(|| self.scratch())
-                        else {
-                            break;
-                        };
-                        let ran = focal_rt::on_pool(&focal_rt::FILES, move || {
-                            let mut buffer = buffer;
-                            let done = job.run(&mut buffer);
-                            (done, buffer)
-                        })
-                        .await;
-                        // A job the pool refused or lost leaves its chunks in the clear: the
-                        // replica's owner takes them again at its next step.
-                        let Ok((result, buffer)) = ran else {
-                            break;
-                        };
-                        scratch = Some((buffer, charge));
-                        done = Some(result);
-                    }
-                }
-                hyper_rt::futures::yield_now().await;
-            }
-            if let Some(done) = done
-                && let Ok(reply) = host.seed_conversion(Some(done), 0, 0).await
-            {
-                status = Some(reply.status);
-            }
-            if let Some(status) = status {
+            // The replica's seeds and cold streams at rest (29 §12.5, §12.6): each directory
+            // converted a job at a time, off the replica's owner.
+            if let Some(status) = self.convert(&host, Directory::Seeds, &mut scratch).await {
                 add_conversion(&mut report.conversion, &status);
+            }
+            for stream in [Directory::ColdData, Directory::ColdMarks] {
+                if let Some(status) = self.convert(&host, stream, &mut scratch).await {
+                    add_conversion(&mut report.cold, &status);
+                }
             }
         }
         Ok(report)
+    }
+    /// One of a replica's directories converted to its sealed form a job at a time (29 §12.5,
+    /// §12.6), at most MAX_STEPS steps a pass, each job's chunks read, sealed and flushed on the
+    /// blocking pool, so the replica's owner only lists, tallies and lets names in the clear go;
+    /// the last job's result goes back before the directory's turn ends. Where its conversion
+    /// stands, or none for a replica that answers no step (one that keeps no such directory, or
+    /// is stopping). `scratch` is the pass's chunk of scratch, made and charged when a job first
+    /// needs it.
+    async fn convert(
+        &self,
+        host: &crate::fleet::ReplicaHost,
+        directory: Directory,
+        scratch: &mut Option<(Vec<u8>, focal_memory::Allocation)>,
+    ) -> Option<focal_evidence::ConversionStatus> {
+        let mut done = None;
+        let mut status = None;
+        for _ in 0..MAX_STEPS {
+            let Ok(Some(reply)) = directory
+                .step(host, done.take(), PAGE, focal_evidence::SEED_JOB_CHUNKS)
+                .await
+            else {
+                break;
+            };
+            status = Some(reply.status);
+            match reply.next {
+                focal_evidence::SeedStep::Done => break,
+                focal_evidence::SeedStep::Visited => {}
+                focal_evidence::SeedStep::Job(job) => {
+                    let Some((buffer, charge)) = scratch.take().or_else(|| self.scratch()) else {
+                        break;
+                    };
+                    let ran = focal_rt::on_pool(&focal_rt::FILES, move || {
+                        let mut buffer = buffer;
+                        let done = job.run(&mut buffer);
+                        (done, buffer)
+                    })
+                    .await;
+                    // A job the pool refused or lost leaves its chunks in the clear: the
+                    // replica's owner takes them again at its next step.
+                    let Ok((result, buffer)) = ran else {
+                        break;
+                    };
+                    *scratch = Some((buffer, charge));
+                    done = Some(result);
+                }
+            }
+            hyper_rt::futures::yield_now().await;
+        }
+        if let Some(done) = done
+            && let Ok(Some(reply)) = directory.step(host, Some(done), 0, 0).await
+        {
+            status = Some(reply.status);
+        }
+        status
     }
     /// A chunk of scratch for the seed conversion's jobs, charged to the agent's budget; none where
     /// the budget has not the room, and the conversion waits for the next pass.
@@ -696,6 +713,30 @@ impl GcAgent {
         buffer.try_reserve_exact(bytes).ok()?;
         buffer.resize(bytes, 0);
         Some((buffer, charge))
+    }
+}
+/// A replica's directory of chunks that converts to its sealed form (29 §12.5, §12.6).
+#[derive(Clone, Copy)]
+enum Directory {
+    Seeds,
+    ColdData,
+    ColdMarks,
+}
+impl Directory {
+    /// One step of the directory's conversion on `host`'s owner, the result of the job handed
+    /// before given back where `done` holds it.
+    async fn step(
+        self,
+        host: &crate::fleet::ReplicaHost,
+        done: Option<focal_evidence::SeedJobDone>,
+        visits: usize,
+        chunks: usize,
+    ) -> Result<Option<focal_ledger::SeedConversionReply>, focal_ledger::LedgerError> {
+        match self {
+            Self::Seeds => host.seed_conversion(done, visits, chunks).await.map(Some),
+            Self::ColdData => host.cold_conversion(true, done, visits, chunks).await,
+            Self::ColdMarks => host.cold_conversion(false, done, visits, chunks).await,
+        }
     }
 }
 /// One replica's seed directory at rest added to the node's view (29 §12): its form counted, and

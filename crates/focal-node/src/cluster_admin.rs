@@ -410,7 +410,7 @@ impl ClusterAdmin {
                         .last
                         .is_none_or(|pass| pass.finished_ms >= pass.started_ms) =>
             {
-                Ok(AdminResult::Gc { gc: *value })
+                Ok(AdminResult::Gc { gc: value })
             }
             (OperatorRead::Archive { session, claim }, OperatorReply::Archive(value))
                 if value.as_ref().is_none_or(|archive| {

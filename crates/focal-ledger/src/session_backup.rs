@@ -360,6 +360,9 @@ pub mod backup {
         pub seeds: SeedReader,
         /// The session's cold directory (`cold/<session>`), when it keeps cold streams.
         pub cold: Option<PathBuf>,
+        /// The data directory's keys, which the cold streams' directories' keys are kept under
+        /// (29 §12.6).
+        pub keys: focal_seal::DataKeys,
     }
     impl SeedSource for SessionSeeds {
         fn read_seed(&self, hash: ContentHash, length: usize) -> Result<Vec<u8>, ContentError> {
@@ -372,7 +375,7 @@ pub mod backup {
             length: usize,
         ) -> Result<Vec<u8>, ContentError> {
             let root = self.cold.as_ref().ok_or(ContentError::Invalid)?;
-            ColdReader::open(root.join(cold_part(data)))?.read(hash, length)
+            ColdReader::open(root.join(cold_part(data)), self.keys.clone())?.read(hash, length)
         }
     }
     impl SeedSource for SeedReader {
@@ -1079,13 +1082,16 @@ pub mod backup {
         Err(BackupError::Capacity)
     }
     /// Install every cold chunk a backup lists into the restored session's cold directory
-    /// `target` (`cold/<session>`), each verified against its name (doc 31 M2, A2).
+    /// `target` (`cold/<session>`), each verified against its name (doc 31 M2, A2), in the form
+    /// `form` under the data directory's `keys` (29 §12.6).
     pub fn import_cold<M: BackupMedium>(
         medium: &M,
         root: &Path,
         manifest: &BackupManifest,
         target: &Path,
         disk: &focal_memory::DiskBudget,
+        keys: &focal_seal::DataKeys,
+        form: focal_evidence::ContentForm,
     ) -> Result<u64, BackupError> {
         let seeds = BackupSeeds::new(medium, root);
         let mut installed = 0u64;
@@ -1095,6 +1101,8 @@ pub mod backup {
                 focal_evidence::install_cold_chunk(
                     &target.join(cold_part(data)),
                     disk,
+                    keys,
+                    form,
                     chunk.hash,
                     &bytes,
                 )?;

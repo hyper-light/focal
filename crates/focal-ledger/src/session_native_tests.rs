@@ -32,11 +32,13 @@ fn hosting_with(dir: &Path, id: u64, limits: NativeSessionLimits) -> NativeHosti
             focal_evidence::ContentForm::Sealed,
         )
         .unwrap(),
-        cold: Some(crate::ColdSource {
+        cold: Some(Box::new(crate::ColdSource {
             root: dir.join(format!("cold-{id}")),
             disk: focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default()).unwrap(),
             geometry: focal_evidence::ColdGeometry::STANDARD,
-        }),
+            keys: focal_seal::test_keys(content_dir(dir, id)).unwrap(),
+            form: focal_evidence::ContentForm::Sealed,
+        })),
         payloads: Some(crate::PayloadSource {
             root: dir.join(format!("payloads-{id}")),
             disk: focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default()).unwrap(),

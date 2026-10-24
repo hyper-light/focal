@@ -211,7 +211,7 @@ pub(crate) fn cold_page(
         .map_err(crate::host::access)?;
     let frame = session
         .native_cold_frame(retired.retired_at, retired.bundle)
-        .map_err(crate::host::access)?;
+        .map_err(cold_frame_error)?;
     let mut bundle = Vec::new();
     // A custody bundle's bytes are charged before they are read, and held while the page is
     // made from them, as a cold frame's are.
@@ -258,6 +258,25 @@ pub(crate) fn cold_page(
         query.object,
         charge,
     )
+}
+/// A cold frame this replica cannot read back is unavailable here, a typed refusal as a custody
+/// bundle it holds corrupt is: its stream's bytes refused (changed, cut, or a sealed record that
+/// does not open, 29 §12.6) or unreadable. A read refused for room is capacity. A read answers no
+/// outcome, so none of it is an unknown one, which a client would retry as if a write's.
+fn cold_frame_error(error: focal_ledger::LedgerError) -> AccessError {
+    use focal_evidence::{ContentError, NativeEvidenceError};
+    match error {
+        focal_ledger::LedgerError::Native(focal_ledger::NativeSessionError::Native(
+            NativeError::Evidence(NativeEvidenceError::Content(content)),
+        )) => match content {
+            ContentError::Capacity => AccessError::Capacity,
+            _ => AccessError::Unavailable,
+        },
+        focal_ledger::LedgerError::Native(focal_ledger::NativeSessionError::Native(
+            NativeError::Evidence(NativeEvidenceError::Memory(_)),
+        )) => AccessError::Capacity,
+        other => crate::host::access(other),
+    }
 }
 /// One page holding `object` of the family `bytes` hold (a bundle or a cold frame), hydrated
 /// against `custody`, or `Missing` for a row it does not hold.

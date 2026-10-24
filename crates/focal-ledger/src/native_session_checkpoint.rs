@@ -385,7 +385,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                 .cold_source
                 .as_ref()
                 .ok_or(NativeSessionError::Legacy)?;
-            let (data, marks) = super::cold::NativeCold::missing(&source.root, streams)
+            let (data, marks) = super::cold::NativeCold::missing(source, streams)
                 .map_err(super::cold::cold_error)?;
             if !data.is_empty() || !marks.is_empty() {
                 self.pending_seed =

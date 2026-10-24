@@ -37,6 +37,10 @@ harness = false
 name = "seeds"
 harness = false
 
+[[bench]]
+name = "cold"
+harness = false
+
 [dev-dependencies]
 tempfile.workspace = true
 focal-seal = { version = "0.1.0", path = "../focal-seal", features = ["test-support"] }

@@ -880,10 +880,13 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
             engine::NativeSources {
                 reader,
                 seeds: seeds.reader(),
+                // Its cold streams sealed as the store it opens over seals, as its seeds are.
                 cold: Some(cold::ColdSource {
                     root: store.root().join("cold"),
                     disk: consensus.disk_budget(),
                     geometry: limits.cold_geometry,
+                    keys: store.data_keys().clone(),
+                    form: store.form(),
                 }),
                 payloads: Some(payloads::PayloadSource {
                     root: store.root().join("payloads"),

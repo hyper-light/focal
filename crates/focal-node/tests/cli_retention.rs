@@ -333,14 +333,10 @@ fn a_terminal_released_claim_retires_to_the_archive_and_the_node_survives_a_kill
     assert_eq!(retried["result"]["created"], created_outcome["created"]);
     // A corrupted frame is detected: its digest no longer verifies, the
     // continuation still names it, and the operator sees it unverified.
-    let chunk = frame_file(&root.join("cold")).expect("the family's frame in the cold stream");
+    let (chunk, at) =
+        frame_byte(&[root.join("cold")]).expect("the family's frame in the cold stream");
     let original = std::fs::read(&chunk).unwrap();
     let mut tampered = original.clone();
-    let at = original
-        .windows(8)
-        .position(|window| window == b"FCNARCHV")
-        .unwrap()
-        + 12;
     tampered[at] ^= 0xff;
     std::fs::write(&chunk, &tampered).unwrap();
     let archive = admin(root, &["inspect", "archive", "--claim", &a]);
@@ -366,12 +362,19 @@ fn a_terminal_released_claim_retires_to_the_archive_and_the_node_survives_a_kill
     );
 }
 
-/// The file under `directory` holding an archive frame (`FCNARCHV`).
-fn frame_file(directory: &Path) -> Option<std::path::PathBuf> {
-    let mut stack = vec![directory.to_path_buf()];
+/// A file holding a retired family's archive frame, and a byte inside the frame: a content chunk
+/// of the bundle below the cold level or a file of the node's cold stream in the clear, where the
+/// frame's magic shows; sealed from the at-rest level (29 §12.6), the data stream's open chunk, a
+/// record file whose first record holds the first batch retired (a byte of its length block, past
+/// the file's 24-byte header).
+fn frame_byte(directories: &[std::path::PathBuf]) -> Option<(std::path::PathBuf, usize)> {
+    let mut stack = directories.to_vec();
+    let mut sealed = None;
     // At most a few hundred directories in a test's data directory.
     for _ in 0..4096 {
-        let directory = stack.pop()?;
+        let Some(directory) = stack.pop() else {
+            break;
+        };
         let Ok(entries) = std::fs::read_dir(&directory) else {
             continue;
         };
@@ -379,12 +382,26 @@ fn frame_file(directory: &Path) -> Option<std::path::PathBuf> {
             let path = entry.unwrap().path();
             if path.is_dir() {
                 stack.push(path);
-            } else if std::fs::read(&path)
-                .is_ok_and(|bytes| bytes.windows(8).any(|window| window == b"FCNARCHV"))
-            {
-                return Some(path);
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            if let Some(at) = bytes.windows(8).position(|window| window == b"FCNARCHV") {
+                return Some((path, at + 12));
+            }
+            let open = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("open."));
+            let data = path
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .is_some_and(|name| name == "data");
+            if open && data && bytes.starts_with(b"FCLCOLD1") && bytes.len() > 26 {
+                sealed = Some((path, 26));
             }
         }
     }
-    None
+    sealed
 }

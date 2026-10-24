@@ -425,6 +425,9 @@ pub struct AdminSeedReport {
     /// The replicas' seed directories at rest (29 §12), as the pass left them.
     #[serde(default)]
     pub conversion: AdminSeedConversion,
+    /// The replicas' cold streams' directories at rest (29 §12.6), each stream's apart.
+    #[serde(default)]
+    pub cold: AdminSeedConversion,
 }
 /// The forms of the seed directories of the replicas a node hosts (29 §12), and what the
 /// conversions of those still converting counted to convert, converted, found gone before they
@@ -874,9 +877,10 @@ pub enum AdminResult {
         claim: String,
         archive: Option<AdminArchiveBundle>,
     },
-    /// The collector's state on this node (26 §5).
+    /// The collector's state on this node (26 §5). Boxed: the forms and conversions of the
+    /// stores it reports make it the largest result by far.
     Gc {
-        gc: AdminGc,
+        gc: Box<AdminGc>,
     },
     /// A quarantined object brought back, or not found in quarantine.
     GcRestored {

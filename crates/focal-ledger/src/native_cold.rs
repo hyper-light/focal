@@ -5,27 +5,39 @@
 //! through its stub's sequence: the marks find the batch, the batch's header the frame.
 use focal_core::native::retirement::{COLD_COUNT_BYTES, COLD_ENTRY_BYTES, ColdEntry, cold_header};
 use focal_evidence::{
-    ColdGeometry, ColdReader, ColdRoom, ColdState, ColdStore, ColdStreams, ContentError,
+    ColdGeometry, ColdPending, ColdReader, ColdRoom, ColdState, ColdStore, ColdStreams,
+    ContentError, ContentForm,
 };
 use focal_memory::{Allocation, BudgetKind, BudgetLane, DiskBudget, MemoryBudget};
 use focal_model::{ContentHash, SessionSeq};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// A cold stream's failure, as the session reports a store's.
 pub(crate) fn cold_error(error: ContentError) -> super::NativeSessionError {
     super::NativeSessionError::Native(focal_evidence::NativeEvidenceError::from(error).into())
 }
 
+/// One step of a cold stream's conversion at rest (29 §12.6): what the job handed before was, where
+/// its result was given, the next piece, and where the conversion stands.
+pub(crate) type ColdStep = (
+    Option<focal_evidence::Conversion>,
+    focal_evidence::SeedStep,
+    focal_evidence::ConversionStatus,
+);
+
 /// The bytes of one mark: a record's sequence and its batch's offset (u64 each, little-endian).
 const MARK_BYTES: usize = 16;
 
-/// Where a session's cold streams live, the volume they are promised from, and how fresh ones
-/// are cut ([`ColdGeometry::STANDARD`] outside tests).
+/// Where a session's cold streams live, the volume they are promised from, how fresh ones are cut
+/// ([`ColdGeometry::STANDARD`] outside tests), the data directory's keys their directories' keys
+/// are kept under, and the form the node's fence asks of them at rest (29 §12.6).
 #[derive(Clone)]
 pub struct ColdSource {
     pub root: PathBuf,
     pub disk: DiskBudget,
     pub geometry: ColdGeometry,
+    pub keys: focal_seal::DataKeys,
+    pub form: ContentForm,
 }
 
 /// What a cold family's frame names of the ledger's content (doc 31 M2, A2): the content roots of
@@ -444,7 +456,7 @@ impl ColdSlot {
                 Ok(Some(ColdData {
                     geometry: streams.geometry,
                     state: streams.data.clone(),
-                    reader: ColdReader::open(source.root.join("data"))?,
+                    reader: ColdReader::open(source.root.join("data"), source.keys.clone())?,
                     _charge: charge,
                 }))
             }
@@ -479,8 +491,8 @@ pub(crate) struct NativeCold {
 /// encoding thread makes durable before the checkpoint may be a recovery base.
 pub(crate) struct CapturedCold {
     pub(crate) streams: ColdStreams,
-    data: (PathBuf, Vec<ContentHash>),
-    marks: (PathBuf, Vec<ContentHash>),
+    data: (PathBuf, Vec<ColdPending>),
+    marks: (PathBuf, Vec<ColdPending>),
     _permit: Allocation,
 }
 impl CapturedCold {
@@ -526,6 +538,8 @@ impl NativeCold {
                 memory,
                 geometry,
                 streams.map(|streams| &streams.data),
+                &source.keys,
+                source.form,
             )?,
             marks: ColdStore::open(
                 source.root.join("marks"),
@@ -533,6 +547,8 @@ impl NativeCold {
                 memory,
                 geometry,
                 streams.map(|streams| &streams.marks),
+                &source.keys,
+                source.form,
             )?,
         })
     }
@@ -584,6 +600,28 @@ impl NativeCold {
             _permit: permit,
         })
     }
+    /// One step of a stream's conversion at rest (29 §12.6), its data stream's where `data` is set
+    /// and its marks' otherwise: the result of the job it handed before taken back first where
+    /// `done` gives one, then its next piece, and where its conversion stands.
+    pub(crate) fn conversion(
+        &mut self,
+        data: bool,
+        done: Option<focal_evidence::SeedJobDone>,
+        visits: usize,
+        chunks: usize,
+    ) -> Result<ColdStep, ContentError> {
+        let stream = if data {
+            &mut self.data
+        } else {
+            &mut self.marks
+        };
+        let taken = match done {
+            Some(done) => Some(stream.conversion_done(done)?),
+            None => None,
+        };
+        let next = stream.conversion_job(visits, chunks)?;
+        Ok((taken, next, stream.conversion_status()))
+    }
     /// A checkpoint naming `streams` made what it names durable.
     pub(crate) fn made_durable(&mut self, streams: &ColdStreams) -> Result<(), ContentError> {
         let (chunks, manifests) = streams.data.named(streams.geometry)?;
@@ -620,15 +658,18 @@ impl NativeCold {
     }
     /// What `streams` names that is not local, data's then marks': what an install pulls.
     pub(crate) fn missing(
-        root: &Path,
+        source: &ColdSource,
         streams: &ColdStreams,
     ) -> Result<(Vec<ContentHash>, Vec<ContentHash>), ContentError> {
         let missing = |part: &str, state: &ColdState| -> Result<Vec<ContentHash>, ContentError> {
-            let directory = root.join(part);
+            let directory = source.root.join(part);
             if !directory.is_dir() {
                 std::fs::create_dir_all(&directory)?;
             }
-            state.missing(streams.geometry, &ColdReader::open(directory)?)
+            state.missing(
+                streams.geometry,
+                &ColdReader::open(directory, source.keys.clone())?,
+            )
         };
         Ok((
             missing("data", &streams.data)?,
@@ -646,6 +687,8 @@ impl NativeCold {
         focal_evidence::install_cold_chunk(
             &source.root.join(if data { "data" } else { "marks" }),
             &source.disk,
+            &source.keys,
+            source.form,
             hash,
             bytes,
         )

@@ -697,6 +697,28 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             None => Ok(None),
         }
     }
+    /// One step of a cold stream's conversion at rest (29 §12.6): the data stream's where `data`
+    /// is set, the marks' otherwise, the writer opened first where it was not, as a first use opens
+    /// it. None where this replica keeps no cold streams.
+    pub(crate) fn cold_conversion(
+        &mut self,
+        data: bool,
+        done: Option<focal_evidence::SeedJobDone>,
+        visits: usize,
+        chunks: usize,
+    ) -> Result<Option<super::cold::ColdStep>, NativeSessionError> {
+        match self
+            .cold
+            .writer(self.cold_source.as_ref(), &self.budget)
+            .map_err(super::cold::cold_error)?
+        {
+            Some(cold) => cold
+                .conversion(data, done, visits, chunks)
+                .map(Some)
+                .map_err(super::cold::cold_error),
+            None => Ok(None),
+        }
+    }
     /// The cold data stream as it stands, to be read away from the owner
     /// (`cold::ColdSlot::data`): none where this replica keeps no cold streams.
     pub(crate) fn cold_data(&self) -> Result<Option<super::cold::ColdData>, NativeSessionError> {

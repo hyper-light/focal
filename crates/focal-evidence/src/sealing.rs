@@ -43,6 +43,7 @@ use hyper_seal::SealError;
 use hyper_seal::keys::{KeyId, RECORD, Wrapped, WrappingKey};
 use hyper_seal::name::Namer;
 use hyper_seal::sealed_file::{SealedFileError, SealedReader, SealedWriter, seal_content};
+use hyper_seal::stream::VersionKey;
 
 use super::ContentError;
 
@@ -60,6 +61,9 @@ pub(crate) const SEALING: &str = "SEALING";
 pub(crate) const SEALED: &str = "SEALED";
 /// What a domain's naming key is derived for (HKDF's salt and info, `derive_child`).
 const NAMES: &[u8] = b"focal content names";
+/// What a record file's key is derived for (HKDF's salt and info, `derive_child`), the file's ID
+/// the label: a cold stream's open chunk, and a whole chunk cut from one (29 §12.6).
+const RECORDS: &[u8] = b"focal cold record key";
 /// Hex digits of a name in the clear: a BLAKE3 hash.
 const CLEAR_NAME: usize = 64;
 /// Hex digits of a keyed name: `hyper_seal::name`'s 128 bits.
@@ -427,7 +431,7 @@ impl<'a> ContentKeys<'a> {
             Content::Clear | Content::Data(_) => return Err(ContentError::Invalid),
         };
         let temporary = path.with_extension("key-install");
-        let _ = fs::remove_file(&temporary);
+        fresh(&temporary)?;
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -462,7 +466,95 @@ impl Sealed {
     }
 }
 
+/// `temporary` made fresh before it is written: one a crash or an earlier failure left is removed,
+/// so no byte of it outlives the write (a device file is opened without truncation, and a sealed
+/// file longer than what was sealed into it would read as corrupt only when it is read). A removal
+/// that fails other than for a file not there is the write's failure.
+fn fresh(temporary: &Path) -> Result<(), ContentError> {
+    match fs::remove_file(temporary) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 impl DomainKey {
+    /// The key of a record file of the domain whose ID is `file`: derived from the domain's key
+    /// and the ID (HKDF-SHA-384), so every record file has a key of its own, and held as the
+    /// AES-GCM context of a [`VersionKey`], outside the locked region, for as long as its file is
+    /// written or read. The domain's record must stand.
+    pub(crate) fn record_key(&self, file: &[u8; 16]) -> Result<VersionKey, ContentError> {
+        let sealed = self.sealed.as_ref().ok_or(ContentError::Invalid)?;
+        let (secret, _) = sealed.key.derive_child(RECORDS, file).map_err(seal_error)?;
+        VersionKey::new(&secret, *file).map_err(seal_error)
+    }
+
+    /// The sealed file at `path` read whole, at most `most` bytes, and checked against `hash`: a
+    /// file another path found (a cold stream's pending chunk), sealed by [`Self::seed_writer`] or
+    /// as the content store seals.
+    pub(crate) fn read_sealed_at(
+        &self,
+        path: &Path,
+        hash: ContentHash,
+        most: usize,
+    ) -> Result<Vec<u8>, ContentError> {
+        self.read_bounded(path, true, hash, most)
+    }
+
+    /// `names` written at `temporary` as one file's bytes, each name's 32 in turn, and left
+    /// unflushed: in the clear, or sealed keyed by their BLAKE3 hash, which is taken here over
+    /// exactly the names written (two passes over the one slice, so no hash is a caller's word).
+    /// The hash, and a handle the caller flushes before it renames the file into place: a cold
+    /// stream's manifest chunk, cut from the names it holds.
+    pub(crate) fn write_names_unflushed(
+        &self,
+        temporary: &Path,
+        names: &[ContentHash],
+    ) -> Result<(ContentHash, File), ContentError> {
+        let mut hasher = blake3::Hasher::new();
+        for name in names {
+            hasher.update(&name.0);
+        }
+        let hash = ContentHash(*hasher.finalize().as_bytes());
+        if !self.seals {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(temporary)?;
+            // A page of names at a time.
+            let mut page = [0u8; 4096];
+            for group in names.chunks(page.len() / 32) {
+                let mut filled = 0usize;
+                for name in group {
+                    let end = filled.checked_add(32).ok_or(ContentError::Capacity)?;
+                    page.get_mut(filled..end)
+                        .ok_or(ContentError::Capacity)?
+                        .copy_from_slice(&name.0);
+                    filled = end;
+                }
+                file.write_all(page.get(..filled).ok_or(ContentError::Capacity)?)?;
+            }
+            return Ok((hash, file));
+        }
+        let sealed = self.sealed.as_ref().ok_or(ContentError::Invalid)?;
+        fresh(temporary)?;
+        let file = DeviceFile::open(temporary, true, CachingRequest::Buffered, Alignment::BYTE)
+            .map_err(disk_error)?;
+        let mut writer = SealedWriter::content_keyed(file, &sealed.key, &hash.0, SEGMENT)
+            .map_err(sealed_error)?;
+        for name in names {
+            writer.write(&name.0).map_err(sealed_error)?;
+        }
+        let file = writer.finish_unflushed().map_err(sealed_error)?;
+        Ok((hash, file.std_file().try_clone()?))
+    }
+
+    /// Whether what the writer installs in the domain is sealed.
+    pub(crate) fn seals(&self) -> bool {
+        self.seals
+    }
+
     /// Whether the domain holds no file: nothing of it may lie in the clear and its record does not
     /// stand.
     pub(crate) fn holds_nothing(&self) -> bool {
@@ -541,7 +633,7 @@ impl DomainKey {
         }
         let sealed = self.sealed.as_ref().ok_or(ContentError::Invalid)?;
         let temporary = path.with_extension("install");
-        let _ = fs::remove_file(&temporary);
+        fresh(&temporary)?;
         let file = DeviceFile::open(&temporary, true, CachingRequest::Buffered, Alignment::BYTE)
             .map_err(disk_error)?;
         let file = seal_content(file, &sealed.key, bytes, SEGMENT).map_err(sealed_error)?;
@@ -563,7 +655,7 @@ impl DomainKey {
     ) -> Result<SeedWriter<'a>, ContentError> {
         let sink = if self.seals {
             let sealed = self.sealed.as_ref().ok_or(ContentError::Invalid)?;
-            let _ = fs::remove_file(temporary);
+            fresh(temporary)?;
             let file = DeviceFile::open(temporary, true, CachingRequest::Buffered, Alignment::BYTE)
                 .map_err(disk_error)?;
             Sink::Sealed(Box::new(

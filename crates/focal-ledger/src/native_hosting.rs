@@ -53,8 +53,9 @@ pub struct NativeHosting {
     pub reader: ContentReader,
     /// The one writer of this ledger's checkpoint seeds on this node (25 §5).
     pub seeds: focal_evidence::SeedStore,
-    /// Where this ledger's cold streams live on this node (doc 31 M2, A2).
-    pub cold: Option<crate::ColdSource>,
+    /// Where this ledger's cold streams live on this node (doc 31 M2, A2). Boxed: a session holds
+    /// its hosting inline and moves by value through its hosts' frames (`Session`'s inline bound).
+    pub cold: Option<Box<crate::ColdSource>>,
     /// Where this ledger's payload log lives on this node (doc 31 M3); none holds every row's
     /// bytes in memory.
     pub payloads: Option<crate::PayloadSource>,
@@ -609,7 +610,7 @@ impl Session {
             engine::NativeSources {
                 reader: hosting.reader.clone(),
                 seeds: hosting.seeds.reader(),
-                cold: hosting.cold.clone(),
+                cold: hosting.cold.as_deref().cloned(),
                 payloads: hosting.payloads.clone(),
             },
             BuiltinNativeSchemas,
@@ -864,6 +865,29 @@ impl Session {
             .ok_or(LedgerError::NativeUnsupported)?
             .cold_frame(sequence, digest)?)
     }
+    /// One step of a cold stream's conversion at rest (29 §12.6), its data stream's where `data`
+    /// is set and its marks' otherwise, as [`Self::native_seed_conversion`] steps the seeds': none
+    /// where this replica keeps no cold streams.
+    pub fn native_cold_conversion(
+        &mut self,
+        data: bool,
+        done: Option<focal_evidence::SeedJobDone>,
+        visits: usize,
+        chunks: usize,
+    ) -> Result<Option<SeedConversionReply>, LedgerError> {
+        self.check()?;
+        let engine = self
+            .native
+            .as_deref_mut()
+            .ok_or(LedgerError::NativeUnsupported)?;
+        Ok(engine
+            .cold_conversion(data, done, visits, chunks)?
+            .map(|(taken, next, status)| SeedConversionReply {
+                taken,
+                next,
+                status,
+            }))
+    }
     /// A read-only view of this ledger's seeds, for serving peers.
     pub fn seed_reader(&self) -> Option<focal_evidence::SeedReader> {
         self.hosting.as_ref().map(|hosting| hosting.seeds.reader())
@@ -947,7 +971,7 @@ impl Session {
             engine::NativeSources {
                 reader: hosting.reader.clone(),
                 seeds: hosting.seeds.reader(),
-                cold: hosting.cold.clone(),
+                cold: hosting.cold.as_deref().cloned(),
                 payloads: hosting.payloads.clone(),
             },
             BuiltinNativeSchemas,

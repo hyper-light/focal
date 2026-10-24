@@ -127,6 +127,7 @@ pub async fn create(
             &data_dir.join("cold"),
             ledger,
         )),
+        keys: reader.data_keys().clone(),
     };
     let work = budget
         .child(VERIFY_BUDGET_BYTES, VERIFY_COMPLETION_BYTES)
