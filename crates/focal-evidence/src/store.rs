@@ -97,6 +97,19 @@ pub(crate) fn test_keys(root: impl AsRef<Path>) -> focal_seal::DataKeys {
     #[allow(clippy::unwrap_used)]
     focal_seal::test_keys(root.as_ref()).unwrap()
 }
+
+/// A stored file's bytes as a test's scan of a directory takes them: an empty file without a read.
+/// A store's held lock is an empty file, and Windows locks its bytes against every other handle
+/// (a read there is refused, `ERROR_LOCK_VIOLATION`), where a Unix lock is advisory.
+#[cfg(test)]
+pub(crate) fn stored_bytes(path: &Path) -> Vec<u8> {
+    #[allow(clippy::unwrap_used)]
+    if fs::metadata(path).unwrap().len() == 0 {
+        return Vec::new();
+    }
+    #[allow(clippy::unwrap_used)]
+    fs::read(path).unwrap()
+}
 pub use native_artifact::*;
 
 #[derive(Debug, Clone)]

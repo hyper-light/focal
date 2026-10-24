@@ -1112,13 +1112,18 @@ impl ColdStore {
     /// Make the chunks `pending` names durable in the directory at `root`, on whichever thread
     /// holds a checkpoint's encoding: every one synced, then renamed under the name it is filed
     /// by, then the directory synced once. A chunk already renamed by an earlier commit that
-    /// failed after it counts as done; one that is nowhere fails the commit.
+    /// failed after it counts as done; one that is nowhere fails the commit. A chunk is synced
+    /// through a handle that may write: Windows' FlushFileBuffers refuses a read-only one.
     pub fn make_durable(root: &Path, pending: &[ColdPending]) -> Result<(), ContentError> {
         if pending.is_empty() {
             return Ok(());
         }
         for chunk in pending {
-            match File::open(root.join(format!("{}.pending", chunk.stem))) {
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(root.join(format!("{}.pending", chunk.stem)))
+            {
                 Ok(file) => file.sync_all()?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     if !root.join(format!("{}.seed", chunk.stem)).is_file() {

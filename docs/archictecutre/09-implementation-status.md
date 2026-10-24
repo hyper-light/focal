@@ -16817,6 +16817,14 @@ shared with seeds), and `inspect node --gc` gives the cold directories beside th
   write's temporary is made fresh with its removal's failure returned: a device file opens without
   truncation, so a leftover the ignored removal failed to clear would have outlived the write and
   read corrupt only later.
+- **Windows.** A checkpoint made a cold stream's pending chunks durable through read-only handles,
+  which Windows' FlushFileBuffers refuses; no Windows step ran the suite that does it, and the clear
+  form did the same before. Reproduced on Windows CI by focal-evidence's suite on a branch without
+  the fix (run 40127233519: seven cold tests refused, `Access is denied`, os error 5); a chunk is
+  synced through a handle that may write, and the suite runs on Windows CI now. Its nine other
+  failures there were the tests' own: a scan of a store read its held lock, whose bytes Windows
+  locks against every other handle (`ERROR_LOCK_VIOLATION`, os error 33); a scan takes an empty
+  file without a read (`store::stored_bytes`).
 - **Measured** (`benches/cold.rs` on fedora, i9-14900HX, NVMe btrfs, one P-core, 12 interleaved
   rounds of 64 MiB with a 16-byte mark a batch, the thread's CPU time, medians; host load 7 to 15):
 
@@ -16848,4 +16856,5 @@ shared with seeds), and `inspect node --gc` gives the cold directories beside th
 - **Gate.** fmt, the contracts, Clippy on every target, the production check, cargo-deny and the
   workspace's tests on the batch (174 test binaries, 3,649 passed, 0 failed, 31 ignored); the
   cross-form assertion (a sealed replica cuts what a clear one cuts) added after, and fmt, the
-  contracts, Clippy, the production check and focal-evidence's tests run again on the final tree.
+  contracts, Clippy, the production check and focal-evidence's tests run again; after the Windows
+  fix, the same and `cli_archive`, `cli_retention`, `cli_backup` and `cli_seeds_at_rest`.

@@ -500,7 +500,7 @@ fn a_sealed_stream_holds_no_plaintext_and_refuses_what_was_changed() {
     for entry in fs::read_dir(&root).unwrap() {
         let path = entry.unwrap().path();
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        let stored = fs::read(&path).unwrap();
+        let stored = crate::store::stored_bytes(&path);
         for hash in &hashes {
             assert!(!name.contains(&hash.to_string()), "{name} names a hash");
             assert!(
@@ -594,7 +594,7 @@ fn no_record_files_key_and_nonce_seal_two_plaintexts() {
     fn record_files(root: &Path) -> Vec<([u8; 16], Vec<u8>)> {
         let mut found = Vec::new();
         for entry in fs::read_dir(root).unwrap() {
-            let stored = fs::read(entry.unwrap().path()).unwrap();
+            let stored = crate::store::stored_bytes(&entry.unwrap().path());
             if stored.starts_with(cold_records::MAGIC) {
                 found.push((stored[8..24].try_into().unwrap(), stored));
             }

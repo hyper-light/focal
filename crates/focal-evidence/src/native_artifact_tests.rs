@@ -373,7 +373,7 @@ fn files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
             } else {
                 files.insert(
                     entry.path().strip_prefix(root).unwrap().to_path_buf(),
-                    fs::read(entry.path()).unwrap(),
+                    crate::store::stored_bytes(&entry.path()),
                 );
             }
         }

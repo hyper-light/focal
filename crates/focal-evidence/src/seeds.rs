@@ -946,7 +946,7 @@ mod tests {
                 for hash in [a, b] {
                     assert!(!name.contains(&hash.to_string()), "{name} names a hash");
                 }
-                let stored = std::fs::read(root.join(&name)).unwrap();
+                let stored = crate::store::stored_bytes(&root.join(&name));
                 for chunk in chunks {
                     for probe in chunk.chunks(4096).map(|piece| &piece[..16]) {
                         assert!(

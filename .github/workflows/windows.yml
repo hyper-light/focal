@@ -43,6 +43,13 @@ jobs:
         # the A1 binary drives - and runs in seconds, so a durability regression
         # is caught here before the multi-minute release A1 build.
         run: cargo test -p focal-enrollment --locked
+      - name: Evidence store tests (content, seeds and cold streams, both forms)
+        shell: bash
+        # Every store beside the log writes, renames and syncs its own files
+        # (29 §12): a cold stream's pending chunks were synced through a
+        # read-only handle, which Windows' FlushFileBuffers refuses, and no
+        # Windows step ran the suite that makes them durable.
+        run: cargo test -p focal-evidence --locked
       - name: Node library tests (cross-platform unit suites)
         shell: bash
         # The focal-node lib unit suites (config, cli, cluster-admin, joins,
