@@ -50,10 +50,13 @@ fn widest_bytes(text: &str) -> Option<usize> {
 pub const FAMILIES: [&str; 4] = ["sessions", "root_peers", "peer_rtts", "tenants"];
 
 /// What a page costs: its fixed part, and one entity of each family, each at
-/// its widest (`widest_bytes` of the renderer's own text).
+/// its widest (`widest_bytes` of the renderer's own text). The fixed part is
+/// larger by the content store's conversion while a page shows it
+/// (`shows_conversion`): `converting`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageBudget {
     pub fixed: usize,
+    pub converting: usize,
     pub entity: [usize; 4],
 }
 impl PageBudget {
@@ -63,6 +66,9 @@ impl PageBudget {
     pub fn derive(labels: &MetricLabels, memory: BudgetStats) -> Option<Self> {
         let mut widest = MetricsSnapshot::widest(labels, memory);
         let fixed = widest_bytes(&widest.render())?;
+        widest.conversion = Some(widest_conversion());
+        let converting = widest_bytes(&widest.render())?;
+        widest.conversion = None;
         let cost = |widest: &MetricsSnapshot| widest_bytes(&widest.render())?.checked_sub(fixed);
         widest.sessions.push(SessionMetrics::widest());
         let sessions = cost(&widest)?;
@@ -86,9 +92,20 @@ impl PageBudget {
         let entity = [sessions, root_peers, peer_rtts, tenants];
         let one_each = entity
             .iter()
-            .try_fold(fixed, |sum, bytes| sum.checked_add(*bytes))?;
-        (one_each <= MAX_PAGE_BYTES && entity.iter().all(|bytes| *bytes > 0))
-            .then_some(Self { fixed, entity })
+            .try_fold(converting.max(fixed), |sum, bytes| sum.checked_add(*bytes))?;
+        (one_each <= MAX_PAGE_BYTES && entity.iter().all(|bytes| *bytes > 0)).then_some(Self {
+            fixed,
+            converting,
+            entity,
+        })
+    }
+    /// The budget of a page that shows the content store's conversion: the same entities, its
+    /// fixed part the larger.
+    pub fn while_converting(&self) -> Self {
+        Self {
+            fixed: self.converting,
+            ..*self
+        }
     }
     /// How many entities of each family a round lists, of `counts`: every
     /// one while the page holds them all. Otherwise one of each family that
@@ -588,11 +605,34 @@ impl SessionMetrics {
         }
     }
 }
+/// The content store's conversion at its widest, as a page shows it: what it adds to a page's
+/// fixed part while the store converts (`PageBudget::converting`).
+fn widest_conversion() -> focal_evidence::ConversionStatus {
+    let wide = u64::MAX;
+    let tally = focal_evidence::Tally {
+        files: wide,
+        bytes: wide,
+    };
+    focal_evidence::ConversionStatus {
+        form: focal_evidence::StoreForm::Converting,
+        resumed: true,
+        started_ms: wide,
+        finished_ms: wide,
+        counted: tally,
+        converted: tally,
+        gone: tally,
+        held: true,
+        held_steps: wide,
+        stopped: Some(focal_evidence::ContentErrorKind::Corrupt),
+    }
+}
 impl MetricsSnapshot {
     /// The snapshot of a node labelled `labels` at its widest: every
-    /// section present, and no entity of any family listed. What a page's
-    /// fixed part costs at most (`PageBudget`); its values do not matter,
-    /// since `widest_bytes` counts each at its widest.
+    /// section present but the content store's conversion, which a page
+    /// shows only while the store converts (`widest_conversion`), and no
+    /// entity of any family listed. What a page's fixed part costs at most
+    /// (`PageBudget`); its values do not matter, since `widest_bytes` counts
+    /// each at its widest.
     pub(crate) fn widest(labels: &MetricLabels, memory: BudgetStats) -> Self {
         let wide = u64::MAX;
         Self {
@@ -609,6 +649,7 @@ impl MetricsSnapshot {
             }),
             staged_uploads: wide,
             staged_bytes: wide,
+            conversion: None,
             content_held: wide,
             content_timed_out: wide,
             evidence: crate::evidence_service::EvidenceDoorStats {

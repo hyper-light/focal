@@ -10,7 +10,8 @@
 //! stood untouched for the grace before it moves.
 use crate::network_service::NetworkHandles;
 use focal_client::admin::{
-    AdminCollectorReport, AdminGc, AdminGcConfig, AdminGcPass, AdminSeedReport,
+    AdminCollectorReport, AdminContentStore, AdminGc, AdminGcConfig, AdminGcPass, AdminSeedReport,
+    AdminStoreForm,
 };
 use focal_core::native::ContentRoot;
 use focal_core::native::record_codec::{InspectionLimits, StructuralArchive};
@@ -186,6 +187,34 @@ pub struct GcAgent {
     status: watch::Sender<AdminGc>,
 }
 
+/// The content store's form and its conversion as the operator reads them (29 §11): published
+/// with the collector's state, whose passes over objects wait while the store converts.
+pub(crate) fn admin_content(status: focal_evidence::ConversionStatus) -> AdminContentStore {
+    let left = status.left();
+    AdminContentStore {
+        form: match status.form {
+            focal_evidence::StoreForm::Clear => AdminStoreForm::Clear,
+            focal_evidence::StoreForm::Counting => AdminStoreForm::Counting,
+            focal_evidence::StoreForm::Converting => AdminStoreForm::Converting,
+            focal_evidence::StoreForm::Sealed => AdminStoreForm::Sealed,
+        },
+        resumed: status.resumed,
+        started_ms: status.started_ms,
+        finished_ms: status.finished_ms,
+        files_counted: status.counted.files,
+        bytes_counted: status.counted.bytes,
+        files_converted: status.converted.files,
+        bytes_converted: status.converted.bytes,
+        files_gone: status.gone.files,
+        bytes_gone: status.gone.bytes,
+        files_left: left.files,
+        bytes_left: left.bytes,
+        held: status.held,
+        held_steps: status.held_steps,
+        stopped: status.stopped.map(|cause| cause.to_string()),
+    }
+}
+
 fn now_ms() -> Result<u64, AccessError> {
     u64::try_from(
         SystemTime::now()
@@ -237,6 +266,7 @@ impl GcAgent {
             passes: 0,
             collecting: false,
             last: None,
+            content: None,
         })?;
         Ok((
             Self {
@@ -302,6 +332,7 @@ impl GcAgent {
             passes: self.passes,
             collecting: self.collecting,
             last: self.last,
+            content: None,
         });
     }
     /// One pass: the roots, the protection set, the store's collector to

@@ -757,7 +757,18 @@ pass: replicas walked, objects protected, opaque domains, bundles this node
 could not read, and the content store's counts (visited, uploads expired,
 terminals released, objects and chunks and records and receipts
 quarantined, chunk sweeps deferred, files and bytes deleted) with the seed
-sweeps' counts. `restore object --domain --root` (`cluster.gc.restore`)
+sweeps' counts. Beside them it reports the content store itself (29 §11),
+asked of the store's owner as the operator reads it rather than at the
+collector's passes: its form (`clear`, `counting`, `converting`, `sealed`)
+and, since the node started, its conversion's tally in files and bytes,
+counted in the clear before any is converted, converted, gone (left with an
+expired round or replaced by a restored copy before the conversion met it)
+and left; whether a step waits for room on the volume and how many have;
+whether the start resumed a conversion begun before it; when it began and
+when it marked the store sealed; and what stopped it, if anything did.
+CockroachDB's stores report gives the same share of files and bytes under
+its active key; unlike it, the conversion meets every file, dormant ones
+included. `restore object --domain --root` (`cluster.gc.restore`)
 brings a quarantined object back, exactly once. The real-binary test
 `cli_gc.rs` seals a work artifact's payload and a refused frame's orphan,
 watches the orphan leave through quarantine while the payload stays,

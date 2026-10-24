@@ -8,7 +8,11 @@ quota or size limit refuses the write.
 volume's `free` near zero and `headroom` unmet; `focal_disk_free_bytes` in
 `inspect node --metrics` is at the floor; the node may stop its ledger owner and exit when the
 write-ahead log itself cannot be extended (`ledger egress ended`). Readers keep answering
-from the durable prefix.
+from the durable prefix. A content store converting to its sealed form
+([29 §11](../archictecutre/29-sealing-at-rest.md)) waits for room rather than failing:
+`inspect node --gc` shows `content.held` true with `held_steps` rising and `files_left` still
+above zero, the page `focal_content_conversion_held 1`; the conversion takes the same file
+first once room comes, with nothing written meanwhile.
 
 **Read-only diagnostics.**
 
@@ -16,7 +20,7 @@ from the durable prefix.
 focal --data-dir DIR inspect node --storage        # disk: free, outstanding, headroom, by kind
 focal --data-dir DIR inspect node --metrics | grep focal_disk
 focal --data-dir DIR inspect replicas --retention      # what holds the retention floor (cursors, archive)
-focal --data-dir DIR inspect node --gc             # what the collector reclaimed and quarantined
+focal --data-dir DIR inspect node --gc             # what the collector reclaimed and quarantined; the store's form and conversion
 ```
 
 **Preconditions.** The volume is the node's own data directory; another node's volume is

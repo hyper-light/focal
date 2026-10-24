@@ -239,3 +239,33 @@ fn a_page_of_the_widest_entities_the_room_allows_stays_within_one_operator_read(
     drop(page);
     assert_eq!(memory.stats().used, used);
 }
+
+/// Do: derive a node's page budget and list a three-host fleet's entities while its store
+/// converts. Expect: a page that shows the conversion still holds its fixed part and one entity of
+/// each family, its fixed part the larger by the conversion's families; and a round lists what fits
+/// within the page, at least one of each family: what the store's one-time conversion costs, for
+/// the rounds it runs, is entities listed a round later.
+#[test]
+fn a_page_that_shows_the_conversion_holds_one_of_each_family() {
+    let budget = PageBudget::derive(&labels(), memory().stats()).unwrap();
+    let converting = budget.while_converting();
+    assert!(converting.fixed > budget.fixed, "{budget:?}");
+    assert!(
+        converting.fixed + converting.entity.iter().sum::<usize>() <= MAX_PAGE_BYTES,
+        "{budget:?}"
+    );
+    let counts = [3, 2, 2, 1];
+    let listed = converting.capacities(counts);
+    let bytes = converting.fixed
+        + listed
+            .iter()
+            .zip(converting.entity)
+            .map(|(listed, bytes)| listed * bytes)
+            .sum::<usize>();
+    assert!(bytes <= MAX_PAGE_BYTES, "{listed:?}");
+    assert!(listed.iter().all(|listed| *listed >= 1), "{listed:?}");
+    println!(
+        "while converting: fixed {} (at rest {}), a three-host round lists {listed:?} of {counts:?}",
+        converting.fixed, budget.fixed
+    );
+}

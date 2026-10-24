@@ -445,6 +445,9 @@ pub struct MetricsSnapshot {
     pub disk: Option<DiskStats>,
     pub staged_uploads: u64,
     pub staged_bytes: u64,
+    /// The content store's form and its conversion since the node started (29 §11), as its owner
+    /// answered; none where it did not.
+    pub conversion: Option<focal_evidence::ConversionStatus>,
     /// The content owner's door: calls held while its queue was full, and those whose time ran
     /// out there (`ContentHost::door_stats`).
     pub content_held: u64,
@@ -594,6 +597,97 @@ fn escape(value: &str, out: &mut String) {
 struct Text {
     out: String,
 }
+/// Whether a page shows the content store's conversion: while the store counts or converts (a
+/// stopped conversion converting still), the only forms with a tally to read. A store at rest in a
+/// form shows nothing, its form following from the fence level on the page (clear below the
+/// content level, sealed from it) and `inspect node --gc` naming it always; so the conversion's
+/// families cost a page's room only while there is a conversion to report (`PageBudget`).
+pub fn shows_conversion(conversion: &focal_evidence::ConversionStatus) -> bool {
+    matches!(
+        conversion.form,
+        focal_evidence::StoreForm::Counting | focal_evidence::StoreForm::Converting
+    )
+}
+impl MetricsSnapshot {
+    /// The content store's conversion where the page shows it ([`shows_conversion`]).
+    pub fn conversion_shown(&self) -> Option<&focal_evidence::ConversionStatus> {
+        self.conversion
+            .as_ref()
+            .filter(|conversion| shows_conversion(conversion))
+    }
+}
+
+/// The content store's form and its conversion's tally (29 §11). The form takes the shape of an
+/// OpenMetrics StateSet, one series a form and exactly one of them 1, as a gauge: this page is the
+/// 0.0.4 text format, which has no stateset type. The tally carries what is still to convert as
+/// Kafka's tiering lag does, in files and in bytes.
+fn conversion_families(text: &mut Text, conversion: &focal_evidence::ConversionStatus) {
+    use focal_evidence::StoreForm;
+    text.header(
+        "focal_content_form",
+        "gauge",
+        "The content store's form: one series a form, the store's own 1 and the others 0.",
+    );
+    for (label, form) in [
+        ("clear", StoreForm::Clear),
+        ("counting", StoreForm::Counting),
+        ("converting", StoreForm::Converting),
+        ("sealed", StoreForm::Sealed),
+    ] {
+        text.labeled(
+            "focal_content_form",
+            &[("focal_content_form", label)],
+            u64::from(conversion.form == form),
+        );
+    }
+    let left = conversion.left();
+    let states = [
+        ("counted", conversion.counted),
+        ("converted", conversion.converted),
+        ("gone", conversion.gone),
+        ("left", left),
+    ];
+    text.header(
+        "focal_content_conversion_files",
+        "gauge",
+        "Files in the clear the content store's conversion counted to convert since the node started, and of them those it converted, those gone before it met them, and those left.",
+    );
+    for (state, tally) in states {
+        text.labeled(
+            "focal_content_conversion_files",
+            &[("state", state)],
+            tally.files,
+        );
+    }
+    text.header(
+        "focal_content_conversion_bytes",
+        "gauge",
+        "The bytes of those files, by the same states.",
+    );
+    for (state, tally) in states {
+        text.labeled(
+            "focal_content_conversion_bytes",
+            &[("state", state)],
+            tally.bytes,
+        );
+    }
+    text.gauge(
+        "focal_content_conversion_held",
+        "Whether the conversion's next file waits for room on the volume for its sealed form.",
+        u64::from(conversion.held),
+    );
+    text.counter(
+        "focal_content_conversion_held_steps_total",
+        "Conversion steps held for room on the volume since the node started.",
+        conversion.held_steps,
+    );
+    text.gauge(
+        "focal_content_conversion_stopped",
+        "Whether the conversion stopped in this run of the node; it resumes at the next start.",
+        u64::from(conversion.stopped.is_some()),
+    );
+}
+
 impl Text {
     fn new(out: String) -> Self {
         Self { out }
@@ -894,6 +988,9 @@ impl MetricsSnapshot {
             "Bytes uploads in progress have staged.",
             self.staged_bytes,
         );
+        if let Some(conversion) = self.conversion_shown() {
+            conversion_families(&mut text, conversion);
+        }
         text.counter(
             "focal_content_requests_held_total",
             "Calls to the content owner held while its queue was full, each until the owner took one before it.",
@@ -2236,6 +2333,7 @@ mod tests {
             disk: None,
             staged_uploads: 0,
             staged_bytes: 0,
+            conversion: None,
             content_held: 0,
             content_timed_out: 0,
             evidence: Default::default(),
@@ -2647,5 +2745,94 @@ mod tests {
         assert!(!text.contains("focal_session_retention_floor{"));
         assert!(text.contains("\nfocal_upgrade_announced_level 1\n"));
         assert!(text.ends_with('\n'));
+    }
+    /// Do: render a node whose content store converts (counted, converted, gone, a step held),
+    /// then each form in turn, a stopped conversion, and one whose owner gave no status. Expect:
+    /// the tally's series as the status has them, left the counted less converted and gone; while
+    /// the store counts or converts every form's series, exactly one 1, and at rest in a form none;
+    /// stopped 1 once it stopped; no family without a status.
+    #[test]
+    fn a_node_exports_its_content_stores_form_and_conversion() {
+        use focal_evidence::{ConversionStatus, StoreForm, Tally};
+        let budget = focal_memory::MemoryBudget::new(1 << 20, 1 << 16).unwrap();
+        let mut sample = snapshot(budget.stats());
+        let mut status = ConversionStatus {
+            form: StoreForm::Converting,
+            resumed: true,
+            started_ms: 1,
+            finished_ms: 0,
+            counted: Tally {
+                files: 10,
+                bytes: 1_000,
+            },
+            converted: Tally {
+                files: 4,
+                bytes: 400,
+            },
+            gone: Tally {
+                files: 1,
+                bytes: 100,
+            },
+            held: true,
+            held_steps: 3,
+            stopped: None,
+        };
+        sample.conversion = Some(status);
+        let text = sample.render();
+        for line in [
+            "# TYPE focal_content_form gauge\n",
+            "focal_content_form{focal_content_form=\"clear\"} 0\n",
+            "focal_content_form{focal_content_form=\"converting\"} 1\n",
+            "focal_content_conversion_files{state=\"counted\"} 10\n",
+            "focal_content_conversion_files{state=\"converted\"} 4\n",
+            "focal_content_conversion_files{state=\"gone\"} 1\n",
+            "focal_content_conversion_files{state=\"left\"} 5\n",
+            "focal_content_conversion_bytes{state=\"left\"} 500\n",
+            "focal_content_conversion_held 1\n",
+            "# TYPE focal_content_conversion_held_steps_total counter\n",
+            "focal_content_conversion_held_steps_total 3\n",
+            "focal_content_conversion_stopped 0\n",
+        ] {
+            assert!(text.contains(line), "missing {line}");
+        }
+        // While the store counts or converts: every form's series, exactly one of them 1. At rest
+        // in a form: none, the form following from the fence level on the page.
+        for (form, shown) in [
+            (StoreForm::Clear, false),
+            (StoreForm::Counting, true),
+            (StoreForm::Converting, true),
+            (StoreForm::Sealed, false),
+        ] {
+            status.form = form;
+            sample.conversion = Some(status);
+            let text = sample.render();
+            let series = text
+                .lines()
+                .filter(|line| line.starts_with("focal_content_form{"))
+                .count();
+            let on = text
+                .lines()
+                .filter(|line| line.starts_with("focal_content_form{") && line.ends_with(" 1"))
+                .count();
+            if shown {
+                assert_eq!((series, on), (4, 1), "{form:?}");
+            } else {
+                assert_eq!((series, on), (0, 0), "{form:?}");
+                assert!(!text.contains("focal_content_conversion"), "{form:?}");
+            }
+        }
+        status.form = StoreForm::Converting;
+        status.stopped = Some(focal_evidence::ContentErrorKind::Corrupt);
+        sample.conversion = Some(status);
+        assert!(
+            sample
+                .render()
+                .contains("focal_content_conversion_stopped 1\n")
+        );
+        sample.conversion = None;
+        let text = sample.render();
+        assert!(!text.contains("focal_content_form"));
+        assert!(!text.contains("focal_content_conversion"));
+        assert!(text.contains("focal_content_requests_held_total"));
     }
 }

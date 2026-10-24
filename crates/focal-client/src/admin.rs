@@ -445,7 +445,8 @@ pub struct AdminGcPass {
     pub seeds: AdminSeedReport,
 }
 /// The collector's state on one node (26 §5): its settings, whether a pass
-/// is in progress, how many completed, and the last one's report.
+/// is in progress, how many completed, and the last one's report; and the
+/// form of the content store it collects in, with its conversion (29 §11).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdminGc {
@@ -454,6 +455,50 @@ pub struct AdminGc {
     pub passes: u64,
     pub collecting: bool,
     pub last: Option<AdminGcPass>,
+    /// Read from the store's owner as the operator asks; none where the
+    /// node holds no content store.
+    pub content: Option<AdminContentStore>,
+}
+/// The form a node's content store is in (29 §11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdminStoreForm {
+    /// Its writer installs files in the clear: below the content level.
+    Clear,
+    /// It seals, and counts the files in the clear it must convert.
+    Counting,
+    /// It seals, and converts its files in the clear a file a step.
+    Converting,
+    /// Every file is sealed and the store is marked so.
+    Sealed,
+}
+/// A node's content store (29 §11): its form, and its conversion since the
+/// node started. What the conversion counted in the clear to convert; of
+/// that, what it converted, what left before the conversion met it (with an
+/// expired quarantine round, or replaced by a restored copy) and what is
+/// left; whether a step waits for room on the volume, and what stopped the
+/// conversion if anything did (it resumes at the node's next start).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminContentStore {
+    pub form: AdminStoreForm,
+    /// Whether this start resumed a conversion an earlier one began.
+    pub resumed: bool,
+    /// Milliseconds since the Unix epoch when this start's conversion
+    /// began, and when it marked the store sealed; zero for one that has not.
+    pub started_ms: u64,
+    pub finished_ms: u64,
+    pub files_counted: u64,
+    pub bytes_counted: u64,
+    pub files_converted: u64,
+    pub bytes_converted: u64,
+    pub files_gone: u64,
+    pub bytes_gone: u64,
+    pub files_left: u64,
+    pub bytes_left: u64,
+    pub held: bool,
+    pub held_steps: u64,
+    pub stopped: Option<String>,
 }
 
 /// The volume envelope every durable owner of a node's data directory

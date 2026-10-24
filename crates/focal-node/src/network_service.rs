@@ -1320,6 +1320,7 @@ impl NetworkService {
             Ok((disk, uploads, bytes)) => (Some(disk), count(uploads), bytes),
             Err(_) => (None, 0, 0),
         };
+        let conversion = self.handles.content.conversion_status().await.ok();
         let mut root = self.handles.control.progress();
         let pace = self.handles.control.current_pace();
         let view = self.handles.liveness.view();
@@ -1474,7 +1475,14 @@ impl NetworkService {
 
         // What this round lists: within one page, each family's flagged
         // entities first, then the next of the rest.
-        let [session_room, member_room, rtt_room, tenant_room] = rounds.budget().capacities([
+        // A page that shows the store's conversion has the less room for entities.
+        let budget = match conversion.as_ref() {
+            Some(conversion) if crate::metrics::shows_conversion(conversion) => {
+                rounds.budget().while_converting()
+            }
+            _ => rounds.budget(),
+        };
+        let [session_room, member_room, rtt_room, tenant_room] = budget.capacities([
             flags.len(),
             member_flags.len(),
             rtt_flags.len(),
@@ -1650,6 +1658,7 @@ impl NetworkService {
             disk,
             staged_uploads,
             staged_bytes,
+            conversion,
             content_held: self.handles.content.door_stats().0,
             content_timed_out: self.handles.content.door_stats().1,
             evidence: self.handles.evidence.door_stats(),

@@ -400,10 +400,27 @@ open is what the fence forbids.
   opens. A step whose sealed file the volume has no room for is held and takes the same file first
   when the owner asks again; one that fails ends the conversion for that run and is reported, the
   store reading both forms until its next start resumes it.
+- **What an operator reads.** Before it converts a file, the conversion counts what it must convert
+  (the chunks and manifests in the clear and their bytes), in its own order, a step at a time; from
+  then on each such file is tallied once, converted by a step or gone before the conversion met it
+  (with an expired round, or replaced by a restored copy of the same name). A restore while the
+  count runs moves files between what the count has passed and what it has not: the count's place
+  says whether a moved file was counted where it left and will be where it lands, and a domain whose
+  listing the restore touches is listed again, POSIX leaving a listing under change unspecified; the
+  collector deletes no round while the store counts. `ContentStore::conversion_status` gives the
+  form (`clear`, `counting`, `converting`, `sealed`), the tally, whether a step is held for room and
+  how many were, what stopped the conversion, whether the start resumed it, and when it began and
+  ended; the node reports it under `inspect node --gc` (26 §5) and on the metrics page
+  (`focal_content_form`, `focal_content_conversion_*`), as CockroachDB's stores report gives the
+  share of files and bytes under its active key and Redis's `INFO` a load's bytes done of its total.
+  The count costs one listing and one metadata read a file, no write: 256 files of 64 KiB counted in
+  under a millisecond beside two seconds of conversion on an NVMe btrfs volume (09).
 - **Bounded.** A step visits at most the collector's step of entries and converts at most one file,
   read into the owner's chunk of scratch (the embedded owner's charged to its budget while the
-  conversion runs). A file longer than the format's bound was never an object's and is left as it
-  is, as are the parts and temporaries a domain's directory holds.
+  conversion runs); the count holds the names of the rounds and of one tree's domains, nothing a
+  file. An entry that is not a file no longer than its kind's bound (a link included) was never an
+  object's and is left as it is, uncounted, as are the parts and temporaries a domain's directory
+  holds.
 - **Tests:** a store in the clear converted while it serves, every object read at every step by
   the store, a reader made before the conversion and one made then; an object sealed meanwhile; the
   collector holding then collecting; the quarantined object restored; a start in the clear after the

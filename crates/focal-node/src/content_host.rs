@@ -104,6 +104,8 @@ enum Command {
     ),
     /// The volume envelope's statistics and what the store has staged.
     DiskStats,
+    /// The store's form and where its conversion stands (29 §11).
+    ConversionStatus,
     /// What the chunks offered to this node's copies came to.
     CustodyStats,
     /// One slice of a custody request's pass over a whole object (the
@@ -148,6 +150,7 @@ enum Output {
     Restored(bool),
     Imported(u64),
     Disk(focal_memory::DiskStats, usize, u64),
+    Conversion(Box<focal_evidence::ConversionStatus>),
     Custody(crate::custody::CustodyStats),
     Pending(Box<PendingPass>),
     /// An upload's seal or a restore not done yet: the store keeps it, and
@@ -758,6 +761,14 @@ impl ContentHost {
             _ => Err(AccessError::Unavailable),
         }
     }
+    /// The content store's form and where its conversion stands since this start (29 §11), asked
+    /// of its owner beside its other work: no cost to a conversion step.
+    pub async fn conversion_status(&self) -> Result<focal_evidence::ConversionStatus, AccessError> {
+        match self.call(Command::ConversionStatus, 4096, true).await? {
+            Output::Conversion(status) => Ok(*status),
+            _ => Err(AccessError::Unavailable),
+        }
+    }
     /// What the chunks offered to this node's copies came to (the audit's F50).
     pub async fn custody_stats(&self) -> Result<crate::custody::CustodyStats, AccessError> {
         match self.call(Command::CustodyStats, 4096, true).await? {
@@ -917,6 +928,9 @@ fn execute(
             let (uploads, bytes) = owner.content().staged();
             Ok(Output::Disk(owner.content().disk_stats(), uploads, bytes))
         }
+        Command::ConversionStatus => Ok(Output::Conversion(Box::new(
+            owner.content().conversion_status(),
+        ))),
         // A restore goes a slice at a time, the store keeping it between
         // asks (`ContentHost::restore_content`, the audit's F51).
         Command::RestoreContent(root, manifest) => Ok(

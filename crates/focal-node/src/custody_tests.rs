@@ -2592,3 +2592,108 @@ fn measure_small_request_waits_while_a_large_upload_seals() {
         owner.join().unwrap();
     }).unwrap()
 }
+
+/// Do: start the owner on a store written in the clear and opened to seal, and ask it for the
+/// store's status as it converts in its idle turns, until it is sealed. Expect: every answer
+/// consistent (counting, converting or sealed; converted never falling; nothing stopped), the last
+/// sealed with every file the store counted in the clear converted, none gone or left; and the
+/// operator's view of it round-trips as the admin socket carries it (postcard) and as the CLI
+/// prints it (JSON).
+#[test]
+fn the_owner_answers_its_stores_form_and_conversion() {
+    use focal_client::admin::{AdminGc, AdminGcConfig, AdminStoreForm};
+    use focal_evidence::{ContentForm, ConversionStatus, StoreForm, Tally};
+    focal_rt::block_on(async move {
+        let root = tempfile::tempdir().unwrap();
+        let keys = focal_seal::test_keys(root.path()).unwrap();
+        let disk =
+            || focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::unbounded()).unwrap();
+        let mut clear =
+            ContentStore::open_with_disk(root.path(), limits(), disk(), &keys, ContentForm::Clear)
+                .unwrap();
+        for id in 1..=6u8 {
+            let bytes: Vec<u8> = (0..64u8).map(|at| at.wrapping_mul(id) ^ id).collect();
+            stored(&mut clear, id, 1, &bytes);
+            clear.finish(UploadId([id; 16])).unwrap();
+        }
+        assert_eq!(clear.conversion_status().form, StoreForm::Clear);
+        drop(clear);
+        let store =
+            ContentStore::open_with_disk(root.path(), limits(), disk(), &keys, ContentForm::Sealed)
+                .unwrap();
+        assert!(store.converting());
+        let budget = memory();
+        let (host, owner) = ContentHost::spawn(
+            store,
+            CustodyConfig::new(1),
+            WireLimits::default(),
+            budget.clone(),
+        )
+        .unwrap();
+        let progress = |status: &ConversionStatus| {
+            [
+                status.counted.files,
+                status.converted.files,
+                status.form as u64,
+            ]
+        };
+        let mut last = host.conversion_status().await.unwrap();
+        // The owner converts whenever no call waits: the wait is charged to the count and the
+        // conversion moving, nothing else.
+        let mut wait = focal_timing::ProgressDeadline::begin(
+            &progress(&last),
+            u64::MAX,
+            crate::test_waits::FROZEN,
+        );
+        while last.form != StoreForm::Sealed {
+            focal_rt::time::sleep(Duration::from_millis(5))
+                .await
+                .unwrap();
+            let status = host.conversion_status().await.unwrap();
+            assert!(
+                matches!(
+                    status.form,
+                    StoreForm::Counting | StoreForm::Converting | StoreForm::Sealed
+                ),
+                "{status:?}"
+            );
+            assert!(status.converted.files >= last.converted.files, "{status:?}");
+            assert_eq!(status.stopped, None, "{status:?}");
+            if let Err(spent) = wait.check(&progress(&status)) {
+                panic!("the store never finished converting: {spent}: {status:?}");
+            }
+            last = status;
+        }
+        assert!(last.counted.files >= 6, "{last:?}");
+        assert_eq!(last.converted, last.counted);
+        assert_eq!(last.gone, Tally::default());
+        assert_eq!(last.left(), Tally::default());
+        let view = crate::gc::admin_content(last);
+        assert_eq!(view.form, AdminStoreForm::Sealed);
+        assert_eq!(view.files_converted, last.counted.files);
+        assert_eq!(view.files_left, 0);
+        let gc = AdminGc {
+            node: 1,
+            config: AdminGcConfig {
+                interval_ms: 60_000,
+                grace_ms: 1,
+                quarantine_ms: 1,
+                terminal_grace_ms: 1,
+                keep_records: 4,
+                max_marks: 1,
+            },
+            passes: 0,
+            collecting: false,
+            last: None,
+            content: Some(view),
+        };
+        let carried: AdminGc = postcard::from_bytes(&postcard::to_allocvec(&gc).unwrap()).unwrap();
+        assert_eq!(carried, gc);
+        let printed = serde_json::to_value(&gc).unwrap();
+        assert_eq!(printed["content"]["form"], "sealed");
+        assert_eq!(printed["content"]["files_left"], 0);
+        host.stop().await.unwrap();
+        owner.join().unwrap();
+    })
+    .unwrap()
+}

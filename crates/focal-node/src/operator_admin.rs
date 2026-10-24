@@ -240,9 +240,15 @@ impl LocalNetworkAdmin {
             }
             OperatorRead::Gc => {
                 let handle = self.gc.as_ref().ok_or(AccessError::Unavailable)?;
-                let status = handle.status();
+                let mut status = handle.status();
                 if status.node != self.identity.node {
                     return Err(AccessError::Unavailable);
+                }
+                // The store's form and conversion as they stand now, asked of its owner: the
+                // collector's own state is published at each of its passes, a minute apart.
+                if let Some(content) = self.content.as_ref() {
+                    status.content =
+                        Some(crate::gc::admin_content(content.conversion_status().await?));
                 }
                 Ok(OperatorReply::Gc(Box::new(status)))
             }
