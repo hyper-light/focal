@@ -150,6 +150,27 @@ impl<F: BlockFile> SealedWriter<F> {
         Self::begin(file, sealer, header, segment)
     }
 
+    /// A writer of a new file in `file`, which must be empty, keyed by its content
+    /// ([`FileSealer::content_keyed`]): its data key and ID derived from `parent` and `content`, on
+    /// the caller's word that `content` is the 256-bit hash of exactly the plaintext it then writes,
+    /// a wrong hash putting two plaintexts under one key and nonce. For a store that names its files
+    /// by a hash it takes of their bytes anyway, so that a file costs it no second pass over them;
+    /// [`seal_content`] takes a SHA-256 of its own, for a caller with no hash at hand.
+    pub fn content_keyed(
+        file: F,
+        parent: &WrappingKey,
+        content: &[u8; 32],
+        segment: u32,
+    ) -> Result<Self, SealedFileError> {
+        if !file.is_empty()? {
+            return Err(SealedFileError::Bound(
+                "a sealed file is written once, into an empty file",
+            ));
+        }
+        let (sealer, header) = FileSealer::content_keyed(parent, content, segment)?;
+        Self::begin(file, sealer, header, segment)
+    }
+
     /// A writer of `file`, empty, under `sealer`, its header `header` queued first.
     fn begin(
         file: F,
@@ -282,7 +303,17 @@ impl<F: BlockFile> SealedWriter<F> {
 
     /// Seals the last segment, writes the padding and the footer, and flushes the file. The file
     /// is whole and durable when this returns; the caller then renames it into place.
-    pub fn finish(mut self) -> Result<F, SealedFileError> {
+    pub fn finish(self) -> Result<F, SealedFileError> {
+        let file = self.finish_unflushed()?;
+        file.sync_data()?;
+        Ok(file)
+    }
+
+    /// As [`Self::finish`], the flush left to the caller: the file is whole when this returns, and
+    /// of unknown durability until the caller flushes it, which it does before it renames the file
+    /// into place. For a writer of many files at once, whose flushes overlap and whose renames
+    /// follow them, then one flush of their directory (Pillai et al., OSDI 2014).
+    pub fn finish_unflushed(mut self) -> Result<F, SealedFileError> {
         self.seal_segment(true)?;
         let stream = self.stream;
         let footer_at = self
@@ -310,7 +341,6 @@ impl<F: BlockFile> SealedWriter<F> {
                 "a footer that does not end on the alignment",
             ));
         }
-        self.file.sync_data()?;
         Ok(self.file)
     }
 }
@@ -411,8 +441,7 @@ pub fn seal_content<F: BlockFile>(
         .as_ref()
         .try_into()
         .map_err(|_| SealedFileError::Bound("a SHA-256 digest is 32 bytes"))?;
-    let (sealer, header) = FileSealer::content_keyed(parent, &content, segment)?;
-    let mut writer = SealedWriter::begin(file, sealer, header, segment)?;
+    let mut writer = SealedWriter::content_keyed(file, parent, &content, segment)?;
     writer.write(plaintext)?;
     writer.finish()
 }

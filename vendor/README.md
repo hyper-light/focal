@@ -18,8 +18,11 @@ in this tree.
 
 The `hyper-*` crates are not crates.io archives. They come from the repository focal shares with
 mantle and slates (<https://github.com/hyper-light/hyper-raft>), taken from it whole at one
-revision, which `SNAPSHOT` in each names (since 2026-10-23 all sixteen at ebdcfb2 of the shared
-repository, whose hyper-log wakes its owner for a job back through a one-slot wake fenced on both
+revision, which `SNAPSHOT` in each names (since 2026-10-24 all sixteen at 8c6b4fa of the shared
+repository, whose hyper-seal seals a whole file keyed by a hash its writer is given
+(`SealedWriter::content_keyed`, focal's seeds keyed by the BLAKE3 hash they are named by) and
+finishes one leaving the flush to its caller (`SealedWriter::finish_unflushed`, a checkpoint's batch
+of seeds flushed together); since 2026-10-23 at ebdcfb2, whose hyper-log wakes its owner for a job back through a one-slot wake fenced on both
 sides, where a token channel deadlocked on linux/arm64, and whose hyper-seal wipes at `memset`'s
 speed behind an optimization barrier and makes a sealed reader's segment buffer at its first read;
 since 2026-10-23 at 5a22c8c, whose hyper-seal seals a whole file by its content with its hash
