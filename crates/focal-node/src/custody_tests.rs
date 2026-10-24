@@ -844,6 +844,68 @@ fn missing_runtime_rejects_before_enqueue_and_dropping_handles_stops_the_owner()
     assert_eq!(budget.stats().used, 0);
 }
 
+/// An open's inventory is advanced by its asker a slice at a time, each slice a turn of the owner's:
+/// an owner slower than the transfer's lease between two slices does not give up the pass it is
+/// advancing, and the open is answered; once nothing advances the transfer, its lease is judged and
+/// the transfer given up. Judged before the slice renewed it, the open was answered `Unavailable`
+/// (`abandoned_transfer_expires_without_another_network_request`, 1 run in 100 at one loaded core).
+#[test]
+fn an_open_slower_than_its_lease_between_slices_is_answered() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = ContentStore::open(
+        root.path(),
+        limits(),
+        &focal_seal::test_keys(root.path()).unwrap(),
+    )
+    .unwrap();
+    let content = stored(&mut store, 1, 1, b"abcdefgh");
+    let manifest = store.export_manifest(&content).unwrap();
+    let budget = memory();
+    let lease = Duration::from_millis(20);
+    let mut config = CustodyConfig::new(1);
+    config.transfer_ttl = lease;
+    let mut owner = CustodyStore::new(store, config, budget.clone()).unwrap();
+    let ledger = ledger(1, 1);
+    owner.install_policy(policy(ledger)).unwrap();
+    let baseline = budget.stats().used;
+    let open = custody(
+        ledger,
+        1,
+        CustodyRequest::Open {
+            transfer: [5; 16],
+            policy_revision: 1,
+            content,
+            manifest: manifest.encoded().to_vec(),
+        },
+    );
+    let Step::Pending(mut pass) = owner.request(&open).unwrap() else {
+        panic!("an open's inventory is a pass of slices");
+    };
+    let mut scratch = vec![0u8; limits().chunk_bytes];
+    let opened = loop {
+        // The owner's next turn comes once the transfer's lease has run out.
+        std::thread::sleep(lease * 2);
+        match owner.advance(pass, &mut scratch).unwrap() {
+            Step::Done(opened) => break opened,
+            Step::Pending(next) => pass = next,
+        }
+    };
+    assert!(
+        matches!(opened.value(), CustodyReply::Opened { .. }),
+        "{:?}",
+        opened.value()
+    );
+    drop(opened);
+    assert!(
+        budget.stats().used > baseline,
+        "the open transfer holds its descriptor"
+    );
+    // Nothing advances it now: its lease runs out and the owner's pass over leases gives it up.
+    std::thread::sleep(lease * 2);
+    owner.expire(std::time::Instant::now()).unwrap();
+    assert_eq!(budget.stats().used, baseline);
+}
+
 #[test]
 fn abandoned_transfer_expires_without_another_network_request() {
     focal_rt::block_on(async move {
@@ -890,10 +952,24 @@ fn abandoned_transfer_expires_without_another_network_request() {
             .unwrap();
         drop(opened);
         assert!(budget.stats().used > baseline);
-        focal_rt::time::sleep(Duration::from_millis(400))
-            .await
-            .unwrap();
-        assert_eq!(budget.stats().used, baseline);
+        // Given up by the owner's own pass over its leases, with no request to prompt it: the wait
+        // is charged to what the budget holds, which nothing but that expiry moves.
+        let mut wait = focal_timing::ProgressDeadline::begin(
+            &[budget.stats().used as u64],
+            u64::MAX,
+            crate::test_waits::FROZEN,
+        );
+        while budget.stats().used != baseline {
+            if let Err(spent) = wait.check(&[budget.stats().used as u64]) {
+                panic!(
+                    "the abandoned transfer was never given up: {spent}: {:?}",
+                    budget.stats()
+                );
+            }
+            focal_rt::time::sleep(Duration::from_millis(5))
+                .await
+                .unwrap();
+        }
         host.stop().await.unwrap();
         owner.join().unwrap();
         assert_eq!(budget.stats().used, 0);

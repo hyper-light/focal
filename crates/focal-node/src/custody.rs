@@ -1341,8 +1341,14 @@ impl CustodyStore {
         pass: Pass,
         scratch: &mut [u8],
     ) -> Result<Step<Accounted<CustodyReply>>, AccessError> {
-        self.expire(Instant::now())?;
+        // The pass is advanced by its asker, whose request is under way: its lease is renewed
+        // before the leases no ask advanced are judged. Judged first, an owner slower than a lease
+        // between two of a pass's slices gave up the very pass it was advancing, and its open was
+        // answered `Unavailable` (custody_tests' abandoned transfer, 1 run in 100 at one loaded
+        // core).
         let deadline = self.deadline()?;
+        self.renew(&pass, deadline);
+        self.expire(Instant::now())?;
         let (reply, output): (CustodyReply, usize) = match pass {
             Pass::Inventory { key, held } => {
                 self.check_read_policy(key.0)?;
@@ -1350,7 +1356,6 @@ impl CustodyStore {
                     .transfers
                     .get_mut(&key)
                     .ok_or(AccessError::Unavailable)?;
-                retained.expires = deadline;
                 if let Some(next) = retained.inventory {
                     if next < retained.manifest.chunks() {
                         if self
@@ -1395,7 +1400,6 @@ impl CustodyStore {
                     .transfers
                     .get_mut(&key)
                     .ok_or(AccessError::Unavailable)?;
-                retained.expires = deadline;
                 if let Some(content) = &retained.sealed {
                     let content = content.clone();
                     (
@@ -1451,7 +1455,6 @@ impl CustodyStore {
                     .verifications
                     .get_mut(&key)
                     .ok_or(AccessError::Unavailable)?;
-                entry.expires = deadline;
                 // An ask that joined a pass another ask finished is answered
                 // by it (`Verifying`).
                 let advanced = match &mut entry.state {
@@ -1603,6 +1606,21 @@ impl CustodyStore {
         Accounted {
             value,
             _allocation: allocation,
+        }
+    }
+    /// The lease of what `pass` advances, renewed to `deadline`; nothing where it is gone.
+    fn renew(&mut self, pass: &Pass, deadline: Instant) {
+        match pass {
+            Pass::Inventory { key, .. } | Pass::Seal { key } => {
+                if let Some(retained) = self.transfers.get_mut(key) {
+                    retained.expires = deadline;
+                }
+            }
+            Pass::Verify { scope, root } => {
+                if let Some(entry) = self.verifications.get_mut(&(*scope, *root)) {
+                    entry.expires = deadline;
+                }
+            }
         }
     }
     pub fn expire(&mut self, now: Instant) -> Result<(), AccessError> {
