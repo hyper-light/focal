@@ -16736,3 +16736,41 @@ other sessions' builds): `cargo fmt --all --check`, `python3 scripts/check-contr
 scripts/cargo.sh clippy --workspace --all-targets --locked -- -D warnings`, `bash
 scripts/check-production.sh`, `cargo deny check advisories bans licenses sources`, then the
 workspace's tests, every target to the end: 174 test binaries, 3,632 passed, 0 failed, 31 ignored.
+
+### 2026-10-24 — A session's checkpoint seeds are sealed from the at-rest level
+
+A session's checkpoint seeds (25 §5), the rows of a native checkpoint too large to travel inline,
+lay on every replica's volume in the clear, named by their hashes (29 §12's inventory, "clear"). From
+the at-rest level (`upgrade::AT_REST_LEVEL`, 10, the compiled level now) they are sealed as the
+content store's objects are (29 §12.5): each seed directory under a key of its own (its record under
+the data directory's group key), each chunk sealed whole keyed by the BLAKE3 hash it is named by and
+filed under the directory's keyed name of that hash. Below the level a directory is written byte for
+byte as before.
+
+- **Shared crate.** hyper-raft 8c6b4fa: `SealedWriter::content_keyed` (a file keyed by a hash its
+  writer is given, so a seed's bytes are passed over once) and `SealedWriter::finish_unflushed` (a
+  checkpoint's batch flushes its files together, as it did in the clear); every shared crate
+  re-vendored at it, only hyper-seal's sources changed.
+- **Conversion off the owner.** A directory in the clear is converted while it serves by jobs the
+  node's collector runs on the blocking pool; the session's owner only lists, tallies and unlinks.
+  `inspect node --gc` gives the directories by form and what their conversions counted, converted,
+  found gone and have left.
+- **Inventory.** Doc 29 §12 taken again from the writers: `CLUSTER.admin` and `CLIENT.contexts`
+  were private journals, sealed since §12.2, and a bus node's log sealed on hyper-log, where the first
+  listing had them clear; the files kept in the clear by design are listed with their reasons.
+- **Measured.** `benches/seeds.rs` on fedora (NVMe btrfs, 16 interleaved rounds of a 64-chunk
+  batch, ms a MiB, medians): writing 0.487 clear and 0.761 sealed, the commit 0.937 and 0.956 (the
+  same flushes), the whole batch +20.6%; a chunk read back verified 0.373 and 0.540; a directory
+  converted by jobs at 2.444. This Mac, under a load of 45 to 93 from other sessions, spread the
+  same rounds 3.9 times run to run; a profile there put the sealed writing's time in file creation and
+  writes, the seal itself a sixteenth of it.
+- **Tests.** focal-evidence: the seed tests in both forms, the clear layout an earlier binary wrote,
+  29 §11's battery on seeds, a directory converted while it serves, a cut at every step, jobs on
+  another thread, a lost job and its late result, a job held for room, the sweep in both forms and
+  during the count (failing without the count's hold), a job's crash-left temporaries swept;
+  hyper-seal's two (one failing if the unflushed finish flushes); the level's rule; the real binary
+  converting a node's seeds while it serves (`cli_seeds_at_rest`); `placement_binary` comparing
+  hosts' seeds by hash.
+- **Gate.** fmt, the contracts, Clippy on every target, the production check, cargo-deny and the
+  workspace's tests (174 test binaries, 3,642 passed, 0 failed, 31 ignored). The upgrade journey's
+  recorded fence arguments follow the level (11, 11, 10).
