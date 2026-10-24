@@ -16774,3 +16774,78 @@ byte as before.
 - **Gate.** fmt, the contracts, Clippy on every target, the production check, cargo-deny and the
   workspace's tests (174 test binaries, 3,642 passed, 0 failed, 31 ignored). The upgrade journey's
   recorded fence arguments follow the level (11, 11, 10).
+
+### 2026-10-24 — A session's cold streams are sealed from the at-rest level
+
+A session's cold streams (doc 31 M2, A2), the archive frames of the families it retired and the
+marks that find each record's batch among them, lay on every replica's volume in the clear (29
+§12's inventory, "clear"). From the at-rest level they are sealed (29 §12.6): each stream's
+directory under a key of its own (its record under the data directory's group key); the open chunk
+a record file, sealed record by record under a key of its file's own (derived from the directory's
+key and a random file ID, each block at the nonce of its place); a whole chunk that same file
+renamed under the directory's keyed name of its hash, so a cut writes nothing again; a manifest
+chunk, a chunk installed from a peer and a chunk converted sealed whole keyed by their hashes.
+Below the level a stream is written byte for byte as before. A directory in the clear is converted
+while the stream goes on, by the seed conversion's jobs off the session's owner (`chunk_convert`,
+shared with seeds), and `inspect node --gc` gives the cold directories beside the seeds.
+
+- **One write a record.** A record's length block and its bytes were written apart at first: the
+  cold bench put a sealed append at 2.94 times the clear's time at 4 KiB batches on fedora, and
+  macOS's `sample` put 98% of it in `write` and 1% in AES-GCM. A record is now sealed whole in one
+  buffer and written once, as the clear form writes an append.
+- **Where it departs from the plan.** The plan sealed the open chunk under a key of the process's
+  and each chunk again whole at its cut. Sealing again at the cut passes every byte through
+  AES-GCM three times and writes it twice; at the bench's measured parts that is about 0.9 ms a MiB
+  more, past +50% for every batch size from 2 KiB (an estimate). A key that outlives the process
+  lets the cut rename the file; what a crash leaves is ciphertext under the directory's key,
+  removed at the next open (29 §12.6).
+- **No key and nonce seal two plaintexts**, tested across appends, cuts, a checkpoint and a crash
+  whose reopen appends other bytes at the same offsets of the stream: each file ID's bytes only
+  grow (the test fails, its keystream showing, when an open chunk's ID is derived from its index).
+- **A frame this replica cannot read is unavailable.** With the open chunk authenticated, a changed
+  byte in it is refused where the stream is read, not where the frame is parsed, and that refusal
+  reached a participant's read of a retired family as `outcome unknown`, which the client retried
+  until its transport gave up (`cli_archive`). A cold frame a replica holds and cannot read back now
+  answers `unavailable`, as a custody bundle held corrupt does, and a read refused for room
+  `capacity`. A whole chunk failing its name's check took the same wrong turn in the clear.
+- **Reads hold what they are charged.** A whole chunk's records are opened in place in its own
+  buffer, taken once: a marks chunk is 65,536 records, and the first reader grew its plaintext a
+  record at a time and held a record's buffer beside it. A capture reads the open chunk the same
+  way; the read and capture charges count the one tag's room.
+- **Found on the way.** A conversion job promised every chunk's volume as a checkpoint's, a cold
+  chunk's included; each directory now says its kind (a cold chunk's an archive's). Every sealed
+  write's temporary is made fresh with its removal's failure returned: a device file opens without
+  truncation, so a leftover the ignored removal failed to clear would have outlived the write and
+  read corrupt only later.
+- **Measured** (`benches/cold.rs` on fedora, i9-14900HX, NVMe btrfs, one P-core, 12 interleaved
+  rounds of 64 MiB with a 16-byte mark a batch, the thread's CPU time, medians; host load 7 to 15):
+
+  | Batches | Clear, CPU ms a MiB | Sealed | Sealed / clear |
+  |---|---|---|---|
+  | 256 to 768 bytes | 5.118 | 6.472 | 1.265 |
+  | 512 bytes | 6.345 | 7.419 | 1.169 |
+  | 2 to 6 KiB | 1.654 | 1.994 | 1.205 |
+  | 4 KiB | 1.151 | 1.996 | 1.735 |
+  | 32 to 96 KiB | 0.847 | 1.134 | 1.339 |
+  | 64 KiB | 0.648 | 0.874 | 1.348 |
+
+  Varied batches, as retirements write them, cost +21% to +34%; batches all exactly one page cost
+  +74%, the clear form's writes then page-aligned by construction while every sealed record spans
+  two pages, and btrfs charges by the page (29 §12.6 has the parts). Bytes stored a byte of stream:
+  1.1365 at 512-byte batches, 1.0175 at 4 KiB, 1.0011 at 64 KiB. This Mac (APFS): +16% to +34%.
+- **Tests.** focal-evidence: every cold test in both forms, a sealed replica cutting the chunks a
+  clear one cuts; 29 §11's battery on a sealed stream (a
+  flipped byte in a whole chunk's header, length block and bytes, a chunk under another's name, a
+  flipped byte and two records swapped in the open chunk, another stream's open chunk in its place,
+  a directory erased by its record, a crash's leftovers gone and the open chunk under a new key);
+  the nonce test; a marks chunk read in place within its charge; an idle stream under a kibibyte;
+  a sealed append spending exactly its room; a directory converted while the stream appends and
+  cuts; a conversion cut after every step. The real binary: `cli_archive` (a family retired to the
+  node's sealed stream read back, a changed byte refused `unavailable`), `cli_seeds_at_rest` (the
+  session's cold directories reported in the clear below the fence and sealed after, each open
+  chunk a record file), `cli_retention`, `cli_backup`, `cli_gc`, `fleet_quic`, `evidence_quic`,
+  `placement_binary`.
+- **Gate.** fmt, the contracts, Clippy on every target, the production check, cargo-deny and the
+  workspace's tests on the batch (174 test binaries, 3,649 passed, 0 failed, 31 ignored); the
+  cross-form assertion (a sealed replica cuts what a clear one cuts) added after, and fmt, the
+  contracts, Clippy, the production check and focal-evidence's tests run again on the final tree.
