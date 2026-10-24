@@ -16655,3 +16655,84 @@ sessions' builds): `cargo fmt --all --check`, `python3 scripts/check-contracts.p
 scripts/cargo.sh clippy --workspace --all-targets --locked -- -D warnings`, `bash
 scripts/check-production.sh`, `cargo deny check advisories bans licenses sources`, then the
 workspace's tests, every target to the end: 173 test binaries, 3,619 passed, 0 failed, 31 ignored.
+
+### 2026-10-24 — An operator sees a content store's form and its conversion: what it counted, converted, lost and has left
+
+A store converting to its sealed form (29 §11) told nobody how far it had come: its conversion kept
+only where it stood, a step held for room set a flag local to its owner, and a stopped conversion was
+a line on stderr. Now the conversion counts what it must convert before it converts any (the chunks
+and manifests in the clear and their bytes), a step at a time on the owner's idle turns and in its
+own order: the quarantine's rounds by name, then the store's own objects, each tree's domains by
+identity. From then on every such file is tallied once: converted by a step, or gone before the
+conversion met it (with an expired round, or replaced by a restored copy of the same name), the rest
+left. A restore while the count runs moves files between what it has passed and what it has not; its
+place says whether a moved file was counted where it left and will be where it lands, and a domain
+whose listing the restore touches is listed again (POSIX leaves unspecified whether a listing open
+as a file comes or goes returns it); the collector deletes no round while the store counts.
+`ContentStore::conversion_status` gives the form (`clear`, `counting`, `converting`, `sealed`), the
+tally in files and bytes, whether a step waits for room and how many have, what stopped the
+conversion (`ContentErrorKind`, kept where the error is not copied), whether the start resumed it,
+and when it began and ended. CockroachDB's stores report shows the same share of files and bytes
+under its active key; unlike it (and unlike NATS, which leaves blocks written in the clear as they
+are), the conversion meets every file, dormant ones included.
+
+The operator reads it two ways. `inspect node --gc` carries the store beside the collector
+(`AdminGc.content`), asked of the store's owner as it is read (`Command::ConversionStatus`, beside
+`disk_stats`, no cost to a step) rather than at the collector's passes a minute apart. The metrics
+page carries `focal_content_form` (an OpenMetrics StateSet's shape as a gauge, the page being the
+0.0.4 format: one series a form, exactly one 1) and `focal_content_conversion_files` /
+`_bytes{state}` (counted, converted, gone, left: what is still to do, as Kafka's tiering lag gauges
+carry it), `_held`, `_held_steps_total` and `_stopped`, while the store counts or converts. Measured
+first: the page had 124 bytes to spare for a three-host node to list every session, root member,
+measured peer and tenant each round (`a_round_lists_all_it_can...`), and these families cost 2,026
+bytes at their widest. So they show only while there is a conversion to report (a store at rest
+shows its form by the fence level on the page, and `--gc` always names it), and the page budget
+keeps a converting fixed part beside the one at rest: 45,984 against 43,958 bytes; a three-host
+round lists [2, 1, 1, 1] of [3, 2, 2, 1] while the store converts, the rest a round later, and every
+entity at rest, as before.
+
+Found on the way: the collector's deletion of an expired round kept to its step's budget only
+between the round's top-level entries, deleting a whole kind's tree in one step whatever its size
+(34 files at a budget of 3, `an_expired_round_is_deleted_a_bounded_number_of_entries_a_step`). The
+walk now resumes inside the tree from step to step, its open directories carried in the phase.
+
+What the count costs (`crates/focal-evidence/benches/content.rs`, which now times the count apart
+within the conversion row; 128 objects of 64 KiB, 256 files):
+
+| | before (214e1466) | after |
+|---|---|---|
+| the count alone, median of 32 runs | | 0.468 ms (max 0.807), 1.8 us a file |
+| conversion, median of 32 interleaved rounds (fedora, NVMe btrfs) | 2,127.1 ms | 2,082.1 ms |
+| paired median over the rounds | | -1.9% (rounds spread -35% to +63%) |
+
+The count is 0.022% of a conversion; the A/B finds no slowdown, the box it ran on being shared with
+CI (load 4 to 50 across the rounds: every run's flushes contend), so the count's own time is the
+measure. On this Mac under load 26 (APFS) the count took 3.5 ms beside 5,361 ms of conversion.
+
+Tests: `convert::tests` (the tally exact through a conversion; a restore at three places of the
+count and while the conversion visits the rounds; a restore over a copy in the clear; a round
+expiring mid-conversion; a held step then room; a cut at every step and the resumed start counting
+what is left; a damaged domain key record and an I/O failure, each stop's cause kept; a link named
+as an object, neither counted nor converted), each rule's test failing without it (re-listing 12
+counted against 11 files, the moved rule 14 against 11, the replaced rule 14 against 13);
+`content_host::tests::the_owner_answers_its_stores_form_and_conversion` (the real owner thread on a
+converting store, then the operator view through postcard and JSON); `metrics::tests::
+a_node_exports_its_content_stores_form_and_conversion`;
+`metrics::rounds::tests::a_page_that_shows_the_conversion_holds_one_of_each_family`; and
+`cli_content_form`, the real binary: a node founded below the content level (its native activation
+announcing that level too, as the older binary's would), four work artifacts delivered through it,
+its store filled out in the clear by the store's own writer (640 objects; 1,288 files in all), the
+fence raised to the content level and recorded, the node restarted; every look at `--gc` and every
+page agrees with itself as the store converts (it converted from 0.18 s to 12.1 s after the restart
+on this Mac), and it ends sealed with every counted file converted, nothing named in the clear, and
+every object and every artifact's payload read back verified through the store's reader. The
+operator looks from the moment the node's process runs (106 looks on this Mac, 105 while the store
+counted or converted). On fedora, whose `/tmp` is a tmpfs, the store converts in 0.8 to 1.2 s: the
+test ran 20 times there, four loops at once, each pinned to two cores beside eight busy loops, and
+passed every time (22 to 24 s a run) with one or two looks while the store converted.
+
+The gate on the batch (9140982a and 23cbfe1c, on 214e1466; macOS 26.4.1 arm64, load 9 to 49 with
+other sessions' builds): `cargo fmt --all --check`, `python3 scripts/check-contracts.py`, `bash
+scripts/cargo.sh clippy --workspace --all-targets --locked -- -D warnings`, `bash
+scripts/check-production.sh`, `cargo deny check advisories bans licenses sources`, then the
+workspace's tests, every target to the end: 174 test binaries, 3,632 passed, 0 failed, 31 ignored.
