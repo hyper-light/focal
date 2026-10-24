@@ -43,6 +43,9 @@ mod state;
 mod stats;
 mod ticket;
 mod unwind;
+mod wake;
+#[cfg(test)]
+mod wake_tests;
 mod writer;
 
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
@@ -877,9 +880,8 @@ impl<F: BlockFile + 'static> Log<F> {
     ) -> Result<Self, Refused<F>> {
         let config = p.config;
         // Everything that may wait in the inbox at once: every submission the queue admits,
-        // every waiter for room, the device's words (its word that a frame is settled, its call
-        // for a completion to be answered, the I/O thread's word that a job is back), and a
-        // release from each group's handle.
+        // every waiter for room, the device's words (its word that a frame is settled, a job's
+        // thread's word that the job is back), and a release from each group's handle.
         let capacity = config
             .queue_submissions
             .max(1)
@@ -892,12 +894,12 @@ impl<F: BlockFile + 'static> Log<F> {
         let (flushed, flushes) = sync_channel(1);
         // One job is out at a time, and comes back before the next goes out.
         let (back, returns) = sync_channel(1);
-        let (token, tokens) = sync_channel(device::TOKENS);
+        let (wake, claim) = wake::Wake::new();
         let lines = Lines {
             inbox,
             flushed,
             returns: back,
-            tokens: token,
+            wake: claim,
         };
         // The owner's thread waits for the owner, which holds the file, until both threads run.
         let (to_owner, owned) = sync_channel::<Box<Owner<F>>>(1);
@@ -935,7 +937,7 @@ impl<F: BlockFile + 'static> Log<F> {
             inbox: messages,
             flushes,
             returns,
-            tokens,
+            wake,
             requests,
         };
         let owner = Box::new(Owner::new(p, state, room, first, wiring, sealer, gate));

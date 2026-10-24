@@ -4,7 +4,8 @@
 //! - **Locked** against swap: `mlock(2)` on Linux and macOS, `VirtualLock` on Windows. A region the
 //!   OS will not lock is refused at [`lock_keys`], never used unlocked.
 //! - **Out of core dumps** where the OS offers it: `MADV_DONTDUMP` on Linux (since 3.4).
-//! - **Wiped** when a key is dropped, with volatile writes and a fence, so the wipe is never elided.
+//! - **Wiped** when a key is dropped: zeroed, then held past an optimization barrier the compiler
+//!   must assume reads the zeros ([`wipe`]), so the wipe is never elided.
 //! - **Bounded**: a slot is claimed through an atomic bitmap; past the stated count a key is refused
 //!   ([`SealError::Capacity`]), and pages are locked once, not a page a key, so the process stays
 //!   inside its locked-memory limit.
@@ -14,7 +15,7 @@
 #![allow(unsafe_code)]
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering, compiler_fence};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::SealError;
 
@@ -245,15 +246,26 @@ fn wipe_slot(region: &Region, slot: usize) {
     wipe(bytes);
 }
 
-/// Zeroes `bytes` with volatile writes, then fences, so the compiler keeps every write.
+/// Zeroes `bytes` at `memset`'s speed and keeps every write. The zeros are written as any fill is,
+/// then an empty assembly block takes their address: stating neither `nomem` nor `readonly`, it may
+/// read any memory it can reach (the Rust reference, "Inline assembly", options), so the compiler
+/// may not drop the zeros as dead stores, even with the buffer freed at once after. aws-lc's
+/// `OPENSSL_cleanse` is the same (`crypto/mem.c`: `memset`, then
+/// `__asm__ __volatile__("" : : "r"(ptr) : "memory")`). The loop of byte-wide volatile writes this
+/// replaced kept the zeros too, but no compiler merges volatile writes into wider stores: dropping
+/// a sealed reader's buffer took 18% of a 64 KiB sealed read (focal, 2026-10-23).
 pub(crate) fn wipe(bytes: &mut [u8]) {
-    for byte in bytes.iter_mut() {
-        let at: *mut u8 = byte;
-        // SAFETY: `at` comes from a `&mut u8` borrowed for this statement, so it is valid, aligned
-        // and exclusively ours for the write.
-        unsafe { std::ptr::write_volatile(at, 0) };
+    bytes.fill(0);
+    // SAFETY: the block is a comment: it reads, writes and changes nothing, and touches no stack
+    // or flags; its operand, named in the comment as an operand must be, only makes the compiler
+    // assume the zeroed bytes may be read here.
+    unsafe {
+        core::arch::asm!(
+            "/* {0} */",
+            in(reg) bytes.as_mut_ptr(),
+            options(nostack, preserves_flags)
+        );
     }
-    compiler_fence(Ordering::SeqCst);
 }
 
 /// The region every test in this crate shares: one per process, large enough for the tests run at
@@ -267,11 +279,20 @@ pub(crate) fn test_region() {
 mod tests {
     use super::*;
 
+    /// Do: wipe buffers of every length a fill takes apart differently (none, one byte, less than
+    /// a word, odd lengths past a vector and past a page), each starting at an odd address. Expect:
+    /// every byte of each is zero, and the bytes either side are untouched.
     #[test]
     fn a_wipe_zeroes_every_byte() {
-        let mut bytes = [0xA5u8; 47];
-        wipe(&mut bytes);
-        assert_eq!(bytes, [0u8; 47]);
+        for len in [0usize, 1, 7, 47, 4099, 65_537] {
+            let mut bytes = vec![0xA5u8; len + 2];
+            if let Some(inner) = bytes.get_mut(1..=len) {
+                wipe(inner);
+            }
+            assert_eq!(bytes.first(), Some(&0xA5), "{len}");
+            assert_eq!(bytes.last(), Some(&0xA5), "{len}");
+            assert!(bytes[1..=len].iter().all(|b| *b == 0), "{len}");
+        }
     }
 
     #[test]

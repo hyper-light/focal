@@ -337,7 +337,8 @@ fn a_readers_and_a_writers_buffers_are_wiped_when_let_go() {
     let mut out = vec![0; plain.len()];
     reader.read_at(&mut out, 0).unwrap();
     assert_eq!(out, plain);
-    let SealedReader { mut buf, .. } = reader;
+    let SealedReader { buf, .. } = reader;
+    let mut buf = buf.unwrap();
     assert!(
         holds_marker(&mut buf),
         "the reader's buffer held what it opened"
@@ -418,4 +419,28 @@ fn a_file_sealed_by_its_content_refuses_a_change_and_a_used_file() {
         seal_content(used, &parent, &plain, S),
         Err(SealedFileError::Bound(_))
     ));
+}
+
+/// A reader makes its segment buffer when it first reads a segment: an open checks the header, the
+/// footer and the padding through a probe of public bytes, so a caller that asks only the file's
+/// length, or whether it opens, makes no buffer of a segment and wipes none. Do: open sealed files
+/// of no bytes, one segment and three, ask their length, then read each whole. Expect: no buffer
+/// after the open or the length; one after the read, and the plaintext read back.
+#[test]
+fn a_reader_makes_its_segment_buffer_at_its_first_read() {
+    let key = parent();
+    for len in [0, SU, 3 * SU + 5] {
+        let plain = plaintext(len);
+        let bytes = sealed(&key, &plain, 512);
+        let mut reader = SealedReader::open(file_of(&bytes, 512), &key, S).unwrap();
+        assert_eq!(reader.len(), len as u64);
+        assert!(
+            reader.buf.is_none(),
+            "{len}: an open makes no segment buffer"
+        );
+        let mut out = vec![0; len];
+        reader.read_at(&mut out, 0).unwrap();
+        assert_eq!(out, plain);
+        assert_eq!(reader.buf.is_some(), len > 0, "{len}: a read makes it");
+    }
 }

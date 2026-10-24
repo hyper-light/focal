@@ -16577,3 +16577,45 @@ Sealing costs the work path nothing these runs can see: the p99s moved both ways
 spread on shared runners, and the leader's CPU within 1.1% at 20 and 50 claims a second. At 100
 the one-CPU leader is past its ceiling on both sides (write p99 near 30 s), the cliff its own
 entry takes up.
+
+### 2026-10-23 — Every shared crate at hyper-raft ebdcfb2: hyper-log's owner wake, hyper-seal's reader
+
+All sixteen `hyper-*` crates at hyper-raft `ebdcfb2` (its fate-commit line), where two changed:
+
+- **hyper-log: the owner's wake for a job back.** The shared log hung on hyper-raft's linux/arm64 CI:
+  every job's thread sent its job's sequence, blocking, on a token channel of two after giving the
+  job back, and with two threads preempted between those steps the next job's thread, the log's
+  I/O thread, blocked on it with the owner asleep and the channel's receiver waiting in the I/O
+  thread's own queue (gdb stacks from hyper-raft's hunt, run 40021371545). The token channel and the
+  I/O thread's watch are gone: the owner opens a one-slot wake before every sleep while work waits
+  on the job out, and the job's thread claims it after giving the job back, each side fenced
+  `SeqCst` between its write and its read (the C++ model's fence rule; hyper-rt's park and kick is
+  the same handshake). The hang's schedule, driven by test-only pause points, hung the old code 5
+  times in 5 and passes; loom checks the handshake in every interleaving and finds the lost wake
+  without the fences. The vendored manifest declares the `loom` configuration as hyper-rt's does.
+- **hyper-seal: a reader's buffer.** A sealed reader made a buffer of a whole segment at every open,
+  the open for a file's length included, and wiped it a byte at a time with volatile writes: 18% of
+  a 64 KiB sealed read in the profile of the sealing entry above. The wipe is now a fill behind an
+  `asm!` barrier that may read it (aws-lc's `OPENSSL_cleanse`), and the reader makes its buffer at
+  its first read.
+
+What it does to the content path (`crates/focal-evidence/benches/content.rs`,
+`FOCAL_BENCH_OBJECTS=16 FOCAL_BENCH_SIZES=64 FOCAL_BENCH_READS=50`, release, the tree at df541226
+and this one each built in a target directory of its own and run interleaved over four rounds,
+macOS 26.4.1 arm64, load 7.5 to 7.9; medians of the rounds):
+
+| 64 KiB object | before (hyper-raft 5a22c8c) | after (ebdcfb2) |
+|---|---|---|
+| verified read, sealed | 0.144 ms (0.137–0.152) | 0.109 ms (0.108–0.115), −24% |
+| verified read, clear | 0.076 ms (0.072–0.081) | 0.082 ms (0.077–0.113) |
+| upload, sealed / copy, sealed | 48.6 / 17.9 ms | 48.2 / 17.4 ms |
+
+A sealed 64 KiB read is now 75% of the clear form's, where it was 53% in these runs (55% in the
+sealing entry's, at load 4.8); uploads and copies are this disk's flushes, as before.
+
+The gate on the re-vendored tree (macOS 26.4.1 arm64, load 7 to 30 with other sessions' builds):
+`cargo fmt --all --check`, `python3 scripts/check-contracts.py`, `bash scripts/cargo.sh clippy
+--workspace --all-targets --locked -- -D warnings`, `bash scripts/check-production.sh`, `cargo deny
+check advisories bans licenses sources`, then the workspace's tests, every target to the end: 173
+test binaries, 3,618 passed, 0 failed, 31 ignored. hyper-raft's CI on ebdcfb2 ran its gates on all
+six targets, ubuntu-24.04-arm among them, where the log had hung (run 40048346079).

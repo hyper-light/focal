@@ -16,11 +16,10 @@
 //! before every message it takes, so anything a caller sends after hearing an answer the device
 //! gave is heard after the completion that freed its room, as when the writer answered under its
 //! lock. The thread that did the job wakes the owner only when the completion leaves the owner
-//! something to answer (a frame another frame will confirm, a failure, a sweep, a read, a look);
-//! the owner, when it has work waiting on the device, asks the I/O thread to wake it once the job
-//! is back (`Request::Watch`). So a write whose frame confirms itself, with no one else
-//! submitting, crosses from its caller to the owner and back: the owner sleeps once and the
-//! caller once, as mantle's writer and its caller did.
+//! something to answer (a frame another frame will confirm, a failure, a sweep, a read, a look),
+//! or when the owner waits on the job, which it says through its wake (`wake.rs`). So a write
+//! whose frame confirms itself, with no one else submitting, crosses from its caller to the owner
+//! and back: the owner sleeps once and the caller once, as mantle's writer and its caller did.
 //!
 //! The operations of a frame are mantle's, in mantle's order: the frame, its persist record, then
 //! one flush, nothing after a failed write, and a failed flush never retried (mantle
@@ -57,38 +56,22 @@ pub(crate) const JOBS: usize = 3;
 /// and a stale word about the frame before, which the device drops.
 pub(crate) const MORE: usize = 2;
 
-/// Requests the I/O thread holds at most: the job out, and the owner's ask to be woken once it is
-/// back; the owner has one job out at a time and asks once for it.
-pub(crate) const REQUESTS: usize = 2;
-
-/// Tokens the owner's token channel holds while the owner holds its receiver: the owner empties
-/// it as it takes each job back and as a watch gives it back, one job is out at a time, and a
-/// job's token is sent after the job is back, so the last job's token can follow the emptying and
-/// the next job's join it before the next. While the I/O thread watches, it takes each token as
-/// it comes, so a job's thread that finds the channel full waits only for it.
-pub(crate) const TOKENS: usize = 2;
+/// Jobs the I/O thread's queue holds at most: the owner has one job out at a time, and gives the
+/// next only once the last is back, which the I/O thread took from its queue before doing it.
+pub(crate) const REQUESTS: usize = 1;
 
 /// A look at the file a caller runs on the thread that holds the device.
 pub(crate) type Look<F> = Box<dyn FnOnce(&F) + Send>;
 
-/// What the I/O thread is asked to do.
-pub(crate) enum Request<F> {
-    /// A job, no caller doing it.
-    Job(Box<Carrier<F>>),
-    /// Wake the owner once the job of this sequence is back, the token of each job back coming
-    /// through this receiver; the receiver goes back to the owner with the word.
-    Watch(u64, Receiver<u64>),
-}
-
 /// Where a thread that does the log's jobs reaches the owner: its inbox, the slot for a frame's
 /// word that it is flushed while the device confirms it (`owner::Owner::flushes`), its returns,
-/// and the token of each job back, for a watch (`serve`). Every thread that does jobs holds its own
-/// and lends it to the job (module docs).
+/// and its wake's slot, which the thread fills to wake an owner that waits on the job back
+/// (`wake.rs`). Every thread that does jobs holds its own and lends it to the job (module docs).
 pub(crate) struct Lines<F> {
     pub(crate) inbox: SyncSender<Message<F>>,
     pub(crate) flushed: SyncSender<Completion>,
     pub(crate) returns: SyncSender<Box<Carrier<F>>>,
-    pub(crate) tokens: SyncSender<u64>,
+    pub(crate) wake: SyncSender<()>,
 }
 
 impl<F> Clone for Lines<F> {
@@ -97,7 +80,7 @@ impl<F> Clone for Lines<F> {
             inbox: self.inbox.clone(),
             flushed: self.flushed.clone(),
             returns: self.returns.clone(),
-            tokens: self.tokens.clone(),
+            wake: self.wake.clone(),
         }
     }
 }
@@ -161,17 +144,14 @@ pub(crate) struct Carrier<F> {
     pub(crate) job: Option<Job<F>>,
     pub(crate) device: Option<Device<F>>,
     pub(crate) completion: Option<Completion>,
-    /// The job's place among the jobs the owner has given out.
-    pub(crate) sequence: u64,
 }
 
 impl<F> Carrier<F> {
-    pub(crate) fn new(job: Job<F>, device: Device<F>, sequence: u64) -> Self {
+    pub(crate) fn new(job: Job<F>, device: Device<F>) -> Self {
         Self {
             job: Some(job),
             device: Some(device),
             completion: None,
-            sequence,
         }
     }
 }
@@ -198,15 +178,18 @@ impl<F: BlockFile + Send + 'static> Carrier<F> {
         // A confirmation that held answered every caller it confirms: the owner has only room to
         // give back and the frame to settle, which it does before the next message it takes.
         let tell = !matches!(completion, Completion::Confirm { result: Ok(()), .. });
-        let sequence = self.sequence;
         self.completion = Some(completion);
         self.device = Some(device);
+        #[cfg(test)]
+        pause::here(pause::At::Done);
         // The owner holds the completion before anyone hears an answer the job gave; should the
         // owner have gone, the answers are dropped and each caller hears the log closed.
         if lines.returns.send(self).is_ok() {
-            // Every token is sent, so a watch for this job ends (`TOKENS`).
-            let _ = lines.tokens.send(sequence);
-            if tell {
+            #[cfg(test)]
+            pause::here(pause::At::Back);
+            // Otherwise the owner hears the job back before its next message, unless it waits on
+            // the job, which the thread that fills its wake's slot tells it (`wake.rs`).
+            if tell || crate::wake::claim(|| lines.wake.try_send(()).is_ok()) {
                 let _ = lines.inbox.send(Message::Returned);
             }
             for answering in answers.drain(..) {
@@ -222,27 +205,59 @@ impl<F: BlockFile + Send + 'static> Carrier<F> {
     }
 }
 
-/// The log's I/O thread: it does the jobs no caller does, and wakes the owner when it asks to be
-/// woken for a job back. It ends once the owner has.
+/// The log's I/O thread: it does the jobs no caller does. It ends once the owner has.
 pub(crate) fn serve<F: BlockFile + Send + 'static>(
-    requests: &Receiver<Request<F>>,
+    requests: &Receiver<Box<Carrier<F>>>,
     lines: &Lines<F>,
 ) {
-    while let Ok(request) = requests.recv() {
-        match request {
-            Request::Job(carrier) => carrier.run(lines),
-            Request::Watch(sequence, tokens) => {
-                loop {
-                    match tokens.recv() {
-                        Ok(back) if back >= sequence => break,
-                        Ok(_) => {}
-                        Err(_) => return,
-                    }
-                }
-                if lines.inbox.send(Message::Watched(tokens)).is_err() {
-                    return;
-                }
-            }
+    while let Ok(carrier) = requests.recv() {
+        carrier.run(lines);
+    }
+}
+
+/// A test's pause of a thread's next job where a thread the OS preempts may stop: done with the
+/// device not yet given back, or given back with the owner not yet woken (`wake.rs`).
+#[cfg(test)]
+pub(crate) mod pause {
+    use std::cell::RefCell;
+    use std::sync::mpsc::{Receiver, SyncSender};
+
+    /// Where a job pauses.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum At {
+        /// Done, the device not yet given back.
+        Done,
+        /// Back in the owner's returns, the owner not yet woken.
+        Back,
+    }
+
+    /// A pause: where, where the thread says it paused, and where it hears it may go on.
+    type Pause = (At, SyncSender<()>, Receiver<()>);
+
+    thread_local! {
+        /// This thread's pause for its next job.
+        static NEXT: RefCell<Option<Pause>> = const { RefCell::new(None) };
+    }
+
+    /// Pauses this thread's next job `at`: `paused` hears it, and the thread goes on once `go`
+    /// hears or is gone.
+    pub(crate) fn next(at: At, paused: SyncSender<()>, go: Receiver<()>) {
+        let _ = NEXT.try_with(|next| *next.borrow_mut() = Some((at, paused, go)));
+    }
+
+    /// Pauses here if this thread's next job pauses `at`.
+    pub(super) fn here(at: At) {
+        let pause = NEXT
+            .try_with(|next| {
+                let mut next = next.borrow_mut();
+                let here = next.as_ref().is_some_and(|(when, ..)| *when == at);
+                if here { next.take() } else { None }
+            })
+            .ok()
+            .flatten();
+        if let Some((_, paused, go)) = pause {
+            let _ = paused.send(());
+            let _ = go.recv();
         }
     }
 }

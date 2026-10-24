@@ -164,6 +164,8 @@ when it waited for the device left the count where it was, since the wake was th
   next frame, waiters for room, I/O, a close), it asks the I/O thread to wake it once the job is
   back (`Request::Watch`): every job's thread sends the job's sequence on a token channel after
   the job is back, which the I/O thread reads while it watches and the owner empties otherwise.
+  (Replaced on 2026-10-23 by the owner's wake, which hung where this did not: "The owner's wake
+  for a job back", below.)
 - **Measured** (`docs/benchmarks.md`, "The replica's path"): 12.0 switches a committed entry,
   mantle-log's count, and the wall time at or below mantle-log's in the same runs; allocations
   and reallocations unchanged (72.2, 0.2).
@@ -469,3 +471,59 @@ start is the log's.
   (every bound a page turns at, with no part, a part of 25 and one of 1,000, from the handle's memory
   and from the log's file), and `a_handle_reads_as_the_log_does` holds the handle's fetches to the
   log's with a part for each entry too; each fails with either count leaving the part out.
+
+## The owner's wake for a job back (2026-10-23)
+
+- **The defect.** The log hung on linux/arm64 CI (fate-commit e15ee61, run 39948749085:
+  `every_acknowledged_update_survives_power_loss` ran until the gate's cancel; never reproduced in
+  about 250,000 generated cases on macOS arm64 and Linux x86_64). The hunt
+  (`scripts/hunt-power-loss.sh`, run 40021371545, on ubuntu-24.04-arm) took every thread's stack
+  in each hang, all the same cycle: the I/O thread in `Carrier::run`, blocked sending a job's token
+  on the token channel, a channel of two; the owner asleep on its inbox (`Owner::next`); the test
+  waiting in `Log::with_file` for a look that never ran. Every job's thread sent the job's
+  sequence, blocking, after giving the job back, and the owner emptied the channel only as it took
+  a job back or as the I/O thread's watch gave the receiver back. Two threads preempted between
+  giving their jobs back and sending their tokens filled it after the owner had emptied it; the
+  next job's thread, the I/O thread, then blocked on its own token with the owner asleep and the
+  channel's receiver waiting in the I/O thread's own queue, behind the job it was doing
+  (`Request::Watch`). The channel's bound of two held only if each token arrived before the next
+  job came back, which a preempted thread does not promise.
+- **The change** (`src/wake.rs`). The token channel, the I/O thread's watch and `Message::Watched`
+  are gone. The owner's wake is a slot of one. It holds a plug while the owner does not wait; the
+  owner opens it, by taking what it holds, before every sleep while work waits on the job out, and
+  then looks at its returns once more; the job's thread, after giving the job back, fills the slot
+  if it can, and only the thread that fills it wakes the owner (`Message::Returned`); the owner
+  plugs the slot again as it takes each job back. Each side writes and then reads what the other
+  wrote, the store-buffering shape, so each fences with `SeqCst` between its write and its read
+  (C++20 [atomics.order], the fence–fence case; hyper-rt `parking.rs` is the same handshake
+  between a shard and its senders). A thread that claims late fills the slot the owner opened for
+  a later job and wakes the owner for nothing; the owner opens the slot again before its next
+  sleep, so the job out claims it then. No job's thread waits on the owner now but in the inbox's
+  own send, which the owner always reads, and a job the owner waits on wakes it directly, where the
+  watch woke the I/O thread to wake the owner.
+- **Tests.**
+  - `wake_tests::late_threads_and_a_look_on_the_io_thread_leave_the_owner_its_wake`: the hang's
+    schedule, fixed by pausing threads where the OS may preempt them (`device::pause`, built into
+    test builds only): two writers paused between giving their jobs back and waking the owner, a
+    look holding the I/O thread while a submission waits on the device, then the writers, then the
+    look. With the token channel it hung 5 times in 5 (each stopped at 30 s), its threads where
+    the CI stacks had them (sampled: the I/O thread in `SyncSender<u64>::send` in `Carrier::run`,
+    the owner in `Owner::next`, the test in `Pending::wait`); with the wake it passes.
+  - `wake_tests::late_claims_never_take_the_wake_of_the_job_out`: two late claims take the slot
+    the owner opened for a third job, whose confirmation held, so that it wakes the owner only
+    through the wake.
+  - loom (`RUSTFLAGS="--cfg loom" cargo test -p hyper-log --release --lib loom`, loom a test-only
+    dependency): the owner's loop and a job's return, step for step through `open` and `claim`,
+    against a late claimer, beside a job that tells, and two jobs in turn, every interleaving the
+    C++ model allows with `SeqCst` fences (33 s). Without the fences loom finds the lost wake in
+    both models whose job wakes the owner only through the wake; with the slot opened once a job
+    instead of before every sleep, too. Every write the model makes to the returns and the slot is
+    a read-modify-write, as a channel's send and receive are: loom keeps a partial modification
+    order, and a plain store there let it report a lost wake no C++ execution has.
+  - Every other hyper-log test passes unchanged.
+- **Measured** (`docs/benchmarks.md`, "The owner's wake"): the replica's path, nine rounds
+  rotated, allocations and reallocations a committed entry unchanged (66.3, 0.2) and switches 19.6
+  before and 18.9 after; appends a second through the I/O thread at 1, 16 and 256 replicas the
+  same within the runs' spread. `hyper-log-compare` builds again: R-8's held fields mapped where
+  it converts hard states (it did not build on fate-commit).
+

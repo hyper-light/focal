@@ -26,8 +26,10 @@
 //!
 //! # Memory
 //!
-//! One aligned buffer per writer or reader, made when it is, reused for every segment: no
-//! allocation after setup. Its size is the segment, its tag, the footer and two alignments.
+//! One aligned buffer per writer or reader, reused for every segment: no allocation after setup.
+//! Its size is the segment, its tag, the footer and two alignments. A writer makes it when it is
+//! made; a reader when it reads its first segment, so a reader that reads no plaintext (a file's
+//! length, or whether it opens) makes none and wipes none.
 
 use hyper_block::DiskError;
 use hyper_block::block::BlockFile;
@@ -421,7 +423,10 @@ pub struct SealedReader<F: BlockFile> {
     opener: FileOpener,
     align: Alignment,
     shape: Shape,
-    buf: Wiped,
+    /// The header's segment size, which the buffer is made for.
+    segment: u32,
+    /// The segment buffer, made when the first segment is read.
+    buf: Option<Wiped>,
 }
 
 impl<F: BlockFile> SealedReader<F> {
@@ -445,7 +450,15 @@ impl<F: BlockFile> SealedReader<F> {
         if as_u64(header_span)? > len {
             return Err(SealedFileError::Layout("a file shorter than its header"));
         }
-        let mut probe = working_buffer(crate::stream::MIN_SEGMENT, align)?;
+        // The header's blocks, then the tail's: public bytes (the header, the last ciphertext,
+        // zeros and the footer), so the probe holds nothing to wipe.
+        let tail_most = align
+            .get()
+            .checked_add(FOOTER)
+            .and_then(|span| align.up(span))
+            .ok_or(SealedFileError::Layout("a tail past the alignment bound"))?;
+        let mut probe = AlignedBuf::zeroed(header_span.max(tail_most), align)
+            .map_err(|_| SealedFileError::Bound("a probe past the largest buffer"))?;
         let probe_bytes = probe
             .as_mut_capacity()
             .get_mut(..header_span)
@@ -463,12 +476,7 @@ impl<F: BlockFile> SealedReader<F> {
         }
         // The footer, and the padding before it: less than an alignment of zeros and the footer,
         // so within the last `up(alignment + footer)` bytes, or the whole file where it is shorter.
-        let tail_span = align
-            .get()
-            .checked_add(FOOTER)
-            .and_then(|span| align.up(span))
-            .ok_or(SealedFileError::Layout("a tail past the alignment bound"))?
-            .min(as_usize(len)?);
+        let tail_span = tail_most.min(as_usize(len)?);
         let tail_at = len
             .checked_sub(as_u64(tail_span)?)
             .ok_or(SealedFileError::Layout("a tail before the file"))?;
@@ -506,14 +514,13 @@ impl<F: BlockFile> SealedReader<F> {
         }
         let shape = Shape::of(stream, header.segment)?;
         let opener = FileOpener::new(parent, &header)?;
-        drop(probe);
-        let buf = working_buffer(header.segment, align)?;
         Ok(Self {
             file,
             opener,
             align,
             shape,
-            buf,
+            segment: header.segment,
+            buf: None,
         })
     }
 
@@ -604,7 +611,14 @@ impl<F: BlockFile> SealedReader<F> {
                 .checked_sub(window_at)
                 .ok_or(SealedFileError::Layout("a window inverted"))?,
         )?;
-        let capacity = self.buf.as_mut_capacity();
+        if self.buf.is_none() {
+            self.buf = Some(working_buffer(self.segment, self.align)?);
+        }
+        let capacity = self
+            .buf
+            .as_mut()
+            .ok_or(SealedFileError::Bound("a segment buffer not made"))?
+            .as_mut_capacity();
         let bytes = capacity
             .get_mut(..window)
             .ok_or(SealedFileError::Bound("a segment past the buffer"))?;

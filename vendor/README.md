@@ -18,9 +18,12 @@ in this tree.
 
 The `hyper-*` crates are not crates.io archives. They come from the repository focal shares with
 mantle and slates (<https://github.com/hyper-light/hyper-raft>), taken from it whole at one
-revision, which `SNAPSHOT` in each names (since 2026-10-23 all sixteen at 5a22c8c of the shared
-repository, whose hyper-seal seals a whole file by its content with its hash taken by the writer
-(`sealed_file::seal_content`) and whose BBR reports the rate it paces at; since 2026-10-23 at
+revision, which `SNAPSHOT` in each names (since 2026-10-23 all sixteen at ebdcfb2 of the shared
+repository, whose hyper-log wakes its owner for a job back through a one-slot wake fenced on both
+sides, where a token channel deadlocked on linux/arm64, and whose hyper-seal wipes at `memset`'s
+speed behind an optimization barrier and makes a sealed reader's segment buffer at its first read;
+since 2026-10-23 at 5a22c8c, whose hyper-seal seals a whole file by its content with its hash
+taken by the writer (`sealed_file::seal_content`) and whose BBR reports the rate it paces at; since 2026-10-23 at
 e911aab, whose BBR paces at its model's rate, takes its least round trip only from packets in
 order and draws its gain cycle's phases from its connection's seed; since 2026-10-23 at c8c3cb6,
 whose hyper-quic learns a reordering path's loss thresholds from its spurious losses, its
