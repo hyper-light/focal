@@ -16619,3 +16619,39 @@ The gate on the re-vendored tree (macOS 26.4.1 arm64, load 7 to 30 with other se
 check advisories bans licenses sources`, then the workspace's tests, every target to the end: 173
 test binaries, 3,618 passed, 0 failed, 31 ignored. hyper-raft's CI on ebdcfb2 ran its gates on all
 six targets, ubuntu-24.04-arm among them, where the log had hung (run 40048346079).
+
+### 2026-10-23 — Two intermittent CI failures root-caused: an exact budget look across two moments, and a pass that expired itself
+
+Both failed on loaded Linux CI and passed alone. Each was reproduced on fedora (x86_64) with the test
+and eight busy loops pinned to the same cores (`taskset`), traced to its cause, and fixed there.
+
+- **focal-wire `a_grant_revoked_while_a_body_arrives_dispatches_nothing_and_closes_the_connection`**
+  (CI 39946268662, "the admission never settled", 100,425 B held). Reproduced 12 times in 80 on four
+  loaded cores. Traced (owner events and the budget's every grant and release, then the endpoint's
+  observations): not a leak. The body (56 B) and the connection's windows are released on every
+  path. The listener's receive ring grows and shrinks with its traffic (`ring_charged` 131,072 at
+  the test's idle look, 262,144 or 65,536 at its body settle), so the test's exact `bytes == idle +
+  body` never held; the half-sent body then met its serve period, was refused `Stalled`, and the
+  settle ran out. The 100,425 B left in the CI stats is what the endpoint's work keeps once its
+  connection has gone (its tables grown, the TLS sessions its server stores, bounded at 256),
+  charged as state by the observation after the close. `AdmissionStats::state_charged` now reports
+  that charge, and the test, with `a_body_is_held_to_its_identitys_share_before_it_is_reserved`
+  (the same exact looks), compares what the connections and exchanges hold: the bytes less the pool,
+  the ring's growth and the state. 200 of 200 each on the same loaded cores.
+- **focal-node `abandoned_transfer_expires_without_another_network_request`** (the open answered
+  `Unavailable`). Reproduced once in 100 on one core with eight busy loops (none in 200 on four).
+  An open's inventory, a seal and a verification are advanced by their asker a slice at a time,
+  each slice a turn on the content owner; `CustodyStore::advance` expired every lease before renewing
+  the one it advanced, so an owner slower than a lease between two slices gave up the very pass it
+  was advancing. It now renews the pass's lease first (`renew`); a pass no ask advances still
+  expires. `an_open_slower_than_its_lease_between_slices_is_answered` drives the store with every
+  slice after the lease has run out: `Unavailable` on the old order every time, answered now, and
+  the idle transfer still given up after its lease. The abandoned-transfer test waits for the
+  owner's expiry charged to the budget's progress instead of a 400 ms sleep. 200 of 200 each on one
+  loaded core.
+
+The gate on this tree, with the re-vendor above (macOS 26.4.1 arm64, load 7 to 14 with other
+sessions' builds): `cargo fmt --all --check`, `python3 scripts/check-contracts.py`, `bash
+scripts/cargo.sh clippy --workspace --all-targets --locked -- -D warnings`, `bash
+scripts/check-production.sh`, `cargo deny check advisories bans licenses sources`, then the
+workspace's tests, every target to the end: 173 test binaries, 3,619 passed, 0 failed, 31 ignored.
