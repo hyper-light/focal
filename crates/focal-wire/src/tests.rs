@@ -632,6 +632,21 @@ async fn settles(what: &str, settled: impl Fn() -> bool) {
     .await;
 }
 
+/// What a listener's connections and exchanges hold of its budget: its bytes less what it keeps
+/// whether or not a connection is up, its receive pool and its ring's growth, which each resize as
+/// the traffic asks, and less what its work is charged as state, which an observation moves at any
+/// quiet moment. A test that compared the whole bytes at two looks raced those: the ring grew or
+/// shrank between the looks, or an observation charged what the work kept once the connection had
+/// gone (CI 39946268662; reproduced 12 times in 80 on 4 loaded cores).
+fn held_by_connections(stats: &AdmissionStats) -> usize {
+    stats.bytes.saturating_sub(
+        stats
+            .pooled
+            .saturating_add(stats.ring_charged)
+            .saturating_add(stats.state_charged),
+    )
+}
+
 async fn admission_settles(
     server: &QuicServer,
     settled: impl Fn(&AdmissionStats) -> bool,
@@ -686,7 +701,10 @@ fn a_grant_revoked_while_a_body_arrives_dispatches_nothing_and_closes_the_connec
         assert_eq!(raw.write(exchange, &body[..body.len() / 2]), body.len() / 2);
         // The body is held whole under its sender's share before the revocation: it is reserved
         // from the listener's budget as its request begins.
-        admission_settles(&server, |stats| stats.bytes == idle.bytes + body.len()).await;
+        admission_settles(&server, |stats| {
+            held_by_connections(stats) == held_by_connections(&idle) + body.len()
+        })
+        .await;
         registry.revoke(fingerprint).unwrap();
         // The connection is closed by the revocation, the peer told it was refused for its
         // identity: the rest of the body has nowhere to go, and what it held is given back.
@@ -696,12 +714,14 @@ fn a_grant_revoked_while_a_body_arrives_dispatches_nothing_and_closes_the_connec
         );
         assert!(raw.try_write(exchange, &body[body.len() / 2..]).is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        // What it held is given back: the listener holds its receive pool and its ring alone.
+        // What it held is given back: no connection or exchange holds anything, the body and the
+        // connection's windows alike. What the listener's work keeps with no connection (its
+        // tables grown, the sessions its TLS server stored) is charged as state, not to them.
         let stats = admission_settles(&server, |stats| {
-            stats.bytes == stats.pooled + stats.ring_charged && stats.connections == 0
+            held_by_connections(stats) == 0 && stats.connections == 0
         })
         .await;
-        assert_eq!(stats.bytes, stats.pooled + stats.ring_charged);
+        assert_eq!(held_by_connections(&stats), 0, "{stats:?}");
         server.close().unwrap();
         task.join().await.unwrap();
     })
@@ -4671,7 +4691,10 @@ mod admission {
             let idle = admission_settles(&server, |stats| stats.connections == 1).await;
             // A request announcing a frame, none of it sent.
             let first = raw.ask(&request(1), frame);
-            let stats = admission_settles(&server, |stats| stats.bytes == idle.bytes + frame).await;
+            let stats = admission_settles(&server, |stats| {
+                held_by_connections(stats) == held_by_connections(&idle) + frame
+            })
+            .await;
             assert_eq!(stats.refused_bytes, 0);
             // A second announcing a frame would take more than the identity's share: refused
             // before any reservation, and its sender told it was the peer's capacity.
@@ -4681,17 +4704,21 @@ mod admission {
                 Err(hyper_transport::Refusal::Budget)
             );
             let stats = admission_settles(&server, |stats| stats.refused_bytes == 1).await;
-            assert_eq!(stats.bytes, idle.bytes + frame);
+            assert_eq!(
+                held_by_connections(&stats),
+                held_by_connections(&idle) + frame,
+                "{stats:?}"
+            );
             // The connection carries on: a request whole is answered on it.
             assert_eq!(
                 raw.request(&request(3)).await.unwrap(),
                 response(&request(3))
             );
-            // The first ends without its body: its reservation goes back.
+            // The first ends without its body: its reservation goes back, with the connection's.
             raw.disconnect();
             let _ = first;
             let stats = admission_settles(&server, |stats| {
-                stats.bytes == stats.pooled + stats.ring_charged
+                held_by_connections(stats) == 0 && stats.connections == 0
             })
             .await;
             assert_eq!(stats.refused_bytes, 1);

@@ -107,6 +107,13 @@ pub struct AdmissionStats {
     /// endpoint's, held whether or not a connection is up, until quiet drains let it shrink
     /// (hyper-raft docs/transport.md §4aa).
     pub ring_charged: usize,
+    /// Of those, what the endpoint's work is charged as its connections' state: what its last
+    /// observation found it holding past what it held with none and past the receive pool
+    /// (hyper-transport's `StateAccount`). It is charged to the work, not to any one connection,
+    /// so it outlives the connections it grew for: tables grown and kept, and the TLS sessions the
+    /// server stores for resumption, are charged after the last connection has gone, from the next
+    /// observation on.
+    pub state_charged: usize,
     /// Exchanges under way on the connections held: what keeps a connection from being replaced.
     pub serving: usize,
     pub admitted: u64,
@@ -172,6 +179,7 @@ impl AdmissionStats {
                 .receive_chunks
                 .saturating_mul(hyper_transport::RECEIVE_CHUNK),
             ring_charged: usize::try_from(stats.ring.charged).unwrap_or(usize::MAX),
+            state_charged: usize::try_from(stats.endpoint.state.charged).unwrap_or(usize::MAX),
             serving: admission.serving,
             admitted: admission.admitted,
             replaced: admission.replaced,
