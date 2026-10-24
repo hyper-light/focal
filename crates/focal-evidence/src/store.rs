@@ -82,7 +82,7 @@ mod sealing;
 pub use sealing::ContentForm;
 #[path = "convert.rs"]
 mod convert;
-pub use convert::Conversion;
+pub use convert::{Conversion, ConversionStatus, StoreForm, Tally};
 
 /// The keys of the data directory a test's store lies in, as a node's start finds or makes them
 /// (`focal_seal::test_keys`): every test store is sealed, as every store is.
@@ -152,6 +152,59 @@ pub enum ContentError {
     Format(#[from] postcard::Error),
     #[error("evidence writer stopped after an I/O failure; reopen to recover")]
     Failed,
+}
+
+/// What kind of failure a [`ContentError`] is, kept where the error cannot be (an I/O error is not
+/// copied): a stopped conversion's cause in its status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentErrorKind {
+    Io(std::io::ErrorKind),
+    Locked,
+    Invalid,
+    Capacity,
+    MissingUpload,
+    FinishedUpload,
+    Offset,
+    Incomplete,
+    Corrupt,
+    Format,
+    Failed,
+}
+
+impl ContentError {
+    pub fn kind(&self) -> ContentErrorKind {
+        match self {
+            Self::Io(error) => ContentErrorKind::Io(error.kind()),
+            Self::Locked => ContentErrorKind::Locked,
+            Self::Invalid => ContentErrorKind::Invalid,
+            Self::Capacity => ContentErrorKind::Capacity,
+            Self::MissingUpload => ContentErrorKind::MissingUpload,
+            Self::FinishedUpload => ContentErrorKind::FinishedUpload,
+            Self::Offset(_) => ContentErrorKind::Offset,
+            Self::Incomplete { .. } => ContentErrorKind::Incomplete,
+            Self::Corrupt => ContentErrorKind::Corrupt,
+            Self::Format(_) => ContentErrorKind::Format,
+            Self::Failed => ContentErrorKind::Failed,
+        }
+    }
+}
+
+impl std::fmt::Display for ContentErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(kind) => write!(f, "io: {kind}"),
+            Self::Locked => f.write_str("locked"),
+            Self::Invalid => f.write_str("invalid"),
+            Self::Capacity => f.write_str("capacity"),
+            Self::MissingUpload => f.write_str("missing upload"),
+            Self::FinishedUpload => f.write_str("finished upload"),
+            Self::Offset => f.write_str("offset"),
+            Self::Incomplete => f.write_str("incomplete"),
+            Self::Corrupt => f.write_str("corrupt"),
+            Self::Format => f.write_str("format"),
+            Self::Failed => f.write_str("failed"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -363,6 +416,8 @@ pub struct ContentStore {
     keys: sealing::ContentKeys<'static>,
     /// The conversion of the store's files in the clear, while one runs ([`Self::convert_step`]).
     conversion: Option<convert::Converting>,
+    /// What the conversion counted and did since this start ([`Self::conversion_status`]).
+    progress: convert::Progress,
     /// Where the data directory's keys are, which a reader of this store is given
     /// ([`ContentStore::reader`]).
     data_keys: focal_seal::DataKeys,
@@ -585,6 +640,7 @@ impl ContentStore {
             plans,
             keys,
             conversion: None,
+            progress: convert::Progress::default(),
             data_keys,
             _writer_lock: lock,
         };
@@ -617,6 +673,7 @@ impl ContentStore {
             }
         }
         if store.keys.converting() {
+            store.progress = convert::Progress::begun(begun);
             if holds_no_object(&store.root)? {
                 store.mark_sealed()?;
             } else {

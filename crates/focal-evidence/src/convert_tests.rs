@@ -142,6 +142,75 @@ fn copy_tree(from: &Path, to: &Path) {
         }
     }
 }
+/// The files in the clear under the store's objects and quarantine, as the conversion counts them,
+/// and their bytes.
+fn clear_tally(root: &Path) -> Tally {
+    let mut tally = Tally::default();
+    for (_, stem, bytes) in object_files(root) {
+        if stem.len() == 64 {
+            tally.add(bytes.len() as u64);
+        }
+    }
+    tally
+}
+/// The same, under the quarantine alone.
+fn clear_in_quarantine(root: &Path) -> Tally {
+    let quarantine = root.join("quarantine");
+    let mut tally = Tally::default();
+    for (path, stem, bytes) in object_files(root) {
+        if stem.len() == 64 && path.starts_with(&quarantine) {
+            tally.add(bytes.len() as u64);
+        }
+    }
+    tally
+}
+/// Where the count stands, as a test asks.
+type CountAt = fn(&Count) -> bool;
+/// Count steps of one visit until the count stands where `at` says.
+fn count_until(store: &mut ContentStore, scratch: &mut [u8], at: CountAt) {
+    for _ in 0..10_000 {
+        let count = store
+            .conversion
+            .as_ref()
+            .and_then(|state| state.count.as_ref())
+            .expect("the count ended before it got there");
+        if at(count) {
+            return;
+        }
+        assert_eq!(store.convert_step(scratch, 1).unwrap(), Conversion::Visited);
+    }
+    panic!("the count never got there");
+}
+/// Count steps until the count is whole.
+fn count_all(store: &mut ContentStore, scratch: &mut [u8]) {
+    for _ in 0..10_000 {
+        if store.conversion_status().form != StoreForm::Counting {
+            return;
+        }
+        assert_eq!(store.convert_step(scratch, 1).unwrap(), Conversion::Visited);
+    }
+    panic!("the count never ended");
+}
+fn collect_at(
+    store: &mut ContentStore,
+    protection: &ProtectionSet,
+    now: u64,
+) -> crate::CollectorReport {
+    let config = CollectorConfig {
+        grace_ms: DAY,
+        quarantine_ms: 7 * DAY,
+        terminal_grace_ms: 7 * DAY,
+        keep_records: 2,
+        max_marks: 1 << 16,
+    };
+    for _ in 0..10_000 {
+        let report = store.collect_step(protection, config, now, 64).unwrap();
+        if report.complete {
+            return report;
+        }
+    }
+    panic!("the pass never completed");
+}
 fn convert_all(store: &mut ContentStore) -> usize {
     let mut scratch = vec![0; crate::MAX_TRANSFER_CHUNK_BYTES];
     for steps in 0..10_000 {
@@ -233,6 +302,7 @@ fn a_store_in_the_clear_is_converted_while_it_serves() {
         quarantined: (gone, gone_bytes),
     } = lay_out_clear(root);
     let keys = crate::store::test_keys(root);
+    let on_disk = clear_tally(root);
     let mut store = open(root, ContentForm::Sealed);
     assert!(store.converting());
     assert!(root.join(sealing::SEALING).exists());
@@ -273,6 +343,13 @@ fn a_store_in_the_clear_is_converted_while_it_serves() {
     }
     let (late, late_bytes) = late.unwrap();
     assert!(!store.converting());
+    // An object sealed while the store converts is not one to convert: the tally closes on what
+    // lay in the clear when it began.
+    let status = store.conversion_status();
+    assert_eq!(status.form, StoreForm::Sealed);
+    assert_eq!(status.counted, on_disk);
+    assert_eq!(status.converted, on_disk);
+    assert_eq!(status.left(), Tally::default());
     assert_eq!(
         store.convert_step(&mut scratch, 1).unwrap(),
         Conversion::Done
@@ -371,6 +448,7 @@ fn a_conversion_cut_at_any_step_resumes_and_loses_nothing() {
                 }
             }
         }
+        let at_reopen = clear_tally(root);
         let mut store = open(root, ContentForm::Clear);
         assert!(store.converting() || cut == steps, "cut {cut}");
         for (reference, bytes) in &live {
@@ -381,6 +459,15 @@ fn a_conversion_cut_at_any_step_resumes_and_loses_nothing() {
             );
         }
         convert_all(&mut store);
+        // A start that resumes counts what is left in the clear and converts exactly that.
+        let status = store.conversion_status();
+        assert_eq!(status.form, StoreForm::Sealed, "cut {cut}");
+        if cut < steps {
+            assert!(status.resumed, "cut {cut}");
+            assert_eq!(status.counted, at_reopen, "cut {cut}");
+            assert_eq!(status.converted, at_reopen, "cut {cut}");
+        }
+        assert_eq!(status.left(), Tally::default(), "cut {cut}");
         for (reference, bytes) in &live {
             assert_eq!(
                 &store.read_bytes(reference, 4096).unwrap(),
@@ -423,6 +510,10 @@ fn a_conversion_without_room_holds_and_takes_the_same_file_next() {
         }
     }
     assert!(held > 0);
+    let status = store.conversion_status();
+    assert!(status.held);
+    assert_eq!(status.held_steps, held);
+    assert_eq!(status.converted, Tally::default());
     let now = object_files(root);
     assert_eq!(now.len(), before.len());
     assert!(now.iter().all(|(_, stem, _)| stem.len() == 64));
@@ -435,7 +526,14 @@ fn a_conversion_without_room_holds_and_takes_the_same_file_next() {
         store.convert_step(&mut scratch, 1).unwrap(),
         Conversion::Converted
     );
+    let status = store.conversion_status();
+    assert!(!status.held);
+    assert_eq!(status.held_steps, held);
+    assert_eq!(status.converted.files, 1);
     convert_all(&mut store);
+    let status = store.conversion_status();
+    assert_eq!(status.form, StoreForm::Sealed);
+    assert_eq!(status.left(), Tally::default());
     let plaintexts: Vec<&[u8]> = live.iter().map(|(_, bytes)| bytes.as_slice()).collect();
     assert_sealed_through(root, &plaintexts);
     for (reference, bytes) in &live {
@@ -453,10 +551,15 @@ fn an_empty_store_is_sealed_at_once_and_one_in_the_clear_stays_so() {
     assert!(!store.converting());
     assert!(root.join(sealing::SEALED).exists());
     assert!(!root.join(sealing::SEALING).exists());
+    let status = store.conversion_status();
+    assert_eq!(status.form, StoreForm::Sealed);
+    assert_eq!(status.counted, Tally::default());
+    assert!(status.finished_ms >= status.started_ms && status.started_ms > 0);
     drop(store);
     let clear = tempfile::tempdir().unwrap();
     let mut store = open(clear.path(), ContentForm::Clear);
     assert!(!store.converting());
+    assert_eq!(store.conversion_status().form, StoreForm::Clear);
     let bytes = payload(9, CHUNK * 2);
     let reference = seal(&mut store, 9, domain(9), &bytes);
     drop(store);
@@ -480,4 +583,413 @@ fn an_empty_store_is_sealed_at_once_and_one_in_the_clear_stays_so() {
         ContentHash(*blake3::hash(&encoded).as_bytes()),
         reference.root
     );
+}
+
+/// Do: a store laid out in the clear opened to seal, counted then converted a visit a step.
+/// Expect: the form reads clear below the fence, then counting, converting and sealed; the count
+/// only grows and ends at exactly the files and bytes in the clear on disk; each step converts at
+/// most one file, and the conversion ends with every counted file converted, none left.
+#[test]
+fn a_conversion_counts_what_it_must_convert_and_tallies_each_file_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let Laid { live, .. } = lay_out_clear(root);
+    let clear = open(root, ContentForm::Clear);
+    let status = clear.conversion_status();
+    assert_eq!(status.form, StoreForm::Clear);
+    assert_eq!(status.counted, Tally::default());
+    drop(clear);
+    let on_disk = clear_tally(root);
+    assert!(on_disk.files > 0);
+    let mut store = open(root, ContentForm::Sealed);
+    let status = store.conversion_status();
+    assert_eq!(status.form, StoreForm::Counting);
+    assert!(!status.resumed);
+    assert!(status.started_ms > 0);
+    assert_eq!(status.finished_ms, 0);
+    let mut scratch = vec![0; crate::MAX_TRANSFER_CHUNK_BYTES];
+    let mut last = Tally::default();
+    while store.conversion_status().form == StoreForm::Counting {
+        assert_eq!(
+            store.convert_step(&mut scratch, 1).unwrap(),
+            Conversion::Visited
+        );
+        let counted = store.conversion_status().counted;
+        assert!(counted.files >= last.files && counted.bytes >= last.bytes);
+        last = counted;
+    }
+    let status = store.conversion_status();
+    assert_eq!(status.form, StoreForm::Converting);
+    assert_eq!(status.counted, on_disk);
+    assert_eq!(status.left(), on_disk);
+    loop {
+        let before = store.conversion_status();
+        let step = store.convert_step(&mut scratch, 1).unwrap();
+        let after = store.conversion_status();
+        match step {
+            Conversion::Done => break,
+            Conversion::Converted => assert_eq!(after.converted.files, before.converted.files + 1),
+            Conversion::Visited => assert_eq!(after.converted, before.converted),
+            Conversion::Held => panic!("held with room"),
+        }
+        assert_eq!(after.left(), on_disk.less(after.converted));
+    }
+    let status = store.conversion_status();
+    assert_eq!(status.form, StoreForm::Sealed);
+    assert_eq!(status.converted, on_disk);
+    assert_eq!(status.gone, Tally::default());
+    assert_eq!(status.left(), Tally::default());
+    assert!(status.finished_ms >= status.started_ms);
+    assert_eq!(status.stopped, None);
+    assert!(!status.held);
+    for (reference, bytes) in &live {
+        assert_eq!(&store.read_bytes(reference, 4096).unwrap(), bytes);
+    }
+    drop(store);
+    let store = open(root, ContentForm::Sealed);
+    let status = store.conversion_status();
+    assert_eq!(status.form, StoreForm::Sealed);
+    assert_eq!(status.counted, Tally::default());
+}
+
+/// Do: while the count runs, restore the quarantined object at three places: while its round's
+/// domain is listed, once its round is counted and the store's own objects are not, and while the
+/// domain of the store's own it comes back to is listed (POSIX leaves a listing under change
+/// unspecified). Expect: each file counted once, the count whole at exactly the files in the clear
+/// on disk, and every counted file converted.
+#[test]
+fn a_restore_while_the_count_runs_leaves_every_file_counted_once() {
+    let pristine = tempfile::tempdir().unwrap();
+    let Laid {
+        quarantined: (gone, gone_bytes),
+        ..
+    } = lay_out_clear(pristine.path());
+    let on_disk = clear_tally(pristine.path());
+    let cases: [(&str, CountAt); 3] = [
+        ("its round's domain listed", |count| {
+            count.tree == 0
+                && count
+                    .listing
+                    .as_ref()
+                    .is_some_and(|listing| listing.partial.files > 0)
+        }),
+        ("its round counted, the store's own ahead", |count| {
+            count.tree == count.rounds.len() && count.domains.is_none()
+        }),
+        ("the store's domain listed", |count| {
+            count.tree == count.rounds.len()
+                && count
+                    .domains
+                    .as_ref()
+                    .and_then(|domains| domains.get(count.domain))
+                    == Some(&domain(1))
+                && count
+                    .listing
+                    .as_ref()
+                    .is_some_and(|listing| listing.partial.files > 0)
+        }),
+    ];
+    for (case, at) in cases {
+        let copy = tempfile::tempdir().unwrap();
+        let root = copy.path();
+        copy_tree(pristine.path(), root);
+        let mut store = open(root, ContentForm::Sealed);
+        let mut scratch = vec![0; crate::MAX_TRANSFER_CHUNK_BYTES];
+        count_until(&mut store, &mut scratch, at);
+        assert!(
+            store.restore_quarantined(domain(1), gone.root).unwrap(),
+            "{case}"
+        );
+        count_all(&mut store, &mut scratch);
+        assert_eq!(store.conversion_status().counted, on_disk, "{case}");
+        convert_all(&mut store);
+        let status = store.conversion_status();
+        assert_eq!(status.form, StoreForm::Sealed, "{case}");
+        assert_eq!(status.converted, on_disk, "{case}");
+        assert_eq!(status.gone, Tally::default(), "{case}");
+        assert_eq!(status.left(), Tally::default(), "{case}");
+        assert_eq!(store.read_bytes(&gone, 4096).unwrap(), gone_bytes, "{case}");
+    }
+}
+
+/// Do: run the collector past the quarantine's grace while the store counts, then again once it
+/// has counted. Expect: no round deleted while it counts; once it has, the expired round goes and
+/// its files in the clear are tallied as gone, and the conversion ends with every counted file
+/// converted or gone, none left.
+#[test]
+fn a_round_that_expires_during_the_conversion_is_tallied_as_gone() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let Laid { live, .. } = lay_out_clear(root);
+    let on_disk = clear_tally(root);
+    let in_round = clear_in_quarantine(root);
+    assert!(in_round.files > 0);
+    let mut store = open(root, ContentForm::Sealed);
+    let mut scratch = vec![0; crate::MAX_TRANSFER_CHUNK_BYTES];
+    assert_eq!(
+        store.convert_step(&mut scratch, 1).unwrap(),
+        Conversion::Visited
+    );
+    assert_eq!(store.conversion_status().form, StoreForm::Counting);
+    let mut protection = ProtectionSet::new();
+    protection.finish();
+    let later = now_ms() + 8 * DAY;
+    let report = collect_at(&mut store, &protection, later);
+    assert_eq!(report.deleted, 0, "{report:?}");
+    assert_eq!(clear_in_quarantine(root), in_round);
+    count_all(&mut store, &mut scratch);
+    assert_eq!(store.conversion_status().counted, on_disk);
+    let report = collect_at(&mut store, &protection, later);
+    assert!(report.deleted >= in_round.files, "{report:?}");
+    assert_eq!(clear_in_quarantine(root), Tally::default());
+    assert_eq!(store.conversion_status().gone, in_round);
+    convert_all(&mut store);
+    let status = store.conversion_status();
+    assert_eq!(status.form, StoreForm::Sealed);
+    assert_eq!(status.converted, on_disk.less(in_round));
+    assert_eq!(status.gone, in_round);
+    assert_eq!(status.left(), Tally::default());
+    for (reference, bytes) in &live {
+        assert_eq!(&store.read_bytes(reference, 4096).unwrap(), bytes);
+    }
+}
+
+/// Do: damage a domain's key record before the store converts its first file of the domain.
+/// Expect: the step that meets it fails, and the status keeps its cause, the form converting and
+/// files left to convert; the store reports no conversion running.
+#[test]
+fn a_conversion_that_stops_keeps_its_cause_in_the_status() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    lay_out_clear(root);
+    fs::write(
+        root.join("objects")
+            .join(hex(&domain(1).0))
+            .join(sealing::DOMAIN_KEY),
+        b"no key record",
+    )
+    .unwrap();
+    let mut store = open(root, ContentForm::Sealed);
+    let mut scratch = vec![0; crate::MAX_TRANSFER_CHUNK_BYTES];
+    let error = (0..10_000)
+        .find_map(|_| match store.convert_step(&mut scratch, 1) {
+            Ok(Conversion::Done) => panic!("the conversion ended past a damaged record"),
+            Ok(_) => None,
+            Err(error) => Some(error),
+        })
+        .expect("no step failed");
+    let status = store.conversion_status();
+    assert_eq!(status.stopped, Some(error.kind()));
+    assert_eq!(status.form, StoreForm::Converting);
+    assert!(status.left().files > 0, "{status:?}");
+    assert!(!store.converting());
+}
+
+/// Do: once the count is whole, restore the quarantined object while the conversion visits its
+/// round. Expect: the files the restore moves in the clear are converted where they land, each
+/// counted file converted once, none gone or left.
+#[test]
+fn a_restore_while_the_conversion_visits_the_rounds_converts_each_file_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let Laid {
+        quarantined: (gone, gone_bytes),
+        ..
+    } = lay_out_clear(root);
+    let on_disk = clear_tally(root);
+    let mut store = open(root, ContentForm::Sealed);
+    let mut scratch = vec![0; crate::MAX_TRANSFER_CHUNK_BYTES];
+    count_all(&mut store, &mut scratch);
+    // Into the round's tree, before any of its files is converted.
+    for _ in 0..10_000 {
+        let state = store.conversion.as_ref().unwrap();
+        if state.domain.is_some() {
+            break;
+        }
+        assert_eq!(
+            store.convert_step(&mut scratch, 1).unwrap(),
+            Conversion::Visited
+        );
+    }
+    let state = store.conversion.as_ref().unwrap();
+    assert!(!state.own);
+    assert!(
+        state
+            .domain
+            .as_ref()
+            .unwrap()
+            .directory
+            .starts_with(root.join("quarantine"))
+    );
+    assert_eq!(store.conversion_status().converted, Tally::default());
+    assert!(store.restore_quarantined(domain(1), gone.root).unwrap());
+    convert_all(&mut store);
+    let status = store.conversion_status();
+    assert_eq!(status.converted, on_disk);
+    assert_eq!(status.gone, Tally::default());
+    assert_eq!(status.left(), Tally::default());
+    assert_eq!(store.read_bytes(&gone, 4096).unwrap(), gone_bytes);
+}
+
+/// Do: upload the quarantined object's bytes again below the fence, so the store's own objects
+/// hold a copy in the clear under the very names its round holds; then restore it from the round
+/// (its chunks stand already; its manifest replaces the copy's) while the count has passed that
+/// domain, and in another copy of the store once the count is whole. Expect: the replaced manifest
+/// leaves the count while it runs, so the count matches the files on disk, and is tallied as gone
+/// once it has counted; every counted file is converted or gone, none left.
+#[test]
+fn a_restore_over_a_copy_in_the_clear_tallies_the_copy_it_replaces() {
+    let pristine = tempfile::tempdir().unwrap();
+    let Laid {
+        quarantined: (gone, gone_bytes),
+        ..
+    } = lay_out_clear(pristine.path());
+    {
+        let mut store = open(pristine.path(), ContentForm::Clear);
+        let again = seal(&mut store, 9, domain(1), &gone_bytes);
+        assert_eq!(again.root, gone.root);
+    }
+    let manifest = |root: &Path| -> u64 {
+        fs::metadata(
+            root.join("objects")
+                .join(hex(&domain(1).0))
+                .join(format!("{}.manifest", gone.root)),
+        )
+        .unwrap()
+        .len()
+    };
+    let on_disk = clear_tally(pristine.path());
+    // While the count runs, past the store's own domain the copy lies in.
+    {
+        let copy = tempfile::tempdir().unwrap();
+        let root = copy.path();
+        copy_tree(pristine.path(), root);
+        let mut store = open(root, ContentForm::Sealed);
+        let mut scratch = vec![0; crate::MAX_TRANSFER_CHUNK_BYTES];
+        count_until(&mut store, &mut scratch, |count| {
+            count.tree == count.rounds.len()
+                && count
+                    .domains
+                    .as_ref()
+                    .and_then(|domains| domains.get(count.domain))
+                    .is_some_and(|listed| *listed > domain(1))
+        });
+        assert!(store.restore_quarantined(domain(1), gone.root).unwrap());
+        count_all(&mut store, &mut scratch);
+        let after = clear_tally(root);
+        assert_eq!(after.files, on_disk.files - 1);
+        assert_eq!(store.conversion_status().counted, after);
+        convert_all(&mut store);
+        let status = store.conversion_status();
+        assert_eq!(status.converted, after);
+        assert_eq!(status.gone, Tally::default());
+        assert_eq!(status.left(), Tally::default());
+        assert_eq!(store.read_bytes(&gone, 4096).unwrap(), gone_bytes);
+    }
+    // Once the count is whole.
+    {
+        let copy = tempfile::tempdir().unwrap();
+        let root = copy.path();
+        copy_tree(pristine.path(), root);
+        let replaced = manifest(root);
+        let mut store = open(root, ContentForm::Sealed);
+        let mut scratch = vec![0; crate::MAX_TRANSFER_CHUNK_BYTES];
+        count_all(&mut store, &mut scratch);
+        assert_eq!(store.conversion_status().counted, on_disk);
+        assert!(store.restore_quarantined(domain(1), gone.root).unwrap());
+        assert_eq!(
+            store.conversion_status().gone,
+            Tally {
+                files: 1,
+                bytes: replaced
+            }
+        );
+        convert_all(&mut store);
+        let status = store.conversion_status();
+        assert_eq!(status.converted.files, on_disk.files - 1);
+        assert_eq!(status.left(), Tally::default());
+        assert_eq!(store.read_bytes(&gone, 4096).unwrap(), gone_bytes);
+    }
+}
+
+/// Do: plant a link named as a chunk in the clear beside a domain's objects, pointing at one of
+/// them. Expect: the count passes over it as the conversion does (it is not a file of the store's),
+/// so the conversion ends with every counted file converted and none left, the link as it was.
+#[cfg(unix)]
+#[test]
+fn a_link_named_like_an_object_is_neither_counted_nor_converted() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    lay_out_clear(root);
+    let on_disk = clear_tally(root);
+    let own = root.join("objects").join(hex(&domain(2).0));
+    let target = fs::read_dir(&own)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "chunk")
+        })
+        .unwrap();
+    let link = own.join(format!("{}.chunk", "ab".repeat(32)));
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let mut store = open(root, ContentForm::Sealed);
+    let mut scratch = vec![0; crate::MAX_TRANSFER_CHUNK_BYTES];
+    count_all(&mut store, &mut scratch);
+    assert_eq!(store.conversion_status().counted, on_disk);
+    convert_all(&mut store);
+    let status = store.conversion_status();
+    assert_eq!(status.converted, on_disk);
+    assert_eq!(status.left(), Tally::default());
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
+/// Do: take away the read permission of a chunk in the clear before the conversion reaches it.
+/// Expect: the step that opens it fails with the I/O error, which stops the store as any write's
+/// does, and the status keeps the cause (an I/O error of that kind) with files left. A test run
+/// as a user that reads every file anyway (root) has nothing to inject, and says so.
+#[cfg(unix)]
+#[test]
+fn an_io_failure_in_a_step_stops_the_conversion_with_its_cause() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    lay_out_clear(root);
+    let own = root.join("objects").join(hex(&domain(2).0));
+    let chunk = fs::read_dir(&own)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "chunk")
+        })
+        .unwrap();
+    fs::set_permissions(&chunk, fs::Permissions::from_mode(0o000)).unwrap();
+    if File::open(&chunk).is_ok() {
+        eprintln!("this user reads a file without its permission: no failure to inject");
+        return;
+    }
+    let mut store = open(root, ContentForm::Sealed);
+    let mut scratch = vec![0; crate::MAX_TRANSFER_CHUNK_BYTES];
+    let error = (0..10_000)
+        .find_map(|_| match store.convert_step(&mut scratch, 1) {
+            Ok(Conversion::Done) => panic!("the conversion ended past an unreadable chunk"),
+            Ok(_) => None,
+            Err(error) => Some(error),
+        })
+        .expect("no step failed");
+    assert!(matches!(error, ContentError::Io(_)), "{error:?}");
+    let status = store.conversion_status();
+    assert_eq!(
+        status.stopped,
+        Some(ContentErrorKind::Io(std::io::ErrorKind::PermissionDenied))
+    );
+    assert_eq!(status.form, StoreForm::Converting);
+    assert!(status.left().files > 0, "{status:?}");
+    assert!(!store.converting());
 }

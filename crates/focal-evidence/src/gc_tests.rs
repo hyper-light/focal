@@ -499,3 +499,48 @@ fn a_file_gone_since_the_walk_listed_it_is_passed_over() {
     );
     seal(&mut store, 99, tenant, b"STILLSERVES");
 }
+
+/// Do: delete an expired round of thirty-four files (two objects of sixteen chunks and their
+/// manifests) with a budget of three entries a step. Expect: no step deletes more files than its
+/// budget, the walk resuming inside the round's object tree from step to step, and the round gone
+/// at the end with every file counted as deleted. A whole tree went in one step before, whatever
+/// the budget.
+#[test]
+fn an_expired_round_is_deleted_a_bounded_number_of_entries_a_step() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let mut store = open(root);
+    let tenant = domain(7);
+    let one: Vec<u8> = (0..64u8).collect();
+    let two: Vec<u8> = (64..128u8).collect();
+    seal(&mut store, 1, tenant, &one);
+    seal(&mut store, 2, tenant, &two);
+    let mut protection = ProtectionSet::new();
+    protection.finish();
+    age_everything(&root.join("objects"), 2 * DAY);
+    let now = now_ms();
+    let report = pass(&mut store, &protection, config(), now, 64);
+    assert_eq!(report.objects_quarantined, 2, "{report:?}");
+    assert_eq!(quarantine_rounds(root).len(), 1);
+    let later = now + 8 * DAY;
+    let budget = 3;
+    let mut deleted = 0;
+    let mut steps = 0;
+    loop {
+        let report = store
+            .collect_step(&protection, config(), later, budget)
+            .unwrap();
+        assert!(
+            report.deleted - deleted <= budget as u64,
+            "{report:?} after {deleted}"
+        );
+        deleted = report.deleted;
+        steps += 1;
+        if report.complete {
+            break;
+        }
+        assert!(steps < 10_000, "the pass never completed");
+    }
+    assert_eq!(deleted, 34);
+    assert!(quarantine_rounds(root).is_empty());
+}

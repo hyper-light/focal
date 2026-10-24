@@ -196,8 +196,14 @@ enum Phase {
     Quarantine {
         rounds: Vec<u64>,
         index: usize,
-        dir: Option<ReadDir>,
+        walk: Option<RoundWalk>,
     },
+}
+/// A round's deletion under way: the round's own listing, and the directories open below the entry
+/// of it being deleted, deepest last, each removed once its entries are.
+struct RoundWalk {
+    listing: ReadDir,
+    open: Vec<(PathBuf, ReadDir)>,
 }
 impl Phase {
     /// The phase to resume from when a step errors: re-derivable directory and
@@ -221,7 +227,7 @@ impl Phase {
             Phase::Quarantine { rounds, index, .. } => Phase::Quarantine {
                 rounds: rounds.clone(),
                 index: *index,
-                dir: None,
+                walk: None,
             },
         }
     }
@@ -290,6 +296,31 @@ fn split_name(entry: &fs::DirEntry) -> Option<(String, String)> {
 /// (`objects`) and a domain under it, its files under that (`quarantine`'s
 /// `objects/<domain>`; a custody record's kind holds its files directly).
 const ROUND_DIRECTORIES: usize = 2;
+
+/// The name of the round whose directory is `round`.
+fn round_name(round: &Path) -> Result<std::ffi::OsString, ContentError> {
+    Ok(round
+        .file_name()
+        .ok_or(ContentError::Invalid)?
+        .to_os_string())
+}
+
+/// Whether a round's file at `path` is one of an object's: under the round's `objects`, in a
+/// domain's directory.
+fn round_object(path: &Path) -> bool {
+    let Some(domain) = path.parent() else {
+        return false;
+    };
+    domain
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(parse_domain)
+        .is_some()
+        && domain
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|kind| kind == "objects")
+}
 
 impl ContentStore {
     fn quarantine_root(&self) -> PathBuf {
@@ -526,28 +557,38 @@ impl ContentStore {
             Phase::Receipts(dir) => match self.sweep_receipts(dir, config, now_ms, budget)? {
                 Some(dir) => Some(Phase::Receipts(Some(dir))),
                 None => {
-                    let rounds = self.expired_rounds(config, now_ms)?;
+                    // While the store's conversion counts the rounds, none is deleted: what it
+                    // counted stays where it counted it, so its tally is whole.
+                    let rounds = if self.conversion_counting() {
+                        Vec::new()
+                    } else {
+                        self.expired_rounds(config, now_ms)?
+                    };
                     Some(Phase::Quarantine {
                         rounds,
                         index: 0,
-                        dir: None,
+                        walk: None,
                     })
                 }
             },
-            Phase::Quarantine { rounds, index, dir } => match rounds.get(index).copied() {
+            Phase::Quarantine {
+                rounds,
+                index,
+                walk,
+            } => match rounds.get(index).copied() {
                 None => None,
                 Some(round) => {
-                    let done = self.delete_round(round, dir, budget)?;
-                    Some(match done {
+                    let walk = self.delete_round(round, walk, budget)?;
+                    Some(match walk {
                         None => Phase::Quarantine {
                             rounds,
                             index: index.saturating_add(1),
-                            dir: None,
+                            walk: None,
                         },
-                        Some(dir) => Phase::Quarantine {
+                        Some(walk) => Phase::Quarantine {
                             rounds,
                             index,
-                            dir: Some(dir),
+                            walk: Some(walk),
                         },
                     })
                 }
@@ -976,79 +1017,82 @@ impl ContentStore {
         rounds.sort_unstable();
         Ok(rounds)
     }
-    /// Delete one expired round's files, bounded; `None` once the round is
-    /// gone, else the directory walk to resume.
+    /// Delete one expired round's files, at most `budget` entries of it a step: `None` once the
+    /// round is gone, else the walk to resume. The walk goes over an explicit stack of the
+    /// directories open below the round's entry being deleted, each removed once its entries are,
+    /// every entry visited and every file counted as deleted; a round is at most
+    /// [`ROUND_DIRECTORIES`] deep below its root, so a deeper tree is not a round's and is refused,
+    /// and no call recurses.
     fn delete_round(
         &mut self,
         round: u64,
-        dir: Option<ReadDir>,
+        walk: Option<RoundWalk>,
         budget: &mut usize,
-    ) -> Result<Option<ReadDir>, ContentError> {
+    ) -> Result<Option<RoundWalk>, ContentError> {
         let root = self.quarantine_root().join(format!("{round:020}"));
-        let mut walk = match dir {
-            Some(dir) => dir,
+        let mut walk = match walk {
+            Some(walk) => walk,
             None => match fs::read_dir(&root) {
-                Ok(dir) => dir,
+                Ok(listing) => {
+                    let mut open = Vec::new();
+                    open.try_reserve_exact(ROUND_DIRECTORIES)
+                        .map_err(|_| ContentError::Capacity)?;
+                    RoundWalk { listing, open }
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(error.into()),
             },
         };
-        // The round holds at most three levels: kind, domain, file.
         while *budget > 0 {
-            let Some(entry) = walk.next() else {
+            if let Some((_, entries)) = walk.open.last_mut() {
+                match entries.next() {
+                    Some(entry) => {
+                        let child = entry?.path();
+                        self.visit(budget);
+                        self.delete_entry(child, &mut walk.open)?;
+                    }
+                    None => {
+                        if let Some((directory, _)) = walk.open.pop() {
+                            fs::remove_dir(&directory)?;
+                        }
+                    }
+                }
+                continue;
+            }
+            let Some(entry) = walk.listing.next() else {
                 fs::remove_dir_all(&root)?;
                 sync_directory(&self.quarantine_root())?;
                 return Ok(None);
             };
-            let entry = entry?;
+            let path = entry?.path();
             self.visit(budget);
-            self.delete_tree(&entry.path(), budget)?;
+            self.delete_entry(path, &mut walk.open)?;
         }
         Ok(Some(walk))
     }
-    /// Delete one kind's tree of a round: a walk over an explicit stack of the
-    /// directories open, each removed once its entries are, every entry
-    /// visited and every file counted as deleted. A round is at most
-    /// [`ROUND_DIRECTORIES`] deep below its root, so a deeper tree is not a
-    /// round's and is refused; no call recurses.
-    fn delete_tree(&mut self, path: &Path, budget: &mut usize) -> Result<(), ContentError> {
-        let metadata = fs::symlink_metadata(path)?;
+    /// One entry of a round's walk: a file deleted, a directory opened below the ones `open`.
+    fn delete_entry(
+        &mut self,
+        path: PathBuf,
+        open: &mut Vec<(PathBuf, ReadDir)>,
+    ) -> Result<(), ContentError> {
+        let metadata = fs::symlink_metadata(&path)?;
         if !metadata.is_dir() {
-            return self.delete_file(path, metadata.len());
+            return self.delete_file(&path, metadata.len());
         }
-        let mut open: Vec<(PathBuf, ReadDir)> = Vec::new();
-        open.try_reserve_exact(ROUND_DIRECTORIES)
-            .map_err(|_| ContentError::Capacity)?;
-        open.push((path.to_path_buf(), fs::read_dir(path)?));
-        loop {
-            let next = match open.last_mut() {
-                Some((_, entries)) => entries.next(),
-                None => return Ok(()),
-            };
-            match next {
-                Some(entry) => {
-                    let child = entry?.path();
-                    self.visit(budget);
-                    let metadata = fs::symlink_metadata(&child)?;
-                    if !metadata.is_dir() {
-                        self.delete_file(&child, metadata.len())?;
-                    } else if open.len() < ROUND_DIRECTORIES {
-                        let entries = fs::read_dir(&child)?;
-                        open.push((child, entries));
-                    } else {
-                        return Err(ContentError::Invalid);
-                    }
-                }
-                None => {
-                    if let Some((directory, _)) = open.pop() {
-                        fs::remove_dir(&directory)?;
-                    }
-                }
-            }
+        if open.len() >= ROUND_DIRECTORIES {
+            return Err(ContentError::Invalid);
         }
+        let entries = fs::read_dir(&path)?;
+        open.push((path, entries));
+        Ok(())
     }
-    /// Delete one file of a round, counted with its bytes.
+    /// Delete one file of a round, counted with its bytes; an object's file the store's conversion
+    /// would convert is tallied as gone with its round.
     fn delete_file(&mut self, path: &Path, bytes: u64) -> Result<(), ContentError> {
+        if round_object(path) {
+            self.conversion_deleting(path)?;
+        }
         fs::remove_file(path)?;
         self.collector.report.deleted = self.collector.report.deleted.saturating_add(1);
         self.collector.report.bytes_deleted =
@@ -1100,11 +1144,11 @@ impl ContentStore {
         for round in &rounds {
             let directory = round.join(&relative);
             if let Some(path) = key.existing(&directory, root, sealing::Kind::Manifest)? {
-                found = Some((directory, path));
+                found = Some((round, directory, path));
                 break;
             }
         }
-        let Some((holder, source)) = found else {
+        let Some((holding, holder, source)) = found else {
             return Ok(false);
         };
         durable_directory(&target)?;
@@ -1128,7 +1172,9 @@ impl ContentStore {
                 let directory = round.join(&relative);
                 if let Some(path) = key.existing(&directory, chunk.hash, sealing::Kind::Chunk)? {
                     let name = path.file_name().ok_or(ContentError::Invalid)?;
-                    focal_platform::fs::atomic_replace(&path, &target.join(name))?;
+                    let destination = target.join(name);
+                    self.conversion_restoring(&round_name(round)?, domain, &path, &destination)?;
+                    focal_platform::fs::atomic_replace(&path, &destination)?;
                     moved = true;
                     break;
                 }
@@ -1138,7 +1184,9 @@ impl ContentStore {
             }
         }
         let name = source.file_name().ok_or(ContentError::Invalid)?;
-        focal_platform::fs::atomic_replace(&source, &target.join(name))?;
+        let destination = target.join(name);
+        self.conversion_restoring(&round_name(holding)?, domain, &source, &destination)?;
+        focal_platform::fs::atomic_replace(&source, &destination)?;
         sync_directory(&target)?;
         Ok(true)
     }

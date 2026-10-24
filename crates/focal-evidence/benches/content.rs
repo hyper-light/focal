@@ -10,15 +10,15 @@
 )]
 //! What sealing costs the content store (29 §12.4): the same objects uploaded and sealed, read back
 //! verified, and copied into a second store as a custody transfer does, by a store in the clear and
-//! by one that seals; then a store in the clear converted a file a step. Each figure is the median
-//! of the repetitions, in milliseconds an object (and MiB/s), on this host's disk: every installed
-//! file is flushed, so the writes are the disk's and the reads are the CPU's (the files are in the
-//! page cache).
+//! by one that seals; then a store in the clear converted a file a step, the count of what it must
+//! convert (no write) timed apart within it. Each figure is the median of the repetitions, in
+//! milliseconds an object (and MiB/s), on this host's disk: every installed file is flushed, so the
+//! writes are the disk's and the reads are the CPU's (the files are in the page cache).
 //!
 //! `FOCAL_BENCH_OBJECTS` objects of each size (default 16), `FOCAL_BENCH_SIZES` sizes in KiB
 //! (default "64 1024 8192"), 1 MiB chunks; `FOCAL_BENCH_READS` passes of reads over them (default
 //! 1), for a read phase long enough to profile.
-use focal_evidence::{ContentForm, ContentStore, Conversion, StoreLimits, UploadId};
+use focal_evidence::{ContentForm, ContentStore, Conversion, StoreForm, StoreLimits, UploadId};
 use focal_memory::{DiskBudget, DiskBudgetConfig};
 use focal_model::{ContentClass, ContentDomainId, ContentRef};
 use std::path::Path;
@@ -169,6 +169,7 @@ fn main() {
         let mut scratch = vec![0; CHUNK];
         let (mut steps, mut converted) = (0usize, 0usize);
         let began = Instant::now();
+        let mut counted = None;
         loop {
             match store.convert_step(&mut scratch, 4096).unwrap() {
                 Conversion::Done => break,
@@ -176,14 +177,19 @@ fn main() {
                 Conversion::Visited | Conversion::Held => {}
             }
             steps += 1;
+            if counted.is_none() && store.conversion_status().form != StoreForm::Counting {
+                counted = Some((began.elapsed(), store.conversion_status().counted.files));
+            }
         }
         let took = began.elapsed();
         let total = (objects * size) as f64 / (1024.0 * 1024.0);
+        let (count_took, count_files) = counted.unwrap_or_default();
         println!(
-            " convert  {objects} objects of {kib} KiB: {converted} files in {steps} steps, {ms:.1} ms, {rate:.1} MiB/s",
+            " convert  {objects} objects of {kib} KiB: {converted} files in {steps} steps, {ms:.1} ms, {rate:.1} MiB/s; count {count_files} files in {count_ms:.3} ms",
             kib = size / 1024,
             ms = took.as_secs_f64() * 1000.0,
             rate = total / took.as_secs_f64(),
+            count_ms = count_took.as_secs_f64() * 1000.0,
         );
     }
 }
