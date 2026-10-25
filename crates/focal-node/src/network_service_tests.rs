@@ -269,22 +269,52 @@ impl TestSettings {
         NetworkService::open_with_socket(&self.value, Some(self.socket.try_clone().unwrap()))
     }
 }
+/// Format: the first loopback port a test's listener is reserved on, and how many follow it. Below
+/// every ephemeral range a target hands out (Linux's default `ip_local_port_range` begins at 32768,
+/// ip(7); macOS and Windows hand out IANA's dynamic ports from 49152, RFC 6335 §6) and above the
+/// system ports (below 1024, the same section), and the eight thousand below the real-binary tests'
+/// own range (`tests/support/ports.rs`, 24000 to 31999), so neither takes the other's. A reservation
+/// on a port of the system's choosing was one the system could hand out again: a test that let its
+/// reservation go and bound the port again was refused it, `Address already in use`, whenever
+/// another test's bind of port 0 was given it in between (macOS CI, 2026-10-25: the holder shared
+/// its port and was gone 9 ms later; a plain socket let go and bound again beside eight threads
+/// binding port 0 was refused 2 times in 3,000).
+const RESERVED_FIRST: u16 = 16_000;
+const RESERVED_COUNT: u16 = 8_000;
+
+/// Where this process tries its next reservation, counted from a place its id gives, so test
+/// processes side by side start apart: the id spread by Knuth's multiplicative hash, 2^32 over the
+/// golden ratio (TAOCP vol. 3, §6.4).
+static RESERVED_NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const KNUTH_MULTIPLIER: u32 = 2_654_435_761;
+
 /// A loopback port held from the moment it is chosen, by a socket bound with its port shared
 /// where the platform shares ports: the listener adopts it and gives each peer a socket of its own
 /// on the port (hyper-rt-transport's `Driver::new`), so a node runs here as one started on its own
 /// address does. A reservation bound plainly kept every peer on the listener's one queue, a path
-/// no node takes once started. Windows shares no port so, and binds it plainly.
+/// no node takes once started. Windows shares no port so, and binds it plainly. The port is one of
+/// the reserved range ([`RESERVED_FIRST`]), each tried once at most, the first that binds taken: a
+/// port another socket holds, this process's or another's, refuses the bind.
 pub(crate) fn reserve_listener() -> std::net::UdpSocket {
-    let loopback = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
-    if cfg!(windows) {
-        return std::net::UdpSocket::bind(loopback).unwrap();
+    let start = std::process::id().wrapping_mul(KNUTH_MULTIPLIER);
+    for _ in 0..RESERVED_COUNT {
+        let step = RESERVED_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let offset = start.wrapping_add(step) % u32::from(RESERVED_COUNT);
+        let port = RESERVED_FIRST + u16::try_from(offset).unwrap();
+        let loopback = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let bound = if cfg!(windows) {
+            std::net::UdpSocket::bind(loopback).ok()
+        } else {
+            hyper_rt::udp::UdpSocket::bind_shared(loopback)
+                .ok()
+                .and_then(|socket| socket.into_owned().ok())
+                .map(std::net::UdpSocket::from)
+        };
+        if let Some(socket) = bound {
+            return socket;
+        }
     }
-    std::net::UdpSocket::from(
-        hyper_rt::udp::UdpSocket::bind_shared(loopback)
-            .unwrap()
-            .into_owned()
-            .unwrap(),
-    )
+    panic!("no loopback port of the reserved range could be bound")
 }
 pub(crate) fn settings(root: &Path) -> TestSettings {
     let socket = reserve_listener();
@@ -556,7 +586,7 @@ fn service_recovers_revocation_before_binding_any_ingress() {
             socket,
         } = settings;
         drop(socket);
-        drop(std::net::UdpSocket::bind(settings.node.listen.unwrap()).unwrap());
+        drop(bind_or_name_holder(settings.node.listen.unwrap()));
         drop(NodeDirectory::open(&settings).unwrap());
     })
     .unwrap()
@@ -961,7 +991,7 @@ fn a_founder_restarted_on_a_new_listen_address_behind_its_advertised_endpoint_re
         drop(first);
         // Restart on the wildcard interface at the same port: the listen address
         // differs from the saved one while the advertised endpoint is unchanged.
-        let second_socket = bind_or_name_holder(port);
+        let second_socket = bind_or_name_holder(std::net::SocketAddr::from(([0, 0, 0, 0], port)));
         let second_listen = second_socket.local_addr().unwrap();
         assert_ne!(second_listen, first_listen);
         let mut value = Settings::default();
@@ -1289,22 +1319,48 @@ fn a_joined_host_measures_its_voter_path_and_keeps_the_configured_period_on_a_lo
     .unwrap()
 }
 
-/// A UDP socket on every interface at `port`, or a panic that names what holds the port: the
-/// stopped founder's sockets are gone once its listener has ended, so a port still held is a socket
-/// that outlived the stop, or one a child process inherited (std sets close-on-exec only after it
-/// makes a socket on Apple targets), and which of the two says where the leak is.
-fn bind_or_name_holder(port: u16) -> std::net::UdpSocket {
-    match std::net::UdpSocket::bind(("0.0.0.0", port)) {
+/// A UDP socket at `address`, or a panic that names what holds its port: every socket a test let go
+/// is gone once it is dropped, so a port still held is a socket that outlived what owned it, or one
+/// a child process inherited (std and hyper-rt set close-on-exec only after they make a socket on
+/// Apple targets), and which of the two says where the leak is.
+fn bind_or_name_holder(address: std::net::SocketAddr) -> std::net::UdpSocket {
+    match std::net::UdpSocket::bind(address) {
         Ok(socket) => socket,
         Err(error) => {
+            let refused = std::time::Instant::now();
+            let port = address.port();
+            // What the holder is, asked at once, before it can go: whether it shares its port (a
+            // socket hyper-rt bound to share it takes a joiner), how long after the refusal the
+            // port is free, then this process's children and who holds the port, if it still is.
+            let shares = match hyper_rt::udp::UdpSocket::join_shared(address) {
+                Ok(_) => format!(
+                    "shares its port (SO_REUSEPORT), {:?} after",
+                    refused.elapsed()
+                ),
+                Err(probe) => format!("does not share its port ({probe})"),
+            };
+            let mut freed = None;
+            while refused.elapsed() < std::time::Duration::from_secs(2) {
+                if std::net::UdpSocket::bind(address).is_ok() {
+                    freed = Some(refused.elapsed());
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            let children = std::process::Command::new("pgrep")
+                .args(["-l", "-P", &std::process::id().to_string()])
+                .output()
+                .map(|output| String::from_utf8_lossy(&output.stdout).replace('\n', "; "))
+                .unwrap_or_else(|pgrep| format!("pgrep could not run: {pgrep}"));
             let holders = std::process::Command::new("lsof")
                 .args(["-nP", &format!("-iUDP:{port}")])
                 .output()
                 .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
                 .unwrap_or_else(|lsof| format!("lsof could not run: {lsof}"));
             panic!(
-                "port {port} still held after the founder stopped ({error}); this process is {}, \
-                 and the port's holders are:\n{holders}",
+                "port {port} still held after its owners were let go ({error}); this process is \
+                 {}; the holder {shares}; the port was free {freed:?} after the refusal; this \
+                 process's children then: [{children}]; the port's holders then:\n{holders}",
                 std::process::id()
             )
         }

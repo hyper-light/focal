@@ -502,10 +502,19 @@ fn scripted_sponsor(
                 async move {
                     let mut guard = state.lock().unwrap();
                     let state = &mut *guard;
-                    let prepared = state
-                        .registry
-                        .prepare_join(&state.authority, &request, now())
-                        .unwrap();
+                    // A join the registry refuses (an ask that arrives after its invitation
+                    // expired) is answered with the refusal, as a sponsor answers it.
+                    let prepared =
+                        match state
+                            .registry
+                            .prepare_join(&state.authority, &request, now())
+                        {
+                            Ok(prepared) => prepared,
+                            Err(refused) => {
+                                state.asks += 1;
+                                return JoinResponse::Rejected(JoinFailure::from(&refused));
+                            }
+                        };
                     let receipt = match prepared {
                         JoinPreparation::Existing(receipt) => receipt,
                         JoinPreparation::Commit(command) => {
@@ -578,13 +587,24 @@ fn a_join_asks_again_while_its_sponsor_cannot_decide_and_is_enrolled_once() {
     .unwrap()
 }
 
-/// A join asked again stops where asking cannot succeed: at the invitation's expiry, after which
-/// the founder admits no new join, with the sponsor's last answer; and at once at a terminal
-/// refusal, which no ask changes.
+/// A join asked again stops where asking cannot succeed: at once at a terminal refusal, which no ask
+/// changes, after any number of asks the sponsor answered unavailable; and at the invitation's
+/// expiry, after which the founder admits no new join, with the sponsor's last answer. The asks are
+/// the facts the first two cases judge, under an invitation that outlives them; the third judges
+/// only that the join ends at the expiry, for how many asks fit before it is the machine's: under
+/// load even the first can reach the sponsor after a two-second invitation expired, and is refused
+/// so (`JoinFailure::Expired`).
 #[test]
 fn a_join_stops_asking_at_its_invitations_expiry_and_at_a_terminal_refusal() {
+    use JoinFailure::{Expired, Revoked, Unavailable};
     focal_rt::block_on(async move {
-        for (answer, lifetime) in [(JoinFailure::Unavailable, 2), (JoinFailure::Revoked, 600)] {
+        // The sponsor's answers in turn, and the invitation's lifetime in seconds.
+        let cases = [
+            (vec![Unavailable, Unavailable, Revoked], 600),
+            (vec![Revoked], 600),
+            (vec![Unavailable; 4096], 2),
+        ];
+        for (answers, lifetime) in cases {
             let mut fixture = Fixture::new();
             let server = Arc::new(
                 EnrollmentServer::bind(
@@ -599,8 +619,7 @@ fn a_join_stops_asking_at_its_invitations_expiry_and_at_a_terminal_refusal() {
                 fixture.invite_until(server.local_addr().unwrap(), EnrollmentRole::Node, expires);
             let bundle =
                 NodeInvitation::new("worker-2", fixture.genesis.clone(), invitation).unwrap();
-            // The sponsor never enrolls: each ask is answered `answer`.
-            let (state, task) = scripted_sponsor(fixture, server.clone(), vec![answer; 4096]);
+            let (state, task) = scripted_sponsor(fixture, server.clone(), answers.clone());
             let disk = tempfile::tempdir().unwrap();
             let settings = settings(disk.path());
             let (listen, advertise) = addresses();
@@ -609,15 +628,21 @@ fn a_join_stops_asking_at_its_invitations_expiry_and_at_a_terminal_refusal() {
                 EnrollmentClient::bind("127.0.0.1:0".parse().unwrap(), TransportLimits::default())
                     .unwrap();
             let ended = pending.redeem_settled(&client).await;
-            assert!(
-                matches!(&ended, Err(JoinError::Transport(JoinTransportError::Rejected(failure))) if *failure == answer),
-                "{ended:?}"
-            );
+            let refused = |failure: JoinFailure| {
+                matches!(&ended, Err(JoinError::Transport(JoinTransportError::Rejected(answer))) if *answer == failure)
+            };
             let asks = state.lock().unwrap().asks;
-            if answer == JoinFailure::Revoked {
-                assert_eq!(asks, 1, "a terminal refusal is not asked again");
+            if answers.contains(&Revoked) {
+                assert!(refused(Revoked), "{ended:?}");
+                assert_eq!(
+                    asks,
+                    answers.len(),
+                    "asked again while the sponsor was unavailable, and not after its refusal"
+                );
             } else {
-                assert!(asks > 1, "an unavailable sponsor was asked again");
+                // Its last answer, or the expiry itself where its last ask reached the sponsor
+                // after it.
+                assert!(refused(Unavailable) || refused(Expired), "{ended:?}");
                 assert!(now() >= expires, "the join stopped before its invitation expired");
             }
             client.close();
