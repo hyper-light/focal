@@ -507,3 +507,27 @@ openssl_interop -- --ignored`. slates ships the same group, checked against Open
 - **Checked.** hyper-tls's own IR at opt-level 0 holds no cycle through hyper-tls code (focal's
   `scripts/check_recursion.py`). The six cycles left are inside the standard library's own
   generic code it instantiates.
+
+## 10. A certificate's Brotli window holds it and no more (2026-10-21)
+
+- **The allocation.** Certificate compression (RFC 8879) by Brotli used Brotli's default window,
+  2^22 bytes (`LGWIN`, upstream rustls's), whatever the certificate's length. At the quality an
+  amortized compression takes (11), Brotli hashes with its binary tree (H10), whose forest holds two
+  `u32` a window position: 2 × 2^22 × 4 bytes, 32 MiB, allocated at a server's first handshake to
+  compress a chain of a few kilobytes, and at every client that compresses its own certificate.
+  Found by hyper-rt-transport's `connection_footprint` measurement: the one block past 512 KiB in a
+  burst of 64 handshakes, a backtrace through `BrotliCompressor::compress`.
+- **The window now.** The least window holding the input whole (`window_bits`: the least WBITS with
+  `2^WBITS − 16` at least the input's length, RFC 7932 §9.1, between 10 and 24). A certificate's
+  compression is one shot of a length known first, and every match within it stays reachable, as
+  Brotli's reference encoder sizes the same hasher to the input of a one-shot compression
+  (`HashMemAllocInBytes` in `c/enc/hash_to_binary_tree_inc.h`: `num_nodes` is the input's size where
+  it is the smaller; read upstream). The `brotli` crate's streaming writer does not, so the window
+  is given it.
+- **Measured.** The burst's largest block 524,288 B where it was 33,554,432; the peak live bytes of
+  a server taking 64 handshakes 38,716 a connection where they were 541,834. A 3,000-byte
+  irregular input compresses to 1,888 bytes against 1,887 under the default window: the stream's
+  header codes the window in one to seven bits.
+- **Oracle.** `compress::tests::brotli_window_holds_the_input_whole`,
+  `brotli_under_the_inputs_window_compresses_as_under_the_default`, and the round trips of
+  `test_brotli` at 16 to 16,384 bytes.

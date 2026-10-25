@@ -28,7 +28,10 @@
 //! **Timing, all measured.** The sender's interval is the one the receiver's configurator chose
 //! (Chen et al.'s adaptive scheme, the receiver asking in its own heartbeats), never shorter than
 //! the sender's stability floor `E[flush] + G` (Lindley 1952; `docs/timing.md` §2.6); before the
-//! receiver has chosen, the floor. `G` is the mean lateness of the owner's waits for the stream's
+//! receiver has chosen, the floor. To a peer from which nothing has come, a sender with no return
+//! traffic, the floor backs off, doubled at each heartbeat to the 3 s RFC 8085 §3.1.3 bounds such a
+//! sender to, and the peer's first heartbeat taken is answered at once (`docs/timing.md` §2.8, "A
+//! peer that has said nothing"). `G` is the mean lateness of the owner's waits for the stream's
 //! wakes, each begun before its deadline and ended at or past it, whatever ended it
 //! ([`Liveness::on_wait`]): how late past its wakes the stream is polled while its owner waits for
 //! them, not what the owner's own work adds. `E[flush]` the mean of the

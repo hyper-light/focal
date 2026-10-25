@@ -18,8 +18,12 @@ in this tree.
 
 The `hyper-*` crates are not crates.io archives. They come from the repository focal shares with
 mantle and slates (<https://github.com/hyper-light/hyper-raft>), taken from it whole at one
-revision, which `SNAPSHOT` in each names (since 2026-10-24 all sixteen at 8c6b4fa of the shared
-repository, whose hyper-seal seals a whole file keyed by a hash its writer is given
+revision, which `SNAPSHOT` in each names (since 2026-10-25 all sixteen at 698c0da of the shared
+repository, whose hyper-transport keeps the key an endpoint resets its last run's connections with
+across its restarts (`RestartKey`, `Endpoint::new_restartable`), so a restarted bus node's peers
+learn at their next send that their connections are gone, and whose hyper-liveness backs a stream to
+a peer from which nothing has come off to a heartbeat every 3 s, announced; since 2026-10-24 at
+8c6b4fa, whose hyper-seal seals a whole file keyed by a hash its writer is given
 (`SealedWriter::content_keyed`, focal's seeds keyed by the BLAKE3 hash they are named by) and
 finishes one leaving the flush to its caller (`SealedWriter::finish_unflushed`, a checkpoint's batch
 of seeds flushed together); since 2026-10-23 at ebdcfb2, whose hyper-log wakes its owner for a job back through a one-slot wake fenced on both
@@ -86,22 +90,22 @@ targets; a change to it is made there first and taken here by a new snapshot, ne
 
 | Crate | Version | Revision | Taken | Why it is here |
 |---|---|---|---|---|
-| `hyper-block` | 0.1.0 | `5a22c8c83360ff5f8eda502cfc4ebd52b06c0c22` | 2026-10-23 | Block I/O for the log: aligned direct I/O, each platform's full flush, group commit's wait |
-| `hyper-datagram` | 0.1.0 | `5a22c8c83360ff5f8eda502cfc4ebd52b06c0c22` | 2026-10-23 | The sealed datagram plane: consensus and membership messages on a UDP socket of their own beside QUIC, so a vote never waits behind a transfer, keyed from each connection's TLS exporter |
-| `hyper-durable` | 0.1.0 | `5a22c8c83360ff5f8eda502cfc4ebd52b06c0c22` | 2026-10-23 | The durable shell a group's replica becomes (27 §15) |
-| `hyper-heap` | 0.1.0 | `5a22c8c83360ff5f8eda502cfc4ebd52b06c0c22` | 2026-10-23 | A node's endpoints run on heaps of their own (mimalloc's first-class heaps), whose bytes in use their endpoints observe as what their connections hold (hyper-raft docs/transport.md §4x) |
-| `hyper-liveness` | 0.1.0 | `5a22c8c83360ff5f8eda502cfc4ebd52b06c0c22` | 2026-10-23 | The node-pair liveness stream, which the shell's owner wires once focal elects by suspicion |
-| `hyper-log` | 0.1.0 | `5a22c8c83360ff5f8eda502cfc4ebd52b06c0c22` | 2026-10-23 | The log every group of a data directory writes, one flush for all of them (27 §15.3) |
-| `hyper-measure` | 0.1.0 | `5a22c8c83360ff5f8eda502cfc4ebd52b06c0c22` | 2026-10-23 | Measurement only, a dev-dependency of the event bus's benchmarks: the counting allocator, the OS's page-fault, CPU and footprint accounts, the open-loop schedule and quantile intervals |
-| `hyper-quic` | 0.1.0 | `5a22c8c83360ff5f8eda502cfc4ebd52b06c0c22` | 2026-10-23 | QUIC (quinn-proto conformed: configuration owned, not shared, no panics), every node's and client's transport |
-| `hyper-raft` | 0.1.0 | `5a22c8c83360ff5f8eda502cfc4ebd52b06c0c22` | 2026-10-23 | The consensus core every group runs |
-| `hyper-rt` | 0.1.0 | `5a22c8c83360ff5f8eda502cfc4ebd52b06c0c22` | 2026-10-23 | The thread-per-core runtime focal runs on: shards, timers, sockets, signals, the blocking pool (it replaced tokio) |
-| `hyper-rt-transport` | 0.1.0 | `5a22c8c83360ff5f8eda502cfc4ebd52b06c0c22` | 2026-10-23 | hyper-transport's endpoint and hyper-datagram's plane driven on a hyper-rt shard, over its batched UDP socket |
-| `hyper-seal` | 0.1.0 | `5a22c8c83360ff5f8eda502cfc4ebd52b06c0c22` | 2026-10-23 | Sealing at rest: the log's per-session keys, MACs and tags (hyper-log's sealed log), whole files sealed by STREAM (`sealed_file`), keys wrapped by AES-256-KW and sent to another machine by ML-KEM-1024 |
-| `hyper-sim` | 0.1.0 | `5a22c8c83360ff5f8eda502cfc4ebd52b06c0c22` | 2026-10-23 | The deterministic world (seeded streams, virtual time, the simulated block device) hyper-block's `sim` feature builds on, and the bus's simulations will |
-| `hyper-timing` | 0.1.0 | `5a22c8c83360ff5f8eda502cfc4ebd52b06c0c22` | 2026-10-23 | The election law's draw the core takes its delays from |
-| `hyper-tls` | 0.1.0 | `5a22c8c83360ff5f8eda502cfc4ebd52b06c0c22` | 2026-10-23 | TLS for QUIC and TCP (rustls conformed: configuration owned and lent per call, hybrid post-quantum groups between nodes) |
-| `hyper-transport` | 0.1.0 | `5a22c8c83360ff5f8eda502cfc4ebd52b06c0c22` | 2026-10-23 | Exchanges over QUIC: admission by identity, lanes, credit and the peer's measured timing (it replaced quinn); a lane's `LaneRoom` event, which focal's replication lanes wait on |
+| `hyper-block` | 0.1.0 | `698c0da947bf095f82737426f58aaa08de4b7b48` | 2026-10-25 | Block I/O for the log: aligned direct I/O, each platform's full flush, group commit's wait |
+| `hyper-datagram` | 0.1.0 | `698c0da947bf095f82737426f58aaa08de4b7b48` | 2026-10-25 | The sealed datagram plane: consensus and membership messages on a UDP socket of their own beside QUIC, so a vote never waits behind a transfer, keyed from each connection's TLS exporter |
+| `hyper-durable` | 0.1.0 | `698c0da947bf095f82737426f58aaa08de4b7b48` | 2026-10-25 | The durable shell a group's replica becomes (27 §15) |
+| `hyper-heap` | 0.1.0 | `698c0da947bf095f82737426f58aaa08de4b7b48` | 2026-10-25 | A node's endpoints run on heaps of their own (mimalloc's first-class heaps), whose bytes in use their endpoints observe as what their connections hold (hyper-raft docs/transport.md §4x) |
+| `hyper-liveness` | 0.1.0 | `698c0da947bf095f82737426f58aaa08de4b7b48` | 2026-10-25 | The node-pair liveness stream, which the shell's owner wires once focal elects by suspicion |
+| `hyper-log` | 0.1.0 | `698c0da947bf095f82737426f58aaa08de4b7b48` | 2026-10-25 | The log every group of a data directory writes, one flush for all of them (27 §15.3) |
+| `hyper-measure` | 0.1.0 | `698c0da947bf095f82737426f58aaa08de4b7b48` | 2026-10-25 | Measurement only, a dev-dependency of the event bus's benchmarks: the counting allocator, the OS's page-fault, CPU and footprint accounts, the open-loop schedule and quantile intervals |
+| `hyper-quic` | 0.1.0 | `698c0da947bf095f82737426f58aaa08de4b7b48` | 2026-10-25 | QUIC (quinn-proto conformed: configuration owned, not shared, no panics), every node's and client's transport |
+| `hyper-raft` | 0.1.0 | `698c0da947bf095f82737426f58aaa08de4b7b48` | 2026-10-25 | The consensus core every group runs |
+| `hyper-rt` | 0.1.0 | `698c0da947bf095f82737426f58aaa08de4b7b48` | 2026-10-25 | The thread-per-core runtime focal runs on: shards, timers, sockets, signals, the blocking pool (it replaced tokio) |
+| `hyper-rt-transport` | 0.1.0 | `698c0da947bf095f82737426f58aaa08de4b7b48` | 2026-10-25 | hyper-transport's endpoint and hyper-datagram's plane driven on a hyper-rt shard, over its batched UDP socket |
+| `hyper-seal` | 0.1.0 | `698c0da947bf095f82737426f58aaa08de4b7b48` | 2026-10-25 | Sealing at rest: the log's per-session keys, MACs and tags (hyper-log's sealed log), whole files sealed by STREAM (`sealed_file`), keys wrapped by AES-256-KW and sent to another machine by ML-KEM-1024 |
+| `hyper-sim` | 0.1.0 | `698c0da947bf095f82737426f58aaa08de4b7b48` | 2026-10-25 | The deterministic world (seeded streams, virtual time, the simulated block device) hyper-block's `sim` feature builds on, and the bus's simulations will |
+| `hyper-timing` | 0.1.0 | `698c0da947bf095f82737426f58aaa08de4b7b48` | 2026-10-25 | The election law's draw the core takes its delays from |
+| `hyper-tls` | 0.1.0 | `698c0da947bf095f82737426f58aaa08de4b7b48` | 2026-10-25 | TLS for QUIC and TCP (rustls conformed: configuration owned and lent per call, hybrid post-quantum groups between nodes) |
+| `hyper-transport` | 0.1.0 | `698c0da947bf095f82737426f58aaa08de4b7b48` | 2026-10-25 | Exchanges over QUIC: admission by identity, lanes, credit and the peer's measured timing (it replaced quinn); a lane's `LaneRoom` event, which focal's replication lanes wait on |
 
 A new snapshot: `git archive <revision> crates/<name>/src crates/<name>/ORIGIN.md
 crates/<name>/README.md LICENSE` from the shared repository into `vendor/<name>`, `SNAPSHOT` set to

@@ -13,6 +13,9 @@ oracle = []
 [dependencies]
 hyper-quic = { version = "0.1.0", path = "../hyper-quic" }
 hyper-timing = { version = "0.1.0", path = "../hyper-timing" }
+# The key an endpoint keeps across its restarts is expanded by HKDF into its reset key, an HMAC key
+# (`RestartKey`), the provider hyper-quic's reset tokens are made with.
+aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
 # The QUIC layer takes a received datagram as BytesMut (hyper-quic's own dependency).
 bytes = "1"
 crc-fast = { version = "1.10", default-features = false, features = ["std", "vpclmulqdq"] }

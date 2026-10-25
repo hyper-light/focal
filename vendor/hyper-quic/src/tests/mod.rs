@@ -969,7 +969,7 @@ fn a_warm_up_over_a_slow_path_ends_once_its_packets_queue_and_over_a_fast_one_me
 #[test]
 fn a_warm_up_keeps_what_its_last_round_trip_measures() {
     let _guard = subscribe();
-    let [(_, client), (_, server)] = warm_up(Duration::from_millis(5), false);
+    let [(_, client), (_, server)] = warm_up(Duration::from_millis(5), false, WARM_UP_SEED);
     assert_eq!(server.warm_up_end, None);
     assert_eq!(server.sent_warm_up_packets, 0);
     assert_eq!(client.warm_up_end, Some(WarmUpEnd::Measured));
@@ -987,10 +987,17 @@ fn a_warm_up_keeps_what_its_last_round_trip_measures() {
 /// round trip, and the warm-up ends at its plateau, short of the target, within its budget. With
 /// the port's estimator the window grew to 147 kB here and the warm-up queued its way to the target
 /// or the budget (`VENDORED.md` §30).
+///
+/// Which end comes first is the seed's: the full-pipe test wants three round trips that do not grow
+/// by a quarter, and a round trip's count moves with the packet numbers each side skips. Over
+/// seeds 0 to 4,999, 19 sides ended at the budget instead, a round having crept past a quarter's
+/// growth late (seed 327's server: 29,040, 33,396 and 40,656 bytes, then 40,656 and 39,204, and the
+/// budget's last 4,356 bytes in a round no window held). Drawn anew each run, the endpoints' seeds
+/// failed this test 6 times in 1,000 at `8c6b4fa`; drawn from [`WARM_UP_SEED`], none in 1,000.
 #[test]
 fn a_warm_up_on_a_path_shorter_than_its_target_ends_at_a_plateau() {
     let _guard = subscribe();
-    for (side, path) in warm_up(Duration::from_micros(40), true) {
+    for (side, path) in warm_up(Duration::from_micros(40), true, WARM_UP_SEED) {
         assert_eq!(path.warm_up_end, Some(WarmUpEnd::Plateau), "{side}");
         assert!(
             path.sent_warm_up_bytes <= 16 * 10 * u64::from(path.current_mtu),
@@ -1000,9 +1007,26 @@ fn a_warm_up_on_a_path_shorter_than_its_target_ends_at_a_plateau() {
     }
 }
 
+/// The seed the warm-up tests run at: each is exact for it.
+const WARM_UP_SEED: u64 = 1;
+
 /// A connection under BBR at 100 Mbit/s and `latency` one way, driven until quiet, the server
 /// warming its path up too if `server_warms`: each side's path statistics.
-fn warm_up(latency: Duration, server_warms: bool) -> [(&'static str, crate::PathStats); 2] {
+///
+/// Each endpoint draws from `seed` and its side, as the geo tests' endpoints do, so a run is its
+/// seed's: the packet numbers each skips (`PacketNumberFilter`) and the grease its transport
+/// parameters carry are the same every run, and with them every round trip's count.
+fn warm_up(
+    latency: Duration,
+    server_warms: bool,
+    seed: u64,
+) -> [(&'static str, crate::PathStats); 2] {
+    let rng = |side: u32| {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&seed.to_le_bytes());
+        bytes[8..12].copy_from_slice(&side.to_le_bytes());
+        Some(bytes)
+    };
     let bbr = || {
         let mut transport = TransportConfig::default();
         transport.congestion(congestion::Congestion::Bbr(congestion::BbrConfig::default()));
@@ -1017,8 +1041,8 @@ fn warm_up(latency: Duration, server_warms: bool) -> [(&'static str, crate::Path
     let mut server_endpoint = EndpointConfig::default();
     server_endpoint.careful_resume(Some(resume));
     let mut pair = Pair::new_from_endpoint(
-        Endpoint::new(EndpointConfig::default(), None, true, None).unwrap(),
-        Endpoint::new(server_endpoint, Some(server), true, None).unwrap(),
+        Endpoint::new(EndpointConfig::default(), None, true, rng(0)).unwrap(),
+        Endpoint::new(server_endpoint, Some(server), true, rng(1)).unwrap(),
     );
     pair.latency = latency;
     pair.rate = Some(12_500_000);

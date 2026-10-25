@@ -1594,3 +1594,13 @@ Tests: `congestion::bbr_at_a_queue_of_one_product_loses_no_more_than_newreno` (1
 before), `congestion::a_path_where_packets_skip_its_delay_is_carried_by_bbr_as_its_delays_kept_in_order`
 (1% and 5% keep nine tenths of the same delays kept in order; 14.1% and 14.6% paced without the
 filter), `congestion::bbr::tests::a_paced_bulk_sender_keeps_about_its_bandwidth_delay_product_in_flight`.
+
+## 44. BBR reports the rate it paces at (2026-10-23)
+
+`congestion/bbr/mod.rs`: `Controller::metrics` gave the model's pacing rate as it stood, zero until
+its model had a bandwidth, where `Controller::pacing_rate`, what the connection paces by (§43), is
+the start-up's until then (its gain times its first window a round trip) and nothing before a round
+trip. The connection's statistics, and hyper-transport's `PathFacts::pacing_rate` through them, said
+a BBR connection paced at zero bits a second while it paced at its start-up's rate. `metrics` now
+gives `pacing_rate`'s. Test: `congestion::bbr::tests::the_rate_reported_is_the_rate_paced_at` (before:
+`(None, Some(0))` where `(None, None)`).

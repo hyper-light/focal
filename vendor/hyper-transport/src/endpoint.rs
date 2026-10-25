@@ -52,6 +52,7 @@ use crate::lane::{LaneIn, LaneOut, OPENER_BYTES, Reading, opened};
 use crate::pool::{Pool, PoolStats, Share};
 use crate::progress::{Carry, Delivered, LEAST_PROGRESS, Moved, Progress};
 use crate::receive::Receive;
+use crate::restart::RestartKey;
 use crate::state::{StateAccount, StateStats};
 use crate::tally::{Table, Tally};
 use crate::timing::PeerTiming;
@@ -811,7 +812,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         directory: D,
         now: Instant,
     ) -> Result<Self, Refusal> {
-        Self::build(config, budget, directory, now, None)
+        Self::build(config, budget, directory, now, None, None)
     }
 
     /// [`Endpoint::new`], with the QUIC layer's own randomness drawn from `seed` where the
@@ -827,7 +828,22 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         now: Instant,
         seed: [u8; 32],
     ) -> Result<Self, Refusal> {
-        Self::build(config, budget, directory, now, Some(seed))
+        Self::build(config, budget, directory, now, Some(seed), None)
+    }
+
+    /// [`Endpoint::new`], keyed by the key the endpoint keeps across its restarts at its address
+    /// ([`RestartKey`]): a peer that sends on a connection the endpoint's last run held is answered
+    /// with a reset it verifies, and is told at once that the connection closed (docs/transport.md
+    /// §4ah). `seed`, where given, is [`Endpoint::new_seeded`]'s.
+    pub fn new_restartable(
+        config: Config<C::Role>,
+        budget: B,
+        directory: D,
+        now: Instant,
+        restart: &RestartKey,
+        seed: Option<[u8; 32]>,
+    ) -> Result<Self, Refusal> {
+        Self::build(config, budget, directory, now, seed, Some(restart))
     }
 
     fn build(
@@ -836,6 +852,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
         directory: D,
         now: Instant,
         seed: Option<[u8; 32]>,
+        restart: Option<&RestartKey>,
     ) -> Result<Self, Refusal> {
         config.limits.validate()?;
         let transport = config.limits.transport(C::RANKS, &config.congestion)?;
@@ -848,6 +865,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             .max_udp_payload_size(u16::try_from(crate::RECEIVE_CHUNK).unwrap_or(u16::MAX))
             .map_err(|_| Refusal::Configuration)?;
         endpoint.config_slots(config_slots(&config.limits.admission)?);
+        if let Some(restart) = restart {
+            restart.configure(&mut endpoint);
+        }
         let mut quic =
             hyper_quic::Endpoint::new(endpoint, server, true, seed).map_err(|_| Refusal::Quic)?;
         let client = quic

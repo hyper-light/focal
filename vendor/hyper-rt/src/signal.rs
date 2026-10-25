@@ -6,7 +6,10 @@
 //!   reads the pipe, swaps the bits to zero, and wakes each subscriber of a kind that arrived.
 //! - **Windows**: `SetConsoleCtrlHandler`; the OS runs the handler on a thread of its own, which marks and
 //!   wakes the subscribers directly. A kind with a subscriber is handled (the default action, ending the
-//!   process, does not run); one without is left to the default.
+//!   process, does not run); one without is left to the default. The OS ends the process as the handler
+//!   returns from a console close or a shutdown, so for those two the handler holds its return (`HOLD_MS`)
+//!   and the process ends when its owner's orderly stop ends it, or at the OS's time-out for the event,
+//!   whichever comes first (docs/runtime.md §6.1).
 //!
 //! **Bounded**: subscribers live in a process-wide table of [`crate::registry::MAX_SHARDS`] slots (DERIVED:
 //! one subscription per shard covers its tasks, for every kind); past it, `Capacity`. A signal arriving
@@ -34,11 +37,18 @@ pub enum Signal {
     Hangup,
     /// Windows' Ctrl-Break.
     Break,
-    /// Windows' console close.
+    /// Windows' console close. The process ends when its owner ends it or at the OS's time-out for a
+    /// close (`SPI_GETHUNGAPPTIMEOUT`, 5 s by default; the OS ended a process 4.99 to 5.00 s after a
+    /// close on the hosted Windows runners), whichever is first: a subscriber's orderly stop has that
+    /// long.
     Close,
-    /// Windows' user logoff (delivered to services).
+    /// Windows' user logoff, delivered only to services, which run on after it.
     Logoff,
-    /// Windows' system shutdown (delivered to services).
+    /// Windows' system shutdown, delivered to the processes still running when the system sends it,
+    /// services among them (interactive applications have ended by then). The process ends when its
+    /// owner ends it or at the OS's time-out for a shutdown, whichever is first:
+    /// `SPI_GETWAITTOKILLTIMEOUT`, 5 s by default, or in a service `SPI_GETWAITTOKILLSERVICETIMEOUT`,
+    /// which Microsoft's table gives as 20 s and the hosted Windows runners' images hold at 5 s.
     Shutdown,
 }
 
@@ -498,6 +508,7 @@ mod os {
         CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
         SetConsoleCtrlHandler,
     };
+    use windows_sys::Win32::System::Threading::Sleep;
 
     use super::{Signal, deliver};
     use crate::error::RtError;
@@ -509,19 +520,47 @@ mod os {
         | Signal::Logoff.bit()
         | Signal::Shutdown.bit();
 
+    /// How long the handler holds its return from a close or a shutdown it handled, in milliseconds
+    /// (docs/runtime.md §6.1). CITED: HandlerRoutine's "Timeouts" table (Microsoft Learn): the OS ends
+    /// the process at the event's time-out whether the handler has returned or not, a close at
+    /// `SPI_GETHUNGAPPTIMEOUT` (5,000 ms by default), a shutdown at `SPI_GETWAITTOKILLTIMEOUT` (5,000 ms)
+    /// or, in a service, `SPI_GETWAITTOKILLSERVICETIMEOUT` (20,000 ms). This is the longest of those
+    /// defaults, so under them the OS's end comes first and the hold never cuts a stop shorter than the
+    /// OS allows it. The time-out the system holds is not read: `SystemParametersInfoW` is in user32.dll,
+    /// and a process that loads user32.dll is no longer sent logoff and shutdown events
+    /// (SetConsoleCtrlHandler, Remarks).
+    pub(super) const HOLD_MS: u32 = 20_000;
+
     static INSTALLED: AtomicBool = AtomicBool::new(false);
 
     /// The console control handler, on the OS's thread: handles a kind some subscriber wants.
+    ///
+    /// A close and a shutdown end the process as the handler returns ("Return TRUE. In this case, no
+    /// other handler functions are called and the system terminates the process", HandlerRoutine), so
+    /// the handler returns from them only after [`HOLD_MS`]: the process ends when its owner's orderly
+    /// stop ends it, `ExitProcess` ending this thread with the others, or at the OS's time-out. The
+    /// owner's exit, not its subscription's end, is what lets the process go, so what the owner does
+    /// after its stop (its last lines, its runtime's end) runs too. A logoff is not held: only services
+    /// receive it, and a service runs on after it (HandlerRoutine), so a held logoff would only keep the
+    /// OS's thread.
     unsafe extern "system" fn on_control(event: u32) -> windows_sys::core::BOOL {
-        let kind = match event {
-            CTRL_C_EVENT => Signal::Interrupt,
-            CTRL_BREAK_EVENT => Signal::Break,
-            CTRL_CLOSE_EVENT => Signal::Close,
-            CTRL_LOGOFF_EVENT => Signal::Logoff,
-            CTRL_SHUTDOWN_EVENT => Signal::Shutdown,
+        let (kind, ends) = match event {
+            CTRL_C_EVENT => (Signal::Interrupt, false),
+            CTRL_BREAK_EVENT => (Signal::Break, false),
+            CTRL_CLOSE_EVENT => (Signal::Close, true),
+            CTRL_LOGOFF_EVENT => (Signal::Logoff, false),
+            CTRL_SHUTDOWN_EVENT => (Signal::Shutdown, true),
             _ => return 0,
         };
-        i32::from(deliver(kind.bit()) != 0)
+        if deliver(kind.bit()) == 0 {
+            return 0;
+        }
+        if ends {
+            // SAFETY: `Sleep` has no preconditions; it blocks only this thread, which the OS made for
+            // this event.
+            unsafe { Sleep(HOLD_MS) };
+        }
+        1
     }
 
     pub(super) fn install(_mask: u32) -> Result<(), RtError> {

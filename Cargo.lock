@@ -1530,6 +1530,7 @@ dependencies = [
 name = "hyper-transport"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "bytes",
  "crc-fast",
  "hyper-quic",
