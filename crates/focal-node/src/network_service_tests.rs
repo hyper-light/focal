@@ -1319,50 +1319,45 @@ fn a_joined_host_measures_its_voter_path_and_keeps_the_configured_period_on_a_lo
     .unwrap()
 }
 
-/// A UDP socket at `address`, or a panic that names what holds its port: every socket a test let go
-/// is gone once it is dropped, so a port still held is a socket that outlived what owned it, or one
-/// a child process inherited (std and hyper-rt set close-on-exec only after they make a socket on
-/// Apple targets), and which of the two says where the leak is.
+/// A UDP socket at `address` once its port is free, or a panic that names what holds it. Every
+/// socket a test let go is gone with its descriptor, but the kernel may hold a closed socket's port
+/// for a moment after its last descriptor closed: on macOS under the suite's load a re-bind was
+/// refused with no descriptor of this process or of any child bound to the port (lsof of this
+/// process, sampled through the close, saw the test's own reservation and nothing else, and nothing
+/// at the refusal), and the port was free 0.8 to 3 ms later (2026-10-25). So the bind is asked again
+/// until the port is free. A port still held after `FROZEN` is a socket that outlived what owned
+/// it, or one a child inherited (std and hyper-rt set close-on-exec only after they make a socket on
+/// Apple targets), and the panic says which.
 fn bind_or_name_holder(address: std::net::SocketAddr) -> std::net::UdpSocket {
-    match std::net::UdpSocket::bind(address) {
-        Ok(socket) => socket,
-        Err(error) => {
-            let refused = std::time::Instant::now();
-            let port = address.port();
-            // What the holder is, asked at once, before it can go: whether it shares its port (a
-            // socket hyper-rt bound to share it takes a joiner), how long after the refusal the
-            // port is free, then this process's children and who holds the port, if it still is.
-            let shares = match hyper_rt::udp::UdpSocket::join_shared(address) {
-                Ok(_) => format!(
-                    "shares its port (SO_REUSEPORT), {:?} after",
-                    refused.elapsed()
-                ),
-                Err(probe) => format!("does not share its port ({probe})"),
-            };
-            let mut freed = None;
-            while refused.elapsed() < std::time::Duration::from_secs(2) {
-                if std::net::UdpSocket::bind(address).is_ok() {
-                    freed = Some(refused.elapsed());
-                    break;
-                }
-                std::thread::yield_now();
-            }
-            let children = std::process::Command::new("pgrep")
-                .args(["-l", "-P", &std::process::id().to_string()])
-                .output()
-                .map(|output| String::from_utf8_lossy(&output.stdout).replace('\n', "; "))
-                .unwrap_or_else(|pgrep| format!("pgrep could not run: {pgrep}"));
-            let holders = std::process::Command::new("lsof")
-                .args(["-nP", &format!("-iUDP:{port}")])
-                .output()
-                .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-                .unwrap_or_else(|lsof| format!("lsof could not run: {lsof}"));
-            panic!(
-                "port {port} still held after its owners were let go ({error}); this process is \
-                 {}; the holder {shares}; the port was free {freed:?} after the refusal; this \
-                 process's children then: [{children}]; the port's holders then:\n{holders}",
-                std::process::id()
-            )
+    let asked = std::time::Instant::now();
+    let error = loop {
+        match std::net::UdpSocket::bind(address) {
+            Ok(socket) => return socket,
+            Err(error) if asked.elapsed() >= FROZEN => break error,
+            Err(_) => std::thread::yield_now(),
         }
-    }
+    };
+    let port = address.port();
+    // What holds it: whether it shares its port (a socket hyper-rt bound to share it takes a
+    // joiner), this process's children, and the port's holders as lsof finds them.
+    let shares = match hyper_rt::udp::UdpSocket::join_shared(address) {
+        Ok(_) => "shares its port (SO_REUSEPORT)".to_owned(),
+        Err(probe) => format!("does not share its port ({probe})"),
+    };
+    let children = std::process::Command::new("pgrep")
+        .args(["-l", "-P", &std::process::id().to_string()])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).replace('\n', "; "))
+        .unwrap_or_else(|pgrep| format!("pgrep could not run: {pgrep}"));
+    let holders = std::process::Command::new("lsof")
+        .args(["-nP", &format!("-iUDP:{port}")])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_else(|lsof| format!("lsof could not run: {lsof}"));
+    panic!(
+        "port {port} still held {FROZEN:?} after its owners were let go ({error}); this process \
+         is {}; the holder {shares}; this process's children: [{children}]; the port's \
+         holders:\n{holders}",
+        std::process::id()
+    )
 }
