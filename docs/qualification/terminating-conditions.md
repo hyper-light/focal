@@ -92,11 +92,13 @@ clear converted while it serves by jobs off the session's owner. A session's col
 from the same level (doc 29 §12.6, "2026-10-24 — A session's cold streams are sealed from the
 at-rest level"): the open chunk record by record under a key of its file's own, a whole chunk the
 same file renamed under a keyed name, a manifest sealed keyed by its hash, a directory in the clear
-converted while the stream goes on.
+converted while the stream goes on. A content store's uploads being staged, chunks being received
+in parts and custody records are sealed from the same level (doc 29 §12.7, "2026-10-24 — A content
+store's staging, parts and custody records are sealed from the at-rest level"), apart from its
+objects' form, so a node between the content and at-rest levels still rolls back.
 
-**Open.** Still written in the clear (doc 29 §12's inventory, taken again 2026-10-24): the content
-store's staging, transfer parts and custody records, session backups, the bus's identities and part
-images, client stores and the node's small files.
+**Open.** Still written in the clear (doc 29 §12's inventory, taken again 2026-10-24): session
+backups, the bus's identities and part images, client stores and the node's small files.
 
 ## 6. Adversarial batteries
 

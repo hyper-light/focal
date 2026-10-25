@@ -2,17 +2,28 @@ use super::*;
 use crate::{ContentStore, MAX_TERMINAL_UPLOADS, StoreLimits};
 use focal_model::{ContentClass, ContentDomainId};
 
+fn limits() -> StoreLimits {
+    StoreLimits {
+        max_content_bytes: 64,
+        max_staging_bytes: 128,
+        max_uploads: 2,
+        chunk_bytes: 4,
+        max_manifest_bytes: 2048,
+    }
+}
 fn store(path: &Path) -> ContentStore {
-    ContentStore::open(
+    ContentStore::open(path, limits(), &crate::store::test_keys(path)).unwrap()
+}
+/// A store in the clear, whose terminal records this module writes and whose crash windows its
+/// cuts are injected into; a sealed store's terminal records are written as every sealed record is
+/// (`staging_tests`).
+fn clear_store(path: &Path) -> ContentStore {
+    ContentStore::open_with_disk(
         path,
-        StoreLimits {
-            max_content_bytes: 64,
-            max_staging_bytes: 128,
-            max_uploads: 2,
-            chunk_bytes: 4,
-            max_manifest_bytes: 2048,
-        },
+        limits(),
+        focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::unbounded()).unwrap(),
         &crate::store::test_keys(path),
+        crate::ContentForm::Clear,
     )
     .unwrap()
 }
@@ -51,8 +62,10 @@ fn terminal_ids_fence_delayed_begin_across_restart_and_preserve_immutable_conten
         ));
         current.finish(id).unwrap();
         assert!(!current.part_path(id).exists());
-        let bytes = fs::read(current.meta_path(id)).unwrap();
-        assert!(postcard::from_bytes::<super::super::UploadMeta>(&bytes).is_err());
+        assert!(matches!(
+            current.staged_record_of(id),
+            Some(super::super::staging::Staged::Terminal(found)) if found == id
+        ));
     }
     assert_eq!(current.read_bytes(&reference, 3).unwrap(), b"abc");
 }
@@ -62,14 +75,14 @@ fn crash_cuts_recover_old_active_or_new_terminal_without_recreating_an_acknowled
     for cut in [Cut::FileSynced, Cut::Renamed] {
         let root = tempfile::tempdir().unwrap();
         let id = UploadId([4; 16]);
-        let mut current = store(root.path());
+        let mut current = clear_store(root.path());
         begin(&mut current, id).unwrap();
         current.append(id, 0, b"abc").unwrap();
         CUT.with(|pending| pending.set(Some(cut)));
         assert!(matches!(current.finish(id), Err(ContentError::Io(_))));
         assert!(matches!(begin(&mut current, id), Err(ContentError::Failed)));
         drop(current);
-        let mut current = store(root.path());
+        let mut current = clear_store(root.path());
         assert!(!current.meta_path(id).with_extension("terminal").exists());
         match cut {
             Cut::FileSynced => assert_eq!(begin(&mut current, id).unwrap(), 3),
@@ -81,7 +94,7 @@ fn crash_cuts_recover_old_active_or_new_terminal_without_recreating_an_acknowled
         current.finish(id).unwrap();
         drop(current);
         assert!(matches!(
-            begin(&mut store(root.path()), id),
+            begin(&mut clear_store(root.path()), id),
             Err(ContentError::FinishedUpload)
         ));
     }
@@ -118,15 +131,9 @@ fn malformed_terminal_state_and_trailing_active_bytes_fail_closed() {
         if mode != 2 {
             fs::write(&path, bytes).unwrap();
         }
-        let limits = StoreLimits {
-            max_content_bytes: 64,
-            max_staging_bytes: 128,
-            max_uploads: 2,
-            chunk_bytes: 4,
-            max_manifest_bytes: 2048,
-        };
         assert!(
-            ContentStore::open(root.path(), limits, &crate::store::test_keys(root.path())).is_err()
+            ContentStore::open(root.path(), limits(), &crate::store::test_keys(root.path()))
+                .is_err()
         );
     }
 }

@@ -1,30 +1,56 @@
-//! A cold stream's record file (29 §12.6): its open chunk, appended to in place, and a whole chunk
-//! cut from one, renamed into place as it is, so a cut writes nothing again. A file is its header
-//! (the format's magic and the file's ID, in the clear) and its records, each a block of its length
+//! A record file (29 §12.6, §12.7): a file appended to in place and sealed as it is written. A cold
+//! stream's open chunk is one, and a whole chunk cut from it is the same file renamed into place,
+//! so a cut writes nothing again; an upload being staged and a chunk a transfer is receiving are
+//! others, parts that a writer opens again to go on with where it stopped. A file is its header
+//! (its kind's magic and the file's ID, in the clear) and its records, each a block of its length
 //! and then a block of its bytes, every block sealed with AES-256-GCM under the file's key (derived
 //! from its directory's key and the file's ID, `sealing::DomainKey::record_key`) at the nonce of its
 //! place among the file's blocks. A block moved within its file, cut short, or carried from another
-//! file opens to nothing, and a whole chunk is checked against its name besides. A record holds at
-//! most [`RECORD_BYTES`]: an append longer is written as several, so a read opens at most that much
-//! more than it wants.
+//! file opens to nothing, and a file of one kind is not read as another's. A record holds at most
+//! [`RECORD_BYTES`]: an append longer is written as several, so a read opens at most that much more
+//! than it wants.
 //!
 //! - **No nonce seals two plaintexts.** Every file has a key of its own (its ID random, 128 bits),
-//!   and a block's place is its nonce under it: a writer only appends, a writer that fails fails
-//!   its stream until the stream opens again, and an open writes its open chunk into a new file.
+//!   and a block's place is its nonce under it: a writer only appends, and a writer that fails is
+//!   not written to again. A part opened again whose last append a crash cut short is written
+//!   again whole, its whole records copied into a file of a new ID under a new key, before anything
+//!   is appended ([`RecordWriter::resume`]): what the cut append left of its blocks may lie on the
+//!   volume, and its places are never sealed over under its key. A cold stream's open writes its
+//!   open chunk into a new file.
 //! - **Bounded.** A writer holds its file's key (an AES-GCM context, 592 bytes with its allocation)
-//!   and where reads begin, one place for each [`RECORD_BYTES`] of the file's plaintext: a chunk's
-//!   worth at most, sized when the file is made. A record is sealed in a buffer of its own, at most
-//!   a record and its overhead long, while it is written, and written with one write.
+//!   and where reads begin, one place for each [`RECORD_BYTES`] of the most plaintext the file
+//!   takes, sized when the file is made. A record is sealed in a buffer of its own, at most a
+//!   record and its overhead long, while it is written, and written with one write.
 use hyper_seal::TAG;
 use hyper_seal::stream::VersionKey;
 
 use super::*;
 
-/// Format: the magic a record file begins with. A sealed file begins with its header's version, so
-/// the two are told apart by their first byte.
-pub(super) const MAGIC: &[u8; 8] = b"FCLCOLD1";
-/// Format: bytes of a record file's header: the magic and the file's ID.
+/// Format: the magic a cold stream's record file begins with. A sealed file begins with its
+/// header's version, so the two are told apart by their first byte.
+pub(super) const COLD_MAGIC: &[u8; 8] = b"FCLCOLD1";
+/// Format: the magic a part's record file begins with: an upload being staged, or a chunk a
+/// transfer is receiving.
+pub(super) const PART_MAGIC: &[u8; 8] = b"FCLPART1";
+/// Format: bytes of a cold record file's header: the magic and the file's ID.
 pub(super) const HEADER: usize = 8 + 16;
+/// Format: bytes of a part's header: the magic, the file's ID, and a tag sealed under the part's key
+/// at a place no record takes ([`BINDING`]), which says whose part the file is: its key is kept for
+/// its owner (an upload, a chunk), so a part under another owner's name fails here, before any of
+/// its records is taken for a crash's leftovers.
+pub(super) const PART_HEADER: usize = HEADER + TAG;
+/// What a part's header tag is sealed at: a version no record's block takes (theirs is
+/// [`VERSION`]).
+const BINDING: u64 = 1;
+
+/// The header's bytes of a record file of the kind `magic` names.
+fn header_of(magic: &[u8; 8]) -> usize {
+    if magic == PART_MAGIC {
+        PART_HEADER
+    } else {
+        HEADER
+    }
+}
 /// The most plaintext one record holds.
 pub(super) const RECORD_BYTES: usize = 64 * 1024;
 /// Format: bytes of a record's length block: the length (u32, little-endian) and its tag.
@@ -35,10 +61,24 @@ pub(super) const RECORD_OVERHEAD: usize = LENGTH_BLOCK + TAG;
 /// What a record's blocks are sealed at: the version of every block of a file (its key is its own).
 const VERSION: u64 = 0;
 
+/// How much of a record file [`RecordWriter::resume`] opens as it reads it through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Verify {
+    /// Every block, lengths and bytes: what an upload's part takes once an open (29 §12.7).
+    All,
+    /// Every length block, each record's bytes passed over by their stated length: what a part a
+    /// transfer is receiving takes at each part it is sent, its bytes opened and checked against
+    /// the chunk's hash once the chunk is whole, so a part's bytes are opened once, not once a
+    /// part sent.
+    Lengths,
+}
+
 /// The writer of one record file.
 pub(super) struct RecordWriter {
     file: File,
     key: VersionKey,
+    /// Its kind's magic, which a file written again for it begins with too.
+    magic: &'static [u8; 8],
     /// Blocks written: the next block's place.
     blocks: u32,
     /// Plaintext bytes written.
@@ -72,39 +112,265 @@ pub(super) fn records_bytes(bytes: usize) -> Result<u64, ContentError> {
 }
 
 impl RecordWriter {
-    /// A new record file at `path`, which must not stand, its header written: its ID `id` and its
-    /// key `key`, made for that ID. `most` is the most plaintext the file takes (a chunk), which
-    /// sizes where reads begin.
+    /// A new record file of the kind `magic` names at `path`, which must not stand, its header
+    /// written: its ID `id` and its key `key`, made for that ID. `most` is the most plaintext the
+    /// file takes (a chunk, an upload), which sizes where reads begin; a file's places count its
+    /// plaintext in 32 bits, so more is refused.
     pub(super) fn create(
         path: &Path,
+        magic: &'static [u8; 8],
         id: [u8; 16],
         key: VersionKey,
         most: usize,
     ) -> Result<Self, ContentError> {
-        let mut starts = Vec::new();
-        starts
-            .try_reserve_exact(most.div_ceil(RECORD_BYTES).saturating_add(1))
-            .map_err(|_| ContentError::Capacity)?;
+        let starts = starts_for(most)?;
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
             .read(true)
             .open(path)?;
-        let mut header = [0u8; HEADER];
-        let (magic, rest) = header.split_at_mut(MAGIC.len());
-        magic.copy_from_slice(MAGIC);
-        rest.copy_from_slice(&id);
-        file.write_all(&header)?;
+        let mut header = [0u8; PART_HEADER];
+        let (head, rest) = header
+            .split_at_mut_checked(magic.len())
+            .ok_or(ContentError::Capacity)?;
+        head.copy_from_slice(magic);
+        let (file_id, binding) = rest
+            .split_at_mut_checked(id.len())
+            .ok_or(ContentError::Capacity)?;
+        file_id.copy_from_slice(&id);
+        if magic == PART_MAGIC {
+            let tag = key
+                .seal(BINDING, 0, false, &mut [])
+                .map_err(|_| ContentError::Corrupt)?;
+            binding.copy_from_slice(&tag);
+        }
+        let length = header_of(magic);
+        file.write_all(header.get(..length).ok_or(ContentError::Capacity)?)?;
         Ok(Self {
             file,
             key,
+            magic,
             blocks: 0,
             plain: 0,
-            size: u64::try_from(HEADER).map_err(|_| ContentError::Capacity)?,
+            size: u64::try_from(length).map_err(|_| ContentError::Capacity)?,
             starts,
             next_start: 0,
         })
+    }
+
+    /// The record file of the kind `magic` names at `path` opened to be appended to again: every
+    /// record read through, opened as `verify` says and placed, the writer at its end. `key_of`
+    /// gives the key of a file's ID, the one its header names or a new one's; `most` is the most
+    /// plaintext the file takes; `torn` the most bytes one append writes ([`records_bytes`] of its
+    /// largest).
+    ///
+    /// A file whose last records do not open, no more than `torn` bytes from the first of them to
+    /// its end, is one whose last append a crash cut short: its whole records are copied into a
+    /// file of a new ID under a new key, beside it (`.resume`), which is synced and renamed over
+    /// it, before the writer appends anything. What the cut append wrote may lie on the volume, and
+    /// its blocks' places are never sealed over under its key. A record that does not open further
+    /// from the end, a header of another kind, or a file holding more than `most` is corrupt.
+    pub(super) fn resume(
+        path: &Path,
+        magic: &'static [u8; 8],
+        key_of: &dyn Fn(&[u8; 16]) -> Result<VersionKey, ContentError>,
+        most: usize,
+        torn: u64,
+        verify: Verify,
+    ) -> Result<Self, ContentError> {
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        let length = file.metadata()?.len();
+        let length_of_header = header_of(magic);
+        let mut header = [0u8; PART_HEADER];
+        let head = header
+            .get_mut(..length_of_header)
+            .ok_or(ContentError::Capacity)?;
+        if read_full(&mut file, head)? != length_of_header {
+            return Err(ContentError::Corrupt);
+        }
+        let id = record_id(&header, magic).ok_or(ContentError::Corrupt)?;
+        let key = key_of(&id)?;
+        if magic == PART_MAGIC {
+            // Whose part this is, before any record is read: another owner's opens to nothing.
+            let tag: [u8; TAG] = header
+                .get(HEADER..PART_HEADER)
+                .and_then(|tag| tag.try_into().ok())
+                .ok_or(ContentError::Corrupt)?;
+            key.open(BINDING, 0, false, &mut [], &tag)
+                .map_err(|_| ContentError::Corrupt)?;
+        }
+        let mut writer = Self {
+            key,
+            file,
+            magic,
+            blocks: 0,
+            plain: 0,
+            size: u64::try_from(length_of_header).map_err(|_| ContentError::Capacity)?,
+            starts: starts_for(most)?,
+            next_start: 0,
+        };
+        let most_plain = u32::try_from(most).map_err(|_| ContentError::Capacity)?;
+        let mut buffer = Vec::new();
+        // A record a step, each at least a byte: no more than the most plaintext the file takes.
+        for _ in 0..=most {
+            writer.mark_start()?;
+            let mut records = Records {
+                file: &mut writer.file,
+                key: &writer.key,
+                block: writer.blocks,
+            };
+            let read = match verify {
+                Verify::All => records
+                    .next(&mut buffer)
+                    .map(|record| record.map(<[u8]>::len)),
+                Verify::Lengths => records.skip(length),
+            };
+            match read {
+                Ok(None) => return Ok(writer),
+                Ok(Some(record)) => {
+                    let record_length =
+                        u32::try_from(record).map_err(|_| ContentError::Capacity)?;
+                    let plain = writer
+                        .plain
+                        .checked_add(record_length)
+                        .filter(|plain| *plain <= most_plain)
+                        .ok_or(ContentError::Corrupt)?;
+                    let sealed = records_bytes(record)?;
+                    writer.blocks = records.block;
+                    writer.plain = plain;
+                    writer.size = writer
+                        .size
+                        .checked_add(sealed)
+                        .ok_or(ContentError::Capacity)?;
+                }
+                Err(ContentError::Corrupt) => {
+                    if length.saturating_sub(writer.size) > torn {
+                        return Err(ContentError::Corrupt);
+                    }
+                    return writer.rewritten(path, key_of);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(ContentError::Corrupt)
+    }
+
+    /// The writer's whole records written again into a file of a new ID under a new key beside it,
+    /// synced, and renamed over it: the writer goes on in the new file ([`Self::resume`]).
+    fn rewritten(
+        self,
+        path: &Path,
+        key_of: &dyn Fn(&[u8; 16]) -> Result<VersionKey, ContentError>,
+    ) -> Result<Self, ContentError> {
+        let temporary = path.with_extension("resume");
+        match fs::remove_file(&temporary) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let id = hyper_seal::keys::KeyId::random()
+            .map_err(|_| {
+                ContentError::Io(std::io::Error::other(
+                    "the operating system's random source failed",
+                ))
+            })?
+            .0;
+        let most = self
+            .starts
+            .capacity()
+            .saturating_sub(1)
+            .saturating_mul(RECORD_BYTES);
+        let mut copy = Self::create(&temporary, self.magic, id, key_of(&id)?, most)?;
+        let mut old = File::open(path)?;
+        old.seek(SeekFrom::Start(
+            u64::try_from(header_of(self.magic)).map_err(|_| ContentError::Capacity)?,
+        ))?;
+        let mut records = Records {
+            file: &mut old,
+            key: &self.key,
+            block: 0,
+        };
+        let mut buffer = Vec::new();
+        // A record a step, the whole records the writer read: no more than its blocks.
+        for _ in 0..=self.blocks {
+            if records.block >= self.blocks {
+                break;
+            }
+            let record = records.next(&mut buffer)?.ok_or(ContentError::Corrupt)?;
+            copy.append(record)?;
+        }
+        if copy.plain != self.plain {
+            return Err(ContentError::Corrupt);
+        }
+        copy.sync()?;
+        // Every handle on either file closed before the rename: Windows renames no open file.
+        drop(old);
+        drop(self);
+        let Self {
+            file,
+            key,
+            magic,
+            blocks,
+            plain,
+            size,
+            starts,
+            next_start,
+        } = copy;
+        drop(file);
+        focal_platform::fs::atomic_replace(&temporary, path)?;
+        sync_directory(path.parent().ok_or(ContentError::Invalid)?)?;
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        file.seek(SeekFrom::Start(size))?;
+        Ok(Self {
+            file,
+            key,
+            magic,
+            blocks,
+            plain,
+            size,
+            starts,
+            next_start,
+        })
+    }
+
+    /// The file's metadata: when it was last written.
+    pub(super) fn metadata(&self) -> Result<fs::Metadata, ContentError> {
+        self.file.metadata().map_err(ContentError::from)
+    }
+
+    /// The plaintext bytes written.
+    pub(super) fn plain(&self) -> u64 {
+        u64::from(self.plain)
+    }
+
+    /// What was appended made durable.
+    pub(super) fn sync(&self) -> Result<(), ContentError> {
+        self.file.sync_all().map_err(ContentError::from)
+    }
+
+    /// The next record's place kept where reads begin, if its plaintext offset reached the next
+    /// [`RECORD_BYTES`] since the last place.
+    fn mark_start(&mut self) -> Result<(), ContentError> {
+        if self.plain < self.next_start {
+            return Ok(());
+        }
+        if self.starts.len() == self.starts.capacity() {
+            return Err(ContentError::Capacity);
+        }
+        self.starts.push(Start {
+            plain: self.plain,
+            file: self.size,
+            block: self.blocks,
+        });
+        let step = u32::try_from(RECORD_BYTES).map_err(|_| ContentError::Capacity)?;
+        self.next_start = self
+            .plain
+            .checked_div(step)
+            .and_then(|index| index.checked_add(1))
+            .and_then(|index| index.checked_mul(step))
+            .ok_or(ContentError::Capacity)?;
+        Ok(())
     }
 
     /// The bytes the writer holds beyond itself: its key's context and where reads begin, what a
@@ -130,23 +396,7 @@ impl RecordWriter {
             )
             .map_err(|_| ContentError::Capacity)?;
         for record in bytes.chunks(RECORD_BYTES) {
-            if self.plain >= self.next_start {
-                if self.starts.len() == self.starts.capacity() {
-                    return Err(ContentError::Capacity);
-                }
-                self.starts.push(Start {
-                    plain: self.plain,
-                    file: self.size,
-                    block: self.blocks,
-                });
-                let step = u32::try_from(RECORD_BYTES).map_err(|_| ContentError::Capacity)?;
-                self.next_start = self
-                    .plain
-                    .checked_div(step)
-                    .and_then(|index| index.checked_add(1))
-                    .and_then(|index| index.checked_mul(step))
-                    .ok_or(ContentError::Capacity)?;
-            }
+            self.mark_start()?;
             let length = u32::try_from(record.len()).map_err(|_| ContentError::Capacity)?;
             let next = self.blocks.checked_add(1).ok_or(ContentError::Capacity)?;
             buffer.clear();
@@ -303,6 +553,23 @@ impl Records<'_> {
         Ok(Some(length))
     }
 
+    /// The next record's length, its length block opened and its bytes passed over by it: none at
+    /// the file's end. A record whose bytes and tag the file's `length` does not hold is cut short.
+    fn skip(&mut self, length: u64) -> Result<Option<usize>, ContentError> {
+        let Some(record) = self.length()? else {
+            return Ok(None);
+        };
+        let past = u64::try_from(record.saturating_add(TAG)).map_err(|_| ContentError::Capacity)?;
+        let at = self.file.stream_position()?;
+        let end = at.checked_add(past).ok_or(ContentError::Corrupt)?;
+        if end > length {
+            return Err(ContentError::Corrupt);
+        }
+        self.file.seek(SeekFrom::Start(end))?;
+        self.block = self.block.checked_add(2).ok_or(ContentError::Corrupt)?;
+        Ok(Some(record))
+    }
+
     /// The next record's length block, opened: the record's length; none at the file's end.
     fn length(&mut self) -> Result<Option<usize>, ContentError> {
         let mut length_block = [0u8; LENGTH_BLOCK];
@@ -391,13 +658,24 @@ pub(super) fn read_full(file: &mut File, buffer: &mut [u8]) -> Result<usize, Con
     Ok(filled)
 }
 
-/// The ID a record file's header names, where `bytes` begin with one: none where they begin with
-/// anything else (a sealed file, or a file in the clear).
-pub(super) fn record_id(bytes: &[u8]) -> Option<[u8; 16]> {
-    if bytes.get(..MAGIC.len())? != MAGIC {
+/// The ID a record file's header names, where `bytes` begin with one of the kind `magic` names:
+/// none where they begin with anything else (another kind's, a sealed file, a file in the clear).
+pub(super) fn record_id(bytes: &[u8], magic: &[u8; 8]) -> Option<[u8; 16]> {
+    if bytes.get(..magic.len())? != magic {
         return None;
     }
-    bytes.get(MAGIC.len()..HEADER)?.try_into().ok()
+    bytes.get(magic.len()..HEADER)?.try_into().ok()
+}
+
+/// Where reads begin, room for a file of `most` plaintext bytes: one place for each
+/// [`RECORD_BYTES`] of it begun and the first. A file's places count its plaintext in 32 bits.
+fn starts_for(most: usize) -> Result<Vec<Start>, ContentError> {
+    u32::try_from(most).map_err(|_| ContentError::Capacity)?;
+    let mut starts = Vec::new();
+    starts
+        .try_reserve_exact(most.div_ceil(RECORD_BYTES).saturating_add(1))
+        .map_err(|_| ContentError::Capacity)?;
+    Ok(starts)
 }
 
 /// The whole plaintext of the record file `file` (its header read already, `key` its key), at most
@@ -435,3 +713,7 @@ pub(super) fn read_all(
     }
     Err(ContentError::Corrupt)
 }
+
+#[cfg(test)]
+#[path = "record_file_tests.rs"]
+mod tests;

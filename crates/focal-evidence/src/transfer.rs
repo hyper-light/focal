@@ -1,6 +1,56 @@
 //! Exact content-tree transfer. A receiver preserves the sender's manifest and
 //! chunk boundaries, independent of its preferred upload chunk size.
+//!
+//! A chunk received in parts is staged beside the objects until it is whole (29 §12.7): in the
+//! clear, a file named by the chunk's hash; where the store seals, a record file sealed as it is
+//! written ([`record_file`]), kept for the chunk (its key derived with the chunk's hash, so a part
+//! under another chunk's name opens to nothing) and named by its domain's keyed name of the hash. A
+//! part in the clear goes on in the clear until the store's conversion seals it; a new part is
+//! written in the store's form.
+use super::record_file::{self, PART_MAGIC, RecordWriter, Verify};
 use super::*;
+
+/// A new part of chunk `hash` at `path` under `key`, its record file made and synced: a file ID of
+/// its own, its key kept for the chunk. `most` is the chunk's length.
+pub(super) fn create_part(
+    key: &sealing::DomainKey,
+    path: &Path,
+    hash: ContentHash,
+    most: usize,
+) -> Result<RecordWriter, ContentError> {
+    let file = hyper_seal::keys::KeyId::random()
+        .map_err(|_| {
+            ContentError::Io(std::io::Error::other(
+                "the operating system's random source failed",
+            ))
+        })?
+        .0;
+    let writer = RecordWriter::create(path, PART_MAGIC, file, key.part_key(&file, &hash.0)?, most)?;
+    writer.sync()?;
+    Ok(writer)
+}
+
+/// A chunk's part as it stands: in the clear (its bytes, its file's length), or sealed (its
+/// writer, read through to its end).
+enum StagedPart {
+    Clear {
+        path: PathBuf,
+        held: u64,
+    },
+    Sealed {
+        path: PathBuf,
+        writer: Box<RecordWriter>,
+    },
+}
+
+impl StagedPart {
+    fn held(&self) -> u64 {
+        match self {
+            Self::Clear { held, .. } => *held,
+            Self::Sealed { writer, .. } => writer.plain(),
+        }
+    }
+}
 
 /// Validated immutable transfer description. A host owns and budgets this value
 /// while transferring; cloning is deliberately not part of the interface.
@@ -270,12 +320,9 @@ impl ContentStore {
             .chunks
             .get(index)
             .ok_or(ContentError::Invalid)?;
-        let path = self.chunk_part_path(transfer, chunk.hash);
-        match std::fs::metadata(&path) {
-            Ok(metadata) => Ok(metadata.len().min(u64::from(chunk.length))),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
-            Err(error) => Err(error.into()),
-        }
+        Ok(self
+            .staged_part(transfer, chunk.hash, chunk.length)?
+            .map_or(0, |part| part.held().min(u64::from(chunk.length))))
     }
     /// Take a part of chunk `index` that begins at `offset`: a chunk that
     /// would take its path longer than a transfer's lease to cross goes in
@@ -323,12 +370,19 @@ impl ContentStore {
                 // Held whole already (F59): the part adds nothing.
                 return Ok(length);
             }
-            let path = self.chunk_part_path(transfer, chunk.hash);
-            let staged = match std::fs::metadata(&path) {
-                Ok(metadata) => metadata.len(),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-                Err(error) => return Err(error.into()),
+            let most = usize::try_from(chunk.length).map_err(|_| ContentError::Capacity)?;
+            // The part as it stands, in its form; a new one in the store's.
+            let mut staged_part = match self.staged_part(transfer, chunk.hash, chunk.length) {
+                Ok(staged_part) => staged_part,
+                Err(ContentError::Corrupt) => {
+                    // A sealed part that does not open as a crash leaves one: discarded, the
+                    // chunk taken again from its start.
+                    self.discard_chunk_part(transfer, chunk.hash)?;
+                    return Err(ContentError::Corrupt);
+                }
+                Err(error) => return Err(error),
             };
+            let staged = staged_part.as_ref().map_or(0, StagedPart::held);
             let end = offset.saturating_add(part);
             if end <= staged {
                 // An exact retry of a part already held.
@@ -341,30 +395,92 @@ impl ContentStore {
             let skip = usize::try_from(staged.saturating_sub(offset))
                 .map_err(|_| ContentError::Capacity)?;
             let fresh = bytes.get(skip..).ok_or(ContentError::Invalid)?;
-            let promise = disk_reserve(
-                &self.disk,
-                &self.root,
-                DiskKind::Content,
-                focal_memory::BudgetLane::Completion,
-                u64::try_from(fresh.len()).map_err(|_| ContentError::Capacity)?,
-            )?;
             durable_directory(&directory)?;
-            {
-                let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-                file.write_all(fresh)?;
-                file.sync_all()?;
+            if staged_part.is_none() {
+                let key = self.keys.domain(&directory, domain, false)?;
+                staged_part = Some(if self.rest.seals() {
+                    let header = disk_reserve(
+                        &self.disk,
+                        &self.root,
+                        DiskKind::Content,
+                        focal_memory::BudgetLane::Completion,
+                        u64::try_from(record_file::PART_HEADER)
+                            .map_err(|_| ContentError::Capacity)?
+                            .checked_add(key.record_bytes())
+                            .ok_or(ContentError::Capacity)?,
+                    )?;
+                    let key = self.keys.writable(&directory, domain, key)?;
+                    let path = key.path(&directory, chunk.hash, sealing::Kind::Part)?;
+                    let writer = create_part(&key, &path, chunk.hash, most)?;
+                    header.commit();
+                    StagedPart::Sealed {
+                        path,
+                        writer: Box::new(writer),
+                    }
+                } else {
+                    StagedPart::Clear {
+                        path: directory.join(format!("{}.part", chunk.hash)),
+                        held: 0,
+                    }
+                });
             }
-            promise.commit();
+            let Some(staged_part) = staged_part.as_mut() else {
+                return Err(ContentError::Invalid);
+            };
+            let fresh_bytes = u64::try_from(fresh.len()).map_err(|_| ContentError::Capacity)?;
+            match staged_part {
+                StagedPart::Clear { path, .. } => {
+                    let promise = disk_reserve(
+                        &self.disk,
+                        &self.root,
+                        DiskKind::Content,
+                        focal_memory::BudgetLane::Completion,
+                        fresh_bytes,
+                    )?;
+                    {
+                        let mut file = OpenOptions::new().create(true).append(true).open(&*path)?;
+                        file.write_all(fresh)?;
+                        file.sync_all()?;
+                    }
+                    promise.commit();
+                    // A part in the clear grew while the store converts: its count follows it.
+                    self.conversion_part(domain, convert::StagingChange::Grew(fresh_bytes))?;
+                }
+                StagedPart::Sealed { writer, .. } => {
+                    let promise = disk_reserve(
+                        &self.disk,
+                        &self.root,
+                        DiskKind::Content,
+                        focal_memory::BudgetLane::Completion,
+                        record_file::records_bytes(fresh.len())?,
+                    )?;
+                    writer.append(fresh)?;
+                    writer.sync()?;
+                    promise.commit();
+                }
+            }
             if end < length {
                 return Ok(end);
             }
-            // Whole: verified, then the staged bytes become the chunk.
-            let held = read_bounded(&path, chunk.length as usize)?;
+            // Whole: every byte opened, verified, then the staged bytes become the chunk.
+            let (held, path, clear) = match staged_part {
+                StagedPart::Clear { path, .. } => (read_bounded(path, most)?, path.clone(), true),
+                StagedPart::Sealed { path, writer } => {
+                    let mut held = Vec::new();
+                    held.try_reserve_exact(most)
+                        .map_err(|_| ContentError::Capacity)?;
+                    held.resize(most, 0);
+                    let opened = writer.read(path, 0, &mut held);
+                    if !matches!(opened, Ok(())) {
+                        held.clear();
+                    }
+                    (held, path.clone(), false)
+                }
+            };
             if held.len() != chunk.length as usize
                 || ContentHash(*blake3::hash(&held).as_bytes()) != chunk.hash
             {
-                let _ = std::fs::remove_file(&path);
-                sync_directory(&directory)?;
+                self.discard_chunk_part(transfer, chunk.hash)?;
                 return Err(ContentError::Corrupt);
             }
             // Installed in its place as the writer installs, sealed under its domain's key from the
@@ -387,6 +503,21 @@ impl ContentStore {
             )?;
             installed.commit();
             std::fs::remove_file(&path)?;
+            if clear {
+                // A part in the clear went, whole and installed, while the store converts.
+                self.conversion_part(
+                    domain,
+                    convert::StagingChange::Gone(u64::try_from(held.len()).unwrap_or(u64::MAX)),
+                )?;
+            }
+            // A sealed copy a crash in the conversion left beside a part in the clear goes too.
+            for (other, _) in self.part_places(transfer, chunk.hash)? {
+                match std::fs::remove_file(&other) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
             sync_directory(&directory)?;
             Ok(length)
         })();
@@ -405,12 +536,7 @@ impl ContentStore {
                 .join(hex(&transfer.reference.domain.0));
             let mut removed = false;
             for chunk in &transfer.manifest.chunks {
-                let path = self.chunk_part_path(transfer, chunk.hash);
-                match std::fs::remove_file(&path) {
-                    Ok(()) => removed = true,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
-                }
+                removed |= self.remove_part(transfer, chunk.hash)?;
             }
             if removed {
                 sync_directory(&directory)?;
@@ -420,15 +546,114 @@ impl ContentStore {
         self.mark_failure(&result);
         result
     }
-    fn chunk_part_path(
+    /// Where chunk `hash`'s part of `transfer` may lie, each form's place with whether it seals: in
+    /// the clear while a file may lie in the clear, under its domain's keyed name once the domain's
+    /// key stands.
+    fn part_places(
         &self,
         transfer: &TransferManifest,
         hash: ContentHash,
-    ) -> std::path::PathBuf {
-        self.root
-            .join("objects")
-            .join(hex(&transfer.reference.domain.0))
-            .join(format!("{hash}.part"))
+    ) -> Result<Vec<(PathBuf, bool)>, ContentError> {
+        let domain = transfer.reference.domain;
+        let directory = domain_directory(&self.root, domain);
+        let mut places = Vec::new();
+        places
+            .try_reserve_exact(2)
+            .map_err(|_| ContentError::Capacity)?;
+        if self.rest.clear_allowed() {
+            places.push((directory.join(format!("{hash}.part")), false));
+        }
+        let key = self.keys.domain(&directory, domain, false)?;
+        if self.rest.seals() && key.record_bytes() == 0 {
+            places.push((key.path(&directory, hash, sealing::Kind::Part)?, true));
+        }
+        Ok(places)
+    }
+
+    /// Chunk `hash`'s part of `transfer` as it stands, the first form it lies in: in the clear first
+    /// (a sealed copy beside it a crash in the conversion left), then sealed, read through by its
+    /// length blocks ([`Verify::Lengths`]). None where no part stands.
+    fn staged_part(
+        &self,
+        transfer: &TransferManifest,
+        hash: ContentHash,
+        length: u32,
+    ) -> Result<Option<StagedPart>, ContentError> {
+        let domain = transfer.reference.domain;
+        let directory = domain_directory(&self.root, domain);
+        let most = usize::try_from(length).map_err(|_| ContentError::Capacity)?;
+        for (path, sealed) in self.part_places(transfer, hash)? {
+            if !sealed {
+                match std::fs::metadata(&path) {
+                    Ok(metadata) => {
+                        return Ok(Some(StagedPart::Clear {
+                            path,
+                            held: metadata.len(),
+                        }));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if !path.exists() {
+                continue;
+            }
+            let key = self.keys.domain(&directory, domain, false)?;
+            let writer = RecordWriter::resume(
+                &path,
+                PART_MAGIC,
+                &|file: &[u8; 16]| key.part_key(file, &hash.0),
+                most,
+                record_file::records_bytes(most)?,
+                Verify::Lengths,
+            )?;
+            return Ok(Some(StagedPart::Sealed {
+                path,
+                writer: Box::new(writer),
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Chunk `hash`'s part of `transfer` removed in whichever form it lies: whether any was. A part in
+    /// the clear that goes while the store converts leaves its count.
+    fn remove_part(
+        &mut self,
+        transfer: &TransferManifest,
+        hash: ContentHash,
+    ) -> Result<bool, ContentError> {
+        let mut removed = false;
+        for (path, sealed) in self.part_places(transfer, hash)? {
+            let bytes = match std::fs::metadata(&path) {
+                Ok(metadata) => metadata.len(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            }
+            if !sealed {
+                self.conversion_part(
+                    transfer.reference.domain,
+                    convert::StagingChange::Gone(bytes),
+                )?;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Chunk `hash`'s part of `transfer` discarded: removed in either form, its directory synced.
+    fn discard_chunk_part(
+        &mut self,
+        transfer: &TransferManifest,
+        hash: ContentHash,
+    ) -> Result<(), ContentError> {
+        if self.remove_part(transfer, hash)? {
+            sync_directory(&domain_directory(&self.root, transfer.reference.domain))?;
+        }
+        Ok(())
     }
 
     /// Verifies every chunk and the whole stream before publishing the original
@@ -1225,5 +1450,235 @@ mod tests {
         );
         assert_eq!(receiver.read_bytes(&reference, 10).unwrap(), b"abcdefghij");
         assert_eq!(disk.stats().outstanding, 0);
+    }
+
+    /// Chunks of several records each, so a part is records too (29 §12.7).
+    const BIG_CHUNK: usize = 3 * record_file::RECORD_BYTES + 777;
+
+    fn big_limits() -> StoreLimits {
+        StoreLimits {
+            max_content_bytes: 4 * BIG_CHUNK as u64,
+            max_staging_bytes: 8 * BIG_CHUNK as u64,
+            max_uploads: 4,
+            chunk_bytes: BIG_CHUNK,
+            max_manifest_bytes: 4096,
+        }
+    }
+    fn big_store(root: &Path, form: ContentForm) -> ContentStore {
+        ContentStore::open_with_disk(
+            root,
+            big_limits(),
+            focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::unbounded()).unwrap(),
+            &crate::store::test_keys(root),
+            form,
+        )
+        .unwrap()
+    }
+    fn patterned(seed: u8, length: usize) -> Vec<u8> {
+        (0..length)
+            .map(|index| (index.wrapping_mul(53) ^ (index >> 6)) as u8 ^ seed)
+            .collect()
+    }
+    /// A source store's object of two chunks, its manifest exported, and a receiver's import of it
+    /// prepared in `form`.
+    fn big_transfer(
+        root: &Path,
+        form: ContentForm,
+    ) -> (
+        tempfile::TempDir,
+        ContentStore,
+        TransferManifest,
+        Vec<Vec<u8>>,
+    ) {
+        let source_dir = tempfile::tempdir().unwrap();
+        let mut source = big_store(source_dir.path(), ContentForm::Sealed);
+        let bytes = patterned(4, 2 * BIG_CHUNK);
+        let upload = UploadId([3; 16]);
+        source
+            .begin(
+                upload,
+                ContentDomainId([2; 16]),
+                ContentClass::Evidence,
+                bytes.len() as u64,
+                None,
+            )
+            .unwrap();
+        for (index, piece) in bytes.chunks(BIG_CHUNK).enumerate() {
+            source
+                .append(upload, (index * BIG_CHUNK) as u64, piece)
+                .unwrap();
+        }
+        let reference = source.seal(upload).unwrap();
+        let exported = source.export_manifest(&reference).unwrap();
+        let chunks = (0..exported.chunks())
+            .map(|index| source.read_transfer_chunk(&exported, index).unwrap())
+            .collect();
+        let receiver = big_store(root, form);
+        let imported = receiver
+            .prepare_import(reference, exported.encoded().to_vec())
+            .unwrap();
+        (source_dir, receiver, imported, chunks)
+    }
+    /// A part of `chunk` sent from `from` to `to`.
+    fn send(
+        store: &mut ContentStore,
+        transfer: &TransferManifest,
+        index: usize,
+        chunk: &[u8],
+        from: usize,
+        to: usize,
+    ) -> u64 {
+        store
+            .import_chunk_part(transfer, index, from as u64, &chunk[from..to])
+            .unwrap()
+    }
+    /// The files of the receiver's domain: none named by a chunk's hash, none holding 16 bytes of a
+    /// chunk.
+    fn assert_parts_sealed(root: &Path, transfer: &TransferManifest, chunks: &[Vec<u8>]) {
+        let directory = domain_directory(root, transfer.reference.domain);
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let stored = crate::store::stored_bytes(&path);
+            for chunk in &transfer.manifest.chunks {
+                assert!(
+                    !name.contains(&chunk.hash.to_string()),
+                    "{name} names a chunk"
+                );
+            }
+            for chunk in chunks {
+                for probe in chunk.chunks(4096).map(|piece| &piece[..16]) {
+                    assert!(
+                        !stored.windows(16).any(|w| w == probe),
+                        "{name} holds plaintext"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Do: receive a chunk in parts into a store that seals, stop it halfway, open it again and
+    /// send the rest. Expect: the part goes on at the bytes it held, the chunk is installed whole,
+    /// and no file of the domain is named by a chunk's hash or holds its bytes in the clear.
+    #[test]
+    fn a_chunk_received_in_parts_sealed_goes_on_after_a_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let (_source, mut receiver, imported, chunks) =
+            big_transfer(root.path(), ContentForm::Sealed);
+        let chunk = &chunks[0];
+        assert_eq!(send(&mut receiver, &imported, 0, chunk, 0, 70_000), 70_000);
+        assert_eq!(
+            send(&mut receiver, &imported, 0, chunk, 70_000, 150_000),
+            150_000
+        );
+        assert_parts_sealed(root.path(), &imported, &chunks);
+        drop(receiver);
+        let mut receiver = big_store(root.path(), ContentForm::Sealed);
+        assert_eq!(receiver.staged_chunk_bytes(&imported, 0).unwrap(), 150_000);
+        // A retry within what is held, then a gap, then the rest.
+        assert_eq!(
+            send(&mut receiver, &imported, 0, chunk, 100_000, 140_000),
+            150_000
+        );
+        assert!(matches!(
+            receiver.import_chunk_part(&imported, 0, 160_000, &chunk[160_000..170_000]),
+            Err(ContentError::Invalid)
+        ));
+        assert_eq!(
+            send(&mut receiver, &imported, 0, chunk, 150_000, chunk.len()),
+            chunk.len() as u64
+        );
+        assert_eq!(&receiver.read_transfer_chunk(&imported, 0).unwrap(), chunk);
+        assert_parts_sealed(root.path(), &imported, &chunks);
+    }
+
+    /// Do: put one chunk's sealed part under another chunk's name, and cut a part's last record
+    /// short. Expect: the moved part opens to nothing (its key is kept for its chunk) and is
+    /// discarded; the cut part goes on at its whole records' bytes under a new key, and the chunk
+    /// installs whole.
+    #[test]
+    fn a_moved_part_is_refused_and_a_cut_part_goes_on_under_a_new_key() {
+        let root = tempfile::tempdir().unwrap();
+        let (_source, mut receiver, imported, chunks) =
+            big_transfer(root.path(), ContentForm::Sealed);
+        send(&mut receiver, &imported, 0, &chunks[0], 0, 90_000);
+        send(&mut receiver, &imported, 1, &chunks[1], 0, 90_000);
+        let directory = domain_directory(root.path(), imported.reference.domain);
+        let key = receiver
+            .keys
+            .domain(&directory, imported.reference.domain, false)
+            .unwrap();
+        let part = |index: usize| {
+            key.path(
+                &directory,
+                imported.manifest.chunks[index].hash,
+                sealing::Kind::Part,
+            )
+            .unwrap()
+        };
+        std::fs::copy(part(0), part(1)).unwrap();
+        assert!(matches!(
+            receiver.import_chunk_part(&imported, 1, 90_000, &chunks[1][90_000..100_000]),
+            Err(ContentError::Corrupt)
+        ));
+        assert!(!part(1).exists(), "the moved part was discarded");
+        assert_eq!(receiver.staged_chunk_bytes(&imported, 1).unwrap(), 0);
+        // Chunk 0's part, its last record cut short.
+        let before = std::fs::read(part(0)).unwrap()[8..24].to_vec();
+        let length = std::fs::metadata(part(0)).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(part(0))
+            .unwrap()
+            .set_len(length - 1000)
+            .unwrap();
+        let held = receiver.staged_chunk_bytes(&imported, 0).unwrap();
+        assert!(
+            held < 90_000 && held >= record_file::RECORD_BYTES as u64,
+            "{held}"
+        );
+        assert_ne!(
+            std::fs::read(part(0)).unwrap()[8..24].to_vec(),
+            before,
+            "a new key"
+        );
+        let chunk = &chunks[0];
+        send(
+            &mut receiver,
+            &imported,
+            0,
+            chunk,
+            held as usize,
+            chunk.len(),
+        );
+        assert_eq!(&receiver.read_transfer_chunk(&imported, 0).unwrap(), chunk);
+    }
+
+    /// Do: stage part of a chunk in a store in the clear, open it sealing and convert it, then send
+    /// the rest. Expect: the conversion seals the part under its keyed name (counted and converted),
+    /// the transfer goes on in it, and the chunk installs whole.
+    #[test]
+    fn a_part_in_the_clear_is_converted_and_its_transfer_goes_on() {
+        let root = tempfile::tempdir().unwrap();
+        let (_source, mut receiver, imported, chunks) =
+            big_transfer(root.path(), ContentForm::Clear);
+        let chunk = &chunks[0];
+        send(&mut receiver, &imported, 0, chunk, 0, 80_000);
+        drop(receiver);
+        let mut receiver = big_store(root.path(), ContentForm::Sealed);
+        let mut scratch = vec![0u8; crate::MAX_TRANSFER_CHUNK_BYTES];
+        for _ in 0..10_000 {
+            if receiver.convert_step(&mut scratch, 1).unwrap() == crate::Conversion::Done {
+                break;
+            }
+        }
+        let status = receiver.conversion_status();
+        assert_eq!(status.form, crate::StoreForm::Sealed);
+        assert_eq!(status.left(), crate::Tally::default());
+        assert!(status.converted.bytes >= 80_000);
+        assert_parts_sealed(root.path(), &imported, &chunks);
+        assert_eq!(receiver.staged_chunk_bytes(&imported, 0).unwrap(), 80_000);
+        send(&mut receiver, &imported, 0, chunk, 80_000, chunk.len());
+        assert_eq!(&receiver.read_transfer_chunk(&imported, 0).unwrap(), chunk);
     }
 }

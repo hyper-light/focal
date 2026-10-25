@@ -137,6 +137,14 @@ impl ProtectionSet {
     fn protects_record(&self, kind: CustodyRecordKind, hash: ContentHash) -> bool {
         self.records.binary_search(&(kind.tag(), hash)).is_ok()
     }
+    /// The protected records of `kind`, by their hashes.
+    fn records_of(&self, kind: CustodyRecordKind) -> impl Iterator<Item = ContentHash> + '_ {
+        let tag = kind.tag();
+        self.records
+            .iter()
+            .filter(move |(each, _)| *each == tag)
+            .map(|(_, hash)| *hash)
+    }
     fn is_opaque(&self, domain: ContentDomainId) -> bool {
         self.opaque.binary_search(&domain).is_ok()
     }
@@ -541,6 +549,15 @@ impl ContentStore {
                     }
                 })
             }
+            // While the store converts, its records lie in either form (29 §12.7): none is swept
+            // until the conversion ends, as no domain's objects are; the quarantine's rounds expire
+            // as before.
+            Phase::Records { .. } if self.rest.converting() => Some(Phase::Receipts(None)),
+            Phase::Receipts(_) if self.rest.converting() => Some(Phase::Quarantine {
+                rounds: self.expirable_rounds(config, now_ms)?,
+                index: 0,
+                walk: None,
+            }),
             Phase::Records { kinds } => {
                 const KINDS: [CustodyRecordKind; 2] =
                     [CustodyRecordKind::Checkpoint, CustodyRecordKind::Manifest];
@@ -556,20 +573,11 @@ impl ContentStore {
             }
             Phase::Receipts(dir) => match self.sweep_receipts(dir, config, now_ms, budget)? {
                 Some(dir) => Some(Phase::Receipts(Some(dir))),
-                None => {
-                    // While the store's conversion counts the rounds, none is deleted: what it
-                    // counted stays where it counted it, so its tally is whole.
-                    let rounds = if self.conversion_counting() {
-                        Vec::new()
-                    } else {
-                        self.expired_rounds(config, now_ms)?
-                    };
-                    Some(Phase::Quarantine {
-                        rounds,
-                        index: 0,
-                        walk: None,
-                    })
-                }
+                None => Some(Phase::Quarantine {
+                    rounds: self.expirable_rounds(config, now_ms)?,
+                    index: 0,
+                    walk: None,
+                }),
             },
             Phase::Quarantine {
                 rounds,
@@ -615,7 +623,7 @@ impl ContentStore {
             }
             *budget = budget.saturating_sub(1);
             self.collector.report.visited = self.collector.report.visited.saturating_add(1);
-            if age_ms(&upload.file.metadata()?, now_ms)? >= config.grace_ms {
+            if age_ms(&upload.part.metadata()?, now_ms)? >= config.grace_ms {
                 stale
                     .try_reserve_exact(1)
                     .map_err(|_| ContentError::Capacity)?;
@@ -653,6 +661,9 @@ impl ContentStore {
             None => fs::read_dir(self.root.join("staging"))?,
         };
         let mut changed = false;
+        // A record in either form, its name its upload's in that form (29 §12.7).
+        let key = self.staging_key(false)?;
+        let keyed = self.rest.seals() && key.record_bytes() == 0;
         while *budget > 0 {
             let Some(entry) = dir.next() else {
                 if changed {
@@ -662,25 +673,17 @@ impl ContentStore {
             };
             let entry = entry?;
             self.visit(budget);
-            let Some((stem, extension)) = split_name(&entry) else {
+            let Some((_, extension)) = split_name(&entry) else {
                 continue;
             };
             if extension != "meta" {
                 continue;
             }
-            let Some(bytes) = read_listed(
-                &entry.path(),
-                self.limits.max_manifest_bytes.max(terminal::RECORD_BYTES),
-            )?
+            let Some((staging::Staged::Terminal(_), sealed)) =
+                self.staged_record(&key, keyed, &entry.path())?
             else {
                 continue;
             };
-            let Some(id) = terminal::decode(&bytes)? else {
-                continue;
-            };
-            if hex(&id.0) != stem {
-                continue;
-            }
             let Some(metadata) = still_there(&entry)? else {
                 continue;
             };
@@ -688,6 +691,10 @@ impl ContentStore {
                 continue;
             }
             fs::remove_file(entry.path())?;
+            if !sealed {
+                // Released in the clear while the store converts: gone from its count.
+                self.conversion_staging(convert::StagingChange::Gone(metadata.len()))?;
+            }
             changed = true;
             self.terminal_uploads = self.terminal_uploads.saturating_sub(1);
             self.collector.report.terminals_released =
@@ -874,7 +881,16 @@ impl ContentStore {
         budget: &mut usize,
     ) -> Result<(), ContentError> {
         let directory = self.root.join(kind.directory());
-        let mut records: Vec<(u64, ContentHash, PathBuf)> = Vec::new();
+        // Where the store seals, a record is filed under its kind's keyed name of its hash (29
+        // §12.7): the protected records' keyed names, taken once, are what is kept.
+        let key = self.record_key(kind, false)?;
+        let mut protected = BTreeSet::new();
+        if self.rest.seals() && key.record_bytes() == 0 {
+            for hash in protection.records_of(kind) {
+                protected.insert(key.name(hash)?);
+            }
+        }
+        let mut records: Vec<(u64, String, PathBuf, bool)> = Vec::new();
         for entry in fs::read_dir(&directory)? {
             let entry = entry?;
             self.visit(budget);
@@ -884,8 +900,16 @@ impl ContentStore {
             if extension != "record" {
                 continue;
             }
-            let Some(hash) = parse_hash(&stem) else {
-                continue;
+            let kept = if self.rest.seals() {
+                if !sealing::is_keyed_name(&stem) {
+                    continue;
+                }
+                protected.contains(&stem)
+            } else {
+                let Some(hash) = parse_hash(&stem) else {
+                    continue;
+                };
+                protection.protects_record(kind, hash)
             };
             if records.len() >= config.max_marks {
                 break;
@@ -896,18 +920,17 @@ impl ContentStore {
             let Some(metadata) = still_there(&entry)? else {
                 continue;
             };
-            records.push((age_ms(&metadata, now_ms)?, hash, entry.path()));
+            records.push((age_ms(&metadata, now_ms)?, stem, entry.path(), kept));
         }
         // Youngest first; the first `keep_records` stay whatever their age.
         // The listing is bounded by the mark bound, so the whole kind is
         // decided in one step and charged as one visit per record moved.
-        records.sort_by_key(|(age, hash, _)| (*age, *hash));
+        records.sort_by(|(age, stem, _, _), (other_age, other, _, _)| {
+            (age, stem).cmp(&(other_age, other))
+        });
         let mut changed = false;
-        for (position, (age, hash, path)) in records.into_iter().enumerate() {
-            if position < config.keep_records
-                || age < config.grace_ms
-                || protection.protects_record(kind, hash)
-            {
+        for (position, (age, _, path, kept)) in records.into_iter().enumerate() {
+            if position < config.keep_records || age < config.grace_ms || kept {
                 continue;
             }
             self.visit(budget);
@@ -951,8 +974,26 @@ impl ContentStore {
             if extension != "record" {
                 continue;
             }
-            let Some(bytes) = read_listed(&entry.path(), CustodyRecordKind::Receipt.limit())?
-            else {
+            // Sealed under the receipts' key where the store seals (29 §12.7).
+            let read = if self.rest.seals() {
+                match self.read_record_at(
+                    CustodyRecordKind::Receipt,
+                    &entry.path(),
+                    true,
+                    CustodyRecordKind::Receipt.limit(),
+                ) {
+                    Ok(bytes) => Some(bytes),
+                    Err(ContentError::Io(error))
+                        if error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        None
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                read_listed(&entry.path(), CustodyRecordKind::Receipt.limit())?
+            };
+            let Some(bytes) = read else {
                 continue;
             };
             let Ok(receipt) = crate::CustodyReceipt::decode(&bytes) else {
@@ -988,6 +1029,18 @@ impl ContentStore {
             sync_directory(&directory)?;
         }
         Ok(Some(dir))
+    }
+    /// The rounds past their grace that may go now: none while the store's conversion counts the
+    /// rounds, so what it counted stays where it counted it and its tally is whole.
+    fn expirable_rounds(
+        &self,
+        config: CollectorConfig,
+        now_ms: u64,
+    ) -> Result<Vec<u64>, ContentError> {
+        if self.conversion_counting() {
+            return Ok(Vec::new());
+        }
+        self.expired_rounds(config, now_ms)
     }
     fn expired_rounds(
         &self,

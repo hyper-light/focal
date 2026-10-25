@@ -1,6 +1,6 @@
 //! Explicit terminal-upload metadata. Its magic is incompatible with the old
 //! schema-one UploadMeta decoder; historical active metadata is not reinterpreted.
-use super::{ContentError, UploadId, read_bounded, sync_directory};
+use super::{ContentError, UploadId, sync_directory};
 use std::{
     fs::{self, OpenOptions},
     io::Write,
@@ -29,7 +29,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Option<UploadId>, ContentError> {
     Ok(Some(UploadId(id)))
 }
 
-fn regular(path: &Path) -> Result<bool, ContentError> {
+pub(super) fn regular(path: &Path) -> Result<bool, ContentError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -47,18 +47,8 @@ fn regular(path: &Path) -> Result<bool, ContentError> {
     }
     Ok(true)
 }
-pub(super) fn contains(path: &Path, id: UploadId) -> Result<bool, ContentError> {
-    if !regular(path)? {
-        return Ok(false);
-    }
-    let bytes = read_bounded(path, RECORD_BYTES)?;
-    if decode(&bytes)? != Some(id) {
-        return Err(ContentError::Corrupt);
-    }
-    Ok(true)
-}
-
-pub(super) fn install(path: &Path, id: UploadId) -> Result<(), ContentError> {
+/// Upload `id`'s terminal record's bytes: the magic, the identity, and their BLAKE3 hash.
+pub(super) fn encode(id: UploadId) -> Result<[u8; RECORD_BYTES], ContentError> {
     let mut bytes = [0; RECORD_BYTES];
     bytes
         .get_mut(..8)
@@ -73,6 +63,11 @@ pub(super) fn install(path: &Path, id: UploadId) -> Result<(), ContentError> {
         .get_mut(24..)
         .ok_or(ContentError::Corrupt)?
         .copy_from_slice(checksum.as_bytes());
+    Ok(bytes)
+}
+
+pub(super) fn install(path: &Path, id: UploadId) -> Result<(), ContentError> {
+    let bytes = encode(id)?;
     let temp = path.with_extension("terminal");
     if regular(&temp)? {
         fs::remove_file(&temp)?;

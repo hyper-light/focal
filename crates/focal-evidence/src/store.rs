@@ -38,7 +38,7 @@ pub enum CustodyRecordKind {
     Receipt,
 }
 impl CustodyRecordKind {
-    fn directory(self) -> &'static str {
+    pub(crate) fn directory(self) -> &'static str {
         match self {
             Self::Checkpoint => "checkpoints",
             Self::Manifest => "custody",
@@ -52,7 +52,17 @@ impl CustodyRecordKind {
             Self::Receipt => 2,
         }
     }
-    fn limit(self) -> usize {
+    /// What the kind's key directory is made under (29 §12.7): each kind's directory a key of its
+    /// own, so a record carried into another kind's directory opens to nothing.
+    pub(crate) fn key_domain(self) -> ContentDomainId {
+        match self {
+            Self::Checkpoint => ContentDomainId(*b"focal checkpoint"),
+            Self::Manifest => ContentDomainId(*b"focal manifests "),
+            Self::Receipt => ContentDomainId(*b"focal receipts  "),
+        }
+    }
+    pub(crate) const ALL: [Self; 3] = [Self::Checkpoint, Self::Manifest, Self::Receipt];
+    pub(crate) fn limit(self) -> usize {
         match self {
             Self::Checkpoint => 8 * 1024 * 1024,
             Self::Manifest => 16 * 1024,
@@ -79,12 +89,15 @@ pub use cold::{
     ColdGeometry, ColdPending, ColdReader, ColdRoom, ColdState, ColdStore, ColdStreams,
     install_cold_chunk,
 };
-#[path = "cold_records.rs"]
-mod cold_records;
+#[path = "record_file.rs"]
+mod record_file;
+
 #[path = "native_artifact.rs"]
 mod native_artifact;
 #[path = "sealing.rs"]
 mod sealing;
+#[path = "staging.rs"]
+mod staging;
 pub use sealing::ContentForm;
 #[path = "convert.rs"]
 mod convert;
@@ -242,7 +255,10 @@ struct UploadMeta {
 
 struct Upload {
     meta: UploadMeta,
-    file: File,
+    /// Its staged bytes, in the form its metadata was written in (29 §12.7).
+    part: staging::Part,
+    part_path: PathBuf,
+    meta_path: PathBuf,
     offset: u64,
     /// The staging bytes promised to this upload; returned when the part is
     /// removed. Absent only for an upload recovered on a volume that could
@@ -413,6 +429,31 @@ fn decode_manifest(bytes: &[u8]) -> Result<Manifest, ContentError> {
 
 /// Node-owned store. The sealed return value proves LOCAL durable custody only.
 /// Distributed ingress must add remote custody before promising a stronger policy.
+/// The form of a content store's files beside its objects (29 §12.7: uploads being staged, chunks a
+/// transfer is receiving, custody records), which the at-rest level opens as the content level
+/// opens the objects': below it they are written byte for byte as every earlier binary wrote them,
+/// so a node rolled back below it reads them. Its markers (`REST_SEALING`, `REST_SEALED`) say where
+/// its conversion stands, apart from the objects'.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Rest {
+    seals: bool,
+    clear: bool,
+}
+impl Rest {
+    /// Whether these files are written sealed.
+    pub(crate) fn seals(self) -> bool {
+        self.seals
+    }
+    /// Whether one of them may lie in the clear.
+    pub(crate) fn clear_allowed(self) -> bool {
+        self.clear
+    }
+    /// Whether they lie in either form: written sealed, not yet marked sealed.
+    pub(crate) fn converting(self) -> bool {
+        self.seals && self.clear
+    }
+}
+
 pub struct ContentStore {
     root: PathBuf,
     limits: StoreLimits,
@@ -433,6 +474,8 @@ pub struct ContentStore {
     /// The node's content key, held for the writer's life where it seals (29 §11): every domain's
     /// key is unwrapped under it for one file. Its form says where a file may lie.
     keys: sealing::ContentKeys<'static>,
+    /// The form of its files beside its objects (29 §12.7).
+    rest: Rest,
     /// The conversion of the store's files in the clear, while one runs ([`Self::convert_step`]).
     conversion: Option<convert::Converting>,
     /// What the conversion counted and did since this start ([`Self::conversion_status`]).
@@ -599,6 +642,21 @@ impl ContentStore {
         keys: &focal_seal::DataKeys,
         form: ContentForm,
     ) -> Result<Self, ContentError> {
+        Self::open_forms(root, limits, disk, keys, form, form)
+    }
+
+    /// [`Self::open_with_disk`], its files beside its objects in `rest` (29 §12.7): what the at-rest
+    /// level asks of them, as `form` is what the content level asks of the objects. They are sealed
+    /// only where the objects are (the at-rest level is past the content level), are marked so apart
+    /// from them, and convert with them, or alone where the objects are sealed already.
+    pub fn open_forms(
+        root: impl AsRef<Path>,
+        limits: StoreLimits,
+        disk: DiskBudget,
+        keys: &focal_seal::DataKeys,
+        form: ContentForm,
+        rest: ContentForm,
+    ) -> Result<Self, ContentError> {
         if limits.chunk_bytes == 0
             || limits.chunk_bytes > MAX_TRANSFER_CHUNK_BYTES
             || limits.max_uploads == 0
@@ -646,6 +704,33 @@ impl ContentStore {
         } else {
             sealing::ContentKeys::clear()
         };
+        let rest_begun = root.join(sealing::REST_SEALING).try_exists()?;
+        let rest = if !keys.seals() {
+            Rest {
+                seals: false,
+                clear: true,
+            }
+        } else if root.join(sealing::REST_SEALED).try_exists()? {
+            // A conversion that ended before its marker went.
+            convert::remove_marker(&root, sealing::REST_SEALING)?;
+            Rest {
+                seals: true,
+                clear: false,
+            }
+        } else if rest_begun || rest == ContentForm::Sealed {
+            if !rest_begun {
+                convert::write_marker(&root, sealing::REST_SEALING)?;
+            }
+            Rest {
+                seals: true,
+                clear: true,
+            }
+        } else {
+            Rest {
+                seals: false,
+                clear: true,
+            }
+        };
         let mut store = Self {
             root,
             limits,
@@ -658,12 +743,13 @@ impl ContentStore {
             collector: gc::CollectorState::new(),
             plans,
             keys,
+            rest,
             conversion: None,
             progress: convert::Progress::default(),
             data_keys,
             _writer_lock: lock,
         };
-        store.recover_uploads()?;
+        store.recover()?;
         // A previous process may have renamed a synced file and failed before
         // its directory sync. Re-establish namespace durability before reads
         // can attest custody or recovered offsets can be acknowledged.
@@ -691,12 +777,13 @@ impl ContentStore {
                 sync_directory(directory)?;
             }
         }
-        if store.keys.converting() {
-            store.progress = convert::Progress::begun(begun);
-            if holds_no_object(&store.root)? {
+        let (objects, files) = (store.keys.converting(), store.rest.converting());
+        if objects || files {
+            store.progress = convert::Progress::begun(begun || rest_begun);
+            if holds_nothing_to_convert(&store.root, objects, files)? {
                 store.mark_sealed()?;
             } else {
-                store.conversion = Some(convert::Converting::begin(&store.root)?);
+                store.conversion = Some(convert::Converting::begin(&store.root, objects, files)?);
             }
         }
         Ok(store)
@@ -716,18 +803,61 @@ impl ContentStore {
             return Err(ContentError::Capacity);
         }
         let hash = ContentHash(*blake3::hash(bytes).as_bytes());
-        let path = self
-            .root
-            .join(kind.directory())
-            .join(format!("{hash}.record"));
+        let key = self.record_key(kind, false)?;
+        if !self.rest.seals() {
+            let path = self
+                .root
+                .join(kind.directory())
+                .join(format!("{hash}.record"));
+            let record = disk_reserve(
+                &self.disk,
+                &self.root,
+                DiskKind::Content,
+                BudgetLane::Completion,
+                u64::try_from(bytes.len()).map_err(|_| ContentError::Capacity)?,
+            )?;
+            if let Err(error) = install_verified_chunk(&path, bytes, hash) {
+                if matches!(error, ContentError::Io(_)) {
+                    self.failed = true;
+                }
+                return Err(error);
+            }
+            record.commit();
+            return Ok(hash);
+        }
+        // Sealed (29 §12.7): a record already there, in either form, that opens to these bytes is
+        // kept; one that opens to anything else is corrupt under a content-addressed name.
+        for (path, sealed) in self.record_places(kind, hash)? {
+            let held = match self.read_record_at(kind, &path, sealed, bytes.len()) {
+                Ok(held) => held,
+                Err(ContentError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if held != bytes {
+                return Err(ContentError::Corrupt);
+            }
+            refresh_mtime(&path)?;
+            return Ok(hash);
+        }
+        let directory = self.root.join(kind.directory());
         let record = disk_reserve(
             &self.disk,
             &self.root,
             DiskKind::Content,
             BudgetLane::Completion,
-            u64::try_from(bytes.len()).map_err(|_| ContentError::Capacity)?,
+            key.file_bytes(bytes.len())?
+                .checked_add(key.record_bytes())
+                .ok_or(ContentError::Capacity)?,
         )?;
-        if let Err(error) = install_verified_chunk(&path, bytes, hash) {
+        let installed = self
+            .keys
+            .writable(&directory, kind.key_domain(), key)
+            .and_then(|key| {
+                key.install(&key.path(&directory, hash, sealing::Kind::Record)?, bytes)
+            });
+        if let Err(error) = installed {
             if matches!(error, ContentError::Io(_)) {
                 self.failed = true;
             }
@@ -750,6 +880,10 @@ impl ContentStore {
             return Err(ContentError::Capacity);
         }
         let directory = self.root.join(kind.directory());
+        let key = self.record_key(kind, false)?;
+        if self.rest.seals() {
+            return self.replace_sealed_record(kind, key, name, bytes);
+        }
         let path = directory.join(format!("{name}.record"));
         // The identical record on the volume already needs no promise and
         // adds no byte.
@@ -774,7 +908,8 @@ impl ContentStore {
         }
         Ok(())
     }
-    /// A named record's bytes, `None` when none was installed.
+    /// A named record's bytes, `None` when none was installed: in the clear first while a record may
+    /// lie in the clear, then sealed under its keyed name (29 §12.7).
     pub fn read_named_custody_record(
         &self,
         kind: CustodyRecordKind,
@@ -782,14 +917,122 @@ impl ContentStore {
         max_bytes: usize,
     ) -> Result<Option<Vec<u8>>, ContentError> {
         self.check()?;
-        let path = self
-            .root
-            .join(kind.directory())
-            .join(format!("{name}.record"));
-        if !path.is_file() {
-            return Ok(None);
+        let most = max_bytes.min(kind.limit());
+        for (path, sealed) in self.record_places(kind, name)? {
+            match self.read_record_at(kind, &path, sealed, most) {
+                Ok(bytes) => return Ok(Some(bytes)),
+                Err(ContentError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
         }
-        read_bounded(&path, max_bytes.min(kind.limit())).map(Some)
+        Ok(None)
+    }
+
+    /// Kind `kind`'s key directory's key: made with its record where `create` is set and the store
+    /// seals (29 §12.7).
+    pub(crate) fn record_key(
+        &self,
+        kind: CustodyRecordKind,
+        create: bool,
+    ) -> Result<sealing::DomainKey, ContentError> {
+        self.keys
+            .domain(&self.root.join(kind.directory()), kind.key_domain(), create)
+    }
+
+    /// Where kind `kind`'s record named `name` may lie, each form's place with whether it seals: its
+    /// name in the clear while a record may lie in the clear, its keyed name once the kind's key
+    /// directory stands.
+    pub(crate) fn record_places(
+        &self,
+        kind: CustodyRecordKind,
+        name: ContentHash,
+    ) -> Result<Vec<(PathBuf, bool)>, ContentError> {
+        let directory = self.root.join(kind.directory());
+        let mut places = Vec::new();
+        places
+            .try_reserve_exact(2)
+            .map_err(|_| ContentError::Capacity)?;
+        if self.rest.clear_allowed() {
+            places.push((directory.join(format!("{name}.record")), false));
+        }
+        let key = self.record_key(kind, false)?;
+        if self.rest.seals() && key.record_bytes() == 0 {
+            places.push((key.path(&directory, name, sealing::Kind::Record)?, true));
+        }
+        Ok(places)
+    }
+
+    /// The record at `path` read whole in its form, at most `most` bytes.
+    pub(crate) fn read_record_at(
+        &self,
+        kind: CustodyRecordKind,
+        path: &Path,
+        sealed: bool,
+        most: usize,
+    ) -> Result<Vec<u8>, ContentError> {
+        if !path.is_file() {
+            return Err(ContentError::Io(std::io::Error::from(
+                std::io::ErrorKind::NotFound,
+            )));
+        }
+        if sealed {
+            self.record_key(kind, false)?.read_record(path, most)
+        } else {
+            read_bounded(path, most)
+        }
+    }
+
+    /// A named record replaced sealed (29 §12.7): the same bytes there already need no promise and
+    /// add no byte; otherwise promised its file's bytes and sealed at its keyed name. A record in
+    /// the clear of that name goes either way, since a reader looks in the clear first and would
+    /// meet the bytes it replaces.
+    fn replace_sealed_record(
+        &mut self,
+        kind: CustodyRecordKind,
+        key: sealing::DomainKey,
+        name: ContentHash,
+        bytes: &[u8],
+    ) -> Result<(), ContentError> {
+        let directory = self.root.join(kind.directory());
+        let held = if key.record_bytes() == 0 {
+            let path = key.path(&directory, name, sealing::Kind::Record)?;
+            match self.read_record_at(kind, &path, true, kind.limit()) {
+                Ok(held) => held == bytes,
+                Err(ContentError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    false
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            false
+        };
+        let result = (|| {
+            if !held {
+                let record = disk_reserve(
+                    &self.disk,
+                    &self.root,
+                    DiskKind::Content,
+                    BudgetLane::Completion,
+                    key.file_bytes(bytes.len())?
+                        .checked_add(key.record_bytes())
+                        .ok_or(ContentError::Capacity)?,
+                )?;
+                durable_directory(&directory)?;
+                let key = self.keys.writable(&directory, kind.key_domain(), key)?;
+                key.install(&key.path(&directory, name, sealing::Kind::Record)?, bytes)?;
+                record.commit();
+            }
+            let clear = directory.join(format!("{name}.record"));
+            if self.rest.clear_allowed() && clear.is_file() {
+                let gone = fs::metadata(&clear)?.len();
+                fs::remove_file(&clear)?;
+                sync_directory(&directory)?;
+                self.conversion_record(kind, gone)?;
+            }
+            Ok(())
+        })();
+        self.mark_failure(&result);
+        result
     }
     /// Reading a recorded manifest never creates a trusted custody witness.
     /// A new process must repeat the snapshot/content verification protocol.
@@ -800,17 +1043,21 @@ impl ContentStore {
         max_bytes: usize,
     ) -> Result<Vec<u8>, ContentError> {
         self.check()?;
-        let bytes = read_bounded(
-            &self
-                .root
-                .join(kind.directory())
-                .join(format!("{hash}.record")),
-            max_bytes.min(kind.limit()),
-        )?;
-        if ContentHash(*blake3::hash(&bytes).as_bytes()) != hash {
-            return Err(ContentError::Corrupt);
+        let most = max_bytes.min(kind.limit());
+        let mut missed = None;
+        for (path, sealed) in self.record_places(kind, hash)? {
+            match self.read_record_at(kind, &path, sealed, most) {
+                Ok(bytes) if ContentHash(*blake3::hash(&bytes).as_bytes()) == hash => {
+                    return Ok(bytes);
+                }
+                Ok(_) => missed = Some(ContentError::Corrupt),
+                Err(ContentError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => missed = Some(error),
+            }
         }
-        Ok(bytes)
+        Err(missed.unwrap_or_else(|| {
+            ContentError::Io(std::io::Error::from(std::io::ErrorKind::NotFound))
+        }))
     }
 
     pub fn begin(
@@ -849,7 +1096,7 @@ impl ContentStore {
                 Err(ContentError::Invalid)
             };
         }
-        if terminal::contains(&self.meta_path(id), id)? {
+        if self.terminal_at(id)?.is_some() {
             return Err(ContentError::FinishedUpload);
         }
         self.reserve_upload(domain, length)?;
@@ -864,33 +1111,46 @@ impl ContentStore {
             .unwrap_or(0)
             .checked_add(length)
             .ok_or(ContentError::Capacity)?;
+        // In the store's form: sealed, a record file whose header is promised with the bytes, each
+        // append promising its records' overhead as it is written.
+        let key = self.staging_key(self.rest.seals())?;
+        let header = if self.rest.seals() {
+            u64::try_from(record_file::PART_HEADER).map_err(|_| ContentError::Capacity)?
+        } else {
+            0
+        };
         let staging = disk_reserve(
             &self.disk,
             &self.root,
             DiskKind::Staging,
             BudgetLane::Ordinary,
-            length,
+            length.checked_add(header).ok_or(ContentError::Capacity)?,
         )?;
-        let part = self.part_path(id);
-        // An orphan with no durable metadata is never an accepted upload; remove it.
-        if part.exists() {
-            fs::remove_file(&part)?;
+        // An orphan with no durable metadata is never an accepted upload; remove it, in either
+        // form.
+        for (orphan, _) in self.staging_places(id, "part")? {
+            if orphan.exists() {
+                fs::remove_file(&orphan)?;
+            }
         }
-        let file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&part)?;
-        file.sync_all()?;
+        let part_path = self.staging_path(&key, id, "part")?;
+        let meta_path = self.staging_path(&key, id, "meta")?;
+        let part = self.create_part(&key, id, &part_path, length)?;
         let bytes = postcard::to_stdvec(&meta)?;
-        atomic_install(&self.meta_path(id), &bytes)?;
+        if self.rest.seals() {
+            key.install(&meta_path, &bytes)?;
+        } else {
+            atomic_install(&meta_path, &bytes)?;
+        }
         self.staged_bytes = staged_bytes;
         self.staged_by_domain.insert(domain, domain_bytes);
         self.uploads.insert(
             id,
             Upload {
                 meta,
-                file,
+                part,
+                part_path,
+                meta_path,
                 offset: 0,
                 _staging: Some(staging),
             },
@@ -926,9 +1186,10 @@ impl ContentStore {
             return Err(ContentError::Capacity);
         }
         if offset < upload.offset && end <= upload.offset {
-            upload.file.seek(SeekFrom::Start(offset))?;
             let mut existing = zeroed_buffer(bytes.len())?;
-            upload.file.read_exact(&mut existing)?;
+            upload
+                .part
+                .read_at(&upload.part_path, offset, &mut existing)?;
             return if existing == bytes {
                 Ok(upload.offset)
             } else {
@@ -938,19 +1199,44 @@ impl ContentStore {
         if offset != upload.offset {
             return Err(ContentError::Offset(upload.offset));
         }
-        upload.file.seek(SeekFrom::Start(offset))?;
-        if let Err(error) = upload
-            .file
-            .write_all(bytes)
-            .and_then(|()| upload.file.sync_all())
-        {
-            // A partial/error write has an unknown outcome. Reload its actual prefix on
-            // next retry; the caller must use the returned/queried durable offset.
-            upload.file.set_len(offset)?;
-            upload.file.sync_all()?;
-            return Err(ContentError::Io(error));
-        }
+        let grew = match &mut upload.part {
+            staging::Part::Clear(file) => {
+                file.seek(SeekFrom::Start(offset))?;
+                if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+                    // A partial/error write has an unknown outcome. Reload its actual prefix on
+                    // next retry; the caller must use the returned/queried durable offset.
+                    file.set_len(offset)?;
+                    file.sync_all()?;
+                    return Err(ContentError::Io(error));
+                }
+                true
+            }
+            staging::Part::Sealed(writer) => {
+                // The records' overhead promised before they are written. A write that fails
+                // fails the store: opened again, the part is read through, and a part whose last
+                // append was cut short is written again under a new key before anything is
+                // appended (`RecordWriter::resume`).
+                let overhead = record_file::records_bytes(bytes.len())?
+                    .checked_sub(bytes.len() as u64)
+                    .ok_or(ContentError::Capacity)?;
+                let promise = disk_reserve(
+                    &self.disk,
+                    &self.root,
+                    DiskKind::Staging,
+                    BudgetLane::Ordinary,
+                    overhead,
+                )?;
+                writer.append(bytes)?;
+                writer.sync()?;
+                promise.commit();
+                false
+            }
+        };
         upload.offset = end;
+        if grew {
+            // A part in the clear grew while the store converts: its count follows it.
+            self.conversion_staging(convert::StagingChange::Grew(bytes.len() as u64))?;
+        }
         Ok(end)
     }
 
@@ -1030,7 +1316,7 @@ impl ContentStore {
             .uploads
             .get_mut(&id)
             .ok_or(ContentError::MissingUpload)?;
-        upload.file.sync_all()?;
+        upload.part.sync()?;
         let directory = domain_directory(&self.root, upload.meta.domain);
         // The sealed object is a second copy of the staged bytes until the
         // part is removed at finish; promise it before the first chunk lands:
@@ -1102,8 +1388,9 @@ impl ContentStore {
             let count =
                 usize::try_from(remaining.min(chunk_bytes)).map_err(|_| ContentError::Capacity)?;
             let block = scratch.get_mut(..count).ok_or(ContentError::Capacity)?;
-            upload.file.seek(SeekFrom::Start(sealing.done))?;
-            upload.file.read_exact(block)?;
+            upload
+                .part
+                .read_at(&upload.part_path, sealing.done, block)?;
             sealing.whole.update(block);
             let hash = ContentHash(*blake3::hash(block).as_bytes());
             install_chunk(&key, &directory, block, hash)?;
@@ -1191,12 +1478,28 @@ impl ContentStore {
             .get(&id)
             .map(|upload| (upload.meta.domain, upload.meta.expected_length));
         let length = upload.map(|(_, length)| length);
-        if length.is_none() {
-            if terminal::contains(&self.meta_path(id), id)? {
-                return terminal::remove_part(&self.part_path(id));
+        // The terminal record replaces the metadata where it lies, in its form; an upload not
+        // staged gets one in the store's form.
+        let (meta_path, part_path, sealed) = match self.uploads.get(&id) {
+            Some(live) => (
+                live.meta_path.clone(),
+                live.part_path.clone(),
+                matches!(live.part, staging::Part::Sealed(_)),
+            ),
+            None => {
+                if let Some((path, _)) = self.terminal_at(id)? {
+                    let part = path.with_extension("part");
+                    return terminal::remove_part(&part);
+                }
+                self.reserve_terminal_slot()?;
+                let key = self.staging_key(self.rest.seals())?;
+                (
+                    self.staging_path(&key, id, "meta")?,
+                    self.staging_path(&key, id, "part")?,
+                    self.rest.seals(),
+                )
             }
-            self.reserve_terminal_slot()?;
-        }
+        };
         let staged_bytes = self
             .staged_bytes
             .checked_sub(length.unwrap_or(0))
@@ -1206,9 +1509,25 @@ impl ContentStore {
             .checked_add(1)
             .filter(|count| *count <= MAX_TERMINAL_UPLOADS)
             .ok_or(ContentError::Capacity)?;
+        // A live upload in the clear, while the store converts: its metadata and part leave the
+        // count as they go, its terminal record joins it.
+        let clear_files = match (sealed, upload.is_some()) {
+            (false, true) => Some((
+                fs::metadata(&meta_path)?.len(),
+                fs::metadata(&part_path)?.len(),
+            )),
+            _ => None,
+        };
         // Publish the durable replay fence before releasing bytes or the live
         // handle. A delayed Begin can never reconstruct this scoped identity.
-        terminal::install(&self.meta_path(id), id)?;
+        self.install_terminal(&meta_path, sealed, id)?;
+        if let Some((meta_bytes, part_bytes)) = clear_files {
+            self.conversion_staging(convert::StagingChange::Gone(meta_bytes))?;
+            self.conversion_staging(convert::StagingChange::Gone(part_bytes))?;
+            self.conversion_staging(convert::StagingChange::Appeared(
+                terminal::RECORD_BYTES as u64,
+            ))?;
+        }
         self.terminal_uploads = terminal_uploads;
         self.uploads.remove(&id);
         self.staged_bytes = staged_bytes;
@@ -1225,7 +1544,7 @@ impl ContentStore {
                 self.staged_by_domain.insert(domain, remaining);
             }
         }
-        terminal::remove_part(&self.part_path(id))
+        terminal::remove_part(&part_path)
     }
 
     /// Delivers only checksum-verified chunks, so a corrupt later chunk cannot cause
@@ -1443,6 +1762,7 @@ impl ContentStore {
             root: self.root.clone(),
             keys: self.data_keys.clone(),
             clear: self.keys.clear_allowed(),
+            rest_clear: self.rest.clear_allowed(),
         })
     }
 
@@ -1482,105 +1802,6 @@ impl ContentStore {
             .is_none_or(|count| count >= MAX_TERMINAL_UPLOADS)
         {
             return Err(ContentError::Capacity);
-        }
-        Ok(())
-    }
-
-    fn part_path(&self, id: UploadId) -> PathBuf {
-        self.root
-            .join("staging")
-            .join(format!("{}.part", hex(&id.0)))
-    }
-    fn meta_path(&self, id: UploadId) -> PathBuf {
-        self.root
-            .join("staging")
-            .join(format!("{}.meta", hex(&id.0)))
-    }
-
-    fn recover_uploads(&mut self) -> Result<(), ContentError> {
-        for entry in fs::read_dir(self.root.join("staging"))? {
-            let entry = entry?;
-            if entry.path().extension().and_then(|x| x.to_str()) == Some("terminal") {
-                terminal::discard_pending(&entry.path())?;
-                continue;
-            }
-            if entry.path().extension().and_then(|x| x.to_str()) != Some("meta") {
-                continue;
-            }
-            let bytes = read_bounded(
-                &entry.path(),
-                self.limits.max_manifest_bytes.max(terminal::RECORD_BYTES),
-            )?;
-            if let Some(id) = terminal::decode(&bytes)? {
-                if entry.path() != self.meta_path(id) {
-                    return Err(ContentError::Corrupt);
-                }
-                terminal::contains(&entry.path(), id)?;
-                self.terminal_uploads = self
-                    .terminal_uploads
-                    .checked_add(1)
-                    .filter(|count| *count <= MAX_TERMINAL_UPLOADS)
-                    .ok_or(ContentError::Capacity)?;
-                if self
-                    .terminal_uploads
-                    .checked_add(self.uploads.len())
-                    .is_none_or(|count| count > MAX_TERMINAL_UPLOADS)
-                {
-                    return Err(ContentError::Capacity);
-                }
-                terminal::remove_part(&self.part_path(id))?;
-                continue;
-            }
-            let (meta, remaining): (UploadMeta, &[u8]) = postcard::take_from_bytes(&bytes)?;
-            if !remaining.is_empty()
-                || meta.schema != UPLOAD_SCHEMA
-                || entry.path() != self.meta_path(meta.id)
-            {
-                return Err(ContentError::Corrupt);
-            }
-            self.reserve_upload(meta.domain, meta.expected_length)?;
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(self.part_path(meta.id))?;
-            let offset = file.metadata()?.len();
-            if offset > meta.expected_length {
-                return Err(ContentError::Corrupt);
-            }
-            // Full chunks acknowledged before restart were synced. An unacknowledged
-            // tail can also survive and is verified against the caller's digest at seal.
-            file.sync_all()?;
-            self.staged_bytes = self
-                .staged_bytes
-                .checked_add(meta.expected_length)
-                .ok_or(ContentError::Corrupt)?;
-            let domain_bytes = self
-                .staged_by_domain
-                .get(&meta.domain)
-                .copied()
-                .unwrap_or(0)
-                .checked_add(meta.expected_length)
-                .ok_or(ContentError::Corrupt)?;
-            self.staged_by_domain.insert(meta.domain, domain_bytes);
-            // The bytes already received are on the volume; promise only the
-            // remainder, and keep an upload resumable when the volume cannot.
-            let staging = disk_reserve(
-                &self.disk,
-                &self.root,
-                DiskKind::Staging,
-                BudgetLane::Completion,
-                meta.expected_length.saturating_sub(offset),
-            )
-            .ok();
-            self.uploads.insert(
-                meta.id,
-                Upload {
-                    meta,
-                    file,
-                    offset,
-                    _staging: staging,
-                },
-            );
         }
         Ok(())
     }
@@ -1642,6 +1863,47 @@ pub(crate) fn chunk_files_bound(
 }
 /// Whether the store at `root` holds no object file: its objects' directory and its quarantine are
 /// empty, so a store asked to seal has nothing to convert.
+/// Whether the store holds nothing its conversion converts (29 §11, §12.7): where the `objects`
+/// convert, no object or quarantine round; where the files beside them (`rest`) do, no custody
+/// record, part or staging record in the clear. Sealed at once then.
+fn holds_nothing_to_convert(root: &Path, objects: bool, rest: bool) -> Result<bool, ContentError> {
+    if objects && !holds_no_object(root)? {
+        return Ok(false);
+    }
+    if !rest {
+        return Ok(true);
+    }
+    let mut directories = Vec::new();
+    for kind in CustodyRecordKind::ALL {
+        directories.push(root.join(kind.directory()));
+    }
+    for entry in fs::read_dir(root.join("objects"))? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            directories
+                .try_reserve_exact(1)
+                .map_err(|_| ContentError::Capacity)?;
+            directories.push(entry.path());
+        }
+    }
+    let wanted = convert::Converts {
+        objects: false,
+        rest: true,
+    };
+    for directory in directories {
+        for entry in fs::read_dir(directory)? {
+            if convert::counted_file(&entry?.path(), wanted)?.is_some() {
+                return Ok(false);
+            }
+        }
+    }
+    for entry in fs::read_dir(root.join("staging"))? {
+        if staging::counted_staging(&entry?.path())?.files > 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
 fn holds_no_object(root: &Path) -> Result<bool, ContentError> {
     if fs::read_dir(root.join("objects"))?.next().is_some() {
         return Ok(false);
@@ -1797,6 +2059,8 @@ pub struct ContentReader {
     /// Whether a file may lie in the clear: the store was not marked sealed as the reader was made,
     /// so each file is looked for in the clear first and then sealed (`sealing::DomainKey::opened`).
     clear: bool,
+    /// The same of its files beside its objects (29 §12.7): a custody record.
+    rest_clear: bool,
 }
 impl ContentReader {
     /// The length of an installed object's manifest, from its file's stated stream, nothing
@@ -1812,7 +2076,13 @@ impl ContentReader {
             return Err(ContentError::Invalid);
         }
         let clear = !root.join(sealing::SEALED).try_exists()?;
-        Ok(Self { root, keys, clear })
+        let rest_clear = !root.join(sealing::REST_SEALED).try_exists()?;
+        Ok(Self {
+            root,
+            keys,
+            clear,
+            rest_clear,
+        })
     }
     fn keys(&self) -> sealing::ContentKeys<'_> {
         sealing::ContentKeys::reading(&self.keys, self.clear)
@@ -1942,23 +2212,42 @@ impl ContentReader {
     pub fn verify(&self, reference: &ContentRef) -> Result<(), ContentError> {
         read_verified_at(&self.root, &self.keys(), reference, std::io::sink())
     }
+    /// Kind `kind`'s record filed under `hash`, checked against it: in the clear first while a record
+    /// may lie in the clear, then sealed under its keyed name, opened under the kind's key (29 §12.7).
     pub fn read_custody_record(
         &self,
         kind: CustodyRecordKind,
         hash: ContentHash,
         max_bytes: usize,
     ) -> Result<Vec<u8>, ContentError> {
-        let bytes = read_bounded(
-            &self
-                .root
-                .join(kind.directory())
-                .join(format!("{hash}.record")),
-            max_bytes.min(kind.limit()),
-        )?;
-        if ContentHash(*blake3::hash(&bytes).as_bytes()) != hash {
-            return Err(ContentError::Corrupt);
+        let most = max_bytes.min(kind.limit());
+        let directory = self.root.join(kind.directory());
+        let keys = self.keys();
+        let mut missed = None;
+        if self.rest_clear {
+            match read_bounded(&directory.join(format!("{hash}.record")), most) {
+                Ok(bytes) if ContentHash(*blake3::hash(&bytes).as_bytes()) == hash => {
+                    return Ok(bytes);
+                }
+                Ok(_) => missed = Some(ContentError::Corrupt),
+                Err(ContentError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => missed = Some(error),
+            }
         }
-        Ok(bytes)
+        let key = keys.domain(&directory, kind.key_domain(), false)?;
+        if key.seals() && key.record_bytes() == 0 {
+            let path = key.path(&directory, hash, sealing::Kind::Record)?;
+            if path.is_file() {
+                let bytes = key.read_record(&path, most)?;
+                if ContentHash(*blake3::hash(&bytes).as_bytes()) != hash {
+                    return Err(ContentError::Corrupt);
+                }
+                return Ok(bytes);
+            }
+        }
+        Err(missed.unwrap_or_else(|| {
+            ContentError::Io(std::io::Error::from(std::io::ErrorKind::NotFound))
+        }))
     }
 }
 
@@ -2119,6 +2408,10 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
+#[path = "record_seal_tests.rs"]
+mod record_seal_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     fn limits() -> StoreLimits {
@@ -2159,11 +2452,11 @@ mod tests {
             Err(ContentError::Capacity)
         ));
         assert_eq!(store.staged(), (0, 0));
+        // No part in either form: the refusal came before any was made.
         assert!(
-            !dir.path()
-                .join("staging")
-                .join(format!("{}.part", hex(&id.0)))
-                .exists()
+            fs::read_dir(dir.path().join("staging"))
+                .unwrap()
+                .all(|entry| entry.unwrap().path().extension() != Some("part".as_ref()))
         );
         assert_eq!(guarded.stats().outstanding, 0);
         assert!(matches!(
@@ -2191,12 +2484,15 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(open.stats().by_kind[DiskKind::Staging as usize], 8);
+        // The bytes and, the part sealed, its record file's header; each append promises its
+        // records' overhead as it is written.
+        let staged = 8 + record_file::PART_HEADER as u64;
+        assert_eq!(open.stats().by_kind[DiskKind::Staging as usize], staged);
         store.append(id, 0, b"abcd").unwrap();
         store.append(id, 4, b"efgh").unwrap();
         store.seal(id).unwrap();
         assert_eq!(open.stats().by_kind[DiskKind::Content as usize], 0);
-        assert_eq!(open.stats().outstanding, 8);
+        assert_eq!(open.stats().outstanding, staged);
         store.finish(id).unwrap();
         assert_eq!(open.stats().outstanding, 0);
     }
@@ -2272,9 +2568,7 @@ mod tests {
             checkpoint
         );
         std::fs::write(
-            dir.path()
-                .join("checkpoints")
-                .join(format!("{hash}.record")),
+            reopened.record_path(CustodyRecordKind::Checkpoint, hash),
             b"bad checkpoint",
         )
         .unwrap();

@@ -308,7 +308,7 @@ fn custody_records_keep_the_newest_and_the_protected() {
             .unwrap();
         hashes.push(hash);
         // Distinct ages, oldest first.
-        let path = root.join("checkpoints").join(format!("{hash}.record"));
+        let path = store.record_path(CustodyRecordKind::Checkpoint, hash);
         File::options()
             .write(true)
             .open(&path)

@@ -18,6 +18,14 @@
 //! `FOCAL_BENCH_OBJECTS` objects of each size (default 16), `FOCAL_BENCH_SIZES` sizes in KiB
 //! (default "64 1024 8192"), 1 MiB chunks; `FOCAL_BENCH_READS` passes of reads over them (default
 //! 1), for a read phase long enough to profile.
+//!
+//! `FOCAL_BENCH_UPLOADS` uploads the objects alone in one form and does nothing else: `clear`
+//! (every file in the clear), `content` (the objects sealed, the files beside them in the clear, as
+//! the content level writes them), `sealed` (both sealed, as the at-rest level writes them, 29
+//! §12.7), or `none` (the objects' bytes made and nothing stored, what the others' CPU includes
+//! besides their uploads). Each is a process of its own, so a host without a thread's CPU clock
+//! measures each form's CPU by the process's (`/usr/bin/time`), the forms run in turn; where the
+//! host says (Linux), the CPU the uploads ran is reported as well.
 use focal_evidence::{ContentForm, ContentStore, Conversion, StoreForm, StoreLimits, UploadId};
 use focal_memory::{DiskBudget, DiskBudgetConfig};
 use focal_model::{ContentClass, ContentDomainId, ContentRef};
@@ -80,6 +88,66 @@ fn upload(store: &mut ContentStore, id: u64, domain: ContentDomainId, bytes: &[u
     reference
 }
 
+/// The time this thread has run on a CPU, in the kernel included, where the host says (Linux's
+/// `/proc/thread-self/schedstat`, nanoseconds).
+fn cpu_now() -> Option<Duration> {
+    std::fs::read_to_string("/proc/thread-self/schedstat")
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+        .map(Duration::from_nanos)
+}
+
+/// `FOCAL_BENCH_UPLOADS`: `objects` objects of each of `sizes` uploaded in `forms` (the objects',
+/// the files beside them), or only their bytes made where `forms` is `None`.
+fn uploads_alone(objects: usize, sizes: &[usize], forms: Option<(ContentForm, ContentForm)>) {
+    let domain = ContentDomainId([7; 16]);
+    for &size in sizes {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = forms.map(|(form, rest)| {
+            ContentStore::open_forms(
+                root.path(),
+                limits(),
+                DiskBudget::new(DiskBudgetConfig::unbounded()).unwrap(),
+                &focal_seal::test_keys(root.path()).unwrap(),
+                form,
+                rest,
+            )
+            .unwrap()
+        });
+        let (mut walls, mut cpus) = (Vec::new(), Vec::new());
+        for index in 0..objects {
+            let bytes = payload((size * 31 + index) as u64, size);
+            let Some(store) = store.as_mut() else {
+                std::hint::black_box(&bytes);
+                continue;
+            };
+            let (began, ran) = (Instant::now(), cpu_now());
+            upload(store, index as u64, domain, &bytes);
+            walls.push(began.elapsed());
+            if let (Some(ran), Some(now)) = (ran, cpu_now()) {
+                cpus.push(now - ran);
+            }
+        }
+        if walls.is_empty() {
+            continue;
+        }
+        let wall = median(&mut walls);
+        let cpu = if cpus.is_empty() {
+            "-".to_string()
+        } else {
+            format!("{:.3}", median(&mut cpus).as_secs_f64() * 1000.0)
+        };
+        println!(
+            "uploads {forms:?} {kib:>6} KiB: wall {wall:.3} ms, cpu {cpu} ms an object",
+            kib = size / 1024,
+            wall = wall.as_secs_f64() * 1000.0,
+        );
+    }
+}
+
 fn median(samples: &mut [Duration]) -> Duration {
     samples.sort();
     samples[samples.len() / 2]
@@ -111,6 +179,20 @@ fn main() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(1);
+    if let Ok(only) = std::env::var("FOCAL_BENCH_UPLOADS") {
+        let forms = match only.trim() {
+            "clear" => Some((ContentForm::Clear, ContentForm::Clear)),
+            "content" => Some((ContentForm::Sealed, ContentForm::Clear)),
+            "sealed" => Some((ContentForm::Sealed, ContentForm::Sealed)),
+            "none" => None,
+            other => {
+                eprintln!("FOCAL_BENCH_UPLOADS={other}: clear, content, sealed or none");
+                std::process::exit(2);
+            }
+        };
+        uploads_alone(objects, &sizes, forms);
+        return;
+    }
     let domain = ContentDomainId([7; 16]);
     for &size in &sizes {
         for form in [ContentForm::Clear, ContentForm::Sealed] {

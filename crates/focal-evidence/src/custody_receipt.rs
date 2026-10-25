@@ -283,10 +283,7 @@ mod tests {
             .unwrap();
         assert_eq!(held.policy_revision, 6);
         let name = CustodyReceipt::name(first.ledger, first.root, 2);
-        let path = directory
-            .path()
-            .join("receipts")
-            .join(format!("{name}.record"));
+        let path = store.record_path(crate::CustodyRecordKind::Receipt, name);
         let mut bytes = std::fs::read(&path).unwrap();
         bytes[40] ^= 0xff;
         std::fs::write(&path, &bytes).unwrap();

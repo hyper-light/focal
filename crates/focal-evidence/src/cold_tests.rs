@@ -464,7 +464,7 @@ fn a_sealed_append_spends_exactly_what_its_room_promised() {
         ContentForm::Sealed,
     )
     .unwrap();
-    let open = 64 + cold_records::HEADER as u64;
+    let open = 64 + record_file::HEADER as u64;
     assert_eq!(disk.stats().outstanding, open, "the open chunk is promised");
     let bytes = stream(64 * 5 + 10);
     for piece in bytes.chunks(23) {
@@ -520,7 +520,7 @@ fn a_sealed_stream_holds_no_plaintext_and_refuses_what_was_changed() {
     let file = reader.file_of(whole).unwrap();
     let original = fs::read(&file).unwrap();
     // A flipped byte in a whole chunk: in its header, a length block and its bytes.
-    for at in [3, cold_records::HEADER + 2, original.len() - 3] {
+    for at in [3, record_file::HEADER + 2, original.len() - 3] {
         let mut flipped = original.clone();
         flipped[at] ^= 1;
         fs::write(&file, &flipped).unwrap();
@@ -551,8 +551,8 @@ fn a_sealed_stream_holds_no_plaintext_and_refuses_what_was_changed() {
     *flipped.last_mut().unwrap() ^= 1;
     fs::write(&open, &flipped).unwrap();
     assert!(cold.read(tail as u64, 50).is_err());
-    let record = cold_records::RECORD_OVERHEAD + 17;
-    let first = cold_records::HEADER;
+    let record = record_file::RECORD_OVERHEAD + 17;
+    let first = record_file::HEADER;
     let mut swapped = open_bytes.clone();
     assert!(swapped.len() >= first + 2 * record);
     let (left, right) = swapped[first..first + 2 * record].split_at_mut(record);
@@ -595,7 +595,7 @@ fn no_record_files_key_and_nonce_seal_two_plaintexts() {
         let mut found = Vec::new();
         for entry in fs::read_dir(root).unwrap() {
             let stored = crate::store::stored_bytes(&entry.unwrap().path());
-            if stored.starts_with(cold_records::MAGIC) {
+            if stored.starts_with(record_file::COLD_MAGIC) {
                 found.push((stored[8..24].try_into().unwrap(), stored));
             }
         }

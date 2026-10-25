@@ -15,8 +15,8 @@
 //! IO: a replica that applied a record never finds its batch refused for room. Retired data is
 //! kept: nothing here is swept, and no seed sweep reaches this directory.
 use super::chunk_convert::{ChunkConversion, ChunkDirectory, SeedJobDone, SeedStep, holds_clear};
-use super::cold_records::{self, RecordWriter};
 use super::convert::{self, Conversion, ConversionStatus};
+use super::record_file::{self, RecordWriter};
 use super::sealing::{self, ContentForm, ContentKeys, Hashed, Kind};
 use super::*;
 use focal_memory::{Allocation, BudgetKind, MemoryBudget};
@@ -388,12 +388,15 @@ fn read_chunk_at(
         return Ok(bytes);
     }
     let mut file = File::open(path)?;
-    let mut head = [0u8; cold_records::HEADER];
-    let read = cold_records::read_full(&mut file, &mut head)?;
-    let bytes = match head.get(..read).and_then(cold_records::record_id) {
+    let mut head = [0u8; record_file::HEADER];
+    let read = record_file::read_full(&mut file, &mut head)?;
+    let bytes = match head
+        .get(..read)
+        .and_then(|head| record_file::record_id(head, record_file::COLD_MAGIC))
+    {
         Some(id) => {
             let record_key = key.record_key(&id)?;
-            cold_records::read_all(&mut file, &record_key, most)?
+            record_file::read_all(&mut file, &record_key, most)?
         }
         None => {
             drop(file);
@@ -603,11 +606,7 @@ impl ColdStore {
     /// worth, and a record file's header where it seals; its records' overhead is promised as
     /// each append's room.
     fn open_bytes(keys: &ContentKeys<'_>, geometry: ColdGeometry) -> Result<u64, ContentError> {
-        let header = if keys.seals() {
-            cold_records::HEADER
-        } else {
-            0
-        };
+        let header = if keys.seals() { record_file::HEADER } else { 0 };
         u64::try_from(geometry.chunk_bytes.saturating_add(header))
             .map_err(|_| ContentError::Capacity)
     }
@@ -617,7 +616,7 @@ impl ColdStore {
         if !keys.seals() || bytes == 0 {
             return Ok(0);
         }
-        cold_records::records_bytes(bytes)?
+        record_file::records_bytes(bytes)?
             .checked_sub(u64::try_from(bytes).map_err(|_| ContentError::Capacity)?)
             .ok_or(ContentError::Capacity)
     }
@@ -652,6 +651,7 @@ impl ColdStore {
         let record_key = key.record_key(&id)?;
         Ok(OpenChunk::Sealed(Box::new(RecordWriter::create(
             &path,
+            record_file::COLD_MAGIC,
             id,
             record_key,
             geometry.chunk_bytes,

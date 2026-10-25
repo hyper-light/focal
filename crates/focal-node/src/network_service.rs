@@ -907,7 +907,9 @@ impl NetworkService {
             let tenant = tenant.clone();
             let settings = settings.clone();
             focal_rt::on_pool(&focal_rt::FILES, move || -> Result<_, ServiceError> {
-                let content = ContentStore::open_with_disk(
+                // Its objects in the content level's form, its files beside them (uploads being
+                // staged, parts, custody records) in the at-rest level's (29 §12.7).
+                let content = ContentStore::open_forms(
                     root.join("content"),
                     StoreLimits {
                         max_content_bytes: 64 * 1024 * 1024,
@@ -919,6 +921,7 @@ impl NetworkService {
                     storage.disk_budget(),
                     &settings.data_keys(&root)?,
                     crate::storage_level::content_form(&root)?,
+                    crate::storage_level::at_rest_form(&root)?,
                 )?;
                 let session = if founder {
                     let mut consensus = storage.open_member(

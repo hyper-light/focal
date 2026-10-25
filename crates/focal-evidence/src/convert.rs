@@ -52,11 +52,44 @@ use focal_memory::{BudgetLane, DiskKind};
 use focal_model::{ContentDomainId, ContentHash};
 
 use super::sealing::{self, Kind};
+use super::staging::StagingStep;
 use super::{
-    ContentError, ContentErrorKind, ContentStore, MAX_TRANSFER_CHUNK_BYTES,
+    ContentError, ContentErrorKind, ContentStore, CustodyRecordKind, MAX_TRANSFER_CHUNK_BYTES,
     MAX_TRANSFER_MANIFEST_BYTES, disk_reserve, domain_directory, durable_directory, hex,
     sync_directory,
 };
+
+/// What a store's conversion converts: its objects (the content level's, 29 §11), its files beside
+/// them (the at-rest level's, §12.7: custody records, parts, staging), or both at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Converts {
+    pub(super) objects: bool,
+    pub(super) rest: bool,
+}
+
+impl Converts {
+    /// Whether a file of `kind` in the clear is the conversion's.
+    fn takes(self, kind: Kind) -> bool {
+        match kind {
+            Kind::Chunk | Kind::Manifest => self.objects,
+            Kind::Part | Kind::Record => self.rest,
+            Kind::Seed => false,
+        }
+    }
+}
+
+/// A change to a file of staging's in the clear while the store converts
+/// ([`ContentStore::conversion_staging`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StagingChange {
+    /// Bytes appended to an upload's part.
+    Grew(u64),
+    /// A file of these bytes written: an upload's terminal record, replacing its metadata.
+    Appeared(u64),
+    /// A file of these bytes gone: an upload's part or metadata at its finish, a terminal record
+    /// released.
+    Gone(u64),
+}
 
 /// What one step of a store's conversion did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,7 +117,11 @@ impl Tally {
         self.files = self.files.saturating_add(1);
         self.bytes = self.bytes.saturating_add(bytes);
     }
-    fn plus(self, other: Self) -> Self {
+    /// Bytes more of a file already tallied.
+    pub(super) fn grow(&mut self, bytes: u64) {
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+    pub(super) fn plus(self, other: Self) -> Self {
         Self {
             files: self.files.saturating_add(other.files),
             bytes: self.bytes.saturating_add(other.bytes),
@@ -107,7 +144,9 @@ pub enum StoreForm {
     Counting,
     /// It seals, and converts its files in the clear a file a step.
     Converting,
-    /// Every file is sealed and the store is marked so.
+    /// Every file its form seals is sealed and the store is marked so: its objects from the
+    /// content level, the files beside them from the at-rest level (29 §12.7), which lie in the
+    /// clear below it as every earlier binary wrote them.
     Sealed,
 }
 
@@ -211,6 +250,17 @@ pub(super) struct Converting {
     tree: Option<ReadDir>,
     /// The domain being visited.
     domain: Option<Visit>,
+    /// The custody records' directories, as the count listed them, the index of the next, and
+    /// the one being visited with its kind.
+    record_dirs: Vec<PathBuf>,
+    record: usize,
+    records: Option<(CustodyRecordKind, PathBuf, ReadDir, bool)>,
+    /// Staging's pass, once the objects are done ([`super::staging::StagingPass`]).
+    staging: Option<super::staging::StagingPass>,
+    /// Whether a pass over staging met nothing in the clear.
+    staged: bool,
+    /// What it converts.
+    converts: Converts,
 }
 
 /// The count of a conversion's files in the clear, in the conversion's order: the rounds by name,
@@ -228,6 +278,18 @@ struct Count {
     listing: Option<Listing>,
     /// What the domains counted to the end hold.
     total: Tally,
+    /// The custody records' directories, each round's kinds then the store's own, and the index of
+    /// the one being counted or next (29 §12.7).
+    record_dirs: Vec<PathBuf>,
+    record: usize,
+    /// The records' directory being listed.
+    records: Option<Listing>,
+    /// Staging's listing, once the objects are counted: its files in the clear (29 §12.7).
+    staging: Option<Listing>,
+    /// Whether staging is counted: the count is whole.
+    staged: bool,
+    /// What it counts.
+    converts: Converts,
 }
 
 /// One domain's directory being counted.
@@ -250,7 +312,7 @@ enum Standing {
 }
 
 impl Count {
-    fn begin(root: &Path) -> Result<Self, ContentError> {
+    fn begin(root: &Path, converts: Converts) -> Result<Self, ContentError> {
         let mut rounds = Vec::new();
         match fs::read_dir(root.join("quarantine")) {
             Ok(listing) => {
@@ -265,6 +327,15 @@ impl Count {
             Err(error) => return Err(error.into()),
         }
         rounds.sort();
+        let record_dirs = if converts.rest {
+            record_directories(root, &rounds)?
+        } else {
+            Vec::new()
+        };
+        // Where only the files beside the objects convert, the rounds' objects are not the count's.
+        if !converts.objects {
+            rounds.clear();
+        }
         Ok(Self {
             rounds,
             tree: 0,
@@ -272,15 +343,82 @@ impl Count {
             domain: 0,
             listing: None,
             total: Tally::default(),
+            record_dirs,
+            record: 0,
+            records: None,
+            staging: None,
+            staged: !converts.rest,
+            converts,
         })
+    }
+
+    /// Where the store's own records of `kind` stand in the count.
+    fn record_standing(&self, kind: CustodyRecordKind) -> Standing {
+        let index = self
+            .rounds
+            .len()
+            .saturating_mul(CustodyRecordKind::ALL.len())
+            .saturating_add(
+                CustodyRecordKind::ALL
+                    .iter()
+                    .position(|each| *each == kind)
+                    .unwrap_or(0),
+            );
+        if index < self.record {
+            Standing::Counted
+        } else if index == self.record && self.records.is_some() {
+            Standing::Listing
+        } else {
+            Standing::Ahead
+        }
+    }
+
+    /// The records' directory being listed, listed again from its start.
+    fn relist_records(&mut self) -> Result<(), ContentError> {
+        let Some(listing) = self.records.take() else {
+            return Ok(());
+        };
+        self.records = Some(Listing {
+            entries: fs::read_dir(&listing.directory)?,
+            directory: listing.directory,
+            partial: Tally::default(),
+        });
+        Ok(())
     }
 
     /// What the count has met so far.
     fn so_far(&self) -> Tally {
-        match &self.listing {
-            Some(listing) => self.total.plus(listing.partial),
-            None => self.total,
+        let partial = self
+            .listing
+            .iter()
+            .chain(&self.records)
+            .chain(&self.staging)
+            .fold(Tally::default(), |sum, listing| sum.plus(listing.partial));
+        self.total.plus(partial)
+    }
+
+    /// Where staging stands in the count.
+    fn staging_standing(&self) -> Standing {
+        if self.staged {
+            Standing::Counted
+        } else if self.staging.is_some() {
+            Standing::Listing
+        } else {
+            Standing::Ahead
         }
+    }
+
+    /// Staging listed again from its start: a file of it changed while it was listed.
+    fn relist_staging(&mut self) -> Result<(), ContentError> {
+        let Some(listing) = self.staging.take() else {
+            return Ok(());
+        };
+        self.staging = Some(Listing {
+            entries: fs::read_dir(&listing.directory)?,
+            directory: listing.directory,
+            partial: Tally::default(),
+        });
+        Ok(())
     }
 
     /// The directory of the tree at `tree`, none past the store's own.
@@ -297,7 +435,7 @@ impl Count {
         for _ in 0..visits {
             if let Some(listing) = self.listing.as_mut() {
                 if let Some(entry) = listing.entries.next() {
-                    if let Some(bytes) = counted_entry(&entry?)? {
+                    if let Some(bytes) = counted_entry(&entry?, self.converts)? {
                         listing.partial.add(bytes);
                     }
                     continue;
@@ -309,7 +447,64 @@ impl Count {
                 continue;
             }
             let Some(tree_root) = self.tree_root(root, self.tree) else {
-                return Ok(true);
+                // Past the objects, the custody records' directories, each round's then the
+                // store's own.
+                if let Some(records) = self.records.as_mut() {
+                    match records.entries.next() {
+                        Some(entry) => {
+                            if let Some(bytes) = counted_entry(&entry?, self.converts)? {
+                                records.partial.add(bytes);
+                            }
+                        }
+                        None => {
+                            if let Some(done) = self.records.take() {
+                                self.total = self.total.plus(done.partial);
+                            }
+                            self.record = self.record.saturating_add(1);
+                        }
+                    }
+                    continue;
+                }
+                if let Some(directory) = self.record_dirs.get(self.record) {
+                    match fs::read_dir(directory) {
+                        Ok(entries) => {
+                            self.records = Some(Listing {
+                                directory: directory.clone(),
+                                entries,
+                                partial: Tally::default(),
+                            });
+                        }
+                        Err(error) if gone(&error) => self.record = self.record.saturating_add(1),
+                        Err(error) => return Err(error.into()),
+                    }
+                    continue;
+                }
+                // Then staging's files in the clear.
+                if self.staged {
+                    return Ok(true);
+                }
+                let Some(staging) = self.staging.as_mut() else {
+                    let directory = root.join("staging");
+                    self.staging = Some(Listing {
+                        entries: fs::read_dir(&directory)?,
+                        directory,
+                        partial: Tally::default(),
+                    });
+                    continue;
+                };
+                match staging.entries.next() {
+                    Some(entry) => {
+                        let found = super::staging::counted_staging(&entry?.path())?;
+                        staging.partial = staging.partial.plus(found);
+                    }
+                    None => {
+                        if let Some(done) = self.staging.take() {
+                            self.total = self.total.plus(done.partial);
+                        }
+                        self.staged = true;
+                    }
+                }
+                continue;
             };
             let Some(domains) = &self.domains else {
                 self.domains = Some(sorted_domains(&tree_root)?);
@@ -444,6 +639,10 @@ fn clear_name(path: &Path) -> Option<(ContentHash, Kind)> {
     let kind = match path.extension()?.to_str()? {
         "chunk" => Kind::Chunk,
         "manifest" => Kind::Manifest,
+        // A chunk a transfer is receiving, staged in parts beside the objects (29 §12.7).
+        "part" => Kind::Part,
+        // A custody record, in its kind's directory or a round's (29 §12.7).
+        "record" => Kind::Record,
         _ => return None,
     };
     Some((sealing::parse_hash(stem)?, kind))
@@ -454,9 +653,15 @@ fn clear_name(path: &Path) -> Option<(ContentHash, Kind)> {
 /// never an object's. `metadata` is the entry's own, its links not followed.
 pub(super) fn convertible(kind: Kind, metadata: &fs::Metadata) -> Option<u64> {
     let bound = match kind {
-        Kind::Chunk => MAX_TRANSFER_CHUNK_BYTES,
+        Kind::Chunk | Kind::Part => MAX_TRANSFER_CHUNK_BYTES,
         Kind::Manifest => MAX_TRANSFER_MANIFEST_BYTES,
         Kind::Seed => super::SEED_CHUNK_BYTES,
+        // The largest record's kind's bound: a checkpoint's.
+        Kind::Record => CustodyRecordKind::ALL
+            .iter()
+            .map(|kind| kind.limit())
+            .max()
+            .unwrap_or(0),
     };
     let length = metadata.len();
     (metadata.is_file() && usize::try_from(length).is_ok_and(|length| length <= bound))
@@ -466,8 +671,8 @@ pub(super) fn convertible(kind: Kind, metadata: &fs::Metadata) -> Option<u64> {
 /// The bytes of the entry at `path` where the conversion converts it: a chunk or a manifest in the
 /// clear, named by its hash, a file no longer than its kind's bound. None for anything the
 /// conversion leaves as it is, and for an entry gone since it was listed.
-pub(super) fn counted_file(path: &Path) -> Result<Option<u64>, ContentError> {
-    let Some((_, kind)) = clear_name(path) else {
+pub(super) fn counted_file(path: &Path, converts: Converts) -> Result<Option<u64>, ContentError> {
+    let Some((_, kind)) = clear_name(path).filter(|(_, kind)| converts.takes(*kind)) else {
         return Ok(None);
     };
     match fs::symlink_metadata(path) {
@@ -479,9 +684,10 @@ pub(super) fn counted_file(path: &Path) -> Result<Option<u64>, ContentError> {
 
 /// [`counted_file`] of a listed entry, from its listing: its name, and its metadata read beside its
 /// directory, no path resolved.
-fn counted_entry(entry: &fs::DirEntry) -> Result<Option<u64>, ContentError> {
+fn counted_entry(entry: &fs::DirEntry, converts: Converts) -> Result<Option<u64>, ContentError> {
     let name = entry.file_name();
-    let Some((_, kind)) = clear_name(Path::new(&name)) else {
+    let Some((_, kind)) = clear_name(Path::new(&name)).filter(|(_, kind)| converts.takes(*kind))
+    else {
         return Ok(None);
     };
     match entry.metadata() {
@@ -511,15 +717,23 @@ enum Visited {
 }
 
 impl Converting {
-    /// A conversion of the store at `root`, nothing counted yet.
-    pub(super) fn begin(root: &Path) -> Result<Self, ContentError> {
+    /// A conversion of the store at `root`, nothing counted yet: of its `objects` and its files
+    /// beside them (`rest`), as each converts.
+    pub(super) fn begin(root: &Path, objects: bool, rest: bool) -> Result<Self, ContentError> {
+        let converts = Converts { objects, rest };
         Ok(Self {
-            count: Some(Count::begin(root)?),
+            count: Some(Count::begin(root, converts)?),
             rounds: Vec::new(),
             round: 0,
             own: false,
             tree: None,
             domain: None,
+            record_dirs: Vec::new(),
+            record: 0,
+            records: None,
+            staging: None,
+            staged: !rest,
+            converts,
         })
     }
 
@@ -540,7 +754,7 @@ impl ContentStore {
     pub fn conversion_status(&self) -> ConversionStatus {
         let form = if !self.keys.seals() {
             StoreForm::Clear
-        } else if !self.keys.clear_allowed() {
+        } else if !self.keys.converting() && !self.rest.converting() {
             StoreForm::Sealed
         } else if self.progress.counting {
             StoreForm::Counting
@@ -565,14 +779,18 @@ impl ContentStore {
         if !self.keys.converting() {
             return Ok(());
         }
-        let replaced = counted_file(destination)?;
+        let objects = Converts {
+            objects: true,
+            rest: false,
+        };
+        let replaced = counted_file(destination, objects)?;
         match self
             .conversion
             .as_mut()
             .and_then(|state| state.count.as_mut())
         {
             Some(count) => {
-                count.restored(round, domain, counted_file(source)?, replaced)?;
+                count.restored(round, domain, counted_file(source, objects)?, replaced)?;
                 self.progress.counted = count.so_far();
             }
             None => {
@@ -587,11 +805,37 @@ impl ContentStore {
     /// The file at `path` of a round the collector deletes, about to go: where it is one the
     /// conversion converts, it left with its round before the conversion met it.
     pub(super) fn conversion_deleting(&mut self, path: &Path) -> Result<(), ContentError> {
-        if !self.keys.converting() {
+        let Some(converts) = self.conversion.as_ref().map(|state| state.converts) else {
+            return Ok(());
+        };
+        if let Some(bytes) = counted_file(path, converts)? {
+            self.progress.gone.add(bytes);
+        }
+        Ok(())
+    }
+
+    /// A file of staging's in the clear changed while the store converts (29 §12.7): what the count
+    /// passed is kept exact by the change, a listing it is in the middle of is listed again, and
+    /// what it has still to list it counts as it finds it.
+    pub(super) fn conversion_staging(&mut self, change: StagingChange) -> Result<(), ContentError> {
+        if !self.rest.converting() {
             return Ok(());
         }
-        if let Some(bytes) = counted_file(path)? {
-            self.progress.gone.add(bytes);
+        if let Some(count) = self
+            .conversion
+            .as_mut()
+            .and_then(|state| state.count.as_mut())
+        {
+            if count.staging_standing() == Standing::Listing {
+                count.relist_staging()?;
+                self.progress.counted = count.so_far();
+            }
+            return Ok(());
+        }
+        match change {
+            StagingChange::Grew(bytes) => self.progress.counted.grow(bytes),
+            StagingChange::Appeared(bytes) => self.progress.counted.add(bytes),
+            StagingChange::Gone(bytes) => self.progress.gone.add(bytes),
         }
         Ok(())
     }
@@ -651,6 +895,7 @@ impl ContentStore {
             }
             if let Some(count) = state.count.take() {
                 state.rounds = count.rounds;
+                state.record_dirs = count.record_dirs;
             }
             self.progress.counting = false;
             return Ok(Conversion::Visited);
@@ -671,7 +916,13 @@ impl ContentStore {
                     state.domain = None;
                     continue;
                 };
-                match self.convert_file(visit.domain, &visit.directory, &path, scratch)? {
+                match self.convert_file(
+                    visit.domain,
+                    &visit.directory,
+                    &path,
+                    scratch,
+                    state.converts,
+                )? {
                     Visited::Converted(bytes) => {
                         visit.removed = true;
                         self.progress.converted.add(bytes);
@@ -710,7 +961,11 @@ impl ContentStore {
                 }
                 continue;
             }
-            if let Some(round) = state.rounds.get(state.round) {
+            if let Some(round) = state
+                .rounds
+                .get(state.round)
+                .filter(|_| state.converts.objects)
+            {
                 let objects = self.root.join("quarantine").join(round).join("objects");
                 state.round = state.round.saturating_add(1);
                 // A round the collector deleted since the count listed it is nothing to convert.
@@ -725,6 +980,57 @@ impl ContentStore {
                 state.own = true;
                 state.tree = Some(fs::read_dir(self.root.join("objects"))?);
                 continue;
+            }
+            // The custody records' directories (29 §12.7), each round's then the store's own.
+            if let Some((kind, directory, listing, removed)) = &mut state.records {
+                let Some(entry) = listing.next() else {
+                    if *removed {
+                        sync_directory(directory)?;
+                    }
+                    state.records = None;
+                    continue;
+                };
+                let path = entry?.path();
+                match self.convert_record(*kind, &path, scratch)? {
+                    Visited::Converted(bytes) => {
+                        *removed = true;
+                        self.progress.converted.add(bytes);
+                        return Ok(Conversion::Converted);
+                    }
+                    Visited::Left => continue,
+                    Visited::Held => return Ok(Conversion::Held),
+                }
+            }
+            if let Some(directory) = state.record_dirs.get(state.record).cloned() {
+                state.record = state.record.saturating_add(1);
+                let kind = record_kind(&directory)?;
+                match fs::read_dir(&directory) {
+                    Ok(listing) => state.records = Some((kind, directory, listing, false)),
+                    Err(error) if gone(&error) => {}
+                    Err(error) => return Err(error.into()),
+                }
+                continue;
+            }
+            // Staging last (29 §12.7), passes until one meets nothing in the clear.
+            if !state.staged {
+                let Some(pass) = state.staging.as_mut() else {
+                    state.staging = Some(self.staging_pass()?);
+                    continue;
+                };
+                match self.staging_step(pass, scratch)? {
+                    StagingStep::Converted => return Ok(Conversion::Converted),
+                    StagingStep::Visited => continue,
+                    StagingStep::Copied => return Ok(Conversion::Visited),
+                    StagingStep::Held => return Ok(Conversion::Held),
+                    StagingStep::Ended { met } => {
+                        if pass.removed {
+                            sync_directory(&self.root.join("staging"))?;
+                        }
+                        state.staging = None;
+                        state.staged = !met;
+                        continue;
+                    }
+                }
             }
             self.mark_sealed()?;
             return Ok(Conversion::Done);
@@ -741,8 +1047,9 @@ impl ContentStore {
         directory: &Path,
         path: &Path,
         scratch: &mut [u8],
+        converts: Converts,
     ) -> Result<Visited, ContentError> {
-        let Some((hash, kind)) = clear_name(path) else {
+        let Some((hash, kind)) = clear_name(path).filter(|(_, kind)| converts.takes(*kind)) else {
             return Ok(Visited::Left);
         };
         // The same entries the count met (`counted_file`): a file itself, a link to one left as it
@@ -771,6 +1078,9 @@ impl ContentStore {
         // sealed under it too, so a restored file opens where it comes back.
         let own = domain_directory(&self.root, domain);
         let key = self.keys.domain(&own, domain, false)?;
+        if kind == Kind::Part {
+            return self.convert_part(domain, directory, path, hash, file, length, key, scratch);
+        }
         // Sealed already, by the writer since the store began converting or by a conversion cut
         // before its removal: the sealed form stands where it opens to the bytes its name says,
         // and the name in the clear goes; where it does not, the bytes in the clear are sealed
@@ -814,13 +1124,233 @@ impl ContentStore {
         Ok(Visited::Converted(bytes))
     }
 
+    /// A custody record in the clear (29 §12.7), of `kind`, in its kind's directory or a round's:
+    /// sealed under the kind's key at its keyed name beside it, and only then its name in the clear
+    /// removed. Where the sealed form stands already (written since the store began converting,
+    /// or by a conversion cut before its removal) it is the record, and the clear one goes: a named
+    /// record is replaced sealed and its clear one removed, so the sealed one is the later. A record
+    /// named by its hash (a checkpoint, a transfer manifest) is streamed through `scratch` keyed by
+    /// it; a receipt, named for what it is about, is sealed keyed by its own bytes, so two versions
+    /// of it are never sealed under one key.
+    fn convert_record(
+        &mut self,
+        kind: CustodyRecordKind,
+        path: &Path,
+        scratch: &mut [u8],
+    ) -> Result<Visited, ContentError> {
+        let Some((name, Kind::Record)) = clear_name(path) else {
+            return Ok(Visited::Left);
+        };
+        let mut file = match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => match File::open(path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(Visited::Left);
+                }
+                Err(error) => return Err(error.into()),
+            },
+            Ok(_) => return Ok(Visited::Left),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Visited::Left);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let bytes = file.metadata()?.len();
+        let length = usize::try_from(bytes)
+            .ok()
+            .filter(|length| *length <= kind.limit())
+            .ok_or(ContentError::Corrupt)?;
+        let own = self.root.join(kind.directory());
+        let directory = path.parent().ok_or(ContentError::Invalid)?.to_path_buf();
+        let key = self.record_key(kind, false)?;
+        if key.record_bytes() == 0 && key.path(&directory, name, Kind::Record)?.is_file() {
+            drop(file);
+            remove_clear(path)?;
+            return Ok(Visited::Converted(bytes));
+        }
+        let room = match disk_reserve(
+            &self.disk,
+            &self.root,
+            DiskKind::Content,
+            BudgetLane::Ordinary,
+            key.file_bytes(length)?
+                .checked_add(key.record_bytes())
+                .ok_or(ContentError::Capacity)?,
+        ) {
+            Ok(room) => room,
+            Err(ContentError::Capacity) => return Ok(Visited::Held),
+            Err(error) => return Err(error),
+        };
+        durable_directory(&own)?;
+        let key = self.keys.writable(&own, kind.key_domain(), key)?;
+        let sealed = key.path(&directory, name, Kind::Record)?;
+        match kind {
+            CustodyRecordKind::Receipt => {
+                let block = scratch.get_mut(..length).ok_or(ContentError::Capacity)?;
+                file.read_exact(block)?;
+                let mut extra = [0u8; 1];
+                if file.read(&mut extra)? != 0 {
+                    return Err(ContentError::Corrupt);
+                }
+                drop(file);
+                key.install(&sealed, block)?;
+            }
+            CustodyRecordKind::Checkpoint | CustodyRecordKind::Manifest => {
+                key.install_streamed(&sealed, name, &mut file, length, scratch)?;
+                drop(file);
+            }
+        }
+        room.commit();
+        remove_clear(path)?;
+        Ok(Visited::Converted(bytes))
+    }
+
+    /// A custody record in the clear of `kind`, of `bytes`, gone from the store's own records while
+    /// it converts (replaced sealed, 29 §12.7): what the count passed leaves it, a directory it is
+    /// listing is listed again, and one it has still to list never counts it.
+    pub(super) fn conversion_record(
+        &mut self,
+        kind: CustodyRecordKind,
+        bytes: u64,
+    ) -> Result<(), ContentError> {
+        if !self.rest.converting() {
+            return Ok(());
+        }
+        if let Some(count) = self
+            .conversion
+            .as_mut()
+            .and_then(|state| state.count.as_mut())
+        {
+            match count.record_standing(kind) {
+                Standing::Listing => count.relist_records()?,
+                Standing::Counted => {
+                    count.total = count.total.less(Tally { files: 1, bytes });
+                }
+                Standing::Ahead => {}
+            }
+            self.progress.counted = count.so_far();
+            return Ok(());
+        }
+        self.progress.gone.add(bytes);
+        Ok(())
+    }
+
+    /// A chunk's part in the clear (29 §12.7), a transfer receiving it: its bytes so far read into
+    /// `scratch` and written as a record file kept for the chunk under its keyed name beside it,
+    /// synced, and only then its name in the clear removed; a sealed copy a crash left beside it is
+    /// written over (the part in the clear stands while it does). Its bytes are checked against the
+    /// chunk's hash when it is whole, as a part in the clear is.
+    #[allow(clippy::too_many_arguments)] // The visit's inputs, each its own owner's.
+    fn convert_part(
+        &mut self,
+        domain: ContentDomainId,
+        directory: &Path,
+        path: &Path,
+        hash: ContentHash,
+        mut file: File,
+        length: usize,
+        key: sealing::DomainKey,
+        scratch: &mut [u8],
+    ) -> Result<Visited, ContentError> {
+        let own = domain_directory(&self.root, domain);
+        let room = match disk_reserve(
+            &self.disk,
+            &self.root,
+            DiskKind::Content,
+            BudgetLane::Ordinary,
+            super::record_file::records_bytes(length)?
+                .checked_add(
+                    u64::try_from(super::record_file::PART_HEADER)
+                        .map_err(|_| ContentError::Capacity)?,
+                )
+                .and_then(|bytes| bytes.checked_add(key.record_bytes()))
+                .ok_or(ContentError::Capacity)?,
+        ) {
+            Ok(room) => room,
+            Err(ContentError::Capacity) => return Ok(Visited::Held),
+            Err(error) => return Err(error),
+        };
+        let block = scratch.get_mut(..length).ok_or(ContentError::Capacity)?;
+        file.read_exact(block)?;
+        let mut extra = [0u8; 1];
+        if file.read(&mut extra)? != 0 {
+            // Grown since it was measured: not the part this visit read.
+            return Err(ContentError::Corrupt);
+        }
+        drop(file);
+        durable_directory(&own)?;
+        let key = self.keys.writable(&own, domain, key)?;
+        let mut part = super::transfer::create_part(
+            &key,
+            &key.path(directory, hash, Kind::Part)?,
+            hash,
+            length,
+        )?;
+        part.append(block)?;
+        part.sync()?;
+        drop(part);
+        room.commit();
+        remove_clear(path)?;
+        let bytes = u64::try_from(length).map_err(|_| ContentError::Capacity)?;
+        Ok(Visited::Converted(bytes))
+    }
+
+    /// A chunk's part in the clear of `domain` changed while the store converts (29 §12.7): grew by
+    /// a part a transfer sent, or went (whole and installed, or discarded). What the count passed
+    /// is kept exact by the change, a domain it is listing is listed again, and one it has still to
+    /// list it counts as it finds it.
+    pub(super) fn conversion_part(
+        &mut self,
+        domain: ContentDomainId,
+        change: StagingChange,
+    ) -> Result<(), ContentError> {
+        if !self.rest.converting() {
+            return Ok(());
+        }
+        if let Some(count) = self
+            .conversion
+            .as_mut()
+            .and_then(|state| state.count.as_mut())
+        {
+            match count.standing(count.rounds.len(), domain) {
+                Standing::Listing => count.relist()?,
+                Standing::Counted => match change {
+                    StagingChange::Grew(bytes) => count.total.grow(bytes),
+                    StagingChange::Appeared(bytes) => count.total.add(bytes),
+                    StagingChange::Gone(bytes) => {
+                        count.total = count.total.less(Tally { files: 1, bytes });
+                    }
+                },
+                Standing::Ahead => {}
+            }
+            self.progress.counted = count.so_far();
+            return Ok(());
+        }
+        match change {
+            StagingChange::Grew(bytes) => self.progress.counted.grow(bytes),
+            StagingChange::Appeared(bytes) => self.progress.counted.add(bytes),
+            StagingChange::Gone(bytes) => self.progress.gone.add(bytes),
+        }
+        Ok(())
+    }
+
     /// Every file is sealed: the store is marked so (each domain's directory flushed as the
     /// conversion left it), its marker of the conversion removed, and nothing in the clear is looked
     /// for from here on.
     pub(super) fn mark_sealed(&mut self) -> Result<(), ContentError> {
-        write_marker(&self.root, sealing::SEALED)?;
-        remove_marker(&self.root, sealing::SEALING)?;
-        self.keys.mark_sealed();
+        if self.keys.converting() {
+            write_marker(&self.root, sealing::SEALED)?;
+            remove_marker(&self.root, sealing::SEALING)?;
+            self.keys.mark_sealed();
+        }
+        if self.rest.converting() {
+            write_marker(&self.root, sealing::REST_SEALED)?;
+            remove_marker(&self.root, sealing::REST_SEALING)?;
+            self.rest = super::Rest {
+                seals: true,
+                clear: false,
+            };
+        }
         self.conversion = None;
         self.progress.counting = false;
         self.progress.finished_ms = now_ms();
@@ -858,6 +1388,38 @@ pub(super) fn remove_clear(path: &Path) -> Result<(), ContentError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+/// The custody records' directories a conversion lists, in its order: each round's kinds (by the
+/// rounds' names), then the store's own.
+fn record_directories(root: &Path, rounds: &[OsString]) -> Result<Vec<PathBuf>, ContentError> {
+    let mut directories = Vec::new();
+    directories
+        .try_reserve_exact(
+            rounds
+                .len()
+                .saturating_add(1)
+                .saturating_mul(CustodyRecordKind::ALL.len()),
+        )
+        .map_err(|_| ContentError::Capacity)?;
+    for round in rounds {
+        for kind in CustodyRecordKind::ALL {
+            directories.push(root.join("quarantine").join(round).join(kind.directory()));
+        }
+    }
+    for kind in CustodyRecordKind::ALL {
+        directories.push(root.join(kind.directory()));
+    }
+    Ok(directories)
+}
+
+/// The kind of record a records' directory holds, by its name.
+fn record_kind(directory: &Path) -> Result<CustodyRecordKind, ContentError> {
+    let name = directory.file_name().and_then(|name| name.to_str());
+    CustodyRecordKind::ALL
+        .into_iter()
+        .find(|kind| Some(kind.directory()) == name)
+        .ok_or(ContentError::Invalid)
 }
 
 /// Whether a directory the conversion lists is gone, or never was one: a round deleted as it is

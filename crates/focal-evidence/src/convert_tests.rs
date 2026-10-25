@@ -142,14 +142,17 @@ fn copy_tree(from: &Path, to: &Path) {
         }
     }
 }
-/// The files in the clear under the store's objects and quarantine, as the conversion counts them,
-/// and their bytes.
+/// The files in the clear under the store's objects and quarantine and in its staging (uploads'
+/// records and parts, 29 §12.7), as the conversion counts them, and their bytes.
 fn clear_tally(root: &Path) -> Tally {
     let mut tally = Tally::default();
     for (_, stem, bytes) in object_files(root) {
         if stem.len() == 64 {
             tally.add(bytes.len() as u64);
         }
+    }
+    for entry in fs::read_dir(root.join("staging")).unwrap() {
+        tally = tally.plus(super::super::staging::counted_staging(&entry.unwrap().path()).unwrap());
     }
     tally
 }
@@ -721,7 +724,6 @@ fn a_round_that_expires_during_the_conversion_is_tallied_as_gone() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path();
     let Laid { live, .. } = lay_out_clear(root);
-    let on_disk = clear_tally(root);
     let in_round = clear_in_quarantine(root);
     assert!(in_round.files > 0);
     let mut store = open(root, ContentForm::Sealed);
@@ -737,6 +739,10 @@ fn a_round_that_expires_during_the_conversion_is_tallied_as_gone() {
     let report = collect_at(&mut store, &protection, later);
     assert_eq!(report.deleted, 0, "{report:?}");
     assert_eq!(clear_in_quarantine(root), in_round);
+    // The uploads' terminal records past their grace went before the count reached staging: never
+    // counted, so never tallied.
+    assert!(report.terminals_released > 0, "{report:?}");
+    let on_disk = clear_tally(root);
     count_all(&mut store, &mut scratch);
     assert_eq!(store.conversion_status().counted, on_disk);
     let report = collect_at(&mut store, &protection, later);

@@ -172,7 +172,9 @@ impl EmbeddedNode {
             .open_member(config, &budget, focal_ledger::entry_needs)?;
         // The content writer exists before the session so a native ledger can
         // read its evidence during recovery.
-        let content = ContentStore::open_with_disk(
+        // Its objects in the form the content level asks, its files beside them (uploads being
+        // staged, parts, custody records) in the form the at-rest level asks (29 §12.7).
+        let content = ContentStore::open_forms(
             root.join("content"),
             StoreLimits {
                 max_content_bytes: 64 * 1024 * 1024,
@@ -184,6 +186,7 @@ impl EmbeddedNode {
             storage.storage.disk_budget(),
             &keys,
             crate::storage_level::content_form_at(level),
+            crate::storage_level::at_rest_form_at(level),
         )?;
         let limits = crate::memory_envelope::found_limits(root, settings, &consensus)?;
         let rule = if level >= crate::upgrade::SEAL_LEVEL {

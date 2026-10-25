@@ -270,9 +270,9 @@ private journals (`focal_enrollment::PrivateJournal`), sealed with the private d
 | Node log and group files | the shell's log, group images and checkpoints | every record of every group | hyper-log, hyper-durable, focal-consensus `group_files` | sealed (steps 1, 2, 5) |
 | Payload log | `payloads/*.seg` | spilled rows' bytes: message payloads | focal-ledger `native_payloads` | sealed (§12.1) |
 | Checkpoint seeds | `seeds/<ledger>/` | a checkpoint's native rows, 1 MiB chunks | focal-evidence `seeds` | sealed from the at-rest level (§12.5) |
-| Cold stream | `cold/<ledger>/` | retired families' archive frames | focal-evidence `cold`, `cold_records` | sealed from the at-rest level (§12.6) |
+| Cold stream | `cold/<ledger>/` | retired families' archive frames | focal-evidence `cold`, `record_file` | sealed from the at-rest level (§12.6) |
 | Content | `content/objects/…`, `content/quarantine/…` | artifacts' chunks and manifests | focal-evidence `store`, `transfer`, `gc`, `native_artifact` | sealed from the content level (§12.4) |
-| Content staging and custody | `content/staging/`, `objects/<domain>/*.part`, `content/{custody,checkpoints,receipts}/` | uploads and transfers being received; custody records | focal-evidence `store`, `transfer`, `upload_terminal`, `custody_receipt` | clear |
+| Content staging and custody | `content/staging/`, `objects/<domain>/*.part`, `content/{custody,checkpoints,receipts}/` | uploads and transfers being received; custody records | focal-evidence `staging`, `transfer`, `upload_terminal`, `store` (records), `record_file` | sealed from the at-rest level (§12.7) |
 | Session backups | a backup's directory | checkpoint, seeds, content, cold | focal-ledger `session_backup` | clear |
 | Private directories and journals | `JOIN/`, `cluster/authority/`, `cluster/invitations/`, `cluster/network/`, `CLUSTER.admin/`, `CLIENT.contexts/`, the placement and admission journals (`cluster/<name>/journal.bin`) | the cluster CA's key, nodes' and clients' keys, invitations, the signer's and every agent's journal, the admin's and contexts' catalogues | focal-enrollment `files::PrivateDirectory`, `PrivateJournal` | sealed (§12.2) |
 | Embedded node log | the shell's log of a node that is its own cluster (`wal/` before) | every record of its session and its root's control group | focal-node `EmbeddedNode` through `storage_start`, as a networked node | sealed (§12.3) |
@@ -292,7 +292,8 @@ private journals (`focal_enrollment::PrivateJournal`), sealed with the private d
   opens one; a level and its CRC.
 - Locks (`LOCK`, `*.lock`) and markers: empty files held for their locks, `*.initialized` files a
   writer leaves to say its store was made (a fixed sentence each), and the empty `SEALING` and
-  `SEALED` of a store converting and converted.
+  `SEALED` of a store converting and converted, and a content store's `REST_SEALING` and
+  `REST_SEALED` for its files beside its objects (§12.7).
 - What an operator asks for in the clear, outside any data directory: an artifact downloaded to a
   file it names, a trace written where it says, a deployment plan's output, and an invitation
   bundle handed to a joiner, a bearer credential kept owner-only and spent once.
@@ -447,7 +448,7 @@ open is what the fence forbids.
   conversion runs); the count holds the names of the rounds and of one tree's domains, nothing a
   file. An entry that is not a file no longer than its kind's bound (a link included) was never an
   object's and is left as it is, uncounted, as are the parts and temporaries a domain's directory
-  holds.
+  holds (its parts are converted from the at-rest level, §12.7).
 - **Tests:** a store in the clear converted while it serves, every object read at every step by
   the store, a reader made before the conversion and one made then; an object sealed meanwhile; the
   collector holding then collecting; the quarantined object restored; a start in the clear after the
@@ -461,9 +462,9 @@ open is what the fence forbids.
   a file under another chunk's name and a chunk carried into another domain refused; no stored name
   or byte holding a hash or plaintext; a domain erased by its record while another reads
   (`sealing_tests`). The level's rule (`the_content_store_seals_once_the_recorded_fence_opens_the_content_level`).
-- **Still in the clear** (this inventory's next rows): parts of chunks a transfer is receiving
-  (`objects/<domain>/*.part`, named by the chunk's hash), uploads being staged (`staging/`), and the
-  custody records (`custody/`, `checkpoints/`, `receipts/`).
+- **Sealed since, at the at-rest level** (§12.7): parts of chunks a transfer is receiving
+  (`objects/<domain>/*.part`), uploads being staged (`staging/`), and the custody records
+  (`custody/`, `checkpoints/`, `receipts/`).
 - **Owed.** A reader made while its store converted keeps looking in the clear first for its life,
   one missed open a file, until the node's next start. (An operator's view of the conversion,
   owed here at first, is in `inspect node --gc` and on the metrics page since 2026-10-24: "What
@@ -577,7 +578,7 @@ before.
   them by, so no name holds a hash, and destroying the record erases the stream.
 - **The open chunk, a record file.** The stream past its last whole chunk is appended in place and
   never synced on its own (a checkpoint carries its bytes), so it is sealed an append at a time
-  (`cold_records`): a file is its header (the format's magic and a random 128-bit file ID, in the
+  (`record_file`): a file is its header (the format's magic and a random 128-bit file ID, in the
   clear) and its records, each a block of its length and a block of its bytes, both sealed with
   AES-256-GCM under the file's key, derived from the directory's key and the file's ID
   (`DomainKey::record_key`), at the nonce of the block's place among the file's blocks. A record
@@ -675,3 +676,111 @@ before.
   retired family from its own sealed stream and refusing a changed byte in it as `unavailable`
   (`cli_archive`), with the node tests that retire to cold, back up and restore a session's
   streams, and install them from peers (`cli_retention`, `cli_backup`, `cli_gc`, `fleet_quic`).
+
+### 12.7 The content store's staging, parts and custody records, sealed (2026-10-24)
+
+A content store's files beside its objects are sealed once the fence a node last recorded opens the
+at-rest level (`storage_level::at_rest_form`): uploads being staged (`staging/`: an upload's part,
+its metadata, the terminal record that fences its identity once it is finished), chunks a transfer
+is receiving in parts (`objects/<domain>/*.part`), and the custody records (`checkpoints/`,
+`custody/`, `receipts/`). The objects themselves are sealed from the content level (§12.4), one
+level below, so these files take a form of their own (`ContentStore::open_forms`): between the two
+levels the objects are sealed and these files are written byte for byte as every earlier binary
+wrote them, so a node can still be rolled back to a binary of the content level while its fence is
+below the at-rest level. Their conversion is marked apart from the objects' (`REST_SEALING`,
+`REST_SEALED`), and runs with theirs or alone where the objects are sealed already.
+
+- **Directories as domains.** Staging and each kind of record have a key directory of their own,
+  as a seed directory is (a record under the content key, made with its first sealed file), so a
+  record carried into another kind's directory opens to nothing. Every file is filed under its
+  directory's keyed name: an upload's of its identity (a hash of it under a context of its own, so
+  the name is no object's), a record's of the hash or the name it is filed by, a part's of its
+  chunk's hash under its domain's key, so no name holds an upload's identity or a hash.
+- **Parts, sealed as they are written.** An upload's part and a chunk's part are record files
+  (§12.6's, of a kind of their own, `FCLPART1`): each append sealed into records at once and written
+  with one write, so an interrupted upload or transfer goes on from sealed bytes. A part's key is
+  derived from its directory's key, its file's ID and its owner together (the upload, the chunk:
+  `DomainKey::part_key`), and its header carries a tag sealed under that key, so a part moved under
+  another owner's name is refused at its header. A part whose last append a crash cut short is read
+  up to its last whole record and written again whole into a file of a new ID under a new key
+  before anything is appended (`RecordWriter::resume`): what the cut append left of its blocks may
+  lie on the volume, and its places are never sealed over under the old key, so no key and nonce
+  seal two plaintexts. A record that does not open further back than one append is no crash's and
+  is refused. An upload's part is opened once a start and read through whole; a chunk's part,
+  opened at every part a sender sends, is read by its length blocks alone (`Verify::Lengths`), its
+  bytes opened and checked against the chunk's hash once it is whole.
+- **Records, sealed whole.** A record named by its hash (a checkpoint, a transfer manifest) and a
+  receipt, named for the copy it is about and replaced as that copy's standing changes, are each
+  sealed whole and keyed by their own bytes, so a receipt's versions are never sealed under one key.
+  A record already there that opens to the same bytes is kept; one that opens to other bytes under
+  a name that is its hash is corrupt. Replacing a receipt removes its name in the clear as well,
+  since a reader looks in the clear first.
+- **Where it departs from the plan.** The plan sealed the custody records through `focal_seal::file`
+  under the content key, as the group files and private directories are sealed (§12.2). That path
+  makes a sealed file whole in memory before it is installed and opens one from its whole bytes:
+  two copies of a record at once, 16 MiB for a checkpoint record of 8 MiB, and one key for every
+  kind, so a record carried into another kind's directory would open and be refused only by its
+  reader. The records are sealed by the content store's own key path instead, as its objects are:
+  each kind a key directory whose record is under the content key, a record sealed as it is
+  written to its file and read through one copy of its plaintext, a conversion streamed through
+  the owner's chunk of scratch, and a record of one kind refused at the seal in another's
+  directory.
+- **The way between the forms.** A store asked to seal them while they lie in the clear converts
+  them while it serves, after its objects: each record directory (each quarantine round's, then the
+  store's own), each chunk's part met in its domain's directory, then staging. A record named by
+  its hash is streamed through the owner's chunk of scratch (`DomainKey::install_streamed`: a
+  checkpoint record runs to 8 MiB); a part in the clear is sealed whole beside itself; an upload in
+  the clear has its part copied into a sealed part a chunk a step, chasing its appends, and once the
+  copy has caught up its sealed metadata is installed, the upload goes on in the sealed part, and
+  only then do its files in the clear go. A file in the clear goes on in the clear until the
+  conversion meets it (a part a transfer appends to, an upload a client sends to); a new one is
+  written in the store's form. A crash at any point leaves each file whole in one form or both: an
+  open settles an upload with files in both (its clear files stand while its clear part does) and
+  removes a part with no metadata beside it.
+- **What an operator reads.** The count counts these files with the objects (staging after them),
+  and what changes them while the store converts keeps it exact: a part's growth counts as it
+  grows, an upload finished in the clear leaves the count (its part and metadata gone, its terminal
+  record counted), a released terminal record or a replaced receipt is tallied gone, and a change
+  while the count lists its directory lists it again. So `inspect node --gc` and the metrics page
+  count and tally them in the content store's conversion, exact as objects are. Between the levels
+  a store reads `sealed`: its objects are, and the files beside them lie in the clear by the
+  level's rule, as the fence says. The collector sweeps no record while they convert, as it
+  collects no object while the objects do; the quarantine's rounds expire as before once the count
+  is taken.
+- **Measured** (`benches/content.rs`'s uploads alone, `FOCAL_BENCH_UPLOADS`, each form a process
+  of its own, 6 interleaved rounds on an idle M4 Max at load 2; each process's CPU from
+  `/usr/bin/time -l`, less a process that only makes the bytes; medians): uploads of 8 MiB take
+  8.44 ms of CPU a MiB with every file in the clear, 9.88 with the objects sealed (the content
+  level) and 10.33 with staging sealed too, +4.5%: two passes of AES-GCM, a part sealed as it is
+  written and opened as it is sealed, 1.8 M cycles a MiB by the core's counters. Uploads of 64 KiB
+  take 7.48, 8.38 and 9.41 ms each, +12%, most of it in the kernel. Wall time, less making the
+  bytes, is the disk's flushes: 205.5 against 204.2 ms an 8 MiB upload (+0.6%), 54.1 against
+  52.6 ms a 64 KiB one (+2.8%). Where a small upload's extra millisecond goes is not measured apart: besides a part's
+  key, header and records and its sealed metadata and terminal record, an upload looks staging's
+  key up from its record four or five times, as an object's install looks its domain's key up for
+  each file, and one look an operation is the first lever to measure.
+- **Windows.** focal-evidence's suite runs on Windows CI, and these files' writes and renames with
+  it.
+- **Tests:** the record file's resume (a part opened again goes on under its key; one cut short is
+  written again under a new key; damage behind its last append, a part of another kind and one
+  holding more than it may are refused); an upload staged sealed and resumed across a restart with
+  nothing of staging's in the clear at any point, a part cut short, a changed or moved part or
+  metadata refused, a sealed terminal record's crash windows (`staging_tests`); a chunk received in
+  parts across a restart with nothing in the clear, a part moved under another chunk's name refused
+  and one cut short gone on under a new key, a part in the clear converted and its transfer gone on
+  (`transfer::tests`); records sealed under keyed names and read in either form, a changed or
+  carried record refused, records converted while one is replaced with the tally exact at every
+  step (`record_seal_tests`); staging converted while its upload goes on, the tally agreeing with
+  the files in the clear at every step, and staging's conversion cut at any step; the whole of it
+  (a staged upload, a finished one, a chunk's part and a record of each kind) cut after every step
+  in turn and resumed (`the_files_beside_the_objects_convert_through_a_cut_at_any_step`); and the
+  level's rule: between the levels the objects sealed and these files as every earlier binary wrote
+  them, at the at-rest level converted alone
+  (`below_the_at_rest_level_the_files_beside_the_objects_stay_as_earlier_binaries_wrote_them`). The
+  real binary (`cli_content_form`): a node founded below the at-rest level, its store sealed,
+  holding beside its objects in the clear 400 uploads' terminal records, an upload half sent, a
+  chunk half received and a record of each kind; below the fence they stay in the clear; the fence
+  raised, the node started again converts them while `inspect node --gc` and the metrics page are
+  read at every step, counting and converting exactly those 406 files, and the upload, the
+  transfer and every record go on from their sealed form, every finished upload's identity still
+  fenced.

@@ -59,15 +59,30 @@ pub(crate) const SEALING: &str = "SEALING";
 /// The file in a store's root that marks every object file sealed: nothing in the clear is looked
 /// for after it.
 pub(crate) const SEALED: &str = "SEALED";
+/// The file in a content store's root that marks the conversion of its files beside its objects
+/// begun (29 §12.7: uploads being staged, chunks a transfer is receiving, custody records), which
+/// the at-rest level seals apart from the objects the content level seals.
+pub(crate) const REST_SEALING: &str = "REST_SEALING";
+/// The file that marks those files sealed: none of them is looked for in the clear after it.
+pub(crate) const REST_SEALED: &str = "REST_SEALED";
 /// What a domain's naming key is derived for (HKDF's salt and info, `derive_child`).
 const NAMES: &[u8] = b"focal content names";
 /// What a record file's key is derived for (HKDF's salt and info, `derive_child`), the file's ID
 /// the label: a cold stream's open chunk, and a whole chunk cut from one (29 §12.6).
 const RECORDS: &[u8] = b"focal cold record key";
+/// What a part's record file's key is derived for, the file's ID the label: an upload being staged,
+/// or a chunk a transfer is receiving (29 §12.7). Apart from [`RECORDS`], so a part's key is never a
+/// cold chunk's even in one directory.
+const PARTS: &[u8] = b"focal part record key";
 /// Hex digits of a name in the clear: a BLAKE3 hash.
 const CLEAR_NAME: usize = 64;
 /// Hex digits of a keyed name: `hyper_seal::name`'s 128 bits.
 const KEYED_NAME: usize = 32;
+
+/// Whether `stem` is a keyed name: 32 lowercase hex digits.
+pub(crate) fn is_keyed_name(stem: &str) -> bool {
+    is_hex(stem, KEYED_NAME)
+}
 
 /// A name the collector marks a chunk by, fixed in size as a hash is (so a mark costs what it did
 /// before the store sealed): the hash itself in the clear, the keyed name's 16 bytes and zeros
@@ -163,6 +178,10 @@ pub(crate) enum Kind {
     Chunk,
     Manifest,
     Seed,
+    /// A chunk a transfer is receiving, staged in parts beside the objects (29 §12.7).
+    Part,
+    /// A custody record: a checkpoint, a transfer manifest, a receipt (29 §12.7).
+    Record,
 }
 
 impl Kind {
@@ -171,6 +190,8 @@ impl Kind {
             Self::Chunk => "chunk",
             Self::Manifest => "manifest",
             Self::Seed => "seed",
+            Self::Part => "part",
+            Self::Record => "record",
         }
     }
 }
@@ -484,9 +505,88 @@ impl DomainKey {
     /// AES-GCM context of a [`VersionKey`], outside the locked region, for as long as its file is
     /// written or read. The domain's record must stand.
     pub(crate) fn record_key(&self, file: &[u8; 16]) -> Result<VersionKey, ContentError> {
+        self.derived_record_key(RECORDS, file)
+    }
+
+    /// The key of a part's record file of the domain whose ID is `file`, kept for `owner` (29
+    /// §12.7): derived from the domain's key, the ID and the owner together (an upload's keyed
+    /// name's hash, a chunk's hash), so a part moved under another owner's name opens to nothing.
+    pub(crate) fn part_key(
+        &self,
+        file: &[u8; 16],
+        owner: &[u8; 32],
+    ) -> Result<VersionKey, ContentError> {
+        let mut label = [0u8; 48];
+        let (id, rest) = label
+            .split_at_mut_checked(file.len())
+            .ok_or(ContentError::Capacity)?;
+        id.copy_from_slice(file);
+        rest.copy_from_slice(owner);
         let sealed = self.sealed.as_ref().ok_or(ContentError::Invalid)?;
-        let (secret, _) = sealed.key.derive_child(RECORDS, file).map_err(seal_error)?;
+        let (secret, _) = sealed.key.derive_child(PARTS, &label).map_err(seal_error)?;
         VersionKey::new(&secret, *file).map_err(seal_error)
+    }
+
+    fn derived_record_key(
+        &self,
+        purpose: &[u8],
+        file: &[u8; 16],
+    ) -> Result<VersionKey, ContentError> {
+        let sealed = self.sealed.as_ref().ok_or(ContentError::Invalid)?;
+        let (secret, _) = sealed.key.derive_child(purpose, file).map_err(seal_error)?;
+        VersionKey::new(&secret, *file).map_err(seal_error)
+    }
+
+    /// The file at `source`, `length` bytes from where it stands, installed at `path` sealed whole and
+    /// keyed by `hash`, the BLAKE3 hash it is named by (not judged here: a file that does not hash to
+    /// its name is refused by every read in either form), its bytes passed through `scratch` a piece
+    /// at a time: written into its own temporary, flushed, renamed into place, the directory flushed
+    /// after. What a record longer than the owner's chunk of scratch is converted by (a checkpoint
+    /// record, 29 §12.7); one grown since it was measured is refused.
+    pub(crate) fn install_streamed(
+        &self,
+        path: &Path,
+        hash: ContentHash,
+        source: &mut File,
+        length: usize,
+        scratch: &mut [u8],
+    ) -> Result<(), ContentError> {
+        let sealed = self.sealed.as_ref().ok_or(ContentError::Invalid)?;
+        let temporary = path.with_extension("install");
+        fresh(&temporary)?;
+        let file = DeviceFile::open(&temporary, true, CachingRequest::Buffered, Alignment::BYTE)
+            .map_err(disk_error)?;
+        let mut writer = SealedWriter::content_keyed(file, &sealed.key, &hash.0, SEGMENT)
+            .map_err(sealed_error)?;
+        let mut left = length;
+        // A piece a step, each at least a byte: no more steps than the record's bytes.
+        for _ in 0..=length {
+            if left == 0 {
+                break;
+            }
+            let piece = scratch
+                .get_mut(..left.min(scratch.len()))
+                .filter(|piece| !piece.is_empty())
+                .ok_or(ContentError::Capacity)?;
+            source.read_exact(piece)?;
+            writer.write(piece).map_err(sealed_error)?;
+            left = left.saturating_sub(piece.len());
+        }
+        let mut extra = [0u8; 1];
+        if source.read(&mut extra)? != 0 {
+            return Err(ContentError::Corrupt);
+        }
+        drop(writer.finish().map_err(sealed_error)?);
+        focal_platform::fs::atomic_replace(&temporary, path)?;
+        focal_platform::sync_dir(path.parent().ok_or(ContentError::Invalid)?)?;
+        Ok(())
+    }
+
+    /// The file at `path` read whole, at most `most` bytes, in the form the domain writes (sealed,
+    /// or in the clear): a record whose name says what it is about rather than its hash (an
+    /// upload's metadata, a named custody record), checked by its seal and by its reader.
+    pub(crate) fn read_record(&self, path: &Path, most: usize) -> Result<Vec<u8>, ContentError> {
+        self.read_unhashed(path, self.seals, most)
     }
 
     /// The sealed file at `path` read whole, at most `most` bytes, and checked against `hash`: a
@@ -969,6 +1069,21 @@ impl DomainKey {
         hash: ContentHash,
         most: usize,
     ) -> Result<Vec<u8>, ContentError> {
+        let bytes = self.read_unhashed(path, sealed, most)?;
+        if ContentHash(*blake3::hash(&bytes).as_bytes()) != hash {
+            return Err(ContentError::Corrupt);
+        }
+        Ok(bytes)
+    }
+
+    /// The file at `path` read whole, at most `most` bytes: sealed, opened under the domain's key,
+    /// or in the clear as it is, a byte past `most` refused.
+    fn read_unhashed(
+        &self,
+        path: &Path,
+        sealed: bool,
+        most: usize,
+    ) -> Result<Vec<u8>, ContentError> {
         let exact = |length: u64| {
             let length = usize::try_from(length)
                 .ok()
@@ -999,9 +1114,6 @@ impl DomainKey {
             }
             bytes
         };
-        if ContentHash(*blake3::hash(&bytes).as_bytes()) != hash {
-            return Err(ContentError::Corrupt);
-        }
         Ok(bytes)
     }
 
