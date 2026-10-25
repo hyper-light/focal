@@ -88,6 +88,20 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// idle timeout.
 pub const KEEP_ALIVE: Duration = Duration::from_secs(15);
 
+/// Cited: what a node waits after a dial to another node of its group began before it dials again,
+/// when the dial gave no connection that lasted that long: at first one second, the interval RFC 8085
+/// §3.1.3 recommends a UDP application start its exponential back-off at (TCP's initial
+/// retransmission timeout, RFC 6298 §2.1), and the probe timeout a QUIC handshake starts at (RFC 9002
+/// §6.2.2), doubled after each such dial (RFC 6298 §5.5) to [`REDIAL_MOST`].
+pub const REDIAL_FIRST: Duration = Duration::from_secs(1);
+
+/// Cited: the most a node's dials to another node of its group are spaced by: three seconds, the
+/// least interval RFC 8085 §3.1.3 allows a sender whose destination sends nothing back, the interval
+/// a liveness stream to a silent peer backs off to (hyper-liveness `UNANSWERED_NS`). A dial that
+/// hears nothing lasts until its idle timeout, so only a dial the peer refused, or one whose
+/// connection closed as it came up, waits this long.
+pub const REDIAL_MOST: Duration = Duration::from_secs(3);
+
 /// The period an exchange is judged at, the idle timeout: an exchange whose peer sends nothing for
 /// a period ends (hyper-transport `progress`), so a shorter one would end a stalled peer's subscribe
 /// sooner than its connection would end, which is the transport's whole judgement of a peer. The

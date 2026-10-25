@@ -39,7 +39,7 @@ use crate::log::{Position, SegmentPool};
 use crate::part::{Appended, Part, PartLimits, Taken};
 use crate::producer::{self, Entry};
 use crate::stream::STREAM_BYTES;
-use crate::wire::{self, Bus, Gap, Kind, LANE, Reply, Subscribe, Subscribed};
+use crate::wire::{self, Bus, Gap, Kind, LANE, Leader, Moved, Reply, Subscribe, Subscribed};
 
 /// What a node holds at most.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +107,9 @@ pub struct NodeStats {
     pub starved: u64,
     /// Subscriptions let go because the transport could no longer reach their peer.
     pub dropped: u64,
+    /// Subscriptions ended because the node stopped leading their part, each subscriber told the
+    /// leader the node knew and the offset it would have been delivered next (doc 34 P7).
+    pub moved: u64,
     /// Segments allocated from the system, each faulted in as it fills.
     pub segments_allocated: u64,
     /// Segments returned to the system.
@@ -147,6 +150,9 @@ struct Subscription {
     last: Option<u64>,
     /// Its lane was full: it waits for room.
     blocked: bool,
+    /// The node stopped leading the stream's part: the subscription is told so, naming this
+    /// leader, as its lane makes room, and is delivered nothing more (doc 34 P7).
+    moved: Option<Leader>,
 }
 
 /// One bus node's state.
@@ -437,6 +443,33 @@ impl Node {
         self.scratch = slots;
     }
 
+    /// The node stopped leading its part (doc 34 P7): every subscription is told so, naming
+    /// `leader`, the leader the node knows, and the offset it would have been delivered next, each
+    /// as its subscriber's lane makes room (a subscriber whose lane is full is told once it reads
+    /// again, never skipped), and is delivered nothing more; the lanes held for their subscribers
+    /// go. A follower applies what its group commits and cannot hold a publisher for a subscriber
+    /// that takes no more, as a leader does, so a subscription it kept would be let go from under.
+    pub fn stop_delivering<B, D>(&mut self, endpoint: &mut Endpoint<Bus, B, D>, leader: Leader)
+    where
+        B: Budget<<Bus as Classes>::Class>,
+        D: Directory<Role = <Bus as Classes>::Role>,
+    {
+        let mut slots = std::mem::take(&mut self.scratch);
+        slots.clear();
+        slots.extend(
+            self.subscriptions
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, subscription)| subscription.as_ref().map(|_| slot)),
+        );
+        for slot in slots.iter().copied() {
+            self.update(slot, |s| s.moved = Some(leader));
+            self.pump(endpoint, slot);
+        }
+        self.scratch = slots;
+        self.release_unblocked(endpoint);
+    }
+
     /// Room for one more batch in the window's index, charged before the batch is taken.
     fn reserve_retained(&mut self) -> Result<(), BusError> {
         if self.retained.len() == self.retained.capacity() {
@@ -717,7 +750,10 @@ impl Node {
                 self.subscriptions
                     .get(*slot)
                     .and_then(Option::as_ref)
-                    .is_some_and(|subscription| subscription.blocked)
+                    // A subscription that is only to be told it moved takes no more batches.
+                    .is_some_and(|subscription| {
+                        subscription.blocked && subscription.moved.is_none()
+                    })
             })
         })
     }
@@ -823,6 +859,7 @@ impl Node {
             cursor: start,
             last: None,
             blocked: false,
+            moved: None,
         };
         let slot = match self.free.pop() {
             Some(slot) => {
@@ -913,6 +950,27 @@ impl Node {
             };
             if subscription.blocked {
                 return;
+            }
+            if let Some(leader) = subscription.moved {
+                let moved = Moved {
+                    stream: subscription.stream,
+                    next: subscription.cursor,
+                    leader,
+                };
+                match send(endpoint, subscription.peer, Kind::Moved, &moved.encode()) {
+                    Sent::Queued => {
+                        self.stats.moved = self.stats.moved.saturating_add(1);
+                        return self.drop_slot(slot);
+                    }
+                    Sent::Full => return self.block(slot),
+                    Sent::Short => {
+                        if self.short(endpoint) {
+                            continue;
+                        }
+                        return self.starve(slot);
+                    }
+                    Sent::Gone => return self.gone(slot),
+                }
             }
             let Some((floor, next)) = self.part.bounds(subscription.stream) else {
                 return;

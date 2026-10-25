@@ -64,6 +64,9 @@ pub enum Kind {
     Redirect,
     /// A node's heartbeat to another, on their liveness lane.
     Heartbeat,
+    /// A node that stopped leading a part ends a subscriber's subscription of one of its streams,
+    /// naming the leader it knows (doc 34 P7).
+    Moved,
 }
 
 /// A sender's role, as the directory names it.
@@ -124,7 +127,7 @@ pub const RAFT_BOUND: u64 = (hyper_raft::wire::MESSAGE_RECORD_FIXED_BYTES as u64
 /// classes a doubling "limit internal fragmentation to approximately 20%" (jemalloc(3)).
 pub const SEGMENT_BATCHES: u64 = 5;
 
-const KINDS: [Kind; 8] = [
+const KINDS: [Kind; 9] = [
     Kind::Subscribe,
     Kind::Publish,
     Kind::Deliver,
@@ -133,6 +136,7 @@ const KINDS: [Kind; 8] = [
     Kind::Ack,
     Kind::Redirect,
     Kind::Heartbeat,
+    Kind::Moved,
 ];
 
 /// The bus's classes for hyper-transport.
@@ -159,7 +163,7 @@ impl Classes for Bus {
             (Kind::Subscribe, Role::Client) | (Kind::Heartbeat, Role::Node) => Some(Class::Control),
             (Kind::Raft, Role::Node) => Some(Class::Replicate),
             (Kind::Publish, Role::Client) => Some(Class::Publish),
-            (Kind::Deliver | Kind::Gap | Kind::Ack | Kind::Redirect, Role::Node) => {
+            (Kind::Deliver | Kind::Gap | Kind::Moved | Kind::Ack | Kind::Redirect, Role::Node) => {
                 Some(Class::Deliver)
             }
             _ => None,
@@ -184,6 +188,7 @@ impl Classes for Bus {
             Kind::Ack => 6,
             Kind::Redirect => 7,
             Kind::Heartbeat => 8,
+            Kind::Moved => 9,
         }
     }
 
@@ -577,6 +582,52 @@ impl Durability {
     }
 }
 
+/// A subscription a node ended, for it stopped leading the stream's part, and the leader it knows
+/// (doc 34 P7): the subscriber subscribes again at that leader from `next`, as a Kafka consumer
+/// whose fetch a former leader refuses (`NOT_LEADER_OR_FOLLOWER`, with KIP-951's leader) fetches
+/// from the new one. A follower applies what its group commits and cannot hold a publisher for a
+/// subscriber that takes no more, as a leader does, so it delivers to none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Moved {
+    /// The stream.
+    pub stream: u64,
+    /// The offset the subscription would have been delivered next: every offset before it was.
+    pub next: u64,
+    /// The leader the node knows.
+    pub leader: Leader,
+}
+
+impl Moved {
+    /// The notice's bytes.
+    pub const BYTES: usize = 8 + 8 + Leader::BYTES;
+
+    /// The notice as sent.
+    pub fn encode(&self) -> [u8; Self::BYTES] {
+        let mut out = [0; Self::BYTES];
+        put(
+            &mut out,
+            &[&self.stream.to_le_bytes(), &self.next.to_le_bytes()],
+        );
+        if let Some(leader) = out.get_mut(16..) {
+            self.leader.encode_into(leader);
+        }
+        out
+    }
+
+    /// The notice received.
+    pub fn decode(bytes: &[u8]) -> Result<Self, BusError> {
+        if bytes.len() != Self::BYTES {
+            return Err(BusError::Protocol("a moved subscription"));
+        }
+        let refused = || BusError::Protocol("a moved subscription");
+        Ok(Self {
+            stream: u64_at(bytes, 0).ok_or_else(refused)?,
+            next: u64_at(bytes, 8).ok_or_else(refused)?,
+            leader: Leader::decode_at(bytes, 16).ok_or_else(refused)?,
+        })
+    }
+}
+
 /// A publish a node did not take, for it does not lead the batch's part, and the leader it knows
 /// (doc 34 P2): the client sends it again to that leader.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -672,7 +723,7 @@ mod tests {
             assert_eq!(Bus::kind_of(Bus::kind_code(kind)), Some(kind));
         }
         assert_eq!(Bus::kind_of(0), None);
-        assert_eq!(Bus::kind_of(9), None);
+        assert_eq!(Bus::kind_of(10), None);
     }
 
     #[test]
@@ -687,7 +738,7 @@ mod tests {
             Some(Class::Control)
         );
         assert_eq!(Bus::class_of(Kind::Heartbeat, Role::Client), None);
-        for kind in [Kind::Ack, Kind::Redirect] {
+        for kind in [Kind::Ack, Kind::Redirect, Kind::Moved] {
             assert_eq!(Bus::class_of(kind, Role::Node), Some(Class::Deliver));
             assert_eq!(Bus::class_of(kind, Role::Client), None);
         }
@@ -748,5 +799,15 @@ mod tests {
         };
         assert_eq!(Redirect::decode(&redirect.encode()).unwrap(), redirect);
         assert!(Redirect::decode(&[0; Redirect::BYTES - 1]).is_err());
+
+        for node in [None, Some(2)] {
+            let moved = Moved {
+                stream: u64::MAX,
+                next: 1 << 40,
+                leader: Leader { node, term: 12 },
+            };
+            assert_eq!(Moved::decode(&moved.encode()).unwrap(), moved);
+        }
+        assert!(Moved::decode(&[0; Moved::BYTES + 1]).is_err());
     }
 }

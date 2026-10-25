@@ -16,7 +16,10 @@
 //! (`StateMachine::durable`), so the log holds what the window holds: a node that restarts opens
 //! on its image and the log replays the window into it, offsets and batches alike (doc 34 P10). A
 //! member that lacks entries its leader's log no longer holds is given the leader's image, and the
-//! entries after it.
+//! entries after it. The image is sealed at rest (29 §12.9): whole, under its node's data
+//! directory's group key, as a group file is; an image an earlier binary kept in the clear is
+//! written again sealed at the node's next open, and refused in the clear once the node is marked
+//! sealed.
 
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -147,8 +150,8 @@ pub struct PartMachine {
     durable: Cell<Point>,
     /// Makes the part's images durable off the shard that applies.
     writer: ImageWriter,
-    /// Where the image is kept.
-    path: PathBuf,
+    /// Where the image is kept, and in what form.
+    image: ImageFile,
     /// The most bytes an image of this part takes: its stream and producer bounds'.
     image_bound: usize,
     /// Whether an apply let the window give memory back since the owner last asked
@@ -157,14 +160,15 @@ pub struct PartMachine {
 }
 
 impl PartMachine {
-    /// The part of `node`, opened on the image at `path` where one is kept, and otherwise empty
+    /// The part of `node`, opened on the image `image` keeps where one is kept, and otherwise empty
     /// under `founding`, the configuration its group was formed with; a configuration of the group
     /// names at most `members` members (hyper-raft's `Stated::members`). A node opened on an image
     /// holds every stream the image names, each from its floor, and nothing else: the group's log
-    /// replays the rest into it.
+    /// replays the rest into it. An image an earlier binary kept in the clear is written again
+    /// sealed by the part's writer, and made durable, before the part is handed back (29 §12.9).
     pub fn open(
         mut node: Node,
-        path: PathBuf,
+        image: ImageFile,
         founding: ConfState,
         members: usize,
     ) -> Result<Self, BusError> {
@@ -175,36 +179,43 @@ impl PartMachine {
             &largest_configuration(members)?,
         )
         .ok_or(BusError::Configuration("an image of the part's streams"))?;
-        let medium = FileMedium;
-        let exists = medium
-            .exists(&path)
-            .map_err(|_| BusError::Configuration("the part's image could not be looked for"))?;
-        let (point, configuration) = if exists {
-            let bytes = medium
-                .read(&path, image_bound)
-                .map_err(|_| BusError::Configuration("the part's image could not be read"))?;
-            let image = Image::decode(&bytes)?;
-            node.restore(
-                image.floors(),
-                &image.producers,
-                (image.point.index, image.point.term),
-            )?;
-            (image.point, image.configuration)
-        } else {
-            (Point::default(), founding)
+        let (point, configuration, clear) = match image.read(image_bound)? {
+            Some((bytes, clear)) => {
+                let decoded = Image::decode(&bytes)?;
+                node.restore(
+                    decoded.floors(),
+                    &decoded.producers,
+                    (decoded.point.index, decoded.point.term),
+                )?;
+                let point = decoded.point;
+                (
+                    point,
+                    decoded.configuration,
+                    clear.then_some((bytes, point)),
+                )
+            }
+            None => (Point::default(), founding, None),
         };
-        Ok(Self {
+        let machine = Self {
             node,
             applied: point,
             configuration: configuration.clone(),
             changes: VecDeque::new(),
             floor_configuration: configuration,
             durable: Cell::new(point),
-            writer: ImageWriter::start(path.clone())?,
-            path,
+            writer: ImageWriter::start(image.clone())?,
+            image,
             image_bound,
             relieved: false,
-        })
+        };
+        // An earlier binary's image, in the clear: its own bytes written again sealed, by the writer
+        // every image goes through, and made durable before the part serves.
+        if let Some((bytes, point)) = clear {
+            let unsealed = |_| BusError::Configuration("the part's image could not be sealed");
+            machine.writer.hand(bytes, point).map_err(unsealed)?;
+            machine.writer.settle(&machine.durable).map_err(unsealed)?;
+        }
+        Ok(machine)
     }
 
     /// The node: its part, its window and its subscribers.
@@ -409,9 +420,7 @@ impl StateMachine for PartMachine {
         // An image the writer has out would land after this one, the older over the newer: its
         // answer comes first.
         self.writer.settle(&self.durable)?;
-        let mut medium = FileMedium;
-        focal_platform::fs::install(&mut medium, &self.path, image)
-            .map_err(|_| Fatal("the part's image could not be made durable"))?;
+        self.image.write(image).map_err(Fatal)?;
         self.node
             .restore(decoded.floors(), &decoded.producers, (at.index, at.term))
             .map_err(|_| Fatal("the part could not hold the image's streams"))?;
@@ -462,20 +471,17 @@ struct ImageWriter {
 }
 
 impl ImageWriter {
-    /// The writer of the image at `path`, its thread started.
-    fn start(path: PathBuf) -> Result<Self, BusError> {
+    /// The writer of the image `image` keeps, its thread started.
+    fn start(image: ImageFile) -> Result<Self, BusError> {
         // One image out at most, and its one answer.
         let (images, requests) = sync_channel::<(Vec<u8>, Point)>(1);
         let (answering, answers) = sync_channel::<Result<Point, ()>>(1);
         let thread = std::thread::Builder::new()
             .name("focal-bus-image".into())
             .spawn(move || {
-                let mut medium = FileMedium;
                 // Bounded: one write an image handed, until the part closes its end.
                 while let Ok((bytes, point)) = requests.recv() {
-                    let answer = focal_platform::fs::install(&mut medium, &path, &bytes)
-                        .map(|()| point)
-                        .map_err(|_| ());
+                    let answer = image.write(&bytes).map(|()| point).map_err(|_| ());
                     if answering.send(answer).is_err() {
                         return;
                     }
@@ -547,6 +553,80 @@ impl Drop for ImageWriter {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+/// Where a part's image is kept, and in what form (29 §12.9): sealed whole under its node's data
+/// directory's group key (`focal_seal::Store::Group`, unwrapped for each image and dropped after
+/// it, as a group file's key is), or, until the node is marked sealed, in the clear as an earlier
+/// binary kept it. A sealed image opens only under its own directory's keys and only as it was
+/// written: a changed byte, or another node's image put in its place, is refused.
+#[derive(Clone, Debug)]
+pub struct ImageFile {
+    path: PathBuf,
+    keys: focal_seal::DataKeys,
+    /// Whether an image in the clear is taken: until the node is marked sealed.
+    clear: bool,
+}
+
+impl ImageFile {
+    /// The image at `path`, sealed under the keys of `keys`' data directory; `clear` while an
+    /// earlier binary's image in the clear is still taken.
+    pub fn new(path: PathBuf, keys: focal_seal::DataKeys, clear: bool) -> Self {
+        Self { path, keys, clear }
+    }
+
+    /// `bytes` sealed whole and installed durably in the image's place (`focal_platform::fs::install`:
+    /// a temporary, its sync, the rename, the directory's sync).
+    fn write(&self, bytes: &[u8]) -> Result<(), &'static str> {
+        let key = self
+            .keys
+            .key(focal_seal::Store::Group)
+            .map_err(|_| "the node's group key could not be opened")?;
+        let sealed = focal_seal::file::seal(&key, bytes)
+            .map_err(|_| "the part's image could not be sealed")?;
+        drop(key);
+        let mut medium = FileMedium;
+        focal_platform::fs::install(&mut medium, &self.path, &sealed)
+            .map_err(|_| "the part's image could not be made durable")
+    }
+
+    /// The image kept, at most `bound` bytes of it: none where none is kept; else its bytes, and
+    /// whether it lay in the clear, an earlier binary's (its magic first, where a sealed file
+    /// begins with its header's version). One in the clear once the node is marked sealed, or a
+    /// sealed one that does not open, is refused.
+    fn read(&self, bound: usize) -> Result<Option<(Vec<u8>, bool)>, BusError> {
+        let medium = FileMedium;
+        let exists = medium
+            .exists(&self.path)
+            .map_err(|_| BusError::Configuration("the part's image could not be looked for"))?;
+        if !exists {
+            return Ok(None);
+        }
+        let most = focal_seal::file::sealed_bound(bound)
+            .ok_or(BusError::Configuration("an image of the part's streams"))?;
+        let bytes = medium
+            .read(&self.path, most)
+            .map_err(|_| BusError::Configuration("the part's image could not be read"))?;
+        if bytes.starts_with(&MAGIC) {
+            if !self.clear {
+                return Err(BusError::Configuration(
+                    "the part's image lies in the clear after its node was sealed",
+                ));
+            }
+            if bytes.len() > bound {
+                return Err(BusError::Configuration("the part's image past its bound"));
+            }
+            return Ok(Some((bytes, true)));
+        }
+        let key = self
+            .keys
+            .key(focal_seal::Store::Group)
+            .map_err(|_| BusError::Configuration("the node's group key could not be opened"))?;
+        let mut plain = focal_seal::file::open(&key, bytes, bound).map_err(|_| {
+            BusError::Configuration("the part's image does not open under its node's keys")
+        })?;
+        Ok(Some((std::mem::take(&mut *plain), false)))
     }
 }
 
@@ -745,8 +825,13 @@ mod tests {
         }
     }
 
+    /// The image `name` in `dir`, sealed under the directory's own keys (29 §12.9).
+    fn image_file(dir: &std::path::Path, name: &str) -> ImageFile {
+        ImageFile::new(dir.join(name), focal_seal::test_keys(dir).unwrap(), true)
+    }
+
     fn machine(segments: usize, dir: &std::path::Path) -> PartMachine {
-        PartMachine::open(node(segments), dir.join("part.image"), founding(), 3).unwrap()
+        PartMachine::open(node(segments), image_file(dir, "part.image"), founding(), 3).unwrap()
     }
 
     /// A batch of `records` records of `payload` bytes each.
@@ -946,7 +1031,8 @@ mod tests {
 
         // A node restarted: opened on the image, and the log replays every entry after it.
         let mut reopened =
-            PartMachine::open(node(2), dir.path().join("part.image"), founding(), 3).unwrap();
+            PartMachine::open(node(2), image_file(dir.path(), "part.image"), founding(), 3)
+                .unwrap();
         assert_eq!(reopened.durable(), durable);
         assert_eq!(reopened.configuration(), &founding());
         for (i, data) in entries.iter().enumerate() {
@@ -974,6 +1060,142 @@ mod tests {
         ));
     }
 
+    /// Do: keep a part's image and read its file; put the image in the clear in its place, as an
+    /// earlier binary kept it, and open the part with its node marked sealed, then not; change a
+    /// byte of the sealed file; put another node's sealed image in its place. Expect: the file holds
+    /// no image in the clear and opens only under its directory's group key; a clear image is
+    /// refused once the node is marked sealed, and before the mark is taken and written again
+    /// sealed, at its own point, before the part is handed back; a changed byte and another node's
+    /// image are refused (29 §12.9).
+    #[test]
+    fn a_parts_image_is_sealed_under_its_nodes_keys_and_one_in_the_clear_converted_until_the_mark()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("part.image");
+        let keys = focal_seal::test_keys(dir.path()).unwrap();
+        // A part whose window let entries go: its image is kept.
+        let kept = |dir: &std::path::Path| {
+            let mut part = machine(2, dir);
+            for at in 0..30u32 {
+                let data = batch(u64::from(at % 4), 2, at / 4 * 2, 2, 300 << 10);
+                apply(&mut part, u64::from(at) + 1, &data).unwrap();
+            }
+            part.persist().unwrap();
+            part.settle_image().unwrap();
+            assert!(part.durable().index > 0);
+            (part.durable(), part.image_bound)
+        };
+        let (durable, bound) = kept(dir.path());
+        let open = |clear: bool| {
+            PartMachine::open(
+                node(2),
+                ImageFile::new(path.clone(), keys.clone(), clear),
+                founding(),
+                3,
+            )
+        };
+        let refusal = |clear: bool| match open(clear) {
+            Err(BusError::Configuration(why)) => why,
+            other => panic!("not refused: {other:?}"),
+        };
+        let sealed = std::fs::read(&path).unwrap();
+        assert!(!sealed.starts_with(&MAGIC), "the image lies in the clear");
+        let group = keys.key(focal_seal::Store::Group).unwrap();
+        let plain = focal_seal::file::open(&group, sealed.clone(), bound).unwrap();
+        assert!(plain.starts_with(&MAGIC));
+        assert_eq!(open(false).unwrap().durable(), durable);
+
+        // An earlier binary's image in the clear: refused once the node is marked sealed, and
+        // before it taken and written again sealed by its own writer.
+        std::fs::write(&path, &*plain).unwrap();
+        assert_eq!(
+            refusal(false),
+            "the part's image lies in the clear after its node was sealed"
+        );
+        assert_eq!(open(true).unwrap().durable(), durable);
+        let converted = std::fs::read(&path).unwrap();
+        assert!(
+            !converted.starts_with(&MAGIC),
+            "the image was left in the clear"
+        );
+        assert_eq!(
+            *focal_seal::file::open(&group, converted.clone(), bound).unwrap(),
+            *plain
+        );
+        // A cut after the conversion and before the node's mark: the next open takes the sealed
+        // image as it is.
+        assert_eq!(open(true).unwrap().durable(), durable);
+        assert_eq!(std::fs::read(&path).unwrap(), converted);
+        assert_eq!(open(false).unwrap().durable(), durable);
+
+        let mut flipped = converted.clone();
+        let middle = flipped.len() / 2;
+        flipped[middle] ^= 1;
+        std::fs::write(&path, &flipped).unwrap();
+        assert_eq!(
+            refusal(false),
+            "the part's image does not open under its node's keys"
+        );
+
+        let other = tempfile::tempdir().unwrap();
+        kept(other.path());
+        std::fs::copy(other.path().join("part.image"), &path).unwrap();
+        assert_eq!(
+            refusal(false),
+            "the part's image does not open under its node's keys"
+        );
+        std::fs::write(&path, &converted).unwrap();
+        assert_eq!(open(false).unwrap().durable(), durable);
+    }
+
+    /// Measures what sealing adds to an image's write (29 §12.9), interleaved with the same bytes
+    /// installed in the clear as an earlier binary wrote them, at an image of a few streams, of 64
+    /// streams and producers, and of 4,096 of each: the group key's unwrap, the seal, and the whole
+    /// write, medians of 101 rounds. Run by hand, in release:
+    /// `cargo test -p focal-bus --release --lib -- --ignored measure_a_sealed_image_write --nocapture`.
+    #[test]
+    #[ignore = "a measurement, run by hand"]
+    fn measure_a_sealed_image_write() {
+        const ROUNDS: usize = 101;
+        let dir = tempfile::tempdir().unwrap();
+        let keys = focal_seal::test_keys(dir.path()).unwrap();
+        let image = ImageFile::new(dir.path().join("part.image"), keys.clone(), false);
+        let plain_path = dir.path().join("plain.image");
+        let median = |mut times: Vec<std::time::Duration>| {
+            times.sort_unstable();
+            times[times.len() / 2]
+        };
+        let entries =
+            |streams: usize, producers: usize| image_len(streams, producers, &founding()).unwrap();
+        for size in [entries(4, 1), entries(64, 64), entries(4096, 4096)] {
+            let bytes = vec![0x5a_u8; size];
+            let (mut unwrap, mut seal, mut sealed, mut clear) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for _ in 0..ROUNDS {
+                let began = std::time::Instant::now();
+                let key = keys.key(focal_seal::Store::Group).unwrap();
+                unwrap.push(began.elapsed());
+                let began = std::time::Instant::now();
+                std::hint::black_box(focal_seal::file::seal(&key, &bytes).unwrap());
+                seal.push(began.elapsed());
+                drop(key);
+                let began = std::time::Instant::now();
+                image.write(&bytes).unwrap();
+                sealed.push(began.elapsed());
+                let began = std::time::Instant::now();
+                focal_platform::fs::install(&mut FileMedium, &plain_path, &bytes).unwrap();
+                clear.push(began.elapsed());
+            }
+            eprintln!(
+                "image of {size} B: key unwrap {:?}, seal {:?}; write sealed {:?}, in the clear {:?}",
+                median(unwrap),
+                median(seal),
+                median(sealed),
+                median(clear)
+            );
+        }
+    }
+
     /// Do: apply batches past the window's floor, persist, and before the image's answer is taken
     /// read the durable point and persist again; then wait for the image. Expect: the durable point
     /// is the image's once its answer comes and never past it before, the second persist hands
@@ -997,7 +1219,8 @@ mod tests {
         machine.settle_image().unwrap();
         assert_eq!(machine.durable(), floor);
         let reopened =
-            PartMachine::open(node(2), dir.path().join("part.image"), founding(), 3).unwrap();
+            PartMachine::open(node(2), image_file(dir.path(), "part.image"), founding(), 3)
+                .unwrap();
         assert_eq!(reopened.durable(), floor);
     }
 
@@ -1013,8 +1236,13 @@ mod tests {
             apply(&mut machine, u64::from(at) + 1, &data).unwrap();
         }
         machine.persist().unwrap();
-        let mut leader =
-            PartMachine::open(node(2), dir.path().join("leader.image"), founding(), 3).unwrap();
+        let mut leader = PartMachine::open(
+            node(2),
+            image_file(dir.path(), "leader.image"),
+            founding(),
+            3,
+        )
+        .unwrap();
         for at in 0..60u32 {
             let data = batch(u64::from(at % 4), 2, at / 4 * 2, 2, 300 << 10);
             apply(&mut leader, u64::from(at) + 1, &data).unwrap();
@@ -1025,7 +1253,8 @@ mod tests {
         machine.install(&image, at, &configuration).unwrap();
         assert_eq!(machine.durable(), at);
         let reopened =
-            PartMachine::open(node(2), dir.path().join("part.image"), founding(), 3).unwrap();
+            PartMachine::open(node(2), image_file(dir.path(), "part.image"), founding(), 3)
+                .unwrap();
         assert_eq!(reopened.durable(), at);
     }
 
@@ -1066,7 +1295,8 @@ mod tests {
         assert!(follower.install(&image, other, &configuration).is_err());
         // It was made durable: a node reopened on it holds the same.
         let reopened =
-            PartMachine::open(node(2), dir.path().join("part.image"), founding(), 3).unwrap();
+            PartMachine::open(node(2), image_file(dir.path(), "part.image"), founding(), 3)
+                .unwrap();
         assert_eq!(reopened.durable(), point);
     }
 }

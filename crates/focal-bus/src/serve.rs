@@ -14,10 +14,12 @@ use std::task::Poll;
 use std::time::Instant;
 
 use focal_memory::{BudgetKind, BudgetLane, MemoryBudget};
+use hyper_rt::RtError;
 use hyper_rt::signal::{self, Signal};
+use hyper_rt::udp::{Batched, UdpSocket};
 use hyper_rt_transport::Driver;
 use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer, Tls};
-use hyper_transport::{Config, Endpoint};
+use hyper_transport::{Config, Endpoint, RestartKey};
 
 use crate::BusError;
 use crate::budget::BusBudget;
@@ -75,6 +77,45 @@ pub fn most_clients(memory_bytes: usize) -> usize {
     memory_bytes.checked_div(per_client).unwrap_or(0)
 }
 
+/// BLAKE3's context for a node endpoint's restart key: hard-coded, unique to its purpose, as BLAKE3's
+/// key derivation asks of a context.
+const RESTART_CONTEXT: &str = "focal-bus 2026-10-25 node endpoint restart key";
+
+/// The key a node's endpoint keeps across its restarts (hyper-transport `RestartKey`, hyper-raft
+/// docs/transport.md §4ah), from the node's private key, `identity_key` (PKCS#8), and the address its
+/// socket is bound to: a node restarted at its address answers a packet on a connection its last run
+/// held with a reset the sender verifies, so its peers and clients learn at their next send that the
+/// connection is gone and connect again, as a restarted host's TCP answers with an RST, where they
+/// waited for their idle timeout. No other endpoint holds it: a node's identity is its own, and its
+/// address keeps apart two endpoints of one identity on a host, a lone node's, which reset each
+/// other's connections if they shared one (RFC 9000 §21.11). A node bound to a port of the system's
+/// choosing has another key at each start, as its port is another, where no peer reaches its last
+/// run.
+pub fn restart_key(identity_key: &[u8], bound: SocketAddr) -> Result<RestartKey, BusError> {
+    let mut derive = blake3::Hasher::new_derive_key(RESTART_CONTEXT);
+    derive.update(identity_key);
+    derive.update(bound.to_string().as_bytes());
+    RestartKey::from_secret(derive.finalize().as_bytes()).map_err(BusError::Transport)
+}
+
+/// The socket a node listens on, bound to `listen` with its port shared where the platform lets it,
+/// as hyper-rt-transport's `Driver::bind` binds one, and the address it is bound to, which its
+/// endpoint's restart key is derived from before the endpoint is made ([`restart_key`]).
+pub fn node_socket(listen: SocketAddr) -> Result<(Batched, SocketAddr), BusError> {
+    let refused = |_| BusError::Configuration("the listen address could not be bound");
+    let socket = match Batched::bind_shared_lent(listen, true) {
+        Ok(socket) => socket,
+        Err(RtError::BadConfig { .. }) => {
+            Batched::lent(UdpSocket::bind(listen).map_err(refused)?, true).map_err(refused)?
+        }
+        Err(error) => return Err(refused(error)),
+    };
+    let bound = socket
+        .local_addr()
+        .map_err(|_| BusError::Configuration("the listen address"))?;
+    Ok((socket, bound))
+}
+
 fn credentials(local: &Local, node: u64) -> Result<Credentials, BusError> {
     let identity = local
         .node(node)
@@ -115,7 +156,9 @@ pub async fn serve(
         Some(group) => (group.node, group.peers.len()),
         None => (1, 0),
     };
-    let local = pki::load_or_make(&config.pki, peers.saturating_add(1), config.clients)?;
+    // The directory's keys under the per-user root key file named for its root key, as a client's
+    // data directory's are (29 §12.9).
+    let local = pki::load_or_make(&config.pki, None, peers.saturating_add(1), config.clients)?;
     // A node of a part's group applies what its group committed within all of its memory, and
     // admits inputs within less (`limits::group_budget`).
     let budget = if config.group.is_some() {
@@ -153,17 +196,13 @@ pub async fn serve(
         limits,
         congestion: Default::default(),
     };
-    let endpoint: Endpoint<Bus, BusBudget, BusDirectory> = Endpoint::new(
-        endpoint_config,
-        BusBudget::new(budget.clone()),
-        directory,
-        Instant::now(),
-    )
-    .map_err(BusError::Transport)?;
-    // What the driver holds for its sockets as it is made, charged for as long as it is bound:
-    // its receive ring at one buffer and its listener's socket (`hyper_rt_transport::least_bytes`).
-    // What the ring grows by as its drains need it, the driver charges to the endpoint's budget as
-    // it grows (hyper-raft docs/transport.md §4aa).
+    let identity = local
+        .node(this)
+        .ok_or(BusError::Configuration("no identity for this node"))?;
+    // What the driver holds for its sockets as it is made, charged before its socket is bound and
+    // for as long as it is: its receive ring at one buffer and its listener's socket
+    // (`hyper_rt_transport::least_bytes`). What the ring grows by as its drains need it, the driver
+    // charges to the endpoint's budget as it grows (hyper-raft docs/transport.md §4aa).
     let _socket = budget
         .reserve(
             BudgetKind::Pending,
@@ -172,7 +211,17 @@ pub async fn serve(
         )
         .map_err(BusError::Memory)?
         .commit();
-    let mut driver = Driver::bind(endpoint, config.listen, crate::limits::IO)
+    let (socket, bound) = node_socket(config.listen)?;
+    let endpoint: Endpoint<Bus, BusBudget, BusDirectory> = Endpoint::new_restartable(
+        endpoint_config,
+        BusBudget::new(budget.clone()),
+        directory,
+        Instant::now(),
+        &restart_key(&identity.key, bound)?,
+        None,
+    )
+    .map_err(BusError::Transport)?;
+    let mut driver = Driver::new(endpoint, socket, crate::limits::IO)
         .map_err(|_| BusError::Configuration("the listen address could not be bound"))?;
     let address = driver
         .local_addr()

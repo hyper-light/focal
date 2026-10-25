@@ -88,7 +88,8 @@ fn session() -> Result<u64, CompareError> {
 /// Runs the schedule; each acknowledged record's latency in the histogram.
 pub fn run(run: Run) -> Result<(Histogram<u64>, Tally), CompareError> {
     let nodes = run.nodes.len();
-    let local = pki::load_or_make(&run.pki, nodes, 2).map_err(fail)?;
+    // The directory the nodes made, its keys found as they keep them (29 §12.9).
+    let local = pki::load_or_make(&run.pki, None, nodes, 2).map_err(fail)?;
     let envelope = focal_platform::memory_envelope()
         .and_then(|bytes| usize::try_from(bytes).ok())
         .ok_or_else(|| fail("the machine's memory could not be read"))?;

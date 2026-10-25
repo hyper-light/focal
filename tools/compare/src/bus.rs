@@ -201,7 +201,8 @@ pub fn run(run: Run) -> Result<(Tally, Received, Lag), CompareError> {
         total,
         payloads,
     } = run;
-    let local = pki::load_or_make(&directory, 1, CLIENTS).map_err(fail)?;
+    // The directory the node made, its keys found as it keeps them (29 §12.9).
+    let local = pki::load_or_make(&directory, None, 1, CLIENTS).map_err(fail)?;
     // Both clients' endpoints are charged within this process's envelope, as a node's are; a machine
     // whose memory cannot be read is refused rather than guessed at.
     let envelope = focal_platform::memory_envelope()
@@ -384,6 +385,9 @@ fn subscriber(
                         Delivery::SubscribeRedirected { leader, .. } => {
                             outcome =
                                 Err(fail(format!("the subscribe was redirected to {leader:?}")));
+                        }
+                        Delivery::Moved(moved) => {
+                            outcome = Err(fail(format!("the subscription moved: {moved:?}")));
                         }
                         Delivery::Redirected(redirect) => {
                             outcome = Err(fail(format!("a publish was redirected: {redirect:?}")));

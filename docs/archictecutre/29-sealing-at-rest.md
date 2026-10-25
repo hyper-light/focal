@@ -278,8 +278,8 @@ private journals (`focal_enrollment::PrivateJournal`), sealed with the private d
 | Private directories and journals | `JOIN/`, `cluster/authority/`, `cluster/invitations/`, `cluster/network/`, `CLUSTER.admin/`, `CLIENT.contexts/`, the placement and admission journals (`cluster/<name>/journal.bin`) | the cluster CA's key, nodes' and clients' keys, invitations, the signer's and every agent's journal, the admin's and contexts' catalogues | focal-enrollment `files::PrivateDirectory`, `PrivateJournal` | sealed (§12.2) |
 | Embedded node log | the shell's log of a node that is its own cluster (`wal/` before) | every record of its session and its root's control group | focal-node `EmbeddedNode` through `storage_start`, as a networked node | sealed (§12.3) |
 | Bus log | a bus node's `bus.log` | its part's records | focal-bus `member` over hyper-log | sealed (its data directory's keys) |
-| Bus identities | the bus's identity directory | its local CA's and members' keys | focal-bus `pki` | clear |
-| Bus part | a part's `part.image`, the node's `run` | streams' floors, producers' sessions; the node's run | focal-bus `group`, `member` | clear |
+| Bus identities | the bus's identity directory | its local CA's and members' keys | focal-bus `pki` | sealed (§12.9) |
+| Bus part | a part's `part.image`, the node's `run` | streams' floors, producers' sessions; the node's run | focal-bus `group`, `member` | sealed (§12.9) |
 | Client stores | a client's data directory (`client/…`), `MCP.operations/` | requests, receipts, pending writes, artifact uploads | focal-client `operation_store`, `native_store`, `pending`, `artifact_transfer`, `managed_store` | clear |
 | Node files | `IDENTITY`, `POLICY`, `NETWORK`, `SESSION.memory`, `trust-adopted.bin`, `cluster/partitions/*.partition`, `cluster/BOOTSTRAP`, `cluster/apply/<plan>/{PLAN,JOURNAL}`, `cluster/pending-retires/` | the node's identity, policy, network state, founded allowance, adopted trust, partition records, the root's genesis, deployment journals, retirements to finish | focal-node | clear |
 
@@ -298,6 +298,8 @@ private journals (`focal_enrollment::PrivateJournal`), sealed with the private d
 - What an operator asks for in the clear, outside any data directory: an artifact downloaded to a
   file it names, a trace written where it says, a deployment plan's output, and an invitation
   bundle handed to a joiner, a bearer credential kept owner-only and spent once.
+- The bus identity directory's certificates (`root.der`, `node-N.der`, `client-K.der`): public,
+  as every handshake shows them (§12.9).
 - A sealed backup's `ENCRYPTION-INFO`: the backup's key wrapped under the operator's key file, and
   that key's ID, a hash of it, neither of which opens anything (§12.8).
 - focal-log's WAL of a node below the storage level, which a binary below that level reads alone,
@@ -860,3 +862,95 @@ under a key made once for the backup:
   refused a key file, verified with and without one and restored on a fresh node at the binary's
   level; `cli_backup`, the restore runbook through its three cuts, and the laptop journey, whose
   concept index records the backup key as the decision it is (DC20).
+
+### 12.9 The bus's files, sealed (2026-10-25)
+
+A bus node keeps three things of its own beside its log, which its data directory's keys sealed
+since its replicated part began: its part's image, its run, and the identity directory its members
+and clients share in the bus's standalone mode. Each is now sealed:
+
+- **The image and the run under the data directory's keys.** `part.image` (each stream's floor,
+  each identity's producer sessions, the configuration, as of the newest entry the window let go)
+  and `run` (the count each start raises before it is used) are sealed whole through
+  `focal_seal::file` under the directory's group key (`Store::Group`), unwrapped for each write and
+  dropped after, as a group file's key is (`group::ImageFile`, `member::raise_run`). A node whose
+  directory is not yet marked takes an image or a run an earlier binary wrote in the clear (the
+  image's magic first, the run's eight bytes alone, where a sealed file begins with its header's
+  version): the run is raised and written sealed, and the image is written again sealed by the
+  part's own image writer, the thread every image goes through, and made durable before the part is
+  handed back. What an earlier binary's cut install of its image left, its temporary holding the
+  image in the clear, is removed, where with no image to convert nothing would replace it before the
+  node's next image. Then the directory is marked `SEALED`, and from the mark either in the clear is
+  refused. A cut before the mark leaves each file whole in one form or the other, and the next open
+  finishes.
+- **The identity directory gets keys of its own.** `focal start bus --pki DIR` reads its local
+  authority's and every member's and client's identity from DIR, made once by its first opener. The
+  directory now has a `SEAL.node` of its own under the per-user root key file named for its root key,
+  as a client's data directory has (`focal_seal::resolve`), and each key file holds a frame sealed
+  whole under the directory's journal key (`Store::Journal`): `FCLBUSK1`, its name's length and its
+  name, the PKCS #8 key and a BLAKE3 hash over all of it. A key file put in another key's place opens
+  to a frame naming another file, and one carried in from another directory opens under no key of
+  this one's, so both are refused, as a changed byte is. A directory an earlier binary wrote in the
+  clear is converted by its first opener under the directory's lock (`LOCK`), key by key, each through
+  the rename every identity file is written by, a key already sealed (a conversion a crash cut) opened
+  to be sure of it, and then marked `SEALED`; from the mark a key in the clear is refused, as §12.2's
+  private directories refuse one. A directory whose make was cut before its authority was never read
+  whole, so nothing in it was served: it is swept of what the cut left (each identity's files and
+  staged copies, and the mark) before it is made, so a key an earlier binary filed there in the clear,
+  one the new make files no more, does not lie there for good. The certificates are public, every
+  handshake shows them, and stay in the clear.
+- **As planned.** The step named `Store::Group` for the image and the run, a `SEAL.node` of the
+  identity directory's own under the per-user root key file and `Store::Journal` for its keys,
+  conversion by the first writer under its lock, and refusal after the mark, as built.
+- **Found on the way: a group restarted one node at a time lost its leader.** The step's test
+  restarts each node of a group of three in turn under publishing. After the third restart no pair
+  was connected and no leader was elected, with the files in either form: a node never dialed a pair
+  again once its connection closed, a restarted node dialed only the nodes above it, and a peer of
+  a restarted node held its dead connection until its two-minute idle timeout, the restarted
+  endpoint drawing a fresh QUIC reset key and connection-ID key at every start, so it could tell no
+  peer that its last run's connection was gone. Both causes are fixed: the pair's lesser node dials
+  whenever its endpoint tells it the pair has no connection, at once after a connection that lasted
+  and after a dial that gave none lasting a back-off from the last dial's start (1 s, RFC 8085
+  §3.1.3's initial interval and TCP's initial retransmission timeout, doubled to 3 s, the least
+  interval that section allows a sender whose destination answers nothing); and an endpoint keeps a
+  key across its restarts (hyper-transport's `RestartKey`, taken from hyper-raft at 698c0da, its
+  docs/transport.md §4ah), derived for each bus node from its own private key and the address its
+  socket is bound to (BLAKE3's key derivation), so a restarted node answers a packet on an old
+  connection with a reset the sender verifies, as a restarted host's TCP answers with an RST, and the
+  sender's owner dials it again. With either fix alone the test froze, no batch acknowledged for 30
+  s (34 §8). And a node that stopped leading kept delivering to its subscribers, where as a
+  follower it could let a stalled subscriber's offsets go: it now ends each subscription with a
+  notice naming the leader it knows and the offset it would have delivered next, and the
+  subscriber subscribes again there (34 P7, §8).
+- **Measured** (this Mac, release, medians of 101 rounds interleaved with the same bytes installed in
+  the clear; `measure_a_sealed_image_write`): sealing adds nothing measurable to an image's write,
+  whose install's flush takes about 8.5 ms here. The group key's unwrap takes 116 to 122 µs a write
+  and the seal 30 µs at an image of 236 bytes (four streams and a producer), 32 µs at 6.2 KB (64 of
+  each) and 141 µs at 393 KB (4,096 of each); written sealed 8.49, 8.43 and 9.28 ms, in the clear
+  8.50, 8.46 and 8.48 ms. The run is written once a start and the identity directory read once a
+  start. Through three restarts under publishing and consuming, each next 20 batches were acknowledged
+  and delivered at the rate before any restart (60 batches in 6.6 to 18.9 s before, 20 in 2.3 to
+  6.2 s after each, this Mac under other sessions' load).
+- **Tests:** an identity directory made sealed and read back; one kept in the clear sealed by its
+  first opener, each key what it was, and a conversion cut after two keys with a third staged
+  finished by the next opener; one an earlier binary's make cut before its authority, its keys in
+  the clear and more of them than asked, one more staged, made with no key left in the clear; a key
+  planted in the clear after the mark, a changed byte, a key file put in another's place and one
+  carried from another directory, each refused by name (`pki`); a
+  part's image sealed and opening only under its directory's group key, one in the clear refused
+  after the mark and before it taken and written again sealed at its own point, a changed byte and
+  another node's image refused (`group`); a run raised sealed, one in the clear taken and sealed
+  before the mark and refused after, a changed byte and another node's run refused; the redial's
+  schedule (`member`); and a group of three whose identity directory an earlier binary made in the
+  clear, its directory and each node's run and image turned back to the clear before the restarts
+  as that binary kept them, restarted one node at a time, each reading its identity from the
+  directory as its service does, while a producer publishes and a subscriber following the leader
+  consumes: every batch acknowledged once and in order, the producer's session carried through (its
+  newest batch sent again recognised), the subscriber delivered every batch from where it began once
+  and in order, each restarted node reopened at its image's floor, the directory sealed by the first
+  start and again by the first restart with every key what it was, each node's run and image sealed
+  after its restart, and a key and an image planted in the clear, changed by a byte or carried from
+  another node or directory each refused; a node whose first image install an earlier binary cut
+  opened with no temporary of it left (`tests/group.rs`). The transport's own test: a peer
+  told its connection closed within a keep-alive of a restart with the kept key, and only at its
+  idle timeout with another (hyper-raft `exchange::a_restarted_endpoint_resets_what_its_last_run_held`).

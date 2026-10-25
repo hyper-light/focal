@@ -235,6 +235,7 @@ fn batch(builder: &mut BatchBuilder, sequence: u32) -> Vec<u8> {
 enum Item {
     Batch { base: u64, end: u64, sequence: u64 },
     Gap { from: u64, to: u64 },
+    Moved { next: u64, leader: wire::Leader },
 }
 
 #[derive(Default)]
@@ -253,6 +254,7 @@ impl Seen {
         match self.order.last() {
             Some(Item::Batch { end, .. }) => *end,
             Some(Item::Gap { to, .. }) => *to,
+            Some(Item::Moved { next, .. }) => *next,
             None => 0,
         }
     }
@@ -343,6 +345,12 @@ impl Harness {
                 Delivery::SubscribeRedirected { leader, .. } => {
                     panic!("a lone node redirected a subscribe to {leader:?}")
                 }
+                // A lone node moves a subscription only where a test tells it it stopped leading,
+                // as a group's member does (doc 34 P7).
+                Delivery::Moved(moved) => seen.order.push(Item::Moved {
+                    next: moved.next,
+                    leader: moved.leader,
+                }),
                 Delivery::Acked(ack) => panic!("a lone node acknowledged {ack:?}"),
                 Delivery::Redirected(redirect) => {
                     panic!("a lone node redirected a publish: {redirect:?}")
@@ -655,6 +663,107 @@ fn every_publish_reaches_the_subscriber_in_order_and_a_stalled_subscriber_holds_
 /// subscriber waits and is served once the transport gives memory back. Taken as the subscriber's
 /// going, the refusal let the subscription go in silence (the pubsub matrix of 2026-10-16 lost 1.1
 /// million messages so at 100,000 a second).
+/// Do: deliver a stream to a subscriber, stop it reading until its lane is full and the node holds
+/// the publisher, then tell the node it stopped leading the stream's part, as a group's member does
+/// when its replica steps down (doc 34 P7); let the subscriber read again, and publish more.
+/// Expect: nothing is told while the lane is full, and nothing skipped; the publisher's lane is let
+/// go at once, its subscriber no longer one the node holds it for; once the subscriber reads, it
+/// takes every batch queued for it, in order, then the notice, naming the leader and the offset
+/// after the last batch it took; and the node delivers it nothing more.
+#[test]
+fn a_node_that_stops_leading_tells_its_subscriber_where_it_left_off_and_delivers_no_more() {
+    let pki = Pki::new();
+    let node_budget = MemoryBudget::new(256 << 20, 0).unwrap();
+    let client_budget = MemoryBudget::new(256 << 20, 0).unwrap();
+    let segment = usize::try_from(wire::BATCH_BOUND).unwrap();
+    let part_budget = node_budget.child(PART_SEGMENTS * segment, 0).unwrap();
+    let config = NodeConfig {
+        segment_bytes: segment,
+        streams: 64,
+        subscriptions: 16,
+        producers: 64,
+    };
+    let mut runtime = LocalRuntime::new(&runtime()).unwrap();
+    runtime
+        .block_on(async move {
+            let mut bus =
+                Harness::connect(&pki, &node_budget, &client_budget, &part_budget, config).await;
+            while bus.seen.reached() < 100 {
+                let ahead = u32::try_from(bus.seen.reached()).unwrap() + KEEPS_UP;
+                bus.publish(100.min(ahead));
+                bus.step(true).await;
+                bus.moved("delivering");
+            }
+            // The subscriber stops reading until the node holds the publisher: a run of turns in
+            // which it took nothing more.
+            let mut still = 0;
+            let mut last = bus.node.stats().published;
+            while still < 200 {
+                bus.publish(u32::MAX);
+                bus.step(false).await;
+                bus.moved("the subscriber stalled");
+                let now = bus.node.stats().published;
+                still = if bus.node.stats().held > 0 && now == last {
+                    still + 1
+                } else {
+                    0
+                };
+                last = now;
+            }
+            let leader = wire::Leader {
+                node: Some(2),
+                term: 7,
+            };
+            bus.node.stop_delivering(bus.node_driver.endpoint(), leader);
+            assert_eq!(bus.node.stats().moved, 0, "told once its lane has room");
+            // The publisher's lane is let go: the node takes batches again.
+            let taken = bus.node.stats().published;
+            while bus.node.stats().published == taken {
+                bus.publish(u32::MAX);
+                bus.step(false).await;
+                bus.moved("the publisher let go");
+            }
+            // The subscriber reads again: every batch queued for it, then the notice.
+            while !matches!(bus.seen.order.last(), Some(Item::Moved { .. })) {
+                bus.step(true).await;
+                bus.moved("the subscriber is told");
+            }
+            let (notice, batches) = bus.seen.order.split_last().unwrap();
+            for (at, item) in batches.iter().enumerate() {
+                let at = at as u64;
+                assert_eq!(
+                    *item,
+                    Item::Batch {
+                        base: at,
+                        end: at + 1,
+                        sequence: at
+                    },
+                    "every batch queued, in order"
+                );
+            }
+            assert_eq!(
+                *notice,
+                Item::Moved {
+                    next: batches.len() as u64,
+                    leader
+                }
+            );
+            assert_eq!(bus.node.stats().moved, 1);
+            assert_eq!(bus.node.stats().gaps, 0, "nothing skipped");
+            // Nothing more: the node appends what is published and delivers none of it.
+            let delivered = bus.node.stats().delivered;
+            let end = u64::from(bus.sent) + 100;
+            while bus.bounds().1 < end {
+                bus.publish(u32::try_from(end).unwrap());
+                bus.step(true).await;
+                bus.moved("publishing past the move");
+            }
+            assert_eq!(bus.node.stats().delivered, delivered);
+            assert!(matches!(bus.seen.order.last(), Some(Item::Moved { .. })));
+        })
+        .unwrap();
+}
+
 #[test]
 fn a_delivery_the_node_has_no_memory_for_waits_and_its_subscriber_stays() {
     /// Batches published, the node's memory refusing deliveries partway.
@@ -708,6 +817,12 @@ fn a_delivery_the_node_has_no_memory_for_waits_and_its_subscriber_stays() {
                     Item::Gap { from, to } => {
                         assert_eq!(from, at, "a gap told where it began: {:?}", bus.seen.order);
                         at = to;
+                    }
+                    Item::Moved { .. } => {
+                        panic!(
+                            "a subscription moved, nothing stopped leading: {:?}",
+                            bus.seen.order
+                        )
                     }
                 }
             }

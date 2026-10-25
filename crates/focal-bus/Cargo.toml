@@ -27,6 +27,8 @@ hyper-liveness.workspace = true
 hyper-timing.workspace = true
 # The node log's keys, kept under the node's root key file (doc 29).
 focal-seal = { version = "0.1.0", path = "../focal-seal" }
+# What an identity key's sealed frame is checked by (29 §12.9).
+blake3.workspace = true
 # A part's image made durable as focal makes every file it installs: a temporary, its sync, the
 # rename and the directory's sync, write-through on Windows.
 focal-platform = { version = "0.1.0", path = "../focal-platform" }
@@ -36,6 +38,8 @@ rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", 
 [dev-dependencies]
 # A part's image written where each test's own directory is (`group`).
 tempfile.workspace = true
+# Each test directory's keys, under the one root key every test shares (`focal_seal::test_keys`).
+focal-seal = { version = "0.1.0", path = "../focal-seal", features = ["test-support"] }
 # What a benchmark costs, counted where it happens (vendor/hyper-measure): allocations, page
 # faults, CPU, and the noise band two sets of runs must clear before they differ.
 hyper-measure.workspace = true

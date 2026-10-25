@@ -98,10 +98,14 @@ store's staging, parts and custody records are sealed from the at-rest level"), 
 objects' form, so a node between the content and at-rest levels still rolls back. A session's
 backup is sealed from the same level under the operator's key file (doc 29 §12.8, "2026-10-24 — A
 session's backups are sealed under the operator's key file"): a key made once for the backup,
-wrapped in its `ENCRYPTION-INFO`, every other file sealed whole under it with keyed names.
+wrapped in its `ENCRYPTION-INFO`, every other file sealed whole under it with keyed names. A bus
+node's part image and run are sealed under its data directory's keys, and the bus's identity
+directory under keys of its own, each key file a sealed frame of its name and key (doc 29 §12.9,
+"2026-10-25 — The bus's images, runs and identity keys are sealed"), each converted at its next open
+and refused in the clear after its mark.
 
-**Open.** Still written in the clear (doc 29 §12's inventory, taken again 2026-10-24): the bus's
-identities and part images, client stores and the node's small files.
+**Open.** Still written in the clear (doc 29 §12's inventory, taken again 2026-10-24): client
+stores and the node's small files.
 
 ## 6. Adversarial batteries
 

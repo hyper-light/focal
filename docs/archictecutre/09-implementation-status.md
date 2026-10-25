@@ -17036,3 +17036,98 @@ verifies and restores as it always did.
   workspace's tests on the final tree: 175 test binaries, 3,671 passed, 0 failed, 32 ignored (run
   detached from the agent's session after a restart of it killed the first run at its 118th binary,
   every one passed to there).
+
+### 2026-10-25 — The bus's images, runs and identity keys are sealed
+
+A bus node's part image (`part.image`: each stream's floor, each identity's producer sessions, the
+configuration) and its run lay in its data directory in the clear beside its sealed log, and the
+bus's identity directory (`--pki`: its local authority's, every member's and every client's private
+key) held each key as a DER document in the clear (29 §12's inventory, "clear"). Each is now sealed
+(29 §12.9): the image and the run whole under the data directory's group key, the identity
+directory under keys of its own (a `SEAL.node` under the per-user root key file named for its root
+key, as a client's data directory has), each key file a frame of its name and key sealed whole
+under the directory's journal key. Files an earlier binary wrote in the clear are converted at
+their next open (the image rewritten sealed by its own writer thread, the run raised and sealed,
+the identity directory key by key under its lock by its first opener), each directory then marked
+`SEALED`, and from the mark a file in the clear is refused. The certificates are public and stay in
+the clear.
+
+- **Nothing of a cut left behind.** A directory whose make an earlier binary cut before its
+  authority was never read whole: it is swept of what the cut left (each identity's files and staged
+  copies, the mark) before it is made, where a key filed there in the clear and no longer filed
+  stayed for good; and what a cut install of a node's first image left, its temporary holding the
+  image in the clear, is removed before the node is marked, where nothing would replace it before the
+  node's next image. A made directory's names are made durable with a directory sync at its end.
+- **Refused by name.** An image or run in the clear after its node's mark, one that does not open
+  under its node's keys (a changed byte, another node's file), a key in the clear after the identity
+  directory's mark, a key file that does not open under its directory's keys (a changed byte,
+  another directory's key) and a key file filed under another key's name: each is refused with its
+  own reason, nothing of it read.
+- **Found on the way: a group restarted one node at a time lost its leader.** The step's test
+  restarts each node of a group of three in turn under publishing. After the third restart no pair
+  was connected and no leader was elected, with the files in either form. Two causes, both fixed: a
+  node never dialed a pair again once its connection closed (the member cleared the pair's outbox
+  and nothing more), and a restarted node dialed only the nodes above it; and a peer of a restarted
+  node held its dead connection until its two-minute idle timeout, the restarted endpoint drawing a
+  fresh QUIC reset key and connection-ID key at every start. The pair's lesser node now dials
+  whenever its endpoint tells it the pair has no connection (`Event::Closed`, `Event::Unreachable`):
+  at once after a connection that lasted, and after a dial that gave none lasting one back-off from
+  the last dial's start, 1 s doubled to 3 s (`limits::REDIAL_FIRST`, `REDIAL_MOST`: RFC 8085
+  §3.1.3's initial interval and TCP's initial retransmission timeout, and the least interval that
+  section allows a sender whose destination answers nothing). And an endpoint keeps a key across its
+  restarts (hyper-transport's `RestartKey`, `Endpoint::new_restartable`, made in the shared
+  repository at 698c0da, its docs/transport.md §4ah), derived for each bus node from its private key
+  and the address its socket is bound to (`serve::restart_key`, BLAKE3's key derivation; the socket
+  is bound first, `serve::node_socket`), so a restarted node answers a packet on an old connection
+  with a reset the sender verifies, as a restarted host's TCP answers with an RST (Kafka's and NATS's
+  brokers have that from the kernel). With either fix alone the test froze, no batch acknowledged
+  for 30 s.
+- **Found on the way: a node that stopped leading kept delivering to its subscribers.** P7 held when
+  a subscription was made, never after; as a follower, which cannot hold a publisher for a
+  subscriber, a stalled subscriber was let go from under (a gap, under other sessions' load on this
+  Mac). A node that stops leading now ends every subscription with a `Moved` notice (`wire::Moved`,
+  `Kind::Moved` in the deliver class: the stream, the offset it would have delivered next, the
+  leader it knows), sent as the lane makes room and never skipped, delivers nothing more and lets go
+  the lanes it held for those subscribers (`Node::stop_delivering`, from the member's
+  `settle_leadership`); a client is handed `Delivery::Moved` and subscribes again at that leader (34
+  P7, §8). Doc 34's open line on a stall every member shares is corrected: it no longer elects
+  since f8052a5e, as Quiver's survey measured on fedora.
+- **Every shared crate at hyper-raft 698c0da.** Besides the restart key, the snapshot brings the
+  shared repository's main since 8c6b4fa: hyper-liveness backs a stream to a peer from which nothing
+  has come off to a heartbeat every 3 s, announced, and answers the peer's first heartbeat at once
+  (a node restarted before its peers flushed its log for every heartbeat at its floor, found by
+  mantle), and hyper-rt holds a Windows console close or a shutdown for the owner's orderly stop.
+  The vendored `VENDORED.md` of hyper-quic and hyper-tls, which earlier snapshots had left behind
+  their sources, are the revision's.
+- **Measured** (this Mac, release, medians of 101 rounds interleaved with the same bytes installed in
+  the clear; `measure_a_sealed_image_write`):
+
+  | Image | Key unwrap | Seal | Write sealed | Write in the clear |
+  |---|---|---|---|---|
+  | 236 B (4 streams, 1 producer) | 120 µs | 30 µs | 8.49 ms | 8.50 ms |
+  | 6.2 KB (64 of each) | 116 µs | 32 µs | 8.43 ms | 8.46 ms |
+  | 393 KB (4,096 of each) | 122 µs | 141 µs | 9.28 ms | 8.48 ms |
+
+  The install's flush dominates; the run is written once a start and the identity directory read
+  once a start. Through three restarts under publishing and consuming, each next 20 batches went at
+  the rate before any restart (60 in 6.6 to 18.9 s before, 20 in 2.3 to 6.2 s after each, this Mac
+  under other sessions' load).
+- **Tests.** focal-bus `pki`: a directory made sealed and read back; one kept in the clear sealed by
+  its first opener, every key what it was, and a conversion cut after two keys with a third staged
+  finished by the next opener; one an earlier binary's make cut before its authority made with no
+  key left in the clear; a planted, changed, moved and carried key each refused. `group`: a
+  part's image sealed and opening only under its directory's group key; one in the clear refused
+  after the mark, and before it taken and written again sealed at its own point; a changed byte and
+  another node's image refused. `member`: a run raised sealed, one in the clear taken before the
+  mark and refused after, a changed byte and another node's run refused; the redial's schedule.
+  `tests/group.rs`: a group of three whose identity directory an earlier binary made in the clear,
+  its directory and each node's run and image turned back to the clear before the restarts,
+  restarted one node at a time while a producer publishes and a subscriber following the leader
+  consumes: every batch acknowledged once and in order, the producer's session carried through, the
+  subscriber delivered every batch once and in order, each node reopened at its image's floor, every
+  file sealed after its restart, and planted, changed and carried images and keys refused; a node
+  whose first image install an earlier binary cut opened with no temporary of it left.
+  hyper-transport (shared repository): a peer told its connection closed within a keep-alive of a
+  restart with the kept key, and only at its idle timeout (12 s) with another. `tests/loopback.rs`:
+  a subscriber whose node stops leading told where it left off once its lane has room, nothing
+  delivered after. `wire`: a `Moved` notice round-trips and only a node sends one.

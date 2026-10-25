@@ -14,7 +14,7 @@ use hyper_transport::{
 use crate::BusError;
 use crate::batch::{Batch, BatchError};
 use crate::wire::{
-    self, Ack, Bus, Gap, Kind, LANE, Leader, Redirect, Reply, Subscribe, Subscribed,
+    self, Ack, Bus, Gap, Kind, LANE, Leader, Moved, Redirect, Reply, Subscribe, Subscribed,
 };
 
 /// What a client is handed.
@@ -24,6 +24,10 @@ pub enum Delivery<'a> {
     Batch(Batch<'a>),
     /// Offsets of a stream the node let go before this client took them.
     Gap(Gap),
+    /// A subscription the node ended, for it stopped leading the stream's part (doc 34 P7):
+    /// subscribe again at the leader it names, from the offset it gives; every offset before it was
+    /// delivered.
+    Moved(Moved),
     /// A subscription's start: the stream's retained window when it was made.
     Subscribed {
         /// The exchange that asked.
@@ -144,6 +148,17 @@ impl Client {
             } => {
                 match Gap::decode(frame.bytes()) {
                     Ok(gap) => take(Delivery::Gap(gap)),
+                    Err(_) => take(Delivery::Refused(BatchError::Short)),
+                }
+                endpoint.release(frame);
+            }
+            Event::Frame {
+                kind: Kind::Moved,
+                frame,
+                ..
+            } => {
+                match Moved::decode(frame.bytes()) {
+                    Ok(moved) => take(Delivery::Moved(moved)),
                     Err(_) => take(Delivery::Refused(BatchError::Short)),
                 }
                 endpoint.release(frame);

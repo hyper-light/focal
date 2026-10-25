@@ -48,7 +48,7 @@ replicas, and what every publish, acknowledgement and delivery does on the way.
 | P4 | The state machine is the part: applying an entry appends its batch to the part's log and streams, which the node delivers from | doc 32 §3; one copy into the segment the delivery reads |
 | P5 | A publish is acknowledged by a frame of its own when its leader applies it: stream, base offset, records, and the class achieved | Kafka's produce response (base offset), JetStream's PubAck (stream, sequence); doc 33 §4.8's typed acknowledgement |
 | P6 | Idempotent publishes in each session's order: the part keeps, for each stream and each identity that publishes to it, the identity's sessions (the one it publishes on and the one it replaced), each with the sequence its next batch must begin with; a batch its session took already is acknowledged with its first offsets where it was the session's newest and is not appended again, one past a gap or across the next sequence is refused `OUT_OF_ORDER` naming the sequence the session waits for, a new session begins at zero, and a session is judged by the identity the leader states with the entry, so no publisher takes another's by naming it | Kafka's idempotent producer (KIP-98: `DUPLICATE_SEQUENCE_NUMBER`, `OUT_OF_ORDER_SEQUENCE_NUMBER`, a fresh producer id for a new producer) and its producer state kept per partition and snapshotted; doc 32 D3. A client resends what a failover left unacknowledged |
-| P7 | Deliveries are made by the leader from its applied part; a follower refuses a subscriber, naming the leader | Kafka's fetch from the leader; reading from a follower (KIP-392) waits for doc 33 §4.7's gate |
+| P7 | Deliveries are made by the leader from its applied part; a follower refuses a subscriber, naming the leader; a node that stops leading ends each subscription it holds with a notice (`Moved`) naming the leader it knows and the offset it would have delivered next, sent as the subscriber's lane makes room, and delivers nothing more | Kafka's fetch from the leader, and its `NOT_LEADER_OR_FOLLOWER` to a fetch at a former leader with KIP-951's leader; reading from a follower (KIP-392) waits for doc 33 §4.7's gate |
 | P8 | Raft messages travel between nodes as lane frames on the bus's endpoint, in hyper-raft's own wire records | one endpoint and one congestion state a peer, sealed by QUIC's TLS; the records carry every R-8 field, where focal-consensus's envelope refuses them (doc 33, step 3c) |
 | P9 | A node's groups write to one hyper-log log on its data directory | hyper-durable's `GroupStore`: one flush commits every group's writes |
 | P10 | A restarted node replays its committed entries into its parts; retention compacts the log, and a part's image is its stream table | D4's small state; Kafka's log is its own recovery |
@@ -75,7 +75,12 @@ replicas, and what every publish, acknowledgement and delivery does on the way.
 - **A publish whose acknowledgement was lost.** Its client sends it again to the new leader; the
   part acknowledges it with the offsets it took, or appends it if no majority took it (P6).
 - **A node restarted.** hyper-log replays its group; the part is rebuilt from the committed entries
-  (P10), and the node rejoins as a follower.
+  (P10), and the node rejoins as a follower. Its endpoint keeps the key it resets its last run's
+  connections with (hyper-transport's `RestartKey`, from the node's private key and its address), so
+  each peer learns at its next send that its connection is gone, as from a restarted host's TCP
+  RST, and the pair's lesser node dials it again: the lesser keeps each pair connected, dialing at
+  once after a connection that lasted and backing off after dials that gave none (RFC 8085 §3.1.3,
+  1 s doubled to 3 s).
 - **What doc 33 §7's battery checks of 3b**: kill -9 of the leader and of every node, partitions
   of a minority and of the leader, a stalled disk; every acknowledged batch read back by the
   black-box history reader.
@@ -163,6 +168,40 @@ Found on the way, each root-caused:
   no node's heartbeat was proved for 0.6 s and each node suspected both others; the leader, left no
   trusted quorum, stepped down, and won the next term. Each detector stood at 165 to 216 ms of
   detection with a mistake expected every 29 to 36 s, charging an election the ballot law's span
-  (a round trip and a vote's flush, about 0.1 s) where the step-down cost a second. Open, in the
-  shared repository's liveness stream: the cost of an election as measured, and a stall that every
-  member shares.
+  (a round trip and a vote's flush, about 0.1 s) where the step-down cost a second. A stall that
+  every member shares no longer elects since focal f8052a5e (hyper-raft 25cf889, the liveness
+  stream's judge of its own flush proof): on fedora (i9-14900HX, one Samsung 9100 PRO), every node's
+  writes held at once for 0.61 s through its cgroup's `io.max` under 128-byte durable appends at
+  1,000 a second, 7a79f0d7 stepped down in 4 of 4 runs and left 282 to 480 publishes
+  unacknowledged, f8052a5e in 0 of 3 with every publish acknowledged, the longest in 675 to 689 ms,
+  the hold itself (Quiver's survey for CP-T2.2, 2026-10-25, its docs/design/persisted-tail.md). Open,
+  in the shared repository's liveness stream: the cost of an election as measured.
+- **A group restarted one node at a time lost its leader** (2026-10-25, found by step 5 of the
+  at-rest program, 29 §12.9). A node never dialed a pair again once its connection closed (the
+  member only cleared the pair's outbox), and a restarted node dialed only the nodes above it; and a
+  restarted endpoint could not tell a peer that its last run's connection was gone, its QUIC reset
+  key and connection-ID key drawn afresh at every start, so the peer held a dead connection until its
+  two-minute idle timeout. Restarting node 1, then 2, then 3 left no pair connected: nodes 1 and 2
+  stood for term after term with no vote reaching anyone. Fixed at both causes: the pair's lesser
+  node dials whenever its endpoint tells it the pair has no connection (`Event::Closed`,
+  `Event::Unreachable`), and a restarted node resets what its last run held (hyper-raft 698c0da,
+  its docs/transport.md §4ah). With either fix alone the test's acknowledgements froze for 30 s; with
+  both, three restarts under publishing and consuming each served their next 20 batches at the rate
+  before any restart (this Mac under load: 60 batches in 6.6 to 18.9 s before, 20 in 2.3 to 6.2 s
+  after each).
+- **A node that stopped leading kept delivering to its subscribers** (2026-10-25, found by the same
+  test, a subscriber following the leader through the restarts). P7 was held when a subscription
+  was made, never after: a leader that stepped down kept its subscriptions, and as a follower, which
+  applies what its group commits and cannot hold a publisher for a subscriber that takes no more,
+  it let a stalled subscriber's offsets go from under it. Under other sessions' load on this Mac, a
+  subscriber at node 3 took two batches, node 3 stepped down for a term, its subscriber's lane filled
+  three times, and it was told a gap. A node that stops leading now ends every subscription it holds
+  with a `Moved` notice (a frame of the deliver class: the stream, the offset it would have delivered
+  next, the leader it knows), sent as the subscriber's lane makes room, never skipped, and delivers
+  nothing more; the lanes it held for those subscribers go at once. The subscriber subscribes again
+  at the leader from that offset, as a Kafka consumer does on a former leader's
+  `NOT_LEADER_OR_FOLLOWER`. Test (`tests/loopback.rs`): a subscriber stalled until its lane is full
+  and the node holds the publisher, the node told it stopped leading: nothing told while the lane is
+  full, the publisher let go at once, then every queued batch in order and the notice naming the
+  leader and the offset after the last batch, and nothing delivered after; without the move the
+  publisher stays held and the test stops.

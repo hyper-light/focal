@@ -32,6 +32,16 @@
 //! core's own bound on the messages it holds for one member, and a message past it is dropped, as
 //! a network may drop it: Raft sends it again.
 //!
+//! **One connection a pair, kept by the lesser node** (doc 34 P8). The node of the lesser id dials
+//! the other as it starts, and again whenever the pair has no connection, told by its endpoint
+//! (`Event::Closed`, `Event::Unreachable`): at once after a connection that lasted, and after a dial
+//! that gave none lasting, a back-off from the last dial's start ([`crate::limits::REDIAL_FIRST`]
+//! doubled to [`crate::limits::REDIAL_MOST`]), so a peer that refuses is not dialed in a loop. A
+//! restarted node is found by its peers at their next send to it: its endpoint keeps the key it
+//! resets the connections of its last run with (`serve::restart_key`), as a restarted host's TCP
+//! answers with an RST, and the lesser dials it again. A node that never redialed lost each pair whose
+//! connection closed, and a group of three restarted one node at a time had no leader left.
+//!
 //! **Elections by suspicion** (doc 33 §4.1): the node-pair liveness stream judges each other node
 //! for every group the pair shares, its heartbeats on a lane of their own (`wire::LIVENESS_LANE`),
 //! and the replica takes its word (`suspect`, `trust`, `restarted`), as hyper-durable-e2e's members
@@ -62,6 +72,7 @@ use hyper_transport::{Budget, Classes, Directory, Endpoint, Event, LaneId, PeerI
 use crate::BusError;
 use crate::batch::{Batch, MIN_BATCH};
 use crate::group::{Applied, Outcome, PartMachine};
+use crate::limits;
 use crate::node::Node;
 use crate::producer::Verdict;
 use crate::wire::{self, Ack, Bus, Durability, Kind, LANE, LIVENESS_LANE, Leader, Redirect, Reply};
@@ -85,6 +96,11 @@ const IMAGE_FILE: &str = "part.image";
 /// Format: the node's run, in the node's data directory: a count it raises at every start, before
 /// the stream's first heartbeat (`hyper_liveness::Settings::run`).
 const RUN_FILE: &str = "run";
+/// Format: the mark a node's data directory holds once its run and its part's image are sealed
+/// (29 §12.9): from then on either in the clear is refused, never read.
+const SEALED_FILE: &str = "SEALED";
+/// Bytes of a run in the clear, as an earlier binary kept it: a little-endian count.
+const RUN_BYTES: usize = 8;
 /// Format: the log's identity: the bus's part log.
 const LOG_ID: u128 = u128::from_le_bytes(*b"focal-bus-part-1");
 
@@ -602,10 +618,61 @@ impl Answer {
 /// The key an acknowledgement is owed under: a batch's stream, producer and sequence.
 type Owed = (u64, u64, u32);
 
+/// This node's connection to another node of its group, as its endpoint tells it (module docs).
+#[derive(Clone, Copy, Debug)]
+struct Link {
+    /// Whether this node dials the peer: the pair's lesser node does.
+    dials: bool,
+    /// When the connection up now came up; none while none is.
+    up: Option<Instant>,
+    /// When this node's last dial to the peer began.
+    dialed: Option<Instant>,
+    /// When this node dials the peer next: set while the pair has no connection and no dial of this
+    /// node's is under way.
+    next: Option<Instant>,
+    /// What the next dial waits after the last began, when that one gave no connection lasting as
+    /// long: [`limits::REDIAL_FIRST`], doubled after each such dial to [`limits::REDIAL_MOST`].
+    backoff: Duration,
+}
+
+impl Link {
+    fn new(dials: bool) -> Self {
+        Self {
+            dials,
+            up: None,
+            dialed: None,
+            next: None,
+            backoff: limits::REDIAL_FIRST,
+        }
+    }
+
+    /// The pair has no connection, at `now`: a node that dials the peer dials it again, at once
+    /// after a connection that lasted its back-off, and otherwise once its back-off, doubled, has
+    /// passed since its last dial began.
+    fn down(&mut self, now: Instant) {
+        let lasted = self
+            .up
+            .take()
+            .is_some_and(|up| now.saturating_duration_since(up) >= self.backoff);
+        if !self.dials {
+            return;
+        }
+        self.backoff = if lasted {
+            limits::REDIAL_FIRST
+        } else {
+            self.backoff.saturating_mul(2).min(limits::REDIAL_MOST)
+        };
+        let from = self.dialed.unwrap_or(now);
+        self.next = Some(from.checked_add(self.backoff).unwrap_or(now).max(now));
+    }
+}
+
 /// A node of a part's group (module docs).
 pub struct Member {
     id: u64,
     peers: Vec<(u64, SocketAddr)>,
+    /// This node's connection to each of `peers`, in their order.
+    links: Vec<Link>,
     replica: PartReplica,
     log: Log<DeviceFile>,
     /// Whether the log's file is written in place, as its file system said when it was opened.
@@ -672,19 +739,41 @@ impl std::fmt::Debug for Member {
     }
 }
 
-/// The node's run: the count kept at `path`, raised and made durable before it is used, so each
-/// start's is greater than every earlier start's.
-fn raise_run(path: &Path) -> Result<u64, BusError> {
+/// The node's run: the count kept at `path`, raised by one and made durable before it is used, so
+/// each start's is greater than every earlier start's, sealed whole under the data directory's group
+/// key (29 §12.9), the key unwrapped for it and dropped after. A run in the clear, as an earlier
+/// binary kept it (its eight bytes alone, where a sealed file is its header and more), is taken
+/// while `clear`, until the node is marked sealed; a sealed run that does not open under its
+/// directory's keys is refused.
+fn raise_run(path: &Path, keys: &focal_seal::DataKeys, clear: bool) -> Result<u64, BusError> {
     use focal_platform::fs::{FileMedium, Medium};
     let medium = FileMedium;
     let previous = if medium
         .exists(path)
         .map_err(|_| BusError::Configuration("the node's run could not be looked for"))?
     {
+        let most = focal_seal::file::sealed_bound(RUN_BYTES)
+            .ok_or(BusError::Configuration("the node's run"))?;
         let bytes = medium
-            .read(path, 8)
+            .read(path, most)
             .map_err(|_| BusError::Configuration("the node's run could not be read"))?;
-        let bytes: [u8; 8] = bytes
+        let plain = if bytes.len() == RUN_BYTES {
+            if !clear {
+                return Err(BusError::Configuration(
+                    "the node's run lies in the clear after the node was sealed",
+                ));
+            }
+            bytes
+        } else {
+            let key = keys
+                .key(focal_seal::Store::Group)
+                .map_err(|_| BusError::Configuration("the node's group key could not be opened"))?;
+            let mut opened = focal_seal::file::open(&key, bytes, RUN_BYTES).map_err(|_| {
+                BusError::Configuration("the node's run does not open under its node's keys")
+            })?;
+            std::mem::take(&mut *opened)
+        };
+        let bytes: [u8; RUN_BYTES] = plain
             .as_slice()
             .try_into()
             .map_err(|_| BusError::Configuration("the node's run is damaged"))?;
@@ -695,10 +784,47 @@ fn raise_run(path: &Path) -> Result<u64, BusError> {
     let run = previous
         .checked_add(1)
         .ok_or(BusError::Capacity("the node's runs"))?;
+    let key = keys
+        .key(focal_seal::Store::Group)
+        .map_err(|_| BusError::Configuration("the node's group key could not be opened"))?;
+    let sealed = focal_seal::file::seal(&key, &run.to_le_bytes())
+        .map_err(|_| BusError::Configuration("the node's run could not be sealed"))?;
+    drop(key);
     let mut medium = FileMedium;
-    focal_platform::fs::install(&mut medium, path, &run.to_le_bytes())
+    focal_platform::fs::install(&mut medium, path, &sealed)
         .map_err(|_| BusError::Configuration("the node's run could not be made durable"))?;
     Ok(run)
+}
+
+/// Whether the node's data directory `data` is marked sealed: its run and its image are, and one in
+/// the clear is refused.
+fn sealed_mark(data: &Path) -> Result<bool, BusError> {
+    data.join(SEALED_FILE)
+        .try_exists()
+        .map_err(|_| BusError::Configuration("the node's seal mark could not be looked for"))
+}
+
+/// The temporary `focal_platform::fs::install` writes `path` through, removed where a cut install
+/// left it (29 §12.9): an earlier binary's held what it installed in the clear, and with no image to
+/// convert, nothing else would replace it until the node's next image. The mark's directory sync
+/// makes the removal durable.
+fn discard_temporary(path: &Path) -> Result<(), BusError> {
+    match std::fs::remove_file(path.with_extension("part")) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(BusError::Configuration(
+            "a temporary of the node's part could not be removed",
+        )),
+    }
+}
+
+/// The node's data directory `data` marked sealed, durably: written once its run and its image are
+/// sealed and durable, so a cut before it leaves each whole in one form or the other and the next
+/// open finishes (29 §12.9).
+fn mark_sealed(data: &Path) -> Result<(), BusError> {
+    let mut medium = focal_platform::fs::FileMedium;
+    focal_platform::fs::install(&mut medium, &data.join(SEALED_FILE), &[])
+        .map_err(|_| BusError::Configuration("the node's seal mark could not be made durable"))
 }
 
 /// The node log's configuration, from what the bus states (hyper-log's `Config::derive`; no field
@@ -805,7 +931,13 @@ impl Member {
             focal_platform::fs::create_dir_private,
         )
         .map_err(|_| BusError::Configuration("the node's data directory could not be made"))?;
-        let run = raise_run(&settings.data.join(RUN_FILE))?;
+        // The directory's keys before any file of it is read (29 §12.9): made with the root key file
+        // where it has none, as the log's are.
+        let keys = focal_seal::DataKeys::new(&settings.data, &settings.key_file);
+        keys.ensure()
+            .map_err(|_| BusError::Configuration("the node's keys could not be opened"))?;
+        let clear = !sealed_mark(&settings.data)?;
+        let run = raise_run(&settings.data.join(RUN_FILE), &keys, clear)?;
         let (log, written_in_place) =
             open_log(&settings.data, &settings.key_file, settings.memory_bytes)?;
         let store = GroupStore::claim(&log, PART_GROUP)
@@ -817,10 +949,17 @@ impl Member {
         };
         let machine = PartMachine::open(
             node,
-            settings.data.join(IMAGE_FILE),
+            crate::group::ImageFile::new(settings.data.join(IMAGE_FILE), keys, clear),
             founding,
             members.len(),
         )?;
+        // The run and the image sealed and durable: the node is marked so, and from here either in
+        // the clear is refused. What an earlier binary's cut install of its image left goes first:
+        // nothing is installing now (the part's writer settled any image it was handed).
+        if clear {
+            discard_temporary(&settings.data.join(IMAGE_FILE))?;
+            mark_sealed(&settings.data)?;
+        }
         let memory = usize::try_from(settings.memory_bytes)
             .map_err(|_| BusError::Configuration("the node's memory"))?;
         let message = usize::try_from(wire::RAFT_BOUND)
@@ -875,9 +1014,15 @@ impl Member {
             resolution: Duration::from_nanos(hyper_rt::machine::clock::resolution_ns()),
         })
         .map_err(|_| BusError::Configuration("the liveness stream"))?;
+        let links = settings
+            .peers
+            .iter()
+            .map(|(peer, _)| Link::new(*peer > settings.id))
+            .collect();
         Ok(Self {
             id: settings.id,
             peers: settings.peers,
+            links,
             replica,
             log,
             written_in_place,
@@ -1001,16 +1146,54 @@ impl Member {
     }
 
     /// Dials every other node of a greater id: one connection a pair, made by the lesser.
-    pub fn connect<B, D>(&self, endpoint: &mut Endpoint<Bus, B, D>, now: Instant)
+    pub fn connect<B, D>(&mut self, endpoint: &mut Endpoint<Bus, B, D>, now: Instant)
     where
         B: Budget<<Bus as Classes>::Class>,
         D: Directory<Role = <Bus as Classes>::Role>,
     {
-        for (peer, address) in &self.peers {
-            if *peer > self.id {
-                let _ = endpoint.connect(now, *peer, *address);
+        for (link, (peer, address)) in self.links.iter_mut().zip(&self.peers) {
+            if link.dials {
+                Self::dial(endpoint, link, *peer, *address, now);
             }
         }
+    }
+
+    /// Dials each peer whose next dial is due by `now` (module docs).
+    fn redial<B, D>(&mut self, endpoint: &mut Endpoint<Bus, B, D>, now: Instant)
+    where
+        B: Budget<<Bus as Classes>::Class>,
+        D: Directory<Role = <Bus as Classes>::Role>,
+    {
+        for (link, (peer, address)) in self.links.iter_mut().zip(&self.peers) {
+            if link.next.is_some_and(|next| next <= now) {
+                Self::dial(endpoint, link, *peer, *address, now);
+            }
+        }
+    }
+
+    /// One dial of `peer`, whose end the endpoint tells (`Endpoint::connect`): a dial it refuses
+    /// at once is a dial that gave no connection.
+    fn dial<B, D>(
+        endpoint: &mut Endpoint<Bus, B, D>,
+        link: &mut Link,
+        peer: u64,
+        address: SocketAddr,
+        now: Instant,
+    ) where
+        B: Budget<<Bus as Classes>::Class>,
+        D: Directory<Role = <Bus as Classes>::Role>,
+    {
+        link.dialed = Some(now);
+        link.next = None;
+        if endpoint.connect(now, peer, address).is_err() {
+            link.down(now);
+        }
+    }
+
+    /// The link to `peer`, if it is another node of the group.
+    fn link_mut(&mut self, peer: PeerId) -> Option<&mut Link> {
+        let at = self.peers.iter().position(|(id, _)| *id == peer)?;
+        self.links.get_mut(at)
     }
 
     /// Whether `peer` is another node of the group.
@@ -1079,10 +1262,24 @@ impl Member {
                 self.flush_answers(endpoint, peer);
                 self.node_mut().on_event(endpoint, room);
             }
+            Event::Connected { peer, .. } if self.is_node(peer) => {
+                if let Some(link) = self.link_mut(peer) {
+                    link.up = Some(now);
+                    link.next = None;
+                }
+            }
             Event::Closed { peer, .. } if self.is_node(peer) => {
                 // What waited for the lane goes with the connection; Raft sends it again.
                 if let Some(waiting) = self.outbox.get_mut(&peer) {
                     waiting.clear();
+                }
+                if let Some(link) = self.link_mut(peer) {
+                    link.down(now);
+                }
+            }
+            Event::Unreachable { peer, .. } if self.is_node(peer) => {
+                if let Some(link) = self.link_mut(peer) {
+                    link.down(now);
                 }
             }
             closed @ Event::Closed { peer, .. } => {
@@ -1605,6 +1802,7 @@ impl Member {
         B: Budget<<Bus as Classes>::Class>,
         D: Directory<Role = <Bus as Classes>::Role>,
     {
+        self.redial(endpoint, now);
         self.written(now);
         self.pairs();
         self.measure();
@@ -1786,7 +1984,9 @@ impl Member {
     }
 
     /// A node that stopped leading redirects every publisher it owed: the group may or may not have
-    /// committed their batches, and the part recognises those it took when they come again.
+    /// committed their batches, and the part recognises those it took when they come again. It
+    /// ends every subscription it held, naming the leader it knows (doc 34 P7): a follower applies
+    /// what its group commits and cannot hold a publisher for a subscriber that takes no more.
     fn settle_leadership<B, D>(&mut self, endpoint: &mut Endpoint<Bus, B, D>)
     where
         B: Budget<<Bus as Classes>::Class>,
@@ -1798,6 +1998,8 @@ impl Member {
             for (peer, key) in owed {
                 self.redirect(endpoint, peer, key);
             }
+            let leader = self.leader();
+            self.node_mut().stop_delivering(endpoint, leader);
         }
         self.leading = leading;
     }
@@ -1820,7 +2022,8 @@ impl Member {
     }
 
     /// When the node next has work though nothing arrives: at once where a turn left its replica
-    /// more to do, and otherwise the replica's deadline or the stream's wake, the sooner.
+    /// more to do, and otherwise the soonest of the replica's deadline, the stream's wake and a
+    /// peer's next dial.
     pub fn deadline(&self) -> Option<Instant> {
         if self.due {
             return Some(self.origin);
@@ -1828,16 +2031,113 @@ impl Member {
         let at = |ns: u64| self.origin.checked_add(Duration::from_nanos(ns));
         let replica = self.replica.deadline().and_then(at);
         let stream = self.liveness.wake().and_then(at);
-        match (replica, stream) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        let dial = self.links.iter().filter_map(|link| link.next).min();
+        [replica, stream, dial].into_iter().flatten().min()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pair's dialer dials again at once after a connection that lasted its back-off, and after
+    /// dials that gave none lasting, one back-off from the last dial's start, doubling from
+    /// `REDIAL_FIRST` to `REDIAL_MOST`; the other node of the pair never dials (module docs).
+    #[test]
+    fn a_dialer_dials_again_at_once_after_a_lasting_connection_and_backs_off_after_failed_dials() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut link = Link::new(true);
+        link.dialed = Some(at(0));
+        link.up = Some(at(10));
+        // Up an hour: the next dial is due at once.
+        link.down(at(3_600_000));
+        assert_eq!(link.next, Some(at(3_600_000)));
+        assert_eq!(link.backoff, limits::REDIAL_FIRST);
+        // Dials refused as they begin: each one back-off, doubled, after the last began, to the most.
+        let mut now = 3_600_000;
+        for wait in [2_000, 3_000, 3_000] {
+            link.dialed = Some(at(now));
+            link.next = None;
+            link.down(at(now + 5));
+            assert_eq!(link.next, Some(at(now + wait)), "after the dial at {now}");
+            now += wait;
+        }
+        // A connection up and closed within its back-off backs off as a refused dial does.
+        link.dialed = Some(at(now));
+        link.up = Some(at(now + 5));
+        link.down(at(now + 10));
+        assert_eq!(link.next, Some(at(now + 3_000)));
+        // A connection up through its back-off starts the back-off over.
+        link.dialed = Some(at(now));
+        link.up = Some(at(now + 5));
+        link.down(at(now + 3_005));
+        assert_eq!(link.backoff, limits::REDIAL_FIRST);
+        assert_eq!(link.next, Some(at(now + 3_005)));
+
+        let mut listener = Link::new(false);
+        listener.up = Some(at(0));
+        listener.down(at(10));
+        assert_eq!(listener.next, None);
+        assert_eq!(listener.up, None);
+    }
+
+    /// A node's run is kept sealed under its directory's group key and raised at each start; one in
+    /// the clear, as an earlier binary kept it, is taken and sealed until the node is marked sealed
+    /// and refused after; a changed byte and another node's run are refused (29 §12.9).
+    #[test]
+    fn a_nodes_run_is_raised_sealed_and_one_in_the_clear_taken_only_before_the_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(RUN_FILE);
+        let keys = focal_seal::test_keys(dir.path()).unwrap();
+        let refusal = |clear: bool| match raise_run(&path, &keys, clear) {
+            Err(BusError::Configuration(why)) => why,
+            other => panic!("not refused: {other:?}"),
+        };
+        assert_eq!(raise_run(&path, &keys, false).unwrap(), 1);
+        assert_eq!(raise_run(&path, &keys, false).unwrap(), 2);
+        let sealed = std::fs::read(&path).unwrap();
+        assert_ne!(sealed.len(), RUN_BYTES, "the run lies in the clear");
+        let group = keys.key(focal_seal::Store::Group).unwrap();
+        assert_eq!(
+            *focal_seal::file::open(&group, sealed.clone(), RUN_BYTES).unwrap(),
+            2u64.to_le_bytes()
+        );
+
+        std::fs::write(&path, 41u64.to_le_bytes()).unwrap();
+        assert_eq!(
+            refusal(false),
+            "the node's run lies in the clear after the node was sealed"
+        );
+        assert_eq!(raise_run(&path, &keys, true).unwrap(), 42);
+        assert_ne!(std::fs::read(&path).unwrap().len(), RUN_BYTES);
+        // A cut after the run was sealed and before the node's mark: the next start raises the
+        // sealed run.
+        assert_eq!(raise_run(&path, &keys, true).unwrap(), 43);
+
+        let mut flipped = std::fs::read(&path).unwrap();
+        let last = flipped.len() - 1;
+        flipped[last] ^= 1;
+        std::fs::write(&path, &flipped).unwrap();
+        assert_eq!(
+            refusal(false),
+            "the node's run does not open under its node's keys"
+        );
+
+        let other = tempfile::tempdir().unwrap();
+        let theirs = other.path().join(RUN_FILE);
+        raise_run(
+            &theirs,
+            &focal_seal::test_keys(other.path()).unwrap(),
+            false,
+        )
+        .unwrap();
+        std::fs::copy(&theirs, &path).unwrap();
+        assert_eq!(
+            refusal(false),
+            "the node's run does not open under its node's keys"
+        );
+    }
 
     fn marks(issued: u64, persisted: u64, committed: u64) -> Reached {
         Reached {

@@ -78,14 +78,6 @@ impl Pki {
         let certificate = params.signed_by(&key, &self.issuer).unwrap();
         (certificate.der().to_vec(), key.serialize_der())
     }
-
-    fn credentials(&self, own: &(Vec<u8>, Vec<u8>)) -> Credentials {
-        Credentials {
-            chain: vec![CertificateDer::from(own.0.clone())],
-            key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(own.1.clone())),
-            roots: vec![CertificateDer::from(self.root.clone())],
-        }
-    }
 }
 
 fn node_name(id: u64) -> String {
@@ -111,9 +103,9 @@ fn runtime() -> RuntimeConfig {
     }
 }
 
-/// The identities: each node's, the client's.
+/// The identities: the authority's certificate, each node's, the client's.
 struct Identities {
-    pki: Pki,
+    root: Vec<u8>,
     nodes: Vec<(Vec<u8>, Vec<u8>)>,
     client: (Vec<u8>, Vec<u8>),
 }
@@ -123,11 +115,44 @@ impl Identities {
         let pki = Pki::new();
         let nodes = NODES.iter().map(|id| pki.issue(&node_name(*id))).collect();
         let client = pki.issue("focal-bus-client-1");
-        Self { pki, nodes, client }
+        Self {
+            root: pki.root,
+            nodes,
+            client,
+        }
     }
 
-    /// The endpoint of node `id`, knowing the other nodes and the client.
-    fn node(&self, id: u64, budget: &MemoryBudget) -> Endpoint<Bus, BusBudget, BusDirectory> {
+    /// The identities of the bus's identity directory `dir`, read as a node's service reads them as
+    /// it starts (`pki::load_or_make`), which seals a directory an earlier binary kept in the clear.
+    fn load(dir: &Path) -> Self {
+        let local = focal_bus::pki::load_or_make(dir, None, NODES.len(), 1).unwrap();
+        let pair = |identity: &focal_bus::pki::Identity| {
+            (identity.certificate.clone(), identity.key.clone())
+        };
+        Self {
+            root: local.root.clone(),
+            nodes: local.nodes.iter().map(pair).collect(),
+            client: pair(&local.clients[0]),
+        }
+    }
+
+    fn credentials(&self, own: &(Vec<u8>, Vec<u8>)) -> Credentials {
+        Credentials {
+            chain: vec![CertificateDer::from(own.0.clone())],
+            key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(own.1.clone())),
+            roots: vec![CertificateDer::from(self.root.clone())],
+        }
+    }
+
+    /// The endpoint of node `id` on a socket bound to `bound`, knowing the other nodes and the
+    /// client, keyed as a node's is across its restarts at that address
+    /// (`focal_bus::serve::restart_key`).
+    fn node(
+        &self,
+        id: u64,
+        budget: &MemoryBudget,
+        bound: SocketAddr,
+    ) -> Endpoint<Bus, BusBudget, BusDirectory> {
         let mut directory = BusDirectory::new(8);
         for (at, peer) in NODES.iter().enumerate() {
             if *peer != id {
@@ -140,9 +165,9 @@ impl Identities {
             .enroll(&self.client.0, CLIENT, Role::Client, "focal-bus-client-1")
             .unwrap();
         let own = &self.nodes[NODES.iter().position(|n| *n == id).unwrap()];
-        Endpoint::new(
+        Endpoint::new_restartable(
             Config {
-                tls: Tls::mutual(&self.pki.credentials(own), true).unwrap(),
+                tls: Tls::mutual(&self.credentials(own), true).unwrap(),
                 role: Role::Node,
                 limits: focal_bus::limits::node(1, NODES.len() - 1).unwrap(),
                 congestion: Default::default(),
@@ -150,8 +175,16 @@ impl Identities {
             BusBudget::new(budget.clone()),
             directory,
             Instant::now(),
+            &focal_bus::serve::restart_key(&own.1, bound).unwrap(),
+            None,
         )
         .unwrap()
+    }
+
+    /// Node `id`'s driver on a socket bound to `listen`, as a node's service binds it.
+    fn bind_node(&self, id: u64, budget: &MemoryBudget, listen: SocketAddr) -> Drv {
+        let (socket, bound) = focal_bus::serve::node_socket(listen).unwrap();
+        Driver::new(self.node(id, budget, bound), socket, IO).unwrap()
     }
 
     /// The client's endpoint, knowing every node.
@@ -164,7 +197,7 @@ impl Identities {
         }
         Endpoint::new(
             Config {
-                tls: Tls::mutual(&self.pki.credentials(&self.client), false).unwrap(),
+                tls: Tls::mutual(&self.credentials(&self.client), false).unwrap(),
                 role: Role::Client,
                 limits: focal_bus::limits::client_of(NODES.len()).unwrap(),
                 congestion: Default::default(),
@@ -211,6 +244,12 @@ struct Seen {
     again: u64,
     delivered: Vec<(u64, u32)>,
     subscribed: bool,
+    /// Subscribes that ended without a subscription or ended one: redirected, or refused.
+    subscription_ends: u64,
+    /// Gaps told: offsets a node let go before the subscriber took them.
+    gaps: u64,
+    /// Each moved subscription's next offset, as its node told it (doc 34 P7).
+    moves: Vec<u64>,
     redirects: u64,
     /// Answers that the part waits for an earlier sequence of the session (KIP-98's
     /// OUT_OF_ORDER_SEQUENCE_NUMBER): every batch not yet acknowledged goes again at the next step.
@@ -263,21 +302,28 @@ impl World {
     /// statistics, its log's, window's, parked and owed among them.
     fn diagnose(&self) -> String {
         let mut out = format!(
-            "client: leader {} term {}, {} acknowledged, {} unacknowledged, {} sent",
+            "client: leader {} term {}, {} acknowledged, {} unacknowledged, {} sent; {} \
+             delivered, subscribed {}, {} subscriptions ended, {} of them moved, {} gaps",
             self.leader,
             self.term,
             self.seen.acked.len(),
             self.unacked.len(),
-            self.sent
+            self.sent,
+            self.seen.delivered.len(),
+            self.seen.subscribed,
+            self.seen.subscription_ends,
+            self.seen.moves.len(),
+            self.seen.gaps
         );
         for running in self.nodes.iter().flatten() {
             let member = &running.member;
             out.push_str(&format!(
-                "\nnode {}: leads {}, term {}: {:?}",
+                "\nnode {}: leads {}, term {}: {:?}\n  its part: {:?}",
                 member.id(),
                 member.is_leader(),
                 member.term(),
-                member.stats()
+                member.stats(),
+                member.node().stats()
             ));
         }
         out
@@ -389,11 +435,18 @@ impl World {
             }
             Delivery::Batch(batch) => seen.delivered.push((batch.base_offset(), batch.sequence())),
             Delivery::Subscribed { .. } => seen.subscribed = true,
-            Delivery::SubscribeRedirected { .. }
-            | Delivery::Gap(_)
-            | Delivery::Refused(_)
-            | Delivery::Unsubscribed { .. }
-            | Delivery::Lost(_) => {}
+            Delivery::SubscribeRedirected { .. } | Delivery::Unsubscribed { .. } => {
+                seen.subscribed = false;
+                seen.subscription_ends += 1;
+            }
+            Delivery::Moved(moved) => {
+                assert_eq!(moved.stream, STREAM);
+                seen.subscribed = false;
+                seen.subscription_ends += 1;
+                seen.moves.push(moved.next);
+            }
+            Delivery::Gap(_) => seen.gaps += 1,
+            Delivery::Refused(_) | Delivery::Lost(_) => {}
         });
         for redirect in redirected {
             self.follow(redirect.leader);
@@ -443,6 +496,19 @@ fn open_node(
     fates: &[(u64, u64)],
     memory: u64,
 ) -> Running {
+    let member = open_member(id, dir, addresses, fates, memory).unwrap();
+    let _ = ids;
+    Running { driver, member }
+}
+
+/// Node `id`'s member opened on its data directory in `dir`, or the reason it is refused.
+fn open_member(
+    id: u64,
+    dir: &Path,
+    addresses: &[SocketAddr],
+    fates: &[(u64, u64)],
+    memory: u64,
+) -> Result<Member, focal_bus::BusError> {
     let budget = focal_bus::limits::group_budget(usize::try_from(memory).unwrap()).unwrap();
     let node = Node::new(
         NodeConfig {
@@ -464,7 +530,7 @@ fn open_node(
     std::fs::create_dir_all(&data).unwrap();
     let keys = dir.join("keys");
     std::fs::create_dir_all(&keys).unwrap();
-    let member = Member::open(
+    Member::open(
         MemberSettings {
             id,
             peers,
@@ -481,9 +547,6 @@ fn open_node(
         budget,
         Instant::now(),
     )
-    .unwrap();
-    let _ = ids;
-    Running { driver, member }
 }
 
 /// Persisted: the group states no fates, and acknowledges a publish once a majority's disks hold
@@ -644,8 +707,7 @@ async fn open_world(
     let mut drivers = Vec::new();
     for id in NODES {
         let budget = MemoryBudget::new(64 << 20, 0).unwrap();
-        let endpoint = ids.node(id, &budget);
-        let driver = Driver::bind(endpoint, "127.0.0.1:0".parse().unwrap(), IO).unwrap();
+        let driver = ids.bind_node(id, &budget, "127.0.0.1:0".parse().unwrap());
         drivers.push(driver);
     }
     let addresses: Vec<SocketAddr> = drivers.iter().map(|d| d.local_addr().unwrap()).collect();
@@ -807,6 +869,502 @@ fn group_keeps_what_it_acknowledged(fates: &[(u64, u64)], class: Durability) {
                 .bounds(STREAM)
                 .unwrap();
             assert_eq!(bounds.1, 200, "two hundred records, none twice");
+        })
+        .unwrap();
+}
+
+/// Node `id`'s data directory in `dir`, and the keys its files are sealed under (29 §12.9).
+fn node_files(dir: &Path, id: u64) -> (std::path::PathBuf, focal_seal::DataKeys) {
+    let data = dir.join(format!("node-{id}"));
+    let keys = focal_seal::DataKeys::new(&data, dir.join("keys").join(format!("node-{id}.key")));
+    (data, keys)
+}
+
+/// Node `id`'s run and part image made what an earlier binary kept, the node down: in the clear,
+/// its directory unmarked. Its log stays as it is.
+fn unseal_node(dir: &Path, id: u64) {
+    let (data, keys) = node_files(dir, id);
+    let group = keys.key(focal_seal::Store::Group).unwrap();
+    for (name, most) in [("part.image", 64usize << 20), ("run", 8)] {
+        let path = data.join(name);
+        let bytes = std::fs::read(&path).unwrap();
+        let plain = focal_seal::file::open(&group, bytes, most).unwrap();
+        std::fs::write(&path, &*plain).unwrap();
+    }
+    std::fs::remove_file(data.join("SEALED")).unwrap();
+}
+
+/// Node `id`'s run and image sealed and its directory marked so.
+fn assert_node_sealed(dir: &Path, id: u64) {
+    let (data, _) = node_files(dir, id);
+    assert!(data.join("SEALED").is_file(), "node {id} is marked sealed");
+    assert_ne!(
+        std::fs::read(data.join("run")).unwrap().len(),
+        8,
+        "node {id}'s run is sealed"
+    );
+    let image = std::fs::read(data.join("part.image")).unwrap();
+    assert!(!image.starts_with(b"FBPI"), "node {id}'s image is sealed");
+}
+
+/// Writes `bytes` to `path` owner-only, as the identity directory's files are written.
+fn write_owner_only(path: &Path, bytes: &[u8]) {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    std::io::Write::write_all(&mut options.open(path).unwrap(), bytes).unwrap();
+}
+
+/// The stems of the identity directory's files: each node's, then the client's.
+fn identity_stems() -> impl Iterator<Item = String> {
+    NODES
+        .iter()
+        .map(|id| format!("node-{id}"))
+        .chain(std::iter::once("client-1".to_owned()))
+}
+
+/// The bus's identity directory `dir` holding `ids` as a binary before 29 §12.9 kept it: each key a
+/// DER document in the clear, the authority written last, no keys of the directory's own and no
+/// mark.
+fn identities_in_the_clear(dir: &Path, ids: &Identities) {
+    std::fs::create_dir_all(dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    for name in ["SEALED", "SEAL.node", "SEAL.root"] {
+        let _ = std::fs::remove_file(dir.join(name));
+    }
+    let pairs = ids.nodes.iter().chain(std::iter::once(&ids.client));
+    for (stem, (certificate, key)) in identity_stems().zip(pairs) {
+        write_owner_only(&dir.join(format!("{stem}.der")), certificate);
+        write_owner_only(&dir.join(format!("{stem}.key")), key);
+    }
+    write_owner_only(&dir.join("root.der"), &ids.root);
+}
+
+/// The identity directory `dir` sealed: marked so, and no key file a DER document or holding any
+/// of its key's bytes.
+fn assert_identities_sealed(dir: &Path, ids: &Identities) {
+    assert!(
+        dir.join("SEALED").is_file(),
+        "the identity directory is marked sealed"
+    );
+    let pairs = ids.nodes.iter().chain(std::iter::once(&ids.client));
+    for (stem, (_, key)) in identity_stems().zip(pairs) {
+        let file = std::fs::read(dir.join(format!("{stem}.key"))).unwrap();
+        assert_ne!(file.first(), Some(&0x30), "{stem}.key lies in the clear");
+        assert!(
+            !file
+                .windows(key.len())
+                .any(|window| window == key.as_slice()),
+            "{stem}.key holds its key's bytes"
+        );
+    }
+}
+
+/// Node `id`'s stream floor: the first offset its part still holds.
+fn floor_of(world: &World, id: u64) -> u64 {
+    let at = NODES.iter().position(|n| *n == id).unwrap();
+    world.nodes[at]
+        .as_ref()
+        .and_then(|running| running.member.node().part().bounds(STREAM))
+        .map_or(0, |bounds| bounds.0)
+}
+
+/// A subscriber of the stream: the node it is subscribed at, the offset it is delivered next, and
+/// how many of the client's deliveries it has read.
+struct Consumer {
+    at: Option<u64>,
+    next: u64,
+    read: usize,
+    /// How many of the client's moved subscriptions it has read.
+    moves: usize,
+}
+
+/// Publishes up to `until` with four batches in flight, as [`publish_until`] does, while the
+/// consumer is delivered every offset below `until`, each once and in order, subscribed at the
+/// leader from the offset it expects next whenever it is subscribed nowhere; charged to the
+/// acknowledgements and the offsets delivered.
+async fn serve_until(world: &mut World, consumer: &mut Consumer, until: u32) {
+    let progress =
+        |world: &World, consumer: &Consumer| [world.seen.acked.len() as u64, consumer.next];
+    let mut wait = ProgressDeadline::begin(&progress(world, consumer), u64::MAX, FROZEN);
+    let mut ends = world.seen.subscription_ends;
+    while world.seen.acked.len() < until as usize || consumer.next < u64::from(until) {
+        let acked = u32::try_from(world.seen.acked.len()).unwrap();
+        if acked < until {
+            world.publish((acked + 4).min(until));
+        }
+        // A subscription its node moved as it stopped leading (doc 34 P7), or a subscribe
+        // redirected or refused, is no subscription: the consumer subscribes again at the leader.
+        if world.seen.subscription_ends != ends {
+            ends = world.seen.subscription_ends;
+            eprintln!(
+                "the subscription at node {:?} ended (moved, redirected or refused): subscribing \
+                 again from {}",
+                consumer.at, consumer.next
+            );
+            consumer.at = None;
+        }
+        assert_eq!(
+            world.seen.gaps,
+            0,
+            "a node let offsets go before the subscriber took them\n{}",
+            world.diagnose()
+        );
+        if consumer.at.is_none()
+            && let Some(leader) = world.leader_now()
+        {
+            let asked = Client::new(leader).subscribe(
+                world.client.endpoint(),
+                Instant::now(),
+                STREAM,
+                wire::From::Offset(consumer.next),
+                focal_bus::limits::SERVE_PERIOD,
+            );
+            if asked.is_ok() {
+                consumer.at = Some(leader);
+            } else {
+                let at = NODES.iter().position(|n| *n == leader).unwrap();
+                let _ =
+                    world
+                        .client
+                        .endpoint()
+                        .connect(Instant::now(), leader, world.addresses[at]);
+            }
+        }
+        world.step().await;
+        for (base, sequence) in &world.seen.delivered[consumer.read..] {
+            assert_eq!(
+                (*base, u64::from(*sequence)),
+                (consumer.next, consumer.next),
+                "delivered once and in order"
+            );
+            consumer.next += 1;
+        }
+        consumer.read = world.seen.delivered.len();
+        // A node that stopped leading names the offset after every one it delivered: the lane is
+        // ordered, so the consumer has taken each of them.
+        for next in &world.seen.moves[consumer.moves..] {
+            assert_eq!(*next, consumer.next, "a moved subscription's next offset");
+        }
+        consumer.moves = world.seen.moves.len();
+        if let Err(frozen) = wait.check(&progress(world, consumer)) {
+            panic!(
+                "the batches were not acknowledged and delivered: {frozen:?}, consumer at {:?} \
+                 next {}\n{}",
+                consumer.at,
+                consumer.next,
+                world.diagnose()
+            );
+        }
+    }
+}
+
+/// Publishes up to `until` with four batches in flight, as a client holds its lane's, until every
+/// batch to it is acknowledged; charged to the acknowledgements.
+async fn publish_until(world: &mut World, until: u32) {
+    let mut wait = ProgressDeadline::begin(&[0], u64::MAX, FROZEN);
+    while world.seen.acked.len() < until as usize {
+        let acked = u32::try_from(world.seen.acked.len()).unwrap();
+        world.publish((acked + 4).min(until));
+        world.step().await;
+        if let Err(frozen) = wait.check(&[world.seen.acked.len() as u64]) {
+            panic!(
+                "the batches were not acknowledged: {frozen:?}\n{}",
+                world.diagnose()
+            );
+        }
+    }
+}
+
+/// How far each running node's stream reaches.
+fn ends(world: &World) -> Vec<u64> {
+    world
+        .nodes
+        .iter()
+        .flatten()
+        .map(|running| {
+            running
+                .member
+                .node()
+                .part()
+                .bounds(STREAM)
+                .map_or(0, |bounds| bounds.1)
+        })
+        .collect()
+}
+
+/// Do: leave in a node's data directory what an earlier binary's first image install left when cut
+/// before its rename (its temporary, the image in the clear, and no image), then open the node.
+/// Expect: the node opens, marked sealed, with no temporary left: nothing else would have replaced
+/// it before the node's next image (29 §12.9).
+#[test]
+fn a_node_whose_first_image_install_was_cut_keeps_nothing_of_it_in_the_clear() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, _) = node_files(dir.path(), NODES[0]);
+    std::fs::create_dir_all(&data).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let temporary = data.join("part.part");
+    let mut clear = b"FBPI".to_vec();
+    clear.resize(4096, 0x5a);
+    std::fs::write(&temporary, &clear).unwrap();
+    let addresses: Vec<SocketAddr> = NODES
+        .iter()
+        .map(|id| SocketAddr::from(([127, 0, 0, 1], 40_000 + *id as u16)))
+        .collect();
+    let mut runtime = LocalRuntime::new(&runtime()).unwrap();
+    runtime
+        .block_on(async move {
+            let member = open_member(NODES[0], dir.path(), &addresses, &[], NODE_MEMORY).unwrap();
+            assert!(data.join("SEALED").is_file(), "the node is marked sealed");
+            assert!(
+                !temporary.exists(),
+                "the cut install's temporary lies in the clear"
+            );
+            drop(member);
+        })
+        .unwrap();
+}
+
+/// Do: make the group's identity directory as an earlier binary kept it, in the clear, and start a
+/// group of three on it whose window lets its batches go, so each node keeps an image; turn the
+/// directory back to the clear and restart the nodes one by one, each first given its run and image
+/// as an earlier binary kept them (in the clear, unmarked) and reading its identity from the
+/// directory as its service does, publishing and consuming between the restarts; then, a node down,
+/// plant its image in the clear after its mark, flip a byte of its sealed image, and put another
+/// node's image in its place, and do the same to a key of the identity directory (29 §12.9).
+/// Expect: the directory is sealed by the first start and again by the first restart, every key
+/// what it was; each node seals its run and image as it opens and marks itself so, and reopens at
+/// its image's floor; the group acknowledges every batch at the offset it gave it, in order, each
+/// once, the producer's session carrying on through every restart (a batch sent again is
+/// recognised); a subscriber following the leader (it first asks a node that does not lead, and
+/// subscribes again after each redirect and each subscription a node that stops leading moves, doc
+/// 34 P7) is delivered every batch from where it began, once and in order, each move naming the
+/// offset it had reached; every node's stream comes to reach every batch; the planted, flipped and
+/// carried images and keys are each refused.
+#[test]
+fn a_group_kept_in_the_clear_seals_its_files_as_its_nodes_restart() {
+    const MEMORY: u64 = 24 << 20;
+    let payload = usize::try_from(wire::BATCH_BOUND).unwrap() - 4096;
+    let dir = tempfile::tempdir().unwrap();
+    // The group's identity directory as an earlier binary made it, sealed by the first start.
+    let pki = dir.path().join("pki");
+    identities_in_the_clear(&pki, &Identities::new());
+    let ids = Identities::load(&pki);
+    assert_identities_sealed(&pki, &ids);
+    let mut runtime = LocalRuntime::new(&runtime()).unwrap();
+    runtime
+        .block_on(async move {
+            let mut world = open_world(
+                &ids,
+                dir.path(),
+                &[],
+                Durability::Persisted,
+                MEMORY,
+                payload,
+            )
+            .await;
+            let began = Instant::now();
+            publish_until(&mut world, 60).await;
+            // What each phase took, for the record (29 §12.9): no wait is judged by it.
+            eprintln!("60 batches before any restart: {:?}", began.elapsed());
+            // Each node keeps an image: its window let batches go. Charged to how far each reaches.
+            let imaged = |dir: &Path| {
+                NODES
+                    .iter()
+                    .all(|id| node_files(dir, *id).0.join("part.image").is_file())
+            };
+            let mut wait = ProgressDeadline::begin(&ends(&world), u64::MAX, FROZEN);
+            while !imaged(dir.path()) {
+                world.step().await;
+                wait.check(&ends(&world))
+                    .expect("a node never kept an image");
+            }
+            // A subscriber from the stream's next offset, delivered every batch from there through
+            // every restart.
+            let mut consumer = Consumer {
+                at: None,
+                next: 60,
+                read: world.seen.delivered.len(),
+                moves: world.seen.moves.len(),
+            };
+            // It first asks a node that does not lead, as a client that knows no leader does: the
+            // node redirects it, and it subscribes again at the leader (`serve_until`). Unless that
+            // node has come to lead meanwhile, and takes it.
+            let leader = world.leader_now().expect("a leader before the restarts");
+            let follower = NODES.iter().copied().find(|n| *n != leader).unwrap();
+            let follower_at = NODES.iter().position(|n| *n == follower).unwrap();
+            let ended = world.seen.subscription_ends;
+            let mut wait = ProgressDeadline::begin(&[0], u64::MAX, FROZEN);
+            while world.seen.subscription_ends == ended && !world.seen.subscribed {
+                if consumer.at.is_none() {
+                    let asked = Client::new(follower).subscribe(
+                        world.client.endpoint(),
+                        Instant::now(),
+                        STREAM,
+                        wire::From::Offset(consumer.next),
+                        focal_bus::limits::SERVE_PERIOD,
+                    );
+                    if asked.is_ok() {
+                        consumer.at = Some(follower);
+                    } else {
+                        let _ = world.client.endpoint().connect(
+                            Instant::now(),
+                            follower,
+                            world.addresses[follower_at],
+                        );
+                    }
+                }
+                world.step().await;
+                wait.check(&[world.seen.subscription_ends])
+                    .expect("a subscribe at a node that does not lead was never answered");
+            }
+            if world.seen.subscription_ends != ended {
+                consumer.at = None;
+            }
+            // The identity directory as the earlier binary left it: the first node restarted
+            // seals it again.
+            identities_in_the_clear(&pki, &ids);
+            let mut until = 60;
+            for id in NODES {
+                let at = NODES.iter().position(|n| *n == id).unwrap();
+                if consumer.at == Some(id) {
+                    consumer.at = None;
+                }
+                let floor = floor_of(&world, id);
+                assert!(floor > 0, "node {id}'s window let batches go");
+                // The client leaves the node going down for another, whose redirect it follows.
+                let other = NODES.iter().copied().find(|n| *n != id).unwrap();
+                let other_at = NODES.iter().position(|n| *n == other).unwrap();
+                world.client.endpoint().disconnect(Instant::now(), id);
+                if world.leader == id {
+                    world.leader = other;
+                }
+                let _ = world.client.endpoint().connect(
+                    Instant::now(),
+                    other,
+                    world.addresses[other_at],
+                );
+                world.nodes[at] = None;
+                unseal_node(dir.path(), id);
+                // The node starts as its service does: its identity read from the directory.
+                let loaded = Identities::load(&pki);
+                assert_eq!((&loaded.nodes, &loaded.client), (&ids.nodes, &ids.client));
+                assert_identities_sealed(&pki, &ids);
+                let budget = MemoryBudget::new(64 << 20, 0).unwrap();
+                let driver = loaded.bind_node(id, &budget, world.addresses[at]);
+                let mut running = open_node(
+                    &loaded,
+                    id,
+                    dir.path(),
+                    &world.addresses,
+                    driver,
+                    &[],
+                    MEMORY,
+                );
+                running
+                    .member
+                    .connect(running.driver.endpoint(), Instant::now());
+                world.nodes[at] = Some(running);
+                assert_node_sealed(dir.path(), id);
+                // Its floor is its image's: none lost, and none it had not reached.
+                let reopened = floor_of(&world, id);
+                assert!(
+                    reopened > 0 && reopened <= floor,
+                    "node {id} reopened at floor {reopened}, where it stood at {floor}"
+                );
+                until += 20;
+                let began = Instant::now();
+                serve_until(&mut world, &mut consumer, until).await;
+                eprintln!(
+                    "20 batches after node {id} restarted: {:?}",
+                    began.elapsed()
+                );
+            }
+            for (sequence, (base, count)) in &world.seen.acked {
+                assert_eq!(
+                    (*base, *count),
+                    (u64::from(*sequence), 1),
+                    "in order, each once"
+                );
+            }
+            // The producer's session carried on: its newest batch sent again is recognised.
+            let again = world.seen.again;
+            let last = world.sent - 1;
+            let bytes = sized_batch(&mut world.builder, last, world.payload);
+            world.unacked.insert(last, bytes);
+            let mut wait = ProgressDeadline::begin(&[0], u64::MAX, FROZEN);
+            while world.seen.again == again {
+                world.publish(world.sent);
+                world.step().await;
+                wait.check(&[world.seen.again])
+                    .expect("the batch sent again was not recognised");
+            }
+            // Every node's stream comes to reach every batch.
+            let mut wait = ProgressDeadline::begin(&ends(&world), u64::MAX, FROZEN);
+            while ends(&world).iter().any(|end| *end < u64::from(until)) {
+                world.step().await;
+                if let Err(frozen) = wait.check(&ends(&world)) {
+                    panic!(
+                        "a node never reached every batch: {frozen:?}\n{}",
+                        world.diagnose()
+                    );
+                }
+            }
+            // A node down: an image in the clear after its mark, a sealed image changed, and
+            // another node's image are each refused at its open.
+            let id = NODES[0];
+            world.nodes[0] = None;
+            let (data, keys) = node_files(dir.path(), id);
+            let image = data.join("part.image");
+            let sealed = std::fs::read(&image).unwrap();
+            let group = keys.key(focal_seal::Store::Group).unwrap();
+            let clear = focal_seal::file::open(&group, sealed.clone(), 64 << 20).unwrap();
+            std::fs::write(&image, &*clear).unwrap();
+            assert!(open_member(id, dir.path(), &world.addresses, &[], MEMORY).is_err());
+            let mut flipped = sealed.clone();
+            let at = flipped.len() / 2;
+            flipped[at] ^= 0x40;
+            std::fs::write(&image, &flipped).unwrap();
+            assert!(open_member(id, dir.path(), &world.addresses, &[], MEMORY).is_err());
+            std::fs::copy(
+                node_files(dir.path(), NODES[1]).0.join("part.image"),
+                &image,
+            )
+            .unwrap();
+            assert!(open_member(id, dir.path(), &world.addresses, &[], MEMORY).is_err());
+            std::fs::write(&image, &sealed).unwrap();
+            assert!(open_member(id, dir.path(), &world.addresses, &[], MEMORY).is_ok());
+            // The identity directory: a key planted in the clear after its mark, a sealed key
+            // changed, and another directory's key are each refused as a node reads it.
+            let key = pki.join("node-2.key");
+            let sealed = std::fs::read(&key).unwrap();
+            let refused =
+                |pki: &Path| focal_bus::pki::load_or_make(pki, None, NODES.len(), 1).is_err();
+            write_owner_only(&key, &ids.nodes[1].1);
+            assert!(refused(&pki), "a key planted in the clear was read");
+            let mut flipped = sealed.clone();
+            let at = flipped.len() / 2;
+            flipped[at] ^= 0x40;
+            write_owner_only(&key, &flipped);
+            assert!(refused(&pki), "a changed key was read");
+            let other = dir.path().join("other-pki");
+            focal_bus::pki::load_or_make(&other, None, NODES.len(), 1).unwrap();
+            write_owner_only(&key, &std::fs::read(other.join("node-2.key")).unwrap());
+            assert!(refused(&pki), "another directory's key was read");
+            write_owner_only(&key, &sealed);
+            assert!(!refused(&pki));
         })
         .unwrap();
 }
