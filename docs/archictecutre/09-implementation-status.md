@@ -16952,6 +16952,11 @@ them as they cover objects.
   its stem being an upload's identity. With it `cli_archive`, `cli_backup`, `cli_gc`,
   `cli_native_a1` to `a4`, `cli_seeds_at_rest`, `cli_transfer`, `evidence_quic` and
   `placement_binary`.
+- **Windows.** The first CI run refused one test there: it truncated a part through a handle that
+  may only append, which Windows refuses (`SetEndOfFile` needs `FILE_WRITE_DATA`: `Access is
+  denied`, os error 5, run 40151558966), where Unix truncates. The test opens the handle each
+  damage needs; no production path truncates through such a handle (a staging part in the clear is
+  cut back through its read-write handle).
 - **Gate.** fmt, the contracts, Clippy on every target, the production check and cargo-deny on
   the final tree. The workspace's tests: a first run stopped at `cli_restore` (80 binaries, 3,173
   passed, 1 failed): at load 41, another session's release build beside the suite,

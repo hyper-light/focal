@@ -85,21 +85,30 @@ fn a_part_cut_short_is_written_again_under_a_new_key() {
         let path = directory.path().join("upload.part");
         drop(part(&path, std::slice::from_ref(&first), most));
         let whole_length = fs::metadata(&path).unwrap().len();
-        {
-            // The cut append: its first record whole, the next half written; or the file run on.
-            let mut file = OpenOptions::new().append(true).open(&path).unwrap();
-            match damage {
-                "half a record" => {
-                    let mut writer =
-                        RecordWriter::resume(&path, PART_MAGIC, &key_of, most, torn, Verify::All)
-                            .unwrap();
-                    writer.append(&cut).unwrap();
-                    drop(writer);
-                    let full = fs::metadata(&path).unwrap().len();
-                    file.set_len(full - 4000).unwrap();
-                }
-                _ => file.write_all(&vec![0u8; 3000]).unwrap(),
+        // The cut append: its first record whole, the next half written; or the file run on. Each
+        // through a handle that may do it: Windows refuses to truncate through a handle that may
+        // only append (`SetEndOfFile` needs `FILE_WRITE_DATA`).
+        match damage {
+            "half a record" => {
+                let mut writer =
+                    RecordWriter::resume(&path, PART_MAGIC, &key_of, most, torn, Verify::All)
+                        .unwrap();
+                writer.append(&cut).unwrap();
+                drop(writer);
+                let full = fs::metadata(&path).unwrap().len();
+                OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(full - 4000)
+                    .unwrap();
             }
+            _ => OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(&vec![0u8; 3000])
+                .unwrap(),
         }
         let before = header_id(&path);
         let mut writer =
