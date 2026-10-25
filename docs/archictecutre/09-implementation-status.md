@@ -16965,3 +16965,74 @@ them as they cover objects.
   the restore-reopen defect open since 2026-10-19; alone it passed 3 of 3 at load 9 to 15. Run
   again whole with `--no-fail-fast`: 175 test binaries, 3,667 passed, 0 failed, 31 ignored. The
   measurements went into the docs during that run, and fmt and the contracts ran again.
+
+### 2026-10-24 — A session's backups are sealed under the operator's key file
+
+A session's backup (26 §6) lay on the operator's volume in the clear: the envelope, every seed and
+cold chunk, every object's manifest and chunks, and the manifest, each file a hash named under that
+hash (29 §12's inventory, "clear"). From the at-rest level it is sealed (29 §12.8) as CockroachDB
+seals a backup: a random key made once for the backup, wrapped under a key file the operator names
+(`--key-file`, 32 random bytes as `focal create root-key` makes them) in the backup's
+`ENCRYPTION-INFO`, its one file in the clear; every other file sealed whole under that key through
+`focal_seal::file` and filed under its keyed name. `create backup`, `verify backup` and `restore
+session` take the key file, as their MCP tools do; a sealed backup asked of without it, or with
+another, is refused by name, naming the key it needs, before anything else of it is read, and a
+restore verifies every file before it writes anything. Below the level a backup is written in the
+clear and a key file is refused; every backup written before the level, and every one below it,
+verifies and restores as it always did.
+
+- **The key file is the operator's.** `focal_seal::operator_key` reads it through the checks a
+  node's root key file passes (owner-only on every platform, exactly 32 bytes) and names it by a hash
+  of the key (BLAKE3's key derivation under a context of its own), so a backup records the key that
+  opens it without holding anything that does. `ENCRYPTION-INFO` (`FCLBKEY1`) holds the backup
+  key's ID, its record under the operator's key (AES-KW, naming the operator key's ID) and a BLAKE3
+  trailer that tells a damaged record from another key's. A write a crash cut goes on under its own
+  key; a directory holding another key's partial backup, or anything else, is refused.
+- **Refused by name.** The CLI opens the backup's key with the named file before it asks the node:
+  `backup_key_required` (no key file, or none at the level for `create backup`),
+  `backup_key_mismatch` (another key file; both keys named), `backup_invalid` (a backup that does not
+  read, which had been reported as a corrupt admin journal), and `invalid_input` for a key file below
+  the level. The node checks every one of them again.
+- **Found on the way.** A restore of a backup that names no content object (a session of claims
+  alone) was refused `unavailable`: the content owner's restore counted its first ask, which only
+  begins the restore, among the slices its objects take, so with none it stopped one short of the
+  answer (`ContentHost::restore_content`). Four tests that a refusal holds (a second backup into a
+  directory, a tampered backup's restore, an unacknowledged recovery, a session restored twice) had
+  passed `--format json` to commands that take no such flag, so the argument parser refused them
+  before any node saw them; each now checks its refusal's code, and the repeated restore, which no
+  node had refused, answers as the restore it repeats, as designed. The deployment complexity study
+  had drifted from the concept index it is generated from in four stages (the CLI's grammar since);
+  every stage is regenerated from the index.
+- **DC20.** The laptop stage introduces the backup key: one concept and one input more, recorded in
+  `tests/deployment/concepts.json` as the decision it is, which the laptop journey checks byte for
+  byte.
+- **Measured** (this Mac, release, a seeded session's backup of 5 files in the clear and 6 sealed, 24
+  interleaved rounds, medians; `measure_a_sealed_backup_against_a_clear_one`):
+
+  | | Files | Bytes | Write | Verify |
+  |---|---|---|---|---|
+  | Clear | 5 | 6,377 | 72.5 ms | 0.348 ms |
+  | Sealed | 6 | 7,184 | 83.8 ms | 0.426 ms |
+
+  The write's difference is one more file's flushes (`ENCRYPTION-INFO`); the verification's, about
+  16 µs a sealed file opened.
+- **Tests.** focal-seal: an operator's key file read again under the same ID, another under
+  another, what one wraps opened by no other, a file others may read or of another length refused.
+  focal-ledger: a backup sealed and in the clear naming the same files; a scan of the sealed one
+  finding no hash in any name or file and no bytes of any clear file; verified under its key file
+  and refused with none or another before anything else is read; a flipped chunk, seed, envelope,
+  manifest and encryption record, two swapped files and a file carried in from another sealed backup
+  each named; a write cut before every durable operation leaving no backup, going on under its own
+  key and refused under another; a sealed backup restoring to the prefix a clear one does. The real
+  binary (`cli_restore`): a session backed up under a key file the binary made, refused without one;
+  a scan for its rows' text, payload, identities, hashes and the manifest's marker; verified without
+  a node under its key file, refused without it or with another, the key named; restored on a fresh
+  node with its claim and artifact read back, and a restore without the key file, with another, with
+  a flipped chunk and with swapped files each refused with the node's stores for the session
+  untouched; a session founded below the level backed up in the clear, refused a key file, verified
+  with and without one and restored at the binary's level. `cli_backup`, the restore runbook through
+  its three cuts and the laptop journey run sealed backups.
+- **Gate.** fmt, the contracts, Clippy on every target, the production check, cargo-deny and the
+  workspace's tests on the final tree: 175 test binaries, 3,671 passed, 0 failed, 32 ignored (run
+  detached from the agent's session after a restart of it killed the first run at its 118th binary,
+  every one passed to there).
