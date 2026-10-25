@@ -17092,6 +17092,21 @@ the clear.
   `settle_leadership`); a client is handed `Delivery::Moved` and subscribes again at that leader (34
   P7, §8). Doc 34's open line on a stall every member shares is corrected: it no longer elects
   since f8052a5e, as Quiver's survey measured on fedora.
+- **Found on macOS CI: two focal-node test flakes, each root-caused.**
+  - The revocation and founder-restart tests let a listener reservation go and bound its port
+    again, and were refused `Address already in use`. A child does not inherit a reservation
+    (close-on-exec holds), so this was not 8214f4db's inheritance.
+  - Two causes, both traced on this Mac:
+    1. The kernel recycled the just-dropped ephemeral port to another thread's bind of port 0:
+       2 of 3,000 re-binds beside eight such binders. Test listeners are now reserved on
+       16000–23999, below every ephemeral range and apart from the real-binary tests' range.
+    2. The kernel held a closed socket's port for 0.8 to 3 ms after its last descriptor closed.
+       lsof of the process, sampled through the close, saw only the test's own reservation, and
+       nothing at the refusal. The tests now wait for the port, bounded by `FROZEN`, so a live
+       socket that outlived its owner still fails and is named.
+  - The join-expiry test judged "asked again" inside a two-second invitation. Its scripted
+    sponsor now answers a refused join as a sponsor does, and each of its three cases judges a
+    fact.
 - **Every shared crate at hyper-raft 698c0da.** Besides the restart key, the snapshot brings the
   shared repository's main since 8c6b4fa: hyper-liveness backs a stream to a peer from which nothing
   has come off to a heartbeat every 3 s, announced, and answers the peer's first heartbeat at once
