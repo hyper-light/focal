@@ -58,6 +58,12 @@ pub fn admin_wire_limits() -> WireLimits {
         request_timeout: Duration::from_secs(20),
     }
 }
+/// A path an admin request names on the node's machine: absolute, and no longer than a path the
+/// request may carry.
+fn admin_path(path: &str) -> bool {
+    !path.is_empty() && path.len() <= 4096 && std::path::Path::new(path).is_absolute()
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum AdminCommand {
     Invite {
@@ -131,16 +137,20 @@ pub enum AdminCommand {
         domain: [u8; 16],
         root: [u8; 32],
     },
-    /// Write a backup of a hosted session at its committed prefix (26 §6).
+    /// Write a backup of a hosted session at its committed prefix (26 §6), sealed under the
+    /// operator's key file from the at-rest level (29 §12.8).
     BackupCreate {
         tenant: [u8; 16],
         session: [u8; 16],
         output: String,
+        key_file: Option<String>,
     },
-    /// Restore a session from a verified backup onto this node (26 §6).
+    /// Restore a session from a verified backup onto this node (26 §6), a sealed backup's key
+    /// opened under the operator's key file (29 §12.8).
     Restore {
         input: String,
         new_incarnation: bool,
+        key_file: Option<String>,
     },
     /// Repair a hosted session's custody on this node (24 §20): re-verify
     /// every object its committed prefix names, recopy what is missing from
@@ -200,7 +210,8 @@ pub struct BackupCreatedReply {
     pub schema: u16,
     pub backup: focal_client::admin::AdminBackup,
 }
-pub const BACKUP_CREATED_REPLY_SCHEMA: u16 = 1;
+/// Schema 2: the backup says whether it is sealed (29 §12.8).
+pub const BACKUP_CREATED_REPLY_SCHEMA: u16 = 2;
 /// The reply to [`AdminCommand::GcRestore`].
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GcRestoreReply {
@@ -878,22 +889,21 @@ impl AdminCommand {
                 tenant,
                 session,
                 output,
+                key_file,
             } => {
                 if *tenant == [0; 16]
                     || *session == [0; 16]
-                    || output.is_empty()
-                    || output.len() > 4096
-                    || !std::path::Path::new(output).is_absolute()
+                    || !admin_path(output)
+                    || key_file.as_deref().is_some_and(|path| !admin_path(path))
                 {
                     return Err(AccessError::InvalidRequest);
                 }
                 Ok(())
             }
-            Self::Restore { input, .. } => {
-                if input.is_empty()
-                    || input.len() > 4096
-                    || !std::path::Path::new(input).is_absolute()
-                {
+            Self::Restore {
+                input, key_file, ..
+            } => {
+                if !admin_path(input) || key_file.as_deref().is_some_and(|path| !admin_path(path)) {
                     return Err(AccessError::InvalidRequest);
                 }
                 Ok(())
@@ -1293,6 +1303,7 @@ impl LocalNetworkAdmin {
         tenant: [u8; 16],
         session: [u8; 16],
         output: String,
+        key_file: Option<String>,
     ) -> Result<Vec<u8>, AccessError> {
         let fleet = self.fleet.as_ref().ok_or(AccessError::Unavailable)?;
         let ledger = focal_model::LedgerId {
@@ -1313,6 +1324,7 @@ impl LocalNetworkAdmin {
             reader,
             ledger,
             PathBuf::from(output),
+            key_file.map(PathBuf::from),
             &self.budget,
         )
         .await?;
@@ -1328,11 +1340,13 @@ impl LocalNetworkAdmin {
         &self,
         input: String,
         new_incarnation: bool,
+        key_file: Option<String>,
         id: RequestId,
     ) -> Result<Vec<u8>, AccessError> {
         let input = PathBuf::from(input);
-        let manifest =
-            crate::backup::read_manifest(&input).map_err(|_| AccessError::InvalidRequest)?;
+        let key_file = key_file.map(PathBuf::from);
+        let manifest = crate::backup::read_manifest(&input, key_file.as_deref())
+            .map_err(crate::backup::access_error)?;
         let (_, registry) = self.read_registry(id).await?;
         let tenant = manifest.prefix.ledger.tenant;
         if tenant != self.identity.ledger.tenant && !registry.admits_tenant(tenant.0) {
@@ -1350,6 +1364,7 @@ impl LocalNetworkAdmin {
             .ok_or(AccessError::Unavailable)?
             .restore_session(crate::backup::RestoreRequest {
                 input: input.clone(),
+                key_file,
                 new_incarnation,
                 decision,
             })
@@ -2047,17 +2062,19 @@ impl LocalNetworkAdmin {
             tenant,
             session,
             output,
+            key_file,
         } = command
         {
-            return self.backup_create(tenant, session, output).await;
+            return self.backup_create(tenant, session, output, key_file).await;
         }
         if let AdminCommand::Restore {
             input,
             new_incarnation,
+            key_file,
         } = command
         {
             return self
-                .restore(input, new_incarnation, request.request_id)
+                .restore(input, new_incarnation, key_file, request.request_id)
                 .await;
         }
         if let AdminCommand::Repair {

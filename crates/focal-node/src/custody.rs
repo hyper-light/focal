@@ -195,16 +195,20 @@ enum Restore {
     Running {
         manifest: Box<focal_ledger::backup::BackupManifest>,
         import: Box<focal_ledger::backup::ContentImport>,
+        /// How the backup's files lie, its key opened where they are sealed (29 §12.8).
+        form: Box<focal_ledger::backup::BackupForm>,
         _charge: Allocation,
     },
     Done(u64),
 }
 /// An ask of a backup's content restore (`CustodyStore::restore_slice`).
 pub(crate) enum RestoreAsk {
-    /// Begin the restore of the backup in a directory, or carry it on.
+    /// Begin the restore of the backup in a directory, or carry it on: its key opened under the
+    /// operator's key file where its files are sealed (29 §12.8).
     Begin(
         std::path::PathBuf,
         Box<focal_ledger::backup::BackupManifest>,
+        Option<std::path::PathBuf>,
     ),
     /// Carry on the restore of the backup in a directory, named by its
     /// checkpoint's hash and creation time: the restore of any other
@@ -1257,7 +1261,7 @@ impl CustodyStore {
         let deadline = self.deadline()?;
         let (root, backup) = match ask {
             RestoreAsk::Continue(root, backup) => (root, backup),
-            RestoreAsk::Begin(root, manifest) => {
+            RestoreAsk::Begin(root, manifest, key_file) => {
                 let backup = (manifest.checkpoint_hash, manifest.created_ms);
                 match &self.restore {
                     Some(restore) if restore.root == root && restore.backup == backup => {
@@ -1271,7 +1275,7 @@ impl CustodyStore {
                         // The place of a restore that is done is given up
                         // before the next is charged.
                         self.restore = None;
-                        // The manifest and the import's own state, each on
+                        // The manifest, the import's own state and the backup's form, each on
                         // the heap while the restore runs.
                         let charge = self.reserve(
                             BudgetKind::Recovery,
@@ -1283,14 +1287,20 @@ impl CustodyStore {
                                         size_of::<focal_ledger::backup::ContentImport>(),
                                     )
                                 })
+                                .and_then(|bytes| {
+                                    bytes.checked_add(size_of::<focal_ledger::backup::BackupForm>())
+                                })
                                 .ok_or(AccessError::Capacity)?,
                         )?;
+                        let form = crate::backup::form(&root, key_file.as_deref())
+                            .map_err(crate::backup::access_error)?;
                         self.restore = Some(Restoring {
                             root,
                             backup,
                             state: Restore::Running {
                                 manifest,
                                 import: Box::new(focal_ledger::backup::ContentImport::new()),
+                                form: Box::new(form),
                                 _charge: charge,
                             },
                             expires: deadline,
@@ -1310,13 +1320,19 @@ impl CustodyStore {
         let advanced = match &mut restore.state {
             Restore::Done(imported) => return Ok(Some(*imported)),
             Restore::Running {
-                manifest, import, ..
+                manifest,
+                import,
+                form,
+                ..
             } => import.advance(
-                &focal_ledger::backup::FileMedium,
-                &restore.root,
+                focal_ledger::backup::BackupFiles {
+                    medium: &focal_ledger::backup::FileMedium,
+                    root: &restore.root,
+                    form,
+                    budget,
+                },
                 manifest,
                 &mut self.store,
-                budget,
                 scratch,
             ),
         };

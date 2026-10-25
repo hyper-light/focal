@@ -868,6 +868,23 @@ coordinates to match. It reports each count, whether this binary carries
 the decoder the backup's log promised, and every problem it found (bounded
 at 64), and it is `complete` only when there is none. Nothing is written.
 
+**Sealed from the at-rest level** (2026-10-24, [29](29-sealing-at-rest.md)
+§12.8). A backup written at or above the at-rest level is sealed under the
+operator's key file (`--key-file`: 32 random bytes, as `create root-key`
+makes them, kept by the operator off the node's volume): a random key made
+for the backup, wrapped under the key file in the backup's `ENCRYPTION-INFO`
+(its one file in the clear, as CockroachDB keeps a backup's), and every other
+file (`checkpoint`, `MANIFEST`, the seeds, the cold chunks, every object's
+manifest and chunks) sealed whole under it through `focal_seal::file` and
+filed under the backup's keyed name of the hash that named it. `verify backup`
+and `restore session` take the same key file: a sealed backup asked of without
+it, or with another, is refused by name before anything else of it is read,
+and a restore verifies every file before it writes anything, so a changed or
+swapped file is refused with the node untouched. Below the level a backup is
+written in the clear, as above, and a key file is refused; a backup in the
+clear, from below the level or from before it, verifies and restores as it
+always did, whatever key file is named.
+
 **What the tests hold.** The ledger suite writes a hosted session's image
 to the simulated disk, verifies it, refuses a second write into the same
 directory, cuts the write before every one of its durable operations and

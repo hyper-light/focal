@@ -52,13 +52,16 @@ pub enum AdminAction {
         tenant: Option<[u8; 16]>,
         session: Option<[u8; 16]>,
         output: String,
+        key_file: Option<String>,
     },
     BackupVerify {
         input: String,
+        key_file: Option<String>,
     },
     Restore {
         input: String,
         new_incarnation: bool,
+        key_file: Option<String>,
     },
     Repair {
         tenant: Option<[u8; 16]>,
@@ -302,11 +305,13 @@ struct BackupCreate {
     tenant: Option<String>,
     session: Option<String>,
     output: String,
+    key_file: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BackupVerify {
     input: String,
+    key_file: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -331,6 +336,14 @@ struct Restore {
     input: String,
     #[serde(default)]
     new_incarnation: bool,
+    key_file: Option<String>,
+}
+/// A key file a backup tool names (29 §12.8): a path no longer than a request carries.
+fn key_file(path: Option<String>) -> Result<Option<String>, InputError> {
+    match path {
+        Some(path) if path.is_empty() || path.len() > 4096 => Err(InputError::Invalid("key file")),
+        path => Ok(path),
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -408,6 +421,7 @@ pub(crate) fn parse(
                     .transpose()?,
                 session: parse_session(args.session)?,
                 output: args.output,
+                key_file: key_file(args.key_file)?,
             }
         }
         "cluster.backup.verify" => {
@@ -416,7 +430,10 @@ pub(crate) fn parse(
             if args.input.is_empty() || args.input.len() > 4096 {
                 return Err(InputError::Invalid("backup input"));
             }
-            AdminAction::BackupVerify { input: args.input }
+            AdminAction::BackupVerify {
+                input: args.input,
+                key_file: key_file(args.key_file)?,
+            }
         }
         "cluster.repair" => {
             let args: Repair =
@@ -449,6 +466,7 @@ pub(crate) fn parse(
             AdminAction::Restore {
                 input: args.input,
                 new_incarnation: args.new_incarnation,
+                key_file: key_file(args.key_file)?,
             }
         }
         "cluster.archive.show" => {

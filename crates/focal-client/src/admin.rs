@@ -663,6 +663,12 @@ pub struct AdminBackupPrefix {
 #[serde(deny_unknown_fields)]
 pub struct AdminBackup {
     pub output: String,
+    /// Whether its files are sealed under the operator's key file (29 §12.8): from the at-rest
+    /// level they are.
+    pub sealed: bool,
+    /// The ID of the operator key a sealed backup needs, hex: a hash of the key, which names it
+    /// without opening anything.
+    pub key: Option<String>,
     pub created_ms: u64,
     pub prefix: AdminBackupPrefix,
     pub checkpoint_hash: String,
@@ -682,6 +688,10 @@ pub struct AdminBackup {
 #[serde(deny_unknown_fields)]
 pub struct AdminBackupVerification {
     pub input: String,
+    /// Whether its files are sealed (29 §12.8), each opened under the named key file to verify it.
+    pub sealed: bool,
+    /// The ID of the operator key a sealed backup needs, hex.
+    pub key: Option<String>,
     pub prefix: AdminBackupPrefix,
     pub checkpoint_verified: bool,
     pub seeds_listed: u64,

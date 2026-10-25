@@ -71,9 +71,10 @@ configuration when present (§7).
   root key every test's directory shares (`focal_seal::TEST_ROOT`): its node and store keys are
   its own and random, so no directory's records open under another's, and a test run leaves no
   key file behind for each directory it made (one each had left 1,153 files in four hours).
-- **Losing the key loses the data**, as with every system that seals at rest. `focal backup`
-  states which root key ID a backup needs, and the operator keeps the key file as they keep
-  any secret. Rotation is a rewrap (§4); nothing below the node key moves.
+- **Losing the key loses the data**, as with every system that seals at rest. A sealed backup
+  names the operator key it needs by its ID (§12.8), in its `ENCRYPTION-INFO`, in what `create
+  backup` and `verify backup` report and in a refusal for want of it, and the operator keeps the key
+  file as they keep any secret. Rotation is a rewrap (§4); nothing below the node key moves.
 
 **Why a file first.** Each established system ships a file-held master key as its baseline
 and adds external key services on top: CockroachDB (store key files named per store), TiKV
@@ -273,7 +274,7 @@ private journals (`focal_enrollment::PrivateJournal`), sealed with the private d
 | Cold stream | `cold/<ledger>/` | retired families' archive frames | focal-evidence `cold`, `record_file` | sealed from the at-rest level (§12.6) |
 | Content | `content/objects/…`, `content/quarantine/…` | artifacts' chunks and manifests | focal-evidence `store`, `transfer`, `gc`, `native_artifact` | sealed from the content level (§12.4) |
 | Content staging and custody | `content/staging/`, `objects/<domain>/*.part`, `content/{custody,checkpoints,receipts}/` | uploads and transfers being received; custody records | focal-evidence `staging`, `transfer`, `upload_terminal`, `store` (records), `record_file` | sealed from the at-rest level (§12.7) |
-| Session backups | a backup's directory | checkpoint, seeds, content, cold | focal-ledger `session_backup` | clear |
+| Session backups | a backup's directory | checkpoint, seeds, content, cold | focal-ledger `session_backup`, focal-seal `operator_key` | sealed from the at-rest level under the operator's key file (§12.8) |
 | Private directories and journals | `JOIN/`, `cluster/authority/`, `cluster/invitations/`, `cluster/network/`, `CLUSTER.admin/`, `CLIENT.contexts/`, the placement and admission journals (`cluster/<name>/journal.bin`) | the cluster CA's key, nodes' and clients' keys, invitations, the signer's and every agent's journal, the admin's and contexts' catalogues | focal-enrollment `files::PrivateDirectory`, `PrivateJournal` | sealed (§12.2) |
 | Embedded node log | the shell's log of a node that is its own cluster (`wal/` before) | every record of its session and its root's control group | focal-node `EmbeddedNode` through `storage_start`, as a networked node | sealed (§12.3) |
 | Bus log | a bus node's `bus.log` | its part's records | focal-bus `member` over hyper-log | sealed (its data directory's keys) |
@@ -297,6 +298,8 @@ private journals (`focal_enrollment::PrivateJournal`), sealed with the private d
 - What an operator asks for in the clear, outside any data directory: an artifact downloaded to a
   file it names, a trace written where it says, a deployment plan's output, and an invitation
   bundle handed to a joiner, a bearer credential kept owner-only and spent once.
+- A sealed backup's `ENCRYPTION-INFO`: the backup's key wrapped under the operator's key file, and
+  that key's ID, a hash of it, neither of which opens anything (§12.8).
 - focal-log's WAL of a node below the storage level, which a binary below that level reads alone,
   converted to the sealed shell at the level (27 §15.8, §12.3).
 - The measurement tools' reports (`tools/load`, `tools/compare`): a run's results, not focal's data.
@@ -784,3 +787,76 @@ below the at-rest level. Their conversion is marked apart from the objects' (`RE
   read at every step, counting and converting exactly those 406 files, and the upload, the
   transfer and every record go on from their sealed form, every finished upload's identity still
   fenced.
+
+### 12.8 Session backups, sealed under an operator's key file (2026-10-24)
+
+A session's backup (26 §6) leaves the node: its files are copied to other volumes, other machines
+and object stores, and restored on nodes with keys of their own. From the at-rest level it is
+sealed as CockroachDB seals a backup, an `ENCRYPTION-INFO` file and every other file encrypted
+under a key made once for the backup:
+
+- **The key file is the operator's.** `--key-file` names 32 random bytes in an owner-only file
+  (`focal create root-key --output FILE` makes one, as it makes a node's root key for a secret
+  store), read through the checks a node's root key file passes: owner-only on every platform,
+  exactly 32 bytes (`focal_seal::operator_key`). Its ID is a hash of the key under a context of its
+  own (BLAKE3's key derivation), so a backup names the key it needs without holding anything that
+  opens it, and the key file is the one thing a restore needs beside the backup: no node's keys,
+  no data directory.
+- **A key made once for the backup.** `create backup` makes a random key under the operator's
+  (`WrappingKey::make_child`) and writes `ENCRYPTION-INFO` before any other file: the format's
+  magic (`FCLBKEY1`), the backup key's ID, its record wrapped under the operator's key (AES-KW,
+  naming the operator key's ID), and a BLAKE3 trailer over the three, which tells a damaged record
+  from another key's. It is the backup's one file in the clear and holds nothing of the session's.
+- **Every other file sealed whole.** The envelope (`checkpoint`), the `MANIFEST`, each seed, each
+  cold chunk and each object's manifest and chunks are sealed through `focal_seal::file`, each
+  under a data key of its own wrapped by the backup's key, and each file a hash names is filed under
+  the backup's keyed name of that hash (a `Namer` derived from the backup's key): no file holds a
+  row, a chunk, a hash or the manifest in the clear, and no name holds a hash. A file's sealed copy
+  is held only while it is written or opened, and charged to the backup's budget while it is
+  (`BackupForm`, read and written through `BackupFiles`).
+- **Refused before anything is read or written.** `verify backup` and `restore session` take the
+  key file. A sealed backup asked of without one, or with a key file whose ID is not the one its
+  `ENCRYPTION-INFO` names, is refused (`backup_key_required`, `backup_key_mismatch`, each naming
+  the key the backup needs) before anything else of it is read: the CLI refuses it before it asks
+  the node, and the node refuses it again. A restore verifies every file before it writes anything,
+  so a changed byte, two swapped files, or a file carried in from another backup (sealed under
+  another key) is refused with the node untouched.
+- **The level's rule.** Below the at-rest level a backup is written in the clear, byte for byte as
+  before, and a key file is refused: a backup written below the level is one every binary the fence
+  admits restores. A backup without `ENCRYPTION-INFO` reads in the clear whatever key file is
+  named, so every backup written before the level, and every one written below it, verifies and
+  restores as it always did. A write a crash cut goes on under its own key when it is asked again
+  with the key file that opens it; a directory holding anything else, or part of a backup sealed
+  under another key, is refused.
+- **As planned.** The plan named `focal_seal::file`, keyed names and the CockroachDB layout, as
+  built; the backup's record names the operator key by its ID as well, so the reports and the
+  refusals name the key a backup needs, as §2 asks of a backup.
+- **Found on the way.** A restore of a backup that names no content object (a session of claims
+  alone) was refused `unavailable`: the content owner's restore counted its first ask, which only
+  begins the restore, among the slices the backup's objects take, so with none it stopped one
+  short of the answer. The tests that a second backup into a directory, a restore of a session
+  already hosted, a tampered backup and an unacknowledged recovery are refused had passed `--format
+  json` to commands that take no such flag, so the argument parser refused every one of them before
+  the node saw it; they now check each refusal's code, and the repeated restore, which no node had
+  refused, answers as the restore it repeats, as designed.
+- **Measured** (this Mac, release, a seeded session's backup of 5 files in the clear and 6 sealed,
+  24 interleaved rounds, medians; `measure_a_sealed_backup_against_a_clear_one`): written in
+  72.5 ms in the clear and 83.8 ms sealed, the difference one more file's flushes
+  (`ENCRYPTION-INFO`); verified in 0.348 ms and 0.426 ms, about 16 µs a sealed file opened.
+- **Tests:** an operator's key file read again under the same ID, another file under another, what
+  one wraps opened by no other, a file others may read or of another length refused (focal-seal);
+  a backup sealed and in the clear naming the same files, a scan of the sealed one finding no hash
+  in any name or file and no bytes of any clear file, verified under its key file and refused with
+  none or another before anything else is read, a flipped chunk, seed, envelope, manifest or
+  encryption record, two swapped files and a file carried from another sealed backup each named, a
+  write cut before every durable operation leaving no backup and going on under its own key and
+  refused under another, and a sealed backup restoring to the prefix a clear one does
+  (focal-ledger); the real binary (`cli_restore`): a session backed up sealed under a key file the
+  binary made, refused without one, scanned for its rows' text, payload, identities, hashes and the
+  manifest's marker, verified without a node under its key file and refused without it or with
+  another, restored on a fresh node with its claim and artifact read back, each of a restore
+  without the key file, with another, with a flipped chunk and with swapped files refused with the
+  node's stores for the session untouched; a session founded below the level backed up in the clear,
+  refused a key file, verified with and without one and restored on a fresh node at the binary's
+  level; `cli_backup`, the restore runbook through its three cuts, and the laptop journey, whose
+  concept index records the backup key as the decision it is (DC20).

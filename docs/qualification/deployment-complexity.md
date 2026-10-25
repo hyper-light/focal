@@ -9,9 +9,9 @@ the stages it builds on — the measure DC20 holds to.
 
 ## Stage 1 — Laptop (DC01, DC02, DC04, DC13, DC15, DC16, DC17)
 
-**Introduces** (21): native engine, start, participant, standing, claim, receipt, artifact, read, crash, one writer, unwritable directory, full volume, identity, placement view, explain, plan, apply, backup, tenant, restore, connection.
+**Introduces** (22): native engine, start, participant, standing, claim, receipt, artifact, read, crash, one writer, unwritable directory, full volume, identity, placement view, explain, plan, apply, backup key, backup, tenant, restore, connection.
 
-**Operator inputs**: data directory, loopback address, participant name, invitation file, claim document, artifact content, file size limit, policy file, plan file, backup directory, tenant, session.
+**Operator inputs**: data directory, loopback address, participant name, invitation file, claim document, artifact content, file size limit, policy file, plan file, key file, backup directory, tenant, session.
 
 Executed by `crates/focal-node/tests/deployment_laptop.rs`.
 
@@ -47,21 +47,22 @@ focal --data-dir <laptop> get claim <id> --format json
 focal --data-dir <laptop> get artifact <id> --format json
 focal --data-dir <laptop> submit claim --json <document> --format json
 focal --data-dir <laptop> post claim <id> --format json
-focal --data-dir <laptop> cluster node identity
+focal --data-dir <laptop> inspect node --identity
 focal --data-dir <laptop> inspect placement
 focal --data-dir <laptop> explain deployment
 focal --data-dir <laptop> --config <laptop>/policy.yaml plan deployment --dry-run
 focal --data-dir <laptop> --config <laptop>/policy.yaml plan deployment --output <laptop>/laptop.plan
 focal --data-dir <laptop> apply deployment --plan-file <laptop>/laptop.plan
 focal --data-dir <laptop> apply deployment --plan-file <laptop>/tampered.plan
-focal --data-dir <laptop> create backup --output <laptop>/backup
+focal --data-dir <laptop> create root-key --output <keys>/ops.key
+focal --data-dir <laptop> create backup --output <laptop>/backup --key-file <keys>/ops.key
 kill -KILL <laptop process>
 focal --data-dir <laptop-b> activate native
 focal --data-dir <laptop-b> start node --advertise <address>
 focal --data-dir <laptop-b> apply deployment --plan-file <laptop>/laptop.plan
 focal --data-dir <laptop-b> admit tenant --tenant <id>
-focal --data-dir <laptop-b> restore session --input <laptop>/backup
-focal --data-dir <laptop-b> restore session --input <laptop>/backup --new-incarnation
+focal --data-dir <laptop-b> restore session --input <laptop>/backup --key-file <keys>/ops.key
+focal --data-dir <laptop-b> restore session --input <laptop>/backup --new-incarnation --key-file <keys>/ops.key
 focal --data-dir <reader> add context restored --node-data-dir <laptop-b> --tenant <id> --session <id>
 focal --data-dir <reader> --client-context restored get claim <id> --format json
 focal --data-dir <fresh> start node --invite-file <laptop-b>/garbage.invite
@@ -269,13 +270,13 @@ focal --data-dir <client> --client-context alice submit artifact --claim <id> --
 focal --config <founder>/focal.yaml --data-dir <founder> get claim <id> --format json
 focal --config <founder>/focal.yaml --data-dir <founder> get artifact <id> --format json
 focal --config <founder>/focal.yaml --data-dir <founder> plan session --tenant <id> --session <id> --survive region --max-failures 1
-focal --data-dir <founder> cluster node metrics
+focal --data-dir <founder> inspect node --metrics
 kill -STOP <host in r3>
 focal --config <founder>/focal.yaml --data-dir <founder> submit claim --json <document> --format json
 focal --config <founder>/focal.yaml --data-dir <founder> post claim <id> --format json
 kill -CONT <host in r3>
-focal --config <founder>/focal.yaml --data-dir <founder> cluster replicas ranges --session <id> list
-focal --config <founder>/focal.yaml --data-dir <founder> cluster replicas ranges --session <id> move --member <id> --node <id>
+focal --config <founder>/focal.yaml --data-dir <founder> list ranges --session <id>
+focal --config <founder>/focal.yaml --data-dir <founder> move range --session <id> --member <id> --node <id>
 ```
 
 </details>
@@ -310,9 +311,9 @@ focal --data-dir <client> --client-context alice submit artifact --claim <id> --
 focal --data-dir <founder> get claim <id> --format json
 focal --data-dir <founder> get artifact <id> --format json
 focal --data-dir <founder> inspect upgrade
-focal --data-dir <host> activate upgrade --fence 3
-focal --data-dir <founder> activate upgrade --fence 3
-focal --data-dir <founder> activate upgrade --fence 2
+focal --data-dir <host> activate upgrade --fence 11
+focal --data-dir <founder> activate upgrade --fence 11
+focal --data-dir <founder> activate upgrade --fence 10
 focal --data-dir <founder> get claim <id> --format json
 focal --data-dir <founder> get artifact <id> --format json
 focal --data-dir <host> start node --advertise <address>
@@ -384,7 +385,7 @@ focal --data-dir <founder> submit claim --json <document> --format json
 focal --data-dir <founder> post claim <id> --format json
 focal --data-dir <client> --client-context alice acquire receipt <id> --format json
 focal --data-dir <client> --client-context alice submit artifact --claim <id> --slot 0 --text <document> --format json
-focal --data-dir <founder> cluster node metrics
+focal --data-dir <founder> inspect node --metrics
 ```
 
 </details>

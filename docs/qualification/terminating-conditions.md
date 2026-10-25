@@ -95,10 +95,13 @@ same file renamed under a keyed name, a manifest sealed keyed by its hash, a dir
 converted while the stream goes on. A content store's uploads being staged, chunks being received
 in parts and custody records are sealed from the same level (doc 29 §12.7, "2026-10-24 — A content
 store's staging, parts and custody records are sealed from the at-rest level"), apart from its
-objects' form, so a node between the content and at-rest levels still rolls back.
+objects' form, so a node between the content and at-rest levels still rolls back. A session's
+backup is sealed from the same level under the operator's key file (doc 29 §12.8, "2026-10-24 — A
+session's backups are sealed under the operator's key file"): a key made once for the backup,
+wrapped in its `ENCRYPTION-INFO`, every other file sealed whole under it with keyed names.
 
-**Open.** Still written in the clear (doc 29 §12's inventory, taken again 2026-10-24): session
-backups, the bus's identities and part images, client stores and the node's small files.
+**Open.** Still written in the clear (doc 29 §12's inventory, taken again 2026-10-24): the bus's
+identities and part images, client stores and the node's small files.
 
 ## 6. Adversarial batteries
 

@@ -157,21 +157,63 @@ fn created(result: &Value, kind: &str) -> Vec<String> {
 const FAR: u64 = 4_102_444_800_000;
 const PROOF: &str = r#"{"passed":3,"failed":0,"skipped":0}"#;
 
-fn backup(root: &Path, output: &Path) -> Value {
+/// A backup of the node's session into `output`, sealed under the operator's key file `key` (at the
+/// binary's level a backup is sealed, 29 §12.8).
+fn backup(root: &Path, output: &Path, key: &Path) -> Value {
     let created = admin(
         root,
-        &["create", "backup", "--output", output.to_str().unwrap()],
+        &[
+            "create",
+            "backup",
+            "--output",
+            output.to_str().unwrap(),
+            "--key-file",
+            key.to_str().unwrap(),
+        ],
     );
     assert_eq!(created["result"]["kind"], "backup_created", "{created}");
+    assert_eq!(created["result"]["backup"]["sealed"], true, "{created}");
     created["result"]["backup"].clone()
 }
-fn verify(root: &Path, input: &Path) -> Value {
+fn verify(root: &Path, input: &Path, key: &Path) -> Value {
     let verified = admin(
         root,
-        &["verify", "backup", "--input", input.to_str().unwrap()],
+        &[
+            "verify",
+            "backup",
+            "--input",
+            input.to_str().unwrap(),
+            "--key-file",
+            key.to_str().unwrap(),
+        ],
     );
     assert_eq!(verified["result"]["kind"], "backup_verified", "{verified}");
     verified["result"]["verification"].clone()
+}
+/// A key file the real binary makes (`focal create root-key`), as an operator makes one.
+fn key_file(dir: &Path, name: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    let made = Command::new(env!("CARGO_BIN_EXE_focal"))
+        .args(["create", "root-key", "--output", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{made:?}");
+    path
+}
+/// The code of the error a refused admin command printed (`focal: [code] message`): a refusal
+/// the command made, not one its arguments' parsing made.
+fn refusal(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "{}\n{stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    stderr
+        .split_once("focal: [")
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map(|(code, _)| code.to_owned())
+        .unwrap_or_else(|| panic!("no refusal code: {stderr}"))
 }
 
 #[test]
@@ -272,9 +314,11 @@ fn a_backup_holds_the_prefix_and_its_proof_and_verifies_without_the_node() {
         assert!(deadline.open(), "the session never registered: {placement}");
         std::thread::sleep(Duration::from_millis(200));
     }
-    // The first backup: the envelope and the sealed payload.
+    // The first backup: the envelope and the sealed payload, under the operator's key file.
+    let keys = founder.path().join("keys");
+    let ops = key_file(&keys, "ops.key");
     let first = founder.path().join("backups").join("first");
-    let backup_one = backup(root, &first);
+    let backup_one = backup(root, &first, &ops);
     assert_eq!(backup_one["prefix"]["session"], session, "{backup_one}");
     assert_eq!(backup_one["prefix"]["node"], identity["node"]);
     assert_eq!(backup_one["objects"], 1, "{backup_one}");
@@ -284,7 +328,7 @@ fn a_backup_holds_the_prefix_and_its_proof_and_verifies_without_the_node() {
     assert!(backup_one["checkpoint_bytes"].as_u64().unwrap() > 0);
     assert!(first.join("MANIFEST").is_file());
     assert!(first.join("checkpoint").is_file());
-    let verified = verify(root, &first);
+    let verified = verify(root, &first, &ops);
     assert_eq!(verified["complete"], true, "{verified}");
     assert_eq!(verified["inventory_matches"], true);
     // The storage view names the volume's pressure, the agents and the
@@ -311,7 +355,7 @@ fn a_backup_holds_the_prefix_and_its_proof_and_verifies_without_the_node() {
     assert_eq!(verified["objects_verified"], 1);
     assert_eq!(verified["problems"].as_array().unwrap().len(), 0);
     assert_eq!(verified["prefix"], backup_one["prefix"]);
-    // A second write into the same directory is refused; the backup stands.
+    // A second write into the same directory is refused by the node; the backup stands.
     let refused = run(
         root,
         None,
@@ -320,12 +364,12 @@ fn a_backup_holds_the_prefix_and_its_proof_and_verifies_without_the_node() {
             "backup",
             "--output",
             first.to_str().unwrap(),
-            "--format",
-            "json",
+            "--key-file",
+            ops.to_str().unwrap(),
         ],
     );
-    assert!(!refused.status.success());
-    assert_eq!(verify(root, &first)["complete"], true);
+    assert_eq!(refusal(&refused), "invalid_input");
+    assert_eq!(verify(root, &first, &ops)["complete"], true);
     // A tampered chunk is named; the envelope still verifies on its own.
     let chunk = std::fs::read_dir(first.join("content"))
         .unwrap()
@@ -335,7 +379,7 @@ fn a_backup_holds_the_prefix_and_its_proof_and_verifies_without_the_node() {
     let mut bytes = std::fs::read(&chunk).unwrap();
     bytes[0] ^= 0xff;
     std::fs::write(&chunk, &bytes).unwrap();
-    let tampered = verify(root, &first);
+    let tampered = verify(root, &first, &ops);
     assert_eq!(tampered["complete"], false, "{tampered}");
     assert_eq!(tampered["checkpoint_verified"], true);
     assert!(
@@ -365,35 +409,28 @@ fn a_backup_holds_the_prefix_and_its_proof_and_verifies_without_the_node() {
         std::thread::sleep(Duration::from_millis(200));
     }
     let second = founder.path().join("backups").join("second");
-    let backup_two = backup(root, &second);
+    let backup_two = backup(root, &second, &ops);
     assert_eq!(backup_two["bundles"], 1, "{backup_two}");
     assert_eq!(backup_two["objects"], 1, "the payload: {backup_two}");
     assert!(
         backup_two["prefix"]["native_sequence"].as_u64().unwrap()
             > backup_one["prefix"]["native_sequence"].as_u64().unwrap()
     );
-    let verified = verify(root, &second);
+    let verified = verify(root, &second, &ops);
     assert_eq!(verified["complete"], true, "{verified}");
     assert_eq!(verified["objects_verified"], 1);
     // Verification needs no node: the killed node's backups still verify,
     // and a directory without a manifest is not a backup.
     drop(server);
-    let verified = verify(root, &second);
+    let verified = verify(root, &second, &ops);
     assert_eq!(verified["complete"], true, "{verified}");
     let empty = founder.path().join("backups").join("empty");
     std::fs::create_dir_all(&empty).unwrap();
     let missing = run(
         root,
         None,
-        &[
-            "verify",
-            "backup",
-            "--input",
-            empty.to_str().unwrap(),
-            "--format",
-            "json",
-        ],
+        &["verify", "backup", "--input", empty.to_str().unwrap()],
     );
-    assert!(!missing.status.success());
+    assert_eq!(refusal(&missing), "backup_invalid");
     let _ = start(root, &advertise);
 }

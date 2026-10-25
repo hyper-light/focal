@@ -2565,6 +2565,25 @@ fn backed_up_cluster_with(limits: NativeSessionLimits) -> (Cluster, backup::Back
     )
 }
 
+/// `backup::verify` of the backup under `root`, read through `medium` in `form` (29 §12.8).
+fn verify_in<M: backup::BackupMedium>(
+    medium: &M,
+    root: &Path,
+    form: &backup::BackupForm,
+    decoder: [u8; 32],
+    budget: &MemoryBudget,
+) -> Result<backup::VerifyReport, backup::BackupError> {
+    backup::verify(
+        backup::BackupFiles {
+            medium,
+            root,
+            form,
+            budget,
+        },
+        decoder,
+    )
+}
+
 #[test]
 fn a_backup_names_exactly_what_its_prefix_references_and_verifies_after_every_durable_cut() {
     let (cluster, image) = backed_up_cluster();
@@ -2587,6 +2606,7 @@ fn a_backup_names_exactly_what_its_prefix_references_and_verifies_after_every_du
     let report = backup::write(
         &mut medium,
         root,
+        &backup::BackupForm::clear(),
         &image,
         &seeds,
         &reader,
@@ -2604,7 +2624,14 @@ fn a_backup_names_exactly_what_its_prefix_references_and_verifies_after_every_du
     );
     assert_eq!(report.bundles, 0);
     assert_eq!(report.manifest.decoder_successor, decoder.1);
-    let verified = backup::verify(&medium, root, decoder.1, &budget).unwrap();
+    let verified = verify_in(
+        &medium,
+        root,
+        &backup::BackupForm::clear(),
+        decoder.1,
+        &budget,
+    )
+    .unwrap();
     assert!(verified.complete(), "{:?}", verified.problems);
     assert!(verified.decoder_supported);
     assert_eq!(verified.objects_verified, 1);
@@ -2615,6 +2642,7 @@ fn a_backup_names_exactly_what_its_prefix_references_and_verifies_after_every_du
         backup::write(
             &mut medium,
             root,
+            &backup::BackupForm::clear(),
             &image,
             &seeds,
             &reader,
@@ -2626,14 +2654,30 @@ fn a_backup_names_exactly_what_its_prefix_references_and_verifies_after_every_du
         Err(backup::BackupError::Exists)
     ));
     // A binary that lacks the decoder says so.
-    let other = backup::verify(&medium, root, [7; 32], &budget).unwrap();
+    let other = verify_in(
+        &medium,
+        root,
+        &backup::BackupForm::clear(),
+        [7; 32],
+        &budget,
+    )
+    .unwrap();
     assert!(!other.decoder_supported && other.complete());
     // Every durable cut before the manifest leaves no backup; the survivors
     // are whole files or absent.
     let operations = {
         let mut probe = focal_sim::disk::Disk::new(64 * 1024 * 1024);
         backup::write(
-            &mut probe, root, &image, &seeds, &reader, decoder, &limits, &budget, 1_000,
+            &mut probe,
+            root,
+            &backup::BackupForm::clear(),
+            &image,
+            &seeds,
+            &reader,
+            decoder,
+            &limits,
+            &budget,
+            1_000,
         )
         .unwrap();
         probe.operations()
@@ -2645,6 +2689,7 @@ fn a_backup_names_exactly_what_its_prefix_references_and_verifies_after_every_du
         let result = backup::write(
             &mut medium,
             root,
+            &backup::BackupForm::clear(),
             &image,
             &seeds,
             &reader,
@@ -2659,7 +2704,13 @@ fn a_backup_names_exactly_what_its_prefix_references_and_verifies_after_every_du
                 assert_eq!(cut, operations + 1, "a cut inside the write cannot succeed");
             }
             Err(_) => {
-                let verified = backup::verify(&medium, root, decoder.1, &budget);
+                let verified = verify_in(
+                    &medium,
+                    root,
+                    &backup::BackupForm::clear(),
+                    decoder.1,
+                    &budget,
+                );
                 assert!(
                     matches!(verified, Err(backup::BackupError::Missing("manifest"))),
                     "cut {cut}: {verified:?}"
@@ -2672,6 +2723,7 @@ fn a_backup_names_exactly_what_its_prefix_references_and_verifies_after_every_du
     backup::write(
         &mut medium,
         root,
+        &backup::BackupForm::clear(),
         &image,
         &seeds,
         &reader,
@@ -2684,7 +2736,14 @@ fn a_backup_names_exactly_what_its_prefix_references_and_verifies_after_every_du
     let chunk = report.manifest.content[0].chunks[0].hash;
     let path = root.join("content").join(format!("{chunk}.chunk"));
     medium.write(&path, 0, &[0xff]).unwrap();
-    let tampered = backup::verify(&medium, root, decoder.1, &budget).unwrap();
+    let tampered = verify_in(
+        &medium,
+        root,
+        &backup::BackupForm::clear(),
+        decoder.1,
+        &budget,
+    )
+    .unwrap();
     assert!(!tampered.complete());
     assert!(
         tampered
@@ -2698,6 +2757,7 @@ fn a_backup_names_exactly_what_its_prefix_references_and_verifies_after_every_du
     backup::write(
         &mut medium,
         root,
+        &backup::BackupForm::clear(),
         &image,
         &seeds,
         &reader,
@@ -2708,19 +2768,42 @@ fn a_backup_names_exactly_what_its_prefix_references_and_verifies_after_every_du
     )
     .unwrap();
     medium.write(root.join("checkpoint"), 3, &[0xff]).unwrap();
-    let tampered = backup::verify(&medium, root, decoder.1, &budget).unwrap();
+    let tampered = verify_in(
+        &medium,
+        root,
+        &backup::BackupForm::clear(),
+        decoder.1,
+        &budget,
+    )
+    .unwrap();
     assert!(!tampered.checkpoint_verified && !tampered.inventory_matches);
     // The real filesystem medium writes the same backup.
     let target = tempfile::tempdir().unwrap();
     let mut files = backup::FileMedium;
     let dir = target.path().join("backup");
     let on_disk = backup::write(
-        &mut files, &dir, &image, &seeds, &reader, decoder, &limits, &budget, 1_000,
+        &mut files,
+        &dir,
+        &backup::BackupForm::clear(),
+        &image,
+        &seeds,
+        &reader,
+        decoder,
+        &limits,
+        &budget,
+        1_000,
     )
     .unwrap();
     assert_eq!(on_disk.manifest, report.manifest);
     assert!(dir.join("MANIFEST").is_file());
-    let verified = backup::verify(&files, &dir, decoder.1, &budget).unwrap();
+    let verified = verify_in(
+        &files,
+        &dir,
+        &backup::BackupForm::clear(),
+        decoder.1,
+        &budget,
+    )
+    .unwrap();
     assert!(verified.complete(), "{:?}", verified.problems);
     assert_eq!(verified.bytes_verified, report.manifest.content[0].length);
 }
@@ -2747,6 +2830,7 @@ fn a_backup_of_a_seeded_root_carries_every_chunk_and_names_them_exactly() {
     let report = backup::write(
         &mut medium,
         root,
+        &backup::BackupForm::clear(),
         &image,
         &seeds,
         &reader,
@@ -2764,14 +2848,28 @@ fn a_backup_of_a_seeded_root_carries_every_chunk_and_names_them_exactly() {
                 .is_ok()
         );
     }
-    let verified = backup::verify(&medium, root, decoder.1, &budget).unwrap();
+    let verified = verify_in(
+        &medium,
+        root,
+        &backup::BackupForm::clear(),
+        decoder.1,
+        &budget,
+    )
+    .unwrap();
     assert!(verified.complete(), "{:?}", verified.problems);
     assert_eq!(verified.seeds_verified, report.manifest.seeds.len() as u64);
     // A missing seed chunk is named and the envelope cannot be rebuilt.
     let first = report.manifest.seeds[0].hash;
     let path = root.join("seeds").join(format!("{first}.seed"));
     medium.rename(&path, root.join("gone")).unwrap();
-    let broken = backup::verify(&medium, root, decoder.1, &budget).unwrap();
+    let broken = verify_in(
+        &medium,
+        root,
+        &backup::BackupForm::clear(),
+        decoder.1,
+        &budget,
+    )
+    .unwrap();
     assert!(!broken.complete());
     assert!(
         broken
@@ -2781,6 +2879,489 @@ fn a_backup_of_a_seeded_root_carries_every_chunk_and_names_them_exactly() {
         "{:?}",
         broken.problems
     );
+}
+
+/// Every file under `dir`, with its bytes.
+fn files_under(dir: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let bytes = std::fs::read(&path).unwrap();
+                found.push((path, bytes));
+            }
+        }
+    }
+    found
+}
+/// `from` copied whole to `to`.
+fn copy_tree(from: &Path, to: &Path) {
+    for (path, bytes) in files_under(from) {
+        let target = to.join(path.strip_prefix(from).unwrap());
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(target, bytes).unwrap();
+    }
+}
+fn holds(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+/// Windows of `bytes` no ciphertext repeats by chance: 32 bytes long, each with at least eight
+/// distinct byte values, from its start, middle and end.
+fn probes(bytes: &[u8]) -> Vec<&[u8]> {
+    const PROBE: usize = 32;
+    let Some(last) = bytes.len().checked_sub(PROBE) else {
+        return Vec::new();
+    };
+    [0, last / 2, last]
+        .into_iter()
+        .map(|at| &bytes[at..at + PROBE])
+        .filter(|window| {
+            let mut seen = [false; 256];
+            window
+                .iter()
+                .for_each(|byte| seen[usize::from(*byte)] = true);
+            seen.iter().filter(|seen| **seen).count() >= 8
+        })
+        .collect()
+}
+/// The file under `dir` whose path ends in `suffix` (a directory and an extension), the first.
+fn file_ending(dir: &Path, folder: &str, extension: &str) -> std::path::PathBuf {
+    files_under(dir)
+        .into_iter()
+        .map(|(path, _)| path)
+        .find(|path| {
+            path.parent().is_some_and(|parent| parent.ends_with(folder))
+                && path.extension().is_some_and(|ext| ext == extension)
+        })
+        .unwrap()
+}
+fn flip(path: &Path) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let at = bytes.len() / 2;
+    bytes[at] ^= 0x40;
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// Do: back a session with a seeded root up in the clear and sealed under an operator's key file
+/// (29 §12.8); scan the sealed backup; verify it under that key file, with none and with another;
+/// flip a byte of each kind of its files, swap two of them and carry in a file of another sealed
+/// backup; cut its write at every durable step. Expect: both name the same files; no sealed file is
+/// named by a hash or holds a hash, a chunk, a row or the manifest in the clear; it verifies whole
+/// under its key file, and without one is refused as needing it, under another as the wrong key,
+/// before anything else is read; the clear backup reads as ever whatever key file is named; every
+/// flipped, swapped or carried file is named; every cut before the manifest leaves no backup, and a
+/// write a crash cut goes on under its own key and is refused under another.
+#[test]
+fn a_sealed_backup_holds_nothing_in_the_clear_and_opens_only_under_its_key_file() {
+    let mut limits = native_limits();
+    limits.checkpoint.inline_bytes = 64;
+    let (cluster, image) = backed_up_cluster_with(limits);
+    let budget = MemoryBudget::new(256 * 1024 * 1024, 64 * 1024 * 1024).unwrap();
+    let reader = ContentReader::open(
+        content_dir(cluster.dir.path(), 1),
+        focal_seal::test_keys(content_dir(cluster.dir.path(), 1)).unwrap(),
+    )
+    .unwrap();
+    let seeds = focal_evidence::SeedReader::open(
+        cluster.dir.path().join("seeds-1"),
+        focal_seal::test_keys(content_dir(cluster.dir.path(), 1)).unwrap(),
+    )
+    .unwrap();
+    let decoder = backup::decoder_pair();
+    let keys = tempfile::tempdir().unwrap();
+    let (ops, stranger) = (keys.path().join("ops.key"), keys.path().join("other.key"));
+    focal_seal::create_root_key(&ops).unwrap();
+    focal_seal::create_root_key(&stranger).unwrap();
+    let operator = focal_seal::operator_key(&ops).unwrap();
+    let other = focal_seal::operator_key(&stranger).unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let (clear_dir, dir) = (target.path().join("clear"), target.path().join("sealed"));
+    let write = |root: &Path, form: &backup::BackupForm| {
+        backup::write(
+            &mut backup::FileMedium,
+            root,
+            form,
+            &image,
+            &seeds,
+            &reader,
+            decoder,
+            &limits,
+            &budget,
+            1_000,
+        )
+    };
+    let clear = write(&clear_dir, &backup::BackupForm::clear()).unwrap();
+    let form = backup::BackupForm::seal_under(&operator).unwrap();
+    let sealed = write(&dir, &form).unwrap();
+    let manifest = &sealed.manifest;
+    assert_eq!(manifest, &clear.manifest, "both name the same files");
+    assert!(!manifest.seeds.is_empty(), "the root is seeded");
+
+    // Nothing of the clear backup, and no hash, lies in the sealed one.
+    let mut hashes = vec![manifest.checkpoint_hash];
+    hashes.extend(manifest.seeds.iter().map(|chunk| chunk.hash));
+    for object in &manifest.content {
+        hashes.push(object.root);
+        hashes.extend(object.chunks.iter().map(|chunk| chunk.hash));
+    }
+    let clear_files = files_under(&clear_dir);
+    let sealed_files = files_under(&dir);
+    assert_eq!(
+        sealed_files.len(),
+        clear_files.len() + 1,
+        "and its ENCRYPTION-INFO"
+    );
+    assert!(
+        sealed_files
+            .iter()
+            .any(|(path, _)| path.ends_with(backup::ENCRYPTION_INFO_FILE))
+    );
+    for (path, bytes) in &sealed_files {
+        let name = path.file_name().unwrap().to_string_lossy();
+        for hash in &hashes {
+            assert!(
+                !name.contains(&hash.to_string()),
+                "{name} is named by a hash"
+            );
+            assert!(!holds(bytes, &hash.0), "{path:?} holds a hash");
+            assert!(
+                !holds(bytes, hash.to_string().as_bytes()),
+                "{path:?} holds a hash's hex"
+            );
+        }
+        assert!(
+            !holds(bytes, backup::MAGIC),
+            "{path:?} holds the manifest's magic"
+        );
+        for (clear_path, clear_bytes) in &clear_files {
+            for probe in probes(clear_bytes) {
+                assert!(
+                    !holds(bytes, probe),
+                    "{path:?} holds bytes of {clear_path:?}"
+                );
+            }
+        }
+    }
+
+    // It opens under its key file alone, and reads as the clear backup does.
+    let opened = backup::BackupForm::of(&backup::FileMedium, &dir, Some(&operator)).unwrap();
+    assert!(opened.sealed());
+    let verified = verify_in(&backup::FileMedium, &dir, &opened, decoder.1, &budget).unwrap();
+    assert!(verified.complete(), "{:?}", verified.problems);
+    assert_eq!(&verified.manifest, manifest);
+    assert_eq!(verified.seeds_verified, manifest.seeds.len() as u64);
+    assert!(matches!(
+        backup::BackupForm::of(&backup::FileMedium, &dir, None),
+        Err(backup::BackupError::KeyRequired { .. })
+    ));
+    assert!(matches!(
+        backup::BackupForm::of(&backup::FileMedium, &dir, Some(&other)),
+        Err(backup::BackupError::WrongKey { .. })
+    ));
+    let clear_form =
+        backup::BackupForm::of(&backup::FileMedium, &clear_dir, Some(&operator)).unwrap();
+    assert!(!clear_form.sealed());
+    assert!(
+        verify_in(
+            &backup::FileMedium,
+            &clear_dir,
+            &clear_form,
+            decoder.1,
+            &budget
+        )
+        .unwrap()
+        .complete()
+    );
+
+    // Each file changed, swapped or carried in is named.
+    let another = target.path().join("another");
+    write(
+        &another,
+        &backup::BackupForm::seal_under(&operator).unwrap(),
+    )
+    .unwrap();
+    type Damage = fn(&Path, &Path);
+    let damages: [(&str, Damage); 6] = [
+        ("chunk", |copy, _| {
+            flip(&file_ending(copy, "content", "chunk"))
+        }),
+        ("seed", |copy, _| flip(&file_ending(copy, "seeds", "seed"))),
+        ("checkpoint", |copy, _| flip(&copy.join("checkpoint"))),
+        ("swapped", |copy, _| {
+            let (checkpoint, seed) = (copy.join("checkpoint"), file_ending(copy, "seeds", "seed"));
+            let (a, b) = (
+                std::fs::read(&checkpoint).unwrap(),
+                std::fs::read(&seed).unwrap(),
+            );
+            std::fs::write(&checkpoint, b).unwrap();
+            std::fs::write(&seed, a).unwrap();
+        }),
+        ("carried", |copy, another| {
+            std::fs::copy(another.join("checkpoint"), copy.join("checkpoint")).unwrap();
+        }),
+        ("manifest", |copy, _| flip(&copy.join("MANIFEST"))),
+    ];
+    for (case, damage) in damages {
+        let copy = target.path().join(format!("copy-{case}"));
+        copy_tree(&dir, &copy);
+        damage(&copy, &another);
+        let opened = backup::BackupForm::of(&backup::FileMedium, &copy, Some(&operator)).unwrap();
+        match verify_in(&backup::FileMedium, &copy, &opened, decoder.1, &budget) {
+            Ok(report) => {
+                assert!(!report.complete(), "{case}: {:?}", report.problems);
+                assert!(!report.problems.is_empty(), "{case}");
+            }
+            Err(error) => assert_eq!(case, "manifest", "{case}: {error:?}"),
+        }
+    }
+    let copy = target.path().join("copy-info");
+    copy_tree(&dir, &copy);
+    flip(&copy.join(backup::ENCRYPTION_INFO_FILE));
+    assert!(matches!(
+        backup::BackupForm::of(&backup::FileMedium, &copy, Some(&operator)),
+        Err(backup::BackupError::Corrupt("encryption info"))
+    ));
+
+    // Every durable cut before the manifest leaves no backup; one a crash cut goes on under its own
+    // key, and is refused under another once its key's record stands.
+    let root = Path::new("/backup");
+    let write_to = |medium: &mut focal_sim::disk::Disk, form: &backup::BackupForm| {
+        backup::write(
+            medium, root, form, &image, &seeds, &reader, decoder, &limits, &budget, 1_000,
+        )
+    };
+    let operations = {
+        let mut probe = focal_sim::disk::Disk::new(64 * 1024 * 1024);
+        write_to(&mut probe, &form).unwrap();
+        probe.operations()
+    };
+    assert!(operations > 5);
+    for cut in 1..=operations {
+        let mut medium = focal_sim::disk::Disk::new(64 * 1024 * 1024);
+        medium.fail_before(Some(cut));
+        assert!(write_to(&mut medium, &form).is_err(), "cut {cut}");
+        medium.crash();
+        medium.fail_before(None);
+        let opened = backup::BackupForm::of(&medium, root, Some(&operator)).unwrap();
+        assert!(
+            matches!(
+                verify_in(&medium, root, &opened, decoder.1, &budget),
+                Err(backup::BackupError::Missing("manifest"))
+            ),
+            "cut {cut}"
+        );
+        if opened.sealed() {
+            assert!(
+                matches!(
+                    write_to(
+                        &mut medium,
+                        &backup::BackupForm::seal_under(&operator).unwrap()
+                    ),
+                    Err(backup::BackupError::Exists)
+                ),
+                "cut {cut}"
+            );
+        }
+        write_to(&mut medium, &form).unwrap();
+        let opened = backup::BackupForm::of(&medium, root, Some(&operator)).unwrap();
+        let verified = verify_in(&medium, root, &opened, decoder.1, &budget).unwrap();
+        assert!(verified.complete(), "cut {cut}: {:?}", verified.problems);
+    }
+}
+
+/// Do: restore a seeded session's backup, written once in the clear and once sealed, each into a
+/// new incarnation (29 §12.8). Expect: the sealed backup imports the same objects and seeds and
+/// rewrites the envelope to the same prefix as the clear one.
+#[test]
+fn a_sealed_backup_restores_as_a_clear_one_does() {
+    let mut limits = native_limits();
+    limits.checkpoint.inline_bytes = 64;
+    let (cluster, image) = backed_up_cluster_with(limits);
+    let budget = MemoryBudget::new(256 * 1024 * 1024, 64 * 1024 * 1024).unwrap();
+    let reader = ContentReader::open(
+        content_dir(cluster.dir.path(), 1),
+        focal_seal::test_keys(content_dir(cluster.dir.path(), 1)).unwrap(),
+    )
+    .unwrap();
+    let seeds = focal_evidence::SeedReader::open(
+        cluster.dir.path().join("seeds-1"),
+        focal_seal::test_keys(content_dir(cluster.dir.path(), 1)).unwrap(),
+    )
+    .unwrap();
+    let decoder = backup::decoder_pair();
+    let keys = tempfile::tempdir().unwrap();
+    let ops = keys.path().join("ops.key");
+    focal_seal::create_root_key(&ops).unwrap();
+    let operator = focal_seal::operator_key(&ops).unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let mut restored = Vec::new();
+    for (name, form) in [
+        ("clear", backup::BackupForm::clear()),
+        ("sealed", backup::BackupForm::seal_under(&operator).unwrap()),
+    ] {
+        let dir = target.path().join(name);
+        let report = backup::write(
+            &mut backup::FileMedium,
+            &dir,
+            &form,
+            &image,
+            &seeds,
+            &reader,
+            decoder,
+            &limits,
+            &budget,
+            1_000,
+        )
+        .unwrap();
+        let opened = backup::BackupForm::of(&backup::FileMedium, &dir, Some(&operator)).unwrap();
+        assert_eq!(opened.sealed(), form.sealed());
+        let files = backup::BackupFiles {
+            medium: &backup::FileMedium,
+            root: &dir,
+            form: &opened,
+            budget: &budget,
+        };
+        let other = target.path().join(format!("{name}-node"));
+        let node = 2u64;
+        let mut store = writer(&other, node);
+        let imported = backup::import_content(files, &report.manifest, &mut store).unwrap();
+        let mut sink = focal_evidence::SeedStore::open(
+            other.join(format!("seeds-{node}")),
+            focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default()).unwrap(),
+            &focal_seal::test_keys(content_dir(&other, node)).unwrap(),
+            focal_evidence::ContentForm::Sealed,
+        )
+        .unwrap();
+        let installed = backup::import_seeds(files, &report.manifest, &mut sink).unwrap();
+        let checkpoint = files.read_checkpoint().unwrap();
+        assert_eq!(checkpoint, image.checkpoint);
+        let rewritten = backup::rewrite(
+            &checkpoint,
+            &backup::BackupSeeds::new(files),
+            &backup::BackupContent::new(files),
+            backup::Incarnation {
+                cluster: [9; 16],
+                group: [7; 16],
+                node,
+            },
+            &limits,
+            &budget,
+            &mut sink,
+        )
+        .unwrap();
+        restored.push((
+            imported,
+            installed,
+            rewritten.index,
+            rewritten.term,
+            rewritten.native_sequence,
+            rewritten.configuration.voters.clone(),
+        ));
+    }
+    assert_eq!(restored[0], restored[1]);
+    assert_eq!(restored[0].0, 1);
+    assert!(restored[0].1 > 0);
+}
+
+/// What sealing costs a backup (29 §12.8): a seeded session's backup written and verified in the
+/// clear and sealed under an operator's key file, in interleaved rounds on the real file system,
+/// the medians of each. A write is its files' flushes; a verification reads what the page cache
+/// holds, so its time is the CPU's: every file opened, hashed and the envelope rebuilt.
+#[test]
+#[ignore = "measurement; run with --ignored --nocapture"]
+fn measure_a_sealed_backup_against_a_clear_one() {
+    use std::time::{Duration, Instant};
+    const ROUNDS: usize = 24;
+    let mut limits = native_limits();
+    limits.checkpoint.inline_bytes = 64;
+    let (cluster, image) = backed_up_cluster_with(limits);
+    let budget = MemoryBudget::new(256 * 1024 * 1024, 64 * 1024 * 1024).unwrap();
+    let reader = ContentReader::open(
+        content_dir(cluster.dir.path(), 1),
+        focal_seal::test_keys(content_dir(cluster.dir.path(), 1)).unwrap(),
+    )
+    .unwrap();
+    let seeds = focal_evidence::SeedReader::open(
+        cluster.dir.path().join("seeds-1"),
+        focal_seal::test_keys(content_dir(cluster.dir.path(), 1)).unwrap(),
+    )
+    .unwrap();
+    let decoder = backup::decoder_pair();
+    let keys = tempfile::tempdir().unwrap();
+    let ops = keys.path().join("ops.key");
+    focal_seal::create_root_key(&ops).unwrap();
+    let operator = focal_seal::operator_key(&ops).unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let mut times: [(Vec<Duration>, Vec<Duration>); 2] = Default::default();
+    let mut files = [0usize; 2];
+    let mut bytes = [0u64; 2];
+    for round in 0..ROUNDS {
+        // Each form first in turn, so a host's drift falls on both alike.
+        let order = if round % 2 == 0 {
+            [false, true]
+        } else {
+            [true, false]
+        };
+        for sealed in order {
+            let dir = target.path().join(format!("{round}-{sealed}"));
+            let form = if sealed {
+                backup::BackupForm::seal_under(&operator).unwrap()
+            } else {
+                backup::BackupForm::clear()
+            };
+            let began = Instant::now();
+            backup::write(
+                &mut backup::FileMedium,
+                &dir,
+                &form,
+                &image,
+                &seeds,
+                &reader,
+                decoder,
+                &limits,
+                &budget,
+                1_000,
+            )
+            .unwrap();
+            let wrote = began.elapsed();
+            let began = Instant::now();
+            let opened =
+                backup::BackupForm::of(&backup::FileMedium, &dir, Some(&operator)).unwrap();
+            let verified =
+                verify_in(&backup::FileMedium, &dir, &opened, decoder.1, &budget).unwrap();
+            let read = began.elapsed();
+            assert!(verified.complete());
+            let slot = usize::from(sealed);
+            times[slot].0.push(wrote);
+            times[slot].1.push(read);
+            let on_disk = files_under(&dir);
+            files[slot] = on_disk.len();
+            bytes[slot] = on_disk.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+    let median = |samples: &mut Vec<Duration>| {
+        samples.sort();
+        samples[samples.len() / 2]
+    };
+    for (slot, form) in [(0, "clear"), (1, "sealed")] {
+        let write = median(&mut times[slot].0);
+        let verify = median(&mut times[slot].1);
+        println!(
+            "{form:>6}: {} files, {} bytes; write {:.3} ms, verify {:.3} ms",
+            files[slot],
+            bytes[slot],
+            write.as_secs_f64() * 1000.0,
+            verify.as_secs_f64() * 1000.0
+        );
+    }
 }
 
 /// Drive a session that stands alone until it is the native authority.
@@ -2819,7 +3400,16 @@ fn a_backup_restores_into_a_new_incarnation_that_holds_the_prefix_and_continues(
     let dir = target.path().join("backup");
     let mut files = backup::FileMedium;
     let report = backup::write(
-        &mut files, &dir, &image, &seeds, &reader, decoder, &limits, &budget, 1_000,
+        &mut files,
+        &dir,
+        &backup::BackupForm::clear(),
+        &image,
+        &seeds,
+        &reader,
+        decoder,
+        &limits,
+        &budget,
+        1_000,
     )
     .unwrap();
     let manifest = &report.manifest;
@@ -2839,7 +3429,14 @@ fn a_backup_restores_into_a_new_incarnation_that_holds_the_prefix_and_continues(
     let group = [7u8; 16];
     let node = 2u64;
     let mut store = writer(other.path(), node);
-    let imported = backup::import_content(&files, &dir, manifest, &mut store, &budget).unwrap();
+    let clear = backup::BackupForm::clear();
+    let backup_files = backup::BackupFiles {
+        medium: &files,
+        root: &dir,
+        form: &clear,
+        budget: &budget,
+    };
+    let imported = backup::import_content(backup_files, manifest, &mut store).unwrap();
     assert_eq!(imported, 1);
     let rewritten = {
         let mut sink = focal_evidence::SeedStore::open(
@@ -2849,10 +3446,10 @@ fn a_backup_restores_into_a_new_incarnation_that_holds_the_prefix_and_continues(
             focal_evidence::ContentForm::Sealed,
         )
         .unwrap();
-        let installed = backup::import_seeds(&files, &dir, manifest, &mut sink).unwrap();
+        let installed = backup::import_seeds(backup_files, manifest, &mut sink).unwrap();
         assert_eq!(installed, manifest.seeds.len() as u64);
-        let content = backup::BackupContent::new(&files, &dir);
-        let backup_seeds = backup::BackupSeeds::new(&files, &dir);
+        let content = backup::BackupContent::new(backup_files);
+        let backup_seeds = backup::BackupSeeds::new(backup_files);
         backup::rewrite(
             &image.checkpoint,
             &backup_seeds,
@@ -3206,6 +3803,7 @@ fn a_sustained_workload_stays_within_its_budgets_and_keeps_every_outcome() {
     let written = backup::write(
         &mut files,
         &dir,
+        &backup::BackupForm::clear(),
         &image,
         &seeds,
         &reader,
@@ -3218,7 +3816,14 @@ fn a_sustained_workload_stays_within_its_budgets_and_keeps_every_outcome() {
     assert_eq!(written.bundles, ROUNDS as u64);
     assert_eq!(written.manifest.content.len(), ROUNDS as usize);
     assert_eq!(written.manifest.retired_families, ROUNDS as u64);
-    let verified = backup::verify(&files, &dir, backup::decoder_pair().1, &budget).unwrap();
+    let verified = verify_in(
+        &files,
+        &dir,
+        &backup::BackupForm::clear(),
+        backup::decoder_pair().1,
+        &budget,
+    )
+    .unwrap();
     assert!(verified.complete(), "{:?}", verified.problems);
 }
 

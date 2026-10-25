@@ -57,6 +57,32 @@ pub enum ClusterAdminError {
     Renewal(#[from] crate::credential_renewal::RenewalError),
     #[error("admin journal is missing, corrupt, or belongs to another physical node")]
     Corrupt,
+    /// A backup that does not read as one: no manifest, a file that does not parse or open (26 §6).
+    #[error("the backup does not read: {0}")]
+    BackupInvalid(String),
+    /// The node's fence is at the at-rest level, where a backup is sealed under an operator's key
+    /// file (29 §12.8), and none was named.
+    #[error(
+        "this node's fence ({level}) is at the at-rest level, where a backup is sealed under an operator's key file: pass --key-file (`focal create root-key --output FILE` makes one)"
+    )]
+    BackupKeyNeeded { level: u32 },
+    /// A key file named for a backup below the at-rest level, where backups are written in the
+    /// clear for the binaries the fence still admits.
+    #[error(
+        "this node's fence ({level}) is below the at-rest level ({needed}): its backups are written in the clear; leave out --key-file"
+    )]
+    BackupBelowLevel { level: u32, needed: u32 },
+    /// A sealed backup asked of with no key file: the ID of the operator key it needs.
+    #[error("the backup is sealed under key {key}: name its key file with --key-file")]
+    BackupKeyRequired { key: String },
+    /// A sealed backup asked of with a key file that does not wrap its key.
+    #[error(
+        "the backup is sealed under key {needed}, and the key file holds key {offered}: name the key file it was written under"
+    )]
+    BackupKeyMismatch { needed: String, offered: String },
+    /// The named key file is not one.
+    #[error("{0}")]
+    BackupKeyFile(String),
     /// The data directory is not this user's, or another user may write to
     /// it and so replace what the journals hold: the rule the node's start
     /// applies to it, and OpenSSH's `StrictModes` to a key's directory.
@@ -283,6 +309,14 @@ impl ClusterAdminError {
                 code: "unknown_node",
                 exit_code: 4,
             },
+            Self::BackupInvalid(_) => Failure::error("backup_invalid", 1),
+            Self::BackupKeyNeeded { .. } | Self::BackupKeyRequired { .. } => {
+                Failure::error("backup_key_required", 2)
+            }
+            Self::BackupKeyMismatch { .. } => Failure::error("backup_key_mismatch", 2),
+            Self::BackupBelowLevel { .. } | Self::BackupKeyFile(_) => {
+                Failure::error("invalid_input", 2)
+            }
             Self::NodeHolding { .. } => Failure::error("node_holding", 5),
             Self::NotDrained(_) => Failure::error("not_drained", 5),
             Self::DrainPending { .. } => Failure::error("drain_pending", 5),
@@ -306,6 +340,23 @@ impl ClusterAdminError {
             }
             _ => Failure::error("admin", 1),
         }
+    }
+}
+
+/// What the operator is told of a backup that is refused (26 §6, 29 §12.8): the key file's absence
+/// or mismatch, and the key file itself, by name.
+fn backup_refusal(error: focal_ledger::backup::BackupError) -> ClusterAdminError {
+    use focal_ledger::backup::BackupError;
+    match error {
+        BackupError::Io(error) => ClusterAdminError::Io(error),
+        BackupError::KeyRequired { key } => ClusterAdminError::BackupKeyRequired { key },
+        BackupError::WrongKey { needed, offered } => {
+            ClusterAdminError::BackupKeyMismatch { needed, offered }
+        }
+        BackupError::KeyFile(error) => ClusterAdminError::BackupKeyFile(error.to_string()),
+        BackupError::Exists => ClusterAdminError::Invalid,
+        BackupError::Capacity | BackupError::Memory(_) => ClusterAdminError::Capacity,
+        other => ClusterAdminError::BackupInvalid(other.to_string()),
     }
 }
 
@@ -482,21 +533,50 @@ impl ClusterAdmin {
         })
     }
     /// Write a backup of a hosted session at its committed prefix into
-    /// `output` on this node (26 §6).
+    /// `output` on this node (26 §6), sealed under the operator's key file
+    /// `key_file` from the at-rest level (29 §12.8). What the fence asks of
+    /// the key file is refused here by name before the node is asked, as the
+    /// node refuses it.
     pub async fn backup_create(
         &self,
         ledger: focal_model::LedgerId,
         output: &Path,
+        key_file: Option<&Path>,
     ) -> Result<AdminResult> {
         let output = std::path::absolute(output)?
             .to_str()
             .ok_or(ClusterAdminError::Invalid)?
             .to_owned();
+        let level = crate::storage_level::known(&self.root)?.unwrap_or(0);
+        let sealed =
+            crate::storage_level::at_rest_form_at(level) == focal_evidence::ContentForm::Sealed;
+        let key_file = match (sealed, key_file) {
+            (true, None) => return Err(ClusterAdminError::BackupKeyNeeded { level }),
+            (false, Some(_)) => {
+                return Err(ClusterAdminError::BackupBelowLevel {
+                    level,
+                    needed: crate::upgrade::AT_REST_LEVEL,
+                });
+            }
+            (_, None) => None,
+            (true, Some(key_file)) => {
+                let key_file = std::path::absolute(key_file)?;
+                focal_seal::operator_key(&key_file)
+                    .map_err(|error| ClusterAdminError::BackupKeyFile(error.to_string()))?;
+                Some(
+                    key_file
+                        .to_str()
+                        .ok_or(ClusterAdminError::Invalid)?
+                        .to_owned(),
+                )
+            }
+        };
         let bytes = self
             .exchange_bytes(AdminCommand::BackupCreate {
                 tenant: ledger.tenant.0,
                 session: ledger.session.0,
                 output,
+                key_file,
             })
             .await?;
         let (reply, tail): (crate::network_admin::BackupCreatedReply, _) =
@@ -543,28 +623,36 @@ impl ClusterAdmin {
         })
     }
     /// Verify a backup directory offline (26 §6): no running node and no
-    /// data directory are needed, only a binary that can read the format.
-    pub fn backup_verify(input: &Path) -> Result<AdminResult> {
-        let verification = crate::backup::verify(input).map_err(|error| match error {
-            focal_ledger::backup::BackupError::Io(error) => ClusterAdminError::Io(error),
-            focal_ledger::backup::BackupError::Missing(_)
-            | focal_ledger::backup::BackupError::Corrupt(_)
-            | focal_ledger::backup::BackupError::Unsupported => ClusterAdminError::Corrupt,
-            focal_ledger::backup::BackupError::Exists => ClusterAdminError::Invalid,
-            _ => ClusterAdminError::Capacity,
-        })?;
+    /// data directory are needed, only a binary that can read the format and,
+    /// for a sealed backup, the key file it was written under (29 §12.8).
+    pub fn backup_verify(input: &Path, key_file: Option<&Path>) -> Result<AdminResult> {
+        let verification = crate::backup::verify(input, key_file).map_err(backup_refusal)?;
         Ok(AdminResult::BackupVerified { verification })
     }
-    /// Restore a session from a verified backup onto this node (26 §6).
-    pub async fn restore(&self, input: &Path, new_incarnation: bool) -> Result<AdminResult> {
-        let input = std::path::absolute(input)?
-            .to_str()
-            .ok_or(ClusterAdminError::Invalid)?
-            .to_owned();
+    /// Restore a session from a verified backup onto this node (26 §6). A
+    /// sealed backup's key is opened here first under the key file the node
+    /// will use (29 §12.8): one asked of without it, or with another, is
+    /// refused by name before the node is asked, and the node refuses it
+    /// again before anything is restored.
+    pub async fn restore(
+        &self,
+        input: &Path,
+        new_incarnation: bool,
+        key_file: Option<&Path>,
+    ) -> Result<AdminResult> {
+        let input = std::path::absolute(input)?;
+        let key_file = key_file.map(std::path::absolute).transpose()?;
+        crate::backup::form(&input, key_file.as_deref()).map_err(backup_refusal)?;
+        let input = input.to_str().ok_or(ClusterAdminError::Invalid)?.to_owned();
+        let key_file = key_file
+            .map(|path| path.to_str().map(str::to_owned))
+            .map(|path| path.ok_or(ClusterAdminError::Invalid))
+            .transpose()?;
         let bytes = self
             .exchange_bytes(AdminCommand::Restore {
                 input,
                 new_incarnation,
+                key_file,
             })
             .await?;
         let (reply, tail): (crate::network_admin::RestoredReply, _) =

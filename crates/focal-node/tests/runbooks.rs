@@ -748,15 +748,40 @@ fn runbook_interrupted_restore() {
         |view| session_row(view, &session).is_some(),
     );
     let backup = founder.root().join("backup");
+    // At the binary's level a backup is sealed under the operator's key file (29 §12.8).
+    let keys = tempfile::Builder::new()
+        .prefix("focal-keys-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let key = keys.path().join("ops.key");
+    let made = std::process::Command::new(env!("CARGO_BIN_EXE_focal"))
+        .args(["create", "root-key", "--output", key.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{made:?}");
     let created = admin(
         &founder,
-        &["create", "backup", "--output", backup.to_str().unwrap()],
+        &[
+            "create",
+            "backup",
+            "--output",
+            backup.to_str().unwrap(),
+            "--key-file",
+            key.to_str().unwrap(),
+        ],
     );
     assert_eq!(created["result"]["kind"], "backup_created", "{created}");
     drop(server);
     let verified = admin(
         &founder,
-        &["verify", "backup", "--input", backup.to_str().unwrap()],
+        &[
+            "verify",
+            "backup",
+            "--input",
+            backup.to_str().unwrap(),
+            "--key-file",
+            key.to_str().unwrap(),
+        ],
     );
     assert_eq!(verified["result"]["kind"], "backup_verified", "{verified}");
     // A fresh founder restores and stops where the restore is cut: once
@@ -782,6 +807,8 @@ fn runbook_interrupted_restore() {
             "--input",
             backup.to_str().unwrap(),
             "--new-incarnation",
+            "--key-file",
+            key.to_str().unwrap(),
         ];
         let interrupted = run(&other, None, &restore_args);
         assert!(

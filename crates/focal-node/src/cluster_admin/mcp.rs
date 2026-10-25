@@ -56,6 +56,7 @@ impl ClusterAdmin {
                     tenant,
                     session,
                     output,
+                    key_file,
                 } => {
                     self.backup_create(
                         focal_model::LedgerId {
@@ -67,12 +68,14 @@ impl ClusterAdmin {
                                 .unwrap_or(self.identity.ledger.session),
                         },
                         std::path::Path::new(&output),
+                        key_file.as_deref().map(std::path::Path::new),
                     )
                     .await
                 }
-                AdminAction::BackupVerify { input } => {
-                    ClusterAdmin::backup_verify(std::path::Path::new(&input))
-                }
+                AdminAction::BackupVerify { input, key_file } => ClusterAdmin::backup_verify(
+                    std::path::Path::new(&input),
+                    key_file.as_deref().map(std::path::Path::new),
+                ),
                 AdminAction::Repair {
                     tenant,
                     session,
@@ -96,9 +99,14 @@ impl ClusterAdmin {
                 AdminAction::Restore {
                     input,
                     new_incarnation,
+                    key_file,
                 } => {
-                    self.restore(std::path::Path::new(&input), new_incarnation)
-                        .await
+                    self.restore(
+                        std::path::Path::new(&input),
+                        new_incarnation,
+                        key_file.as_deref().map(std::path::Path::new),
+                    )
+                    .await
                 }
                 AdminAction::GcRestore { domain, root } => {
                     self.gc_restore(

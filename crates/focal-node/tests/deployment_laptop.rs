@@ -301,12 +301,33 @@ fn the_laptop_stage_needs_a_directory_an_address_and_one_command() {
     // incarnation, and only when the operator says so; the other laptop
     // refuses this one's plan by name.
     let backup = laptop.root().join("backup");
+    // A backup at the binary's level is sealed under the operator's key file (29 §12.8), which
+    // lives off the data volume, as a root key does.
+    let keys = tempfile::Builder::new()
+        .prefix("focal-keys-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let key = keys.path().join("ops.key");
+    journey.admin(
+        &laptop,
+        "backup key",
+        &["key file"],
+        &["create", "root-key", "--output", key.to_str().unwrap()],
+    );
     let created = journey.admin(
         &laptop,
         "backup",
-        &["backup directory"],
-        &["create", "backup", "--output", backup.to_str().unwrap()],
+        &["backup directory", "key file"],
+        &[
+            "create",
+            "backup",
+            "--output",
+            backup.to_str().unwrap(),
+            "--key-file",
+            key.to_str().unwrap(),
+        ],
     );
+    assert_eq!(created["result"]["backup"]["sealed"], true, "{created}");
     assert_eq!(created["result"]["kind"], "backup_created", "{created}");
     drop(server);
     journey.manual("crash", &[], &["kill", "-KILL", "<laptop process>"]);
@@ -348,20 +369,29 @@ fn the_laptop_stage_needs_a_directory_an_address_and_one_command() {
         &other,
         None,
         "restore",
-        &["backup directory"],
-        &["restore", "session", "--input", backup.to_str().unwrap()],
+        &["backup directory", "key file"],
+        &[
+            "restore",
+            "session",
+            "--input",
+            backup.to_str().unwrap(),
+            "--key-file",
+            key.to_str().unwrap(),
+        ],
     );
     assert_ne!(code, 0, "{report}");
     let restored = journey.admin(
         &other,
         "restore",
-        &["backup directory"],
+        &["backup directory", "key file"],
         &[
             "restore",
             "session",
             "--input",
             backup.to_str().unwrap(),
             "--new-incarnation",
+            "--key-file",
+            key.to_str().unwrap(),
         ],
     );
     assert_eq!(restored["result"]["kind"], "restored", "{restored}");

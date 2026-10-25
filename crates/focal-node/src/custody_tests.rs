@@ -2314,7 +2314,11 @@ fn a_restore_is_kept_between_asks_and_answers_once_done() {
     .unwrap();
     let mut scratch = vec![0u8; store.content().max_chunk_bytes()];
     let begin = |created_ms: u64| {
-        RestoreAsk::Begin(backup.path().to_path_buf(), Box::new(manifest(created_ms)))
+        RestoreAsk::Begin(
+            backup.path().to_path_buf(),
+            Box::new(manifest(created_ms)),
+            None,
+        )
     };
     let carry_on = |created_ms: u64| {
         RestoreAsk::Continue(

@@ -13,6 +13,10 @@
 //! incarnation, registers there, answers reads of its history through an
 //! enrolled client addressing the restored session, backs up again, refuses
 //! a second restore and an unacknowledged recovery, and survives a restart.
+//! From the at-rest level the backup is sealed under an operator's key file
+//! (29 §12.8): nothing of the session lies in it in the clear, and it is
+//! verified and restored with that key file alone; a backup from below the
+//! level, in the clear, restores as it always did.
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader},
@@ -42,9 +46,18 @@ fn address() -> String {
     ports::address()
 }
 fn start(root: &Path, advertise: &str) -> Server {
+    start_announcing(root, advertise, None)
+}
+/// The node on `root` started announcing the capability level `announced` (a staged rollout, 24
+/// §21), or the binary's own.
+fn start_announcing(root: &Path, advertise: &str, announced: Option<&str>) -> Server {
     progress::admit();
     deadline::observe(root);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_focal"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
+    if let Some(level) = announced {
+        command.env("FOCAL_CAPABILITY_LEVEL", level);
+    }
+    let mut child = command
         .args([
             "--data-dir",
             root.to_str().unwrap(),
@@ -155,6 +168,72 @@ fn created(result: &Value, kind: &str) -> Vec<String> {
 
 const FAR: u64 = 4_102_444_800_000;
 const PROOF: &str = r#"{"passed":3,"failed":0,"skipped":0}"#;
+const DESCRIPTION: &str = "Run the suite and deliver the report.";
+
+/// A key file the real binary makes (`focal create root-key`), as an operator makes one.
+fn key_file(dir: &Path, name: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    let made = Command::new(env!("CARGO_BIN_EXE_focal"))
+        .args(["create", "root-key", "--output", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{made:?}");
+    path
+}
+/// The code of the error a refused admin command printed (`focal: [code] message`): a refusal
+/// the command made, not one its arguments' parsing made.
+fn refusal(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "{}\n{stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    stderr
+        .split_once("focal: [")
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map(|(code, _)| code.to_owned())
+        .unwrap_or_else(|| panic!("no refusal code: {stderr}"))
+}
+/// Every file under `dir`, with its bytes.
+fn files_under(dir: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        let Ok(listing) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in listing {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let bytes = std::fs::read(&path).unwrap();
+                found.push((path, bytes));
+            }
+        }
+    }
+    found
+}
+fn holds(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+fn unhex(text: &str) -> Vec<u8> {
+    (0..text.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap())
+        .collect()
+}
+/// Nothing of the restored session's on the node at `root`: no file in its tenant's content
+/// domain, no seed or cold directory of its session.
+fn untouched(root: &Path, tenant: &str, session: &str) -> bool {
+    files_under(&root.join("content").join("objects").join(tenant)).is_empty()
+        && !root.join("seeds").join(session).exists()
+        && !root.join("cold").join(session).exists()
+}
 
 fn temp(prefix: &str) -> tempfile::TempDir {
     let dir = tempfile::Builder::new()
@@ -228,7 +307,7 @@ fn a_backup_restores_onto_a_fresh_cluster_as_a_recovery_incarnation() {
     let tenant = identity["tenant"].as_str().unwrap().to_owned();
     let alice = enroll(root, client.path(), "alice");
     let document = json!({
-        "description": "Run the suite and deliver the report.",
+        "description": DESCRIPTION,
         "target": alice,
         "validations": [
             {"kind": "receipt", "description": "Record delivery.", "deadline": {"at": FAR}},
@@ -263,15 +342,93 @@ fn a_backup_restores_onto_a_fresh_cluster_as_a_recovery_incarnation() {
     assert!(claim_before.get("Claim").is_some(), "{claim_before}");
     wait_registered(root, &session);
     let backup = founder.path().join("backup");
+    // At the binary's level a backup is sealed under an operator's key file (29 §12.8): one asked
+    // for without a key file is refused by name before the node is asked.
+    let keys = temp("focal-restore-keys-");
+    let ops = key_file(keys.path(), "ops.key");
+    let stranger = key_file(keys.path(), "other.key");
+    let unkeyed = run(
+        root,
+        None,
+        &["create", "backup", "--output", backup.to_str().unwrap()],
+    );
+    assert_eq!(refusal(&unkeyed), "backup_key_required");
+    assert!(!backup.exists(), "a refused backup writes nothing");
     let created_backup = admin(
         root,
-        &["create", "backup", "--output", backup.to_str().unwrap()],
+        &[
+            "create",
+            "backup",
+            "--output",
+            backup.to_str().unwrap(),
+            "--key-file",
+            ops.to_str().unwrap(),
+        ],
     );
     assert_eq!(created_backup["result"]["kind"], "backup_created");
     let backed = created_backup["result"]["backup"].clone();
     assert_eq!(backed["objects"], 1);
-    // The old cluster is gone.
+    assert_eq!(backed["sealed"], true, "{backed}");
+    let key = backed["key"].as_str().unwrap().to_owned();
+    assert_eq!(key.len(), 32, "the operator key's ID: {backed}");
+    // Nothing of the session lies in its backup in the clear: no row's text, no payload, no
+    // identity, no hash, no manifest's marker, in any file's bytes or name.
+    let checkpoint_hash = backed["checkpoint_hash"].as_str().unwrap().to_owned();
+    let mut markers: Vec<Vec<u8>> = vec![
+        PROOF.as_bytes().to_vec(),
+        DESCRIPTION.as_bytes().to_vec(),
+        b"FCLBKUP1".to_vec(),
+    ];
+    for id in [&claim, &artifact, &session, &tenant, &checkpoint_hash] {
+        markers.push(id.as_bytes().to_vec());
+        markers.push(unhex(id));
+    }
+    let sealed_files = files_under(&backup);
+    assert!(sealed_files.len() > 3, "{sealed_files:?}");
+    for (path, bytes) in &sealed_files {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        for id in [&claim, &artifact, &session, &tenant, &checkpoint_hash] {
+            assert!(!name.contains(id.as_str()), "{name} is named by {id}");
+        }
+        for marker in &markers {
+            assert!(
+                !holds(bytes, marker),
+                "{path:?} holds {marker:?} in the clear"
+            );
+        }
+    }
+    // The old cluster is gone; the backup verifies without it, with its key file alone.
     drop(server);
+    let verified = admin(
+        root,
+        &[
+            "verify",
+            "backup",
+            "--input",
+            backup.to_str().unwrap(),
+            "--key-file",
+            ops.to_str().unwrap(),
+        ],
+    );
+    let verification = &verified["result"]["verification"];
+    assert_eq!(verification["complete"], true, "{verified}");
+    assert_eq!(verification["sealed"], true);
+    assert_eq!(verification["key"], backed["key"]);
+    assert_eq!(verification["objects_verified"], 1);
+    let verify = |key: Option<&Path>| {
+        let mut args = vec!["verify", "backup", "--input", backup.to_str().unwrap()];
+        if let Some(key) = key {
+            args.extend(["--key-file", key.to_str().unwrap()]);
+        }
+        run(root, None, &args)
+    };
+    // Refused without its key file, or with another, the backup naming the key it needs.
+    let unkeyed = verify(None);
+    assert_eq!(refusal(&unkeyed), "backup_key_required");
+    assert!(String::from_utf8_lossy(&unkeyed.stderr).contains(&key));
+    let mismatched = verify(Some(&stranger));
+    assert_eq!(refusal(&mismatched), "backup_key_mismatch");
+    assert!(String::from_utf8_lossy(&mismatched.stderr).contains(&key));
 
     // A fresh cluster on a fresh node serves the old tenant and restores.
     let other = temp("focal-restore-b-");
@@ -294,7 +451,27 @@ fn a_backup_restores_onto_a_fresh_cluster_as_a_recovery_incarnation() {
             .any(|entry| entry == &Value::String(tenant.clone())),
         "{admitted}"
     );
-    // A tampered backup restores nothing: verification comes first.
+    // A restore that is refused writes nothing here: without its key file, with another, with a
+    // file of it flipped or two of its files swapped, it is refused before anything of the session
+    // reaches this node.
+    assert!(untouched(root_b, &tenant, &session));
+    let restore = |key: Option<&Path>| {
+        let mut args = vec![
+            "restore",
+            "session",
+            "--input",
+            backup.to_str().unwrap(),
+            "--new-incarnation",
+        ];
+        if let Some(key) = key {
+            args.extend(["--key-file", key.to_str().unwrap()]);
+        }
+        run(root_b, None, &args)
+    };
+    assert_eq!(refusal(&restore(None)), "backup_key_required");
+    assert!(untouched(root_b, &tenant, &session));
+    assert_eq!(refusal(&restore(Some(&stranger))), "backup_key_mismatch");
+    assert!(untouched(root_b, &tenant, &session));
     let chunk = std::fs::read_dir(backup.join("content"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -302,26 +479,18 @@ fn a_backup_restores_onto_a_fresh_cluster_as_a_recovery_incarnation() {
         .unwrap();
     let original = std::fs::read(&chunk).unwrap();
     let mut tampered = original.clone();
-    tampered[0] ^= 0xff;
+    tampered[original.len() / 2] ^= 0xff;
     std::fs::write(&chunk, &tampered).unwrap();
-    let corrupt = run(
-        root_b,
-        None,
-        &[
-            "restore",
-            "session",
-            "--input",
-            backup.to_str().unwrap(),
-            "--new-incarnation",
-            "--format",
-            "json",
-        ],
-    );
-    assert!(
-        !corrupt.status.success(),
-        "{}",
-        String::from_utf8_lossy(&corrupt.stdout)
-    );
+    refusal(&restore(Some(&ops)));
+    assert!(untouched(root_b, &tenant, &session));
+    std::fs::write(&chunk, &original).unwrap();
+    let checkpoint_file = backup.join("checkpoint");
+    let checkpoint = std::fs::read(&checkpoint_file).unwrap();
+    std::fs::write(&checkpoint_file, &original).unwrap();
+    std::fs::write(&chunk, &checkpoint).unwrap();
+    refusal(&restore(Some(&ops)));
+    assert!(untouched(root_b, &tenant, &session));
+    std::fs::write(&checkpoint_file, &checkpoint).unwrap();
     std::fs::write(&chunk, &original).unwrap();
     // The source is another cluster: its incarnation cannot continue here.
     let refused = run(
@@ -332,15 +501,11 @@ fn a_backup_restores_onto_a_fresh_cluster_as_a_recovery_incarnation() {
             "session",
             "--input",
             backup.to_str().unwrap(),
-            "--format",
-            "json",
+            "--key-file",
+            ops.to_str().unwrap(),
         ],
     );
-    assert!(
-        !refused.status.success(),
-        "{}",
-        String::from_utf8_lossy(&refused.stdout)
-    );
+    refusal(&refused);
     let restored = admin(
         root_b,
         &[
@@ -349,6 +514,8 @@ fn a_backup_restores_onto_a_fresh_cluster_as_a_recovery_incarnation() {
             "--input",
             backup.to_str().unwrap(),
             "--new-incarnation",
+            "--key-file",
+            ops.to_str().unwrap(),
         ],
     );
     assert_eq!(restored["result"]["kind"], "restored", "{restored}");
@@ -439,35 +606,48 @@ fn a_backup_restores_onto_a_fresh_cluster_as_a_recovery_incarnation() {
             &session,
             "--output",
             again.to_str().unwrap(),
+            "--key-file",
+            ops.to_str().unwrap(),
         ],
     );
     let again_backup = created_again["result"]["backup"].clone();
     assert_eq!(again_backup["objects"], 1, "{again_backup}");
+    assert_eq!(again_backup["sealed"], true);
     assert_eq!(again_backup["prefix"]["group"], restored["group"]);
     assert_eq!(again_backup["prefix"]["session"], session);
     let verified = admin(
         root_b,
-        &["verify", "backup", "--input", again.to_str().unwrap()],
+        &[
+            "verify",
+            "backup",
+            "--input",
+            again.to_str().unwrap(),
+            "--key-file",
+            ops.to_str().unwrap(),
+        ],
     );
     assert_eq!(
         verified["result"]["verification"]["complete"], true,
         "{verified}"
     );
-    // A session this node already hosts is not restored again.
-    let twice = run(
+    // The same restore asked again answers as the restore it repeats (an operator reissuing a
+    // command whose reply was lost): the copy already installed under its recovery group, nothing
+    // imported again.
+    let twice = admin(
         root_b,
-        None,
         &[
             "restore",
             "session",
             "--input",
             backup.to_str().unwrap(),
             "--new-incarnation",
-            "--format",
-            "json",
+            "--key-file",
+            ops.to_str().unwrap(),
         ],
     );
-    assert!(!twice.status.success());
+    let twice = &twice["result"]["restored"];
+    assert_eq!(twice["group"], restored["group"], "{twice}");
+    assert_eq!(twice["objects_imported"], 0, "{twice}");
     // A restart reopens the restored session from the install record.
     drop(server_b);
     let _server_b = start(root_b, &advertise_b);
@@ -502,4 +682,148 @@ fn a_backup_restores_onto_a_fresh_cluster_as_a_recovery_incarnation() {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+}
+
+/// Do: found a node announcing the level below the at-rest level, write a claim, and back its
+/// session up; ask for one under a key file; verify the backup with and without a key file; restore
+/// it on a fresh node at the binary's level and read the claim back (29 §12.8). Expect: below the
+/// level the backup is written in the clear as every earlier binary writes it (its manifest's
+/// marker in its first bytes, no `ENCRYPTION-INFO`) and a key file is refused by name; it verifies
+/// whole whatever key file is named; it restores onto the fresh node with no key file, its claim as
+/// it was.
+#[test]
+fn a_clear_backup_from_below_the_at_rest_level_still_verifies_and_restores() {
+    let founder = temp("focal-restore-clear-a-");
+    let root = founder.path();
+    let below = (focal_node::upgrade::AT_REST_LEVEL - 1).to_string();
+    let activation = Command::new(env!("CARGO_BIN_EXE_focal"))
+        .args(["--data-dir", root.to_str().unwrap(), "activate", "native"])
+        .env("FOCAL_CAPABILITY_LEVEL", &below)
+        .output()
+        .unwrap();
+    assert!(activation.status.success(), "{activation:?}");
+    let advertise = address();
+    let server = start_announcing(root, &advertise, Some(&below));
+    let identity = admin(root, &["inspect", "node", "--identity"])["result"]["identity"].clone();
+    let session = identity["session"].as_str().unwrap().to_owned();
+    let tenant = identity["tenant"].as_str().unwrap().to_owned();
+    let document = json!({
+        "description": DESCRIPTION,
+        "target": format!("{:032x}", 5),
+        "validations": [
+            {"kind": "receipt", "description": "Record delivery.", "deadline": {"at": FAR}}
+        ]
+    });
+    let (_, result) = committed(&cli(
+        root,
+        None,
+        &["submit", "claim", "--json", &document.to_string()],
+    ));
+    let claim = created(&result, "Claim").remove(0);
+    let claim_before = objects(&cli(root, None, &["get", "claim", &claim]))[0].clone();
+    wait_registered(root, &session);
+    let keys = temp("focal-restore-clear-keys-");
+    let ops = key_file(keys.path(), "ops.key");
+    let backup = founder.path().join("backup");
+    // Below the level a backup is written in the clear: a key file asked for is refused by name.
+    let keyed = run(
+        root,
+        None,
+        &[
+            "create",
+            "backup",
+            "--output",
+            backup.to_str().unwrap(),
+            "--key-file",
+            ops.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(refusal(&keyed), "invalid_input");
+    let created_backup = admin(
+        root,
+        &["create", "backup", "--output", backup.to_str().unwrap()],
+    );
+    let backed = created_backup["result"]["backup"].clone();
+    assert_eq!(backed["sealed"], false, "{backed}");
+    assert!(
+        std::fs::read(backup.join("MANIFEST"))
+            .unwrap()
+            .starts_with(b"FCLBKUP1")
+    );
+    assert!(!backup.join("ENCRYPTION-INFO").exists());
+    drop(server);
+    // It verifies whole, with no key file and with one, which it does not need.
+    for key in [None, Some(&ops)] {
+        let mut args = vec!["verify", "backup", "--input", backup.to_str().unwrap()];
+        if let Some(key) = key {
+            args.extend(["--key-file", key.to_str().unwrap()]);
+        }
+        let verified = admin(root, &args);
+        let verification = &verified["result"]["verification"];
+        assert_eq!(verification["complete"], true, "{verified}");
+        assert_eq!(verification["sealed"], false);
+    }
+    // A fresh node at the binary's level restores it as it always did.
+    let other = temp("focal-restore-clear-b-");
+    let client_b = temp("focal-restore-clear-client-b-");
+    let root_b = other.path();
+    let activation = admin(root_b, &["activate", "native"]);
+    assert_eq!(activation["activated"], true, "{activation}");
+    let advertise_b = address();
+    let _server_b = start(root_b, &advertise_b);
+    admin(root_b, &["admit", "tenant", "--tenant", &tenant]);
+    let restored = admin(
+        root_b,
+        &[
+            "restore",
+            "session",
+            "--input",
+            backup.to_str().unwrap(),
+            "--new-incarnation",
+        ],
+    );
+    assert_eq!(restored["result"]["kind"], "restored", "{restored}");
+    assert_eq!(restored["result"]["restored"]["session"], session);
+    wait_registered(root_b, &session);
+    assert!(
+        run(
+            client_b.path(),
+            None,
+            &[
+                "add",
+                "context",
+                "restored",
+                "--node-data-dir",
+                root_b.to_str().unwrap(),
+                "--tenant",
+                &tenant,
+                "--session",
+                &session
+            ]
+        )
+        .status
+        .success()
+    );
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
+    let claim_after = loop {
+        let output = run(
+            client_b.path(),
+            Some("restored"),
+            &["get", "claim", &claim, "--format", "json"],
+        );
+        if output.status.success()
+            && let Ok(page) = serde_json::from_slice::<Value>(&output.stdout)
+            && page["result"]["kind"] == "native_read"
+        {
+            break objects(&page)[0].clone();
+        }
+        assert!(
+            deadline.open(),
+            "the restored session never answered: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    assert_eq!(claim_after["Claim"], claim_before["Claim"]);
 }

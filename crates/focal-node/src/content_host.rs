@@ -97,10 +97,12 @@ enum Command {
     Collect(focal_evidence::CollectorConfig, u64, usize),
     /// Bring a quarantined object back.
     Restore(focal_model::ContentDomainId, focal_model::ContentHash),
-    /// Import every object a backup lists from its directory (26 §6).
+    /// Import every object a backup lists from its directory (26 §6), its key opened under the
+    /// operator's key file where its files are sealed (29 §12.8).
     RestoreContent(
         std::path::PathBuf,
         Box<focal_ledger::backup::BackupManifest>,
+        Option<std::path::PathBuf>,
     ),
     /// The volume envelope's statistics and what the store has staged.
     DiskStats,
@@ -782,6 +784,7 @@ impl ContentHost {
         &self,
         root: std::path::PathBuf,
         manifest: focal_ledger::backup::BackupManifest,
+        key_file: Option<std::path::PathBuf>,
     ) -> Result<u64, AccessError> {
         // A slice for each object's manifest, each of its chunks twice (read
         // in, read back) — a chunk holds a byte at least — and its
@@ -804,7 +807,7 @@ impl ContentHost {
         let backup = (manifest.checkpoint_hash, manifest.created_ms);
         let mut output = self
             .call(
-                Command::RestoreContent(root.clone(), Box::new(manifest)),
+                Command::RestoreContent(root.clone(), Box::new(manifest), key_file),
                 carried,
                 true,
             )
@@ -812,9 +815,11 @@ impl ContentHost {
         // A chunk a slice, each its own turn in the owner's queue, and the
         // store keeps the restore between asks (the audit's F51): asked
         // again for the same backup, it is carried on. Each ask names the
-        // backup, so that it carries on no other.
-        let mut taken = 0u64;
-        while taken < slices {
+        // backup, so that it carries on no other. The first ask only began
+        // the restore: its answer is read beside every slice's, one more
+        // than the slices (a backup that names no object is begun and
+        // ended, and was refused when the first ask was counted a slice).
+        for _ in 0..=slices {
             match output {
                 Output::Imported(imported) => return Ok(imported),
                 Output::RestorePending => {
@@ -824,7 +829,6 @@ impl ContentHost {
                 }
                 _ => return Err(AccessError::Unavailable),
             }
-            taken = taken.saturating_add(1);
         }
         Err(AccessError::Unavailable)
     }
@@ -933,8 +937,12 @@ fn execute(
         ))),
         // A restore goes a slice at a time, the store keeping it between
         // asks (`ContentHost::restore_content`, the audit's F51).
-        Command::RestoreContent(root, manifest) => Ok(
-            match owner.restore_slice(RestoreAsk::Begin(root, manifest), budget, scratch)? {
+        Command::RestoreContent(root, manifest, key_file) => Ok(
+            match owner.restore_slice(
+                RestoreAsk::Begin(root, manifest, key_file),
+                budget,
+                scratch,
+            )? {
                 Some(imported) => Output::Imported(imported),
                 None => Output::RestorePending,
             },

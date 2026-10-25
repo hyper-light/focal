@@ -157,7 +157,7 @@ const CLUSTER_GC_SHOW: OperationDescriptor = OperationDescriptor {
 const CLUSTER_BACKUP_CREATE: OperationDescriptor = OperationDescriptor {
     name: "cluster.backup.create",
     version: 1,
-    description: "Write a coherent backup of a hosted native session at a declared prefix into a new directory on this node: the session envelope its replica installed durably (a checkpoint is taken and fsynced first), the chunks of a seeded Core root, the exact authenticated tree of every content object the prefix's rows and archive bundles name, and a manifest written last. A directory that already holds a backup is refused; a killed write leaves no manifest and therefore no backup.",
+    description: "Write a coherent backup of a hosted native session at a declared prefix into a new directory on this node: the session envelope its replica installed durably (a checkpoint is taken and fsynced first), the chunks of a seeded Core root, the exact authenticated tree of every content object the prefix's rows and archive bundles name, and a manifest written last. A directory that already holds a backup is refused; a killed write leaves no manifest and therefore no backup. From the at-rest level the backup is sealed under the operator's key file `key_file` (29 §12.8): a random key made for the backup, wrapped under the key file in the backup's ENCRYPTION-INFO, and every other file sealed whole under it and named by keyed names, so no file holds a row, a chunk, a hash or the manifest in the clear; below the level the backup is written in the clear and a key file is refused.",
     capability: Capability::Node,
     mutation: true,
     destructive: false,
@@ -168,7 +168,7 @@ const CLUSTER_BACKUP_CREATE: OperationDescriptor = OperationDescriptor {
     surface: Surface::Administration,
     cli_path: Some("create backup"),
     input: InputKind::Literal(
-        r#"{"type":"object","additionalProperties":false,"required":["output"],"properties":{"tenant":{"type":"string","pattern":"^[0-9a-fA-F]{32}$"},"session":{"type":"string","pattern":"^[0-9a-fA-F]{32}$"},"output":{"type":"string","minLength":1}}}"#,
+        r#"{"type":"object","additionalProperties":false,"required":["output"],"properties":{"tenant":{"type":"string","pattern":"^[0-9a-fA-F]{32}$"},"session":{"type":"string","pattern":"^[0-9a-fA-F]{32}$"},"output":{"type":"string","minLength":1},"key_file":{"type":"string","minLength":1}}}"#,
     ),
     family: None,
 };
@@ -193,7 +193,7 @@ const CLUSTER_REPAIR: OperationDescriptor = OperationDescriptor {
 const CLUSTER_BACKUP_VERIFY: OperationDescriptor = OperationDescriptor {
     name: "cluster.backup.verify",
     version: 1,
-    description: "Verify a backup directory without writing: the manifest's digest and schema, the envelope's hash, every seed chunk and every object's manifest and chunks, then rebuild the envelope against the backup's own content and compare what it names with what the manifest lists; report whether this binary carries the decoder the backup's log promised. Problems are listed, not hidden.",
+    description: "Verify a backup directory without writing: the manifest's digest and schema, the envelope's hash, every seed chunk and every object's manifest and chunks, then rebuild the envelope against the backup's own content and compare what it names with what the manifest lists; report whether this binary carries the decoder the backup's log promised. Problems are listed, not hidden. A sealed backup (29 §12.8) is opened under `key_file`, the key file it was written under; without it, or with another, it is refused by name before anything else is read.",
     capability: Capability::Node,
     mutation: false,
     destructive: false,
@@ -204,7 +204,7 @@ const CLUSTER_BACKUP_VERIFY: OperationDescriptor = OperationDescriptor {
     surface: Surface::Administration,
     cli_path: Some("verify backup"),
     input: InputKind::Literal(
-        r#"{"type":"object","additionalProperties":false,"required":["input"],"properties":{"input":{"type":"string","minLength":1}}}"#,
+        r#"{"type":"object","additionalProperties":false,"required":["input"],"properties":{"input":{"type":"string","minLength":1},"key_file":{"type":"string","minLength":1}}}"#,
     ),
     family: None,
 };
@@ -227,7 +227,7 @@ const CLUSTER_STORAGE_SHOW: OperationDescriptor = OperationDescriptor {
 const CLUSTER_RESTORE: OperationDescriptor = OperationDescriptor {
     name: "cluster.restore",
     version: 1,
-    description: "Restore a native session from a verified backup directory onto this node (26 §6): the backup is verified first, its objects are imported into this node's content store and its seed chunks into the session's seed store, its envelope is rewritten for the incarnation the restore takes, a fresh log begins from it, and the session is hosted and registered with the directory as founded here. The old incarnation continues only when the backup came from this cluster and every other member of its membership is revoked; otherwise the restore is a recovery incarnation under a new log group and genesis, which `new_incarnation` must acknowledge. A session this cluster's directory already holds, or this node already hosts, is refused. The tenant must be served by this cluster.",
+    description: "Restore a native session from a verified backup directory onto this node (26 §6): the backup is verified first, its objects are imported into this node's content store and its seed chunks into the session's seed store, its envelope is rewritten for the incarnation the restore takes, a fresh log begins from it, and the session is hosted and registered with the directory as founded here. The old incarnation continues only when the backup came from this cluster and every other member of its membership is revoked; otherwise the restore is a recovery incarnation under a new log group and genesis, which `new_incarnation` must acknowledge. A session this cluster's directory already holds, or this node already hosts, is refused. The tenant must be served by this cluster. A sealed backup (29 §12.8) is opened under `key_file`, the key file it was written under: without it, with another, or with a file of it changed, it is refused before anything is written to this node.",
     capability: Capability::Node,
     mutation: true,
     destructive: false,
@@ -238,7 +238,7 @@ const CLUSTER_RESTORE: OperationDescriptor = OperationDescriptor {
     surface: Surface::Administration,
     cli_path: Some("restore session"),
     input: InputKind::Literal(
-        r#"{"type":"object","additionalProperties":false,"required":["input"],"properties":{"input":{"type":"string","minLength":1},"new_incarnation":{"type":"boolean"}}}"#,
+        r#"{"type":"object","additionalProperties":false,"required":["input"],"properties":{"input":{"type":"string","minLength":1},"new_incarnation":{"type":"boolean"},"key_file":{"type":"string","minLength":1}}}"#,
     ),
     family: None,
 };

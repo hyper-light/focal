@@ -553,6 +553,57 @@ pub fn create_root_key(path: &Path) -> Result<(), SealSetupError> {
     }
 }
 
+/// The context an operator key's ID is derived under (BLAKE3's key derivation): a fixed string of
+/// its own, so the ID is no other use's hash of the key.
+const OPERATOR_KEY_ID: &str = "focal.operator-key.id.v1";
+
+/// An operator's key file (29 §12.8): 32 random bytes in an owner-only file, as
+/// [`create_root_key`] makes them, named by the operator for what a node writes outside its data
+/// directory (a session's backup). Read whole and held as a wrapping key whose ID is a hash of the
+/// key under a context of its own, so what the key wraps records which key wraps it without holding
+/// anything that opens it, and a record made under another key is told apart by its ID before
+/// anything is unwrapped. A file another principal may read, or of any length but 32, is refused,
+/// as a node's root key file is.
+pub fn operator_key(path: &Path) -> Result<WrappingKey, SealSetupError> {
+    use std::io::Read as _;
+    hyper_seal::lock_keys(key_slots())?;
+    let fail = |source| SealSetupError::KeyFile {
+        path: path.to_path_buf(),
+        source,
+    };
+    let file = focal_platform::fs::open_private(path, true, false, false).map_err(fail)?;
+    let mut bytes = zeroize::Zeroizing::new([0u8; ROOT_BYTES + 1]);
+    let mut read = 0usize;
+    let mut handle = &file;
+    // One byte past a key tells a longer file from a key.
+    while let Some(rest) = bytes.get_mut(read..) {
+        if rest.is_empty() {
+            break;
+        }
+        let n = handle.read(rest).map_err(fail)?;
+        if n == 0 {
+            break;
+        }
+        read = read.saturating_add(n);
+    }
+    let read = bytes.get(..read).unwrap_or(&[]);
+    let digest = blake3::derive_key(OPERATOR_KEY_ID, read);
+    let id = KeyId(
+        digest
+            .get(..16)
+            .and_then(|id| <[u8; 16]>::try_from(id).ok())
+            .ok_or(SealSetupError::Damaged("a key ID past its hash"))?,
+    );
+    // The checks a node's root key file passes (owner-only on every platform, exactly 32 bytes),
+    // made by the source that reads one; the key is then held as a wrapping key, which makes a
+    // backup's key and unwraps it, and which the source does not lend.
+    drop(FileSource::new(id, 0, read, &file)?);
+    let key = <&[u8; ROOT_BYTES]>::try_from(read)
+        .map_err(|_| SealSetupError::Damaged("a key file of other than 32 bytes"))?;
+    let secret = Secret32::from_bytes(key)?;
+    Ok(WrappingKey::new(id, 0, secret))
+}
+
 /// A random key from the operating system's generator, wiped wherever it was staged.
 fn random_key() -> Result<Secret32, SealSetupError> {
     let mut bytes = [0u8; ROOT_BYTES];

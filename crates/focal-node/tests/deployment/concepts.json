@@ -19,6 +19,7 @@
       "explain",
       "plan",
       "apply",
+      "backup key",
       "backup",
       "tenant",
       "restore",
@@ -34,6 +35,7 @@
       "file size limit",
       "policy file",
       "plan file",
+      "key file",
       "backup directory",
       "tenant",
       "session"
@@ -485,9 +487,25 @@
         ]
       },
       {
+        "concept": "backup key",
+        "inputs": [
+          "key file"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop>",
+          "create",
+          "root-key",
+          "--output",
+          "<keys>/ops.key"
+        ]
+      },
+      {
         "concept": "backup",
         "inputs": [
-          "backup directory"
+          "backup directory",
+          "key file"
         ],
         "command": [
           "focal",
@@ -496,7 +514,9 @@
           "create",
           "backup",
           "--output",
-          "<laptop>/backup"
+          "<laptop>/backup",
+          "--key-file",
+          "<keys>/ops.key"
         ]
       },
       {
@@ -569,22 +589,8 @@
       {
         "concept": "restore",
         "inputs": [
-          "backup directory"
-        ],
-        "command": [
-          "focal",
-          "--data-dir",
-          "<laptop-b>",
-          "restore",
-          "session",
-          "--input",
-          "<laptop>/backup"
-        ]
-      },
-      {
-        "concept": "restore",
-        "inputs": [
-          "backup directory"
+          "backup directory",
+          "key file"
         ],
         "command": [
           "focal",
@@ -594,7 +600,27 @@
           "session",
           "--input",
           "<laptop>/backup",
-          "--new-incarnation"
+          "--key-file",
+          "<keys>/ops.key"
+        ]
+      },
+      {
+        "concept": "restore",
+        "inputs": [
+          "backup directory",
+          "key file"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop-b>",
+          "restore",
+          "session",
+          "--input",
+          "<laptop>/backup",
+          "--new-incarnation",
+          "--key-file",
+          "<keys>/ops.key"
         ]
       },
       {

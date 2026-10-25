@@ -102,6 +102,9 @@ pub(crate) enum ClusterCommand {
         input: PathBuf,
         #[arg(long)]
         new_incarnation: bool,
+        /// The operator's key file a sealed backup was written under (29 §12.8).
+        #[arg(long)]
+        key_file: Option<PathBuf>,
     },
     /// Repair a hosted session's custody on this node: re-verify every
     /// object its committed prefix names, recopy what is missing from
@@ -159,11 +162,18 @@ pub(crate) enum BackupCommand {
         session: Option<String>,
         #[arg(long)]
         output: PathBuf,
+        /// The operator's key file the backup is sealed under: needed from the at-rest level,
+        /// refused below it (29 §12.8). `focal create root-key --output FILE` makes one.
+        #[arg(long)]
+        key_file: Option<PathBuf>,
     },
     /// Verify a backup directory without writing; needs no running node.
     Verify {
         #[arg(long)]
         input: PathBuf,
+        /// The operator's key file a sealed backup was written under (29 §12.8).
+        #[arg(long)]
+        key_file: Option<PathBuf>,
     },
 }
 #[derive(Subcommand)]
@@ -530,10 +540,10 @@ pub(crate) async fn run(
     }
     // Verification reads only the backup: it runs anywhere the binary does.
     if let ClusterCommand::Backup {
-        command: BackupCommand::Verify { input },
+        command: BackupCommand::Verify { input, key_file },
     } = &command
     {
-        let result = ClusterAdmin::backup_verify(input)?;
+        let result = ClusterAdmin::backup_verify(input, key_file.as_deref())?;
         return crate::print_json(&serde_json::json!({"schema_version":1,"result":result}));
     }
     // A laptop node has no admin socket: its activation runs offline against
@@ -591,6 +601,7 @@ pub(crate) async fn run(
                     tenant,
                     session,
                     output,
+                    key_file,
                 },
         } => {
             let ledger = focal_model::LedgerId {
@@ -599,7 +610,9 @@ pub(crate) async fn run(
                 })?,
                 session: session_of(&admin, session)?,
             };
-            admin.backup_create(ledger, &output).await
+            admin
+                .backup_create(ledger, &output, key_file.as_deref())
+                .await
         }
         ClusterCommand::Backup {
             command: BackupCommand::Verify { .. },
@@ -607,7 +620,12 @@ pub(crate) async fn run(
         ClusterCommand::Restore {
             input,
             new_incarnation,
-        } => admin.restore(&input, new_incarnation).await,
+            key_file,
+        } => {
+            admin
+                .restore(&input, new_incarnation, key_file.as_deref())
+                .await
+        }
         ClusterCommand::Repair {
             tenant,
             session,

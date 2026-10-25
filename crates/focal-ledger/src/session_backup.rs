@@ -10,9 +10,13 @@ pub mod backup {
     use focal_core::native::{ContentRoot, NativeError};
     use focal_evidence::{
         BuiltinNativeSchemas, ColdGeometry, ColdReader, ColdState, ColdStreams, ContentError,
-        ContentReader, NativeCustodyReader, SeedReader, TransferManifest, describe_encoded,
+        ContentReader, MAX_TRANSFER_MANIFEST_BYTES, NativeCustodyReader, SeedReader,
+        TransferManifest, describe_encoded,
     };
     use focal_memory::RangeId;
+    use hyper_seal::keys::{KeyId, RECORD, Wrapped, WrappingKey};
+    use hyper_seal::name::Namer;
+    use hyper_seal::{SealError, Secret32};
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
@@ -64,6 +68,20 @@ pub mod backup {
         Unsupported,
         #[error("bounded backup capacity exceeded")]
         Capacity,
+        /// A sealed backup asked of with no key file (29 §12.8): `key` is the ID of the operator
+        /// key it needs, hex.
+        #[error("the backup is sealed under key {key}: name its key file")]
+        KeyRequired { key: String },
+        /// A sealed backup asked of with a key file that does not wrap its key: the key it needs
+        /// and the key the file holds, by their IDs, hex.
+        #[error("the backup is sealed under key {needed}; the key file holds key {offered}")]
+        WrongKey { needed: String, offered: String },
+        /// The operator's key file could not be read as a key.
+        #[error("key file: {0}")]
+        KeyFile(#[from] focal_seal::SealSetupError),
+        /// A sealed backup's key could not be made or used.
+        #[error("the backup's key: {0}")]
+        Seal(#[from] SealError),
     }
     impl From<NativeSessionError> for BackupError {
         fn from(error: NativeSessionError) -> Self {
@@ -340,6 +358,270 @@ pub mod backup {
         Ok(())
     }
 
+    /// A sealed backup's key, wrapped under the operator's key file, kept in the clear beside the
+    /// files it seals (29 §12.8), as CockroachDB keeps a backup's `ENCRYPTION-INFO`: its presence
+    /// says the backup is sealed, and its record says which key file opens it.
+    pub const ENCRYPTION_INFO_FILE: &str = "ENCRYPTION-INFO";
+    /// `FCLBKEY1`: the encryption record's magic; the backup key's ID, its record under the
+    /// operator's key and a BLAKE3 trailer over the three follow.
+    const KEY_MAGIC: &[u8; 8] = b"FCLBKEY1";
+    /// The trailer's bytes: a BLAKE3 hash, which tells a damaged record from another key's.
+    const KEY_TRAILER: usize = 32;
+    const KEY_ID: usize = 16;
+    /// Bytes of a backup's `ENCRYPTION-INFO`.
+    const KEY_INFO: usize = KEY_MAGIC.len() + KEY_ID + RECORD + KEY_TRAILER;
+    /// What a sealed backup's keyed names are derived under, as a content domain's are (29 §11).
+    const NAMES: &[u8] = b"focal backup names";
+
+    /// How a backup's files lie (29 §12.8): in the clear, as every backup below the at-rest level
+    /// is written and every backup before it was; or sealed, each file whole under a data key of
+    /// its own wrapped by a key made for the backup (`focal_seal::file`), and each file a hash
+    /// names filed under the backup's keyed name of it, so no file holds a row, a chunk, a hash or
+    /// the manifest in the clear.
+    pub struct BackupForm {
+        sealed: Option<SealedBackup>,
+    }
+    struct SealedBackup {
+        key: WrappingKey,
+        names: Namer,
+        /// The ID of the operator key the backup's key is wrapped under.
+        operator: KeyId,
+        /// The backup's `ENCRYPTION-INFO`: installed before any file it seals.
+        info: [u8; KEY_INFO],
+    }
+    impl BackupForm {
+        /// A backup in the clear.
+        pub fn clear() -> Self {
+            Self { sealed: None }
+        }
+        /// A new sealed backup's form: a random key made for it and recorded under `operator`, the
+        /// operator's key file ([`focal_seal::operator_key`]).
+        pub fn seal_under(operator: &WrappingKey) -> Result<Self, BackupError> {
+            let (secret, record) = operator.make_child()?;
+            let id = KeyId::random()?;
+            let mut info = [0u8; KEY_INFO];
+            let mut at = 0usize;
+            for field in [KEY_MAGIC.as_slice(), id.0.as_slice(), record.encode().as_slice()] {
+                let end = at.checked_add(field.len()).ok_or(BackupError::Capacity)?;
+                info.get_mut(at..end)
+                    .ok_or(BackupError::Capacity)?
+                    .copy_from_slice(field);
+                at = end;
+            }
+            let (body, trailer) = info
+                .split_at_mut_checked(at)
+                .ok_or(BackupError::Capacity)?;
+            trailer.copy_from_slice(blake3::hash(body).as_bytes());
+            Self::from_parts(id, secret, operator.id(), info)
+        }
+        /// The form of the backup under `root`, read through `medium`: in the clear where it holds
+        /// no `ENCRYPTION-INFO`; sealed, its key unwrapped under `operator`. A sealed backup asked
+        /// of with no key file is [`BackupError::KeyRequired`], with a key file that does not wrap
+        /// its key [`BackupError::WrongKey`]; a record that does not parse, or fails its trailer,
+        /// is corrupt. Nothing else of the backup is read.
+        pub fn of<M: BackupMedium>(
+            medium: &M,
+            root: &Path,
+            operator: Option<&WrappingKey>,
+        ) -> Result<Self, BackupError> {
+            let path = root.join(ENCRYPTION_INFO_FILE);
+            if !medium.exists(&path)? {
+                return Ok(Self::clear());
+            }
+            let bytes = medium.read(&path, KEY_INFO)?;
+            let info = <[u8; KEY_INFO]>::try_from(bytes.as_slice())
+                .map_err(|_| BackupError::Corrupt("encryption info"))?;
+            let body = info
+                .get(..KEY_INFO.saturating_sub(KEY_TRAILER))
+                .ok_or(BackupError::Corrupt("encryption info"))?;
+            let trailer = info
+                .get(body.len()..)
+                .ok_or(BackupError::Corrupt("encryption info"))?;
+            if !body.starts_with(KEY_MAGIC) || blake3::hash(body).as_bytes() != trailer {
+                return Err(BackupError::Corrupt("encryption info"));
+            }
+            let id_end = KEY_MAGIC.len().saturating_add(KEY_ID);
+            let id = body
+                .get(KEY_MAGIC.len()..id_end)
+                .and_then(|id| <[u8; KEY_ID]>::try_from(id).ok())
+                .map(KeyId)
+                .ok_or(BackupError::Corrupt("encryption info"))?;
+            let record = body
+                .get(id_end..)
+                .ok_or(BackupError::Corrupt("encryption info"))
+                .and_then(|record| {
+                    Wrapped::decode(record).map_err(|_| BackupError::Corrupt("encryption info"))
+                })?;
+            let operator = operator.ok_or_else(|| BackupError::KeyRequired {
+                key: hex_id(&record.parent),
+            })?;
+            if record.parent != operator.id() {
+                return Err(BackupError::WrongKey {
+                    needed: hex_id(&record.parent),
+                    offered: hex_id(&operator.id()),
+                });
+            }
+            // The record names this key and its trailer holds, yet it does not unwrap: changed by
+            // someone who could recompute the trailer, which no key file's choice explains.
+            let secret = operator
+                .unwrap(&record)
+                .map_err(|_| BackupError::Corrupt("encryption info"))?;
+            Self::from_parts(id, secret, record.parent, info)
+        }
+        fn from_parts(
+            id: KeyId,
+            secret: Secret32,
+            operator: KeyId,
+            info: [u8; KEY_INFO],
+        ) -> Result<Self, BackupError> {
+            let key = WrappingKey::new(id, 0, secret);
+            let (naming, _) = key.derive_child(NAMES, &id.0)?;
+            let names = Namer::new(&naming)?;
+            Ok(Self {
+                sealed: Some(SealedBackup {
+                    key,
+                    names,
+                    operator,
+                    info,
+                }),
+            })
+        }
+        /// Whether the backup's files are sealed.
+        pub fn sealed(&self) -> bool {
+            self.sealed.is_some()
+        }
+        /// The ID of the operator key a sealed backup needs, hex: what its `ENCRYPTION-INFO`
+        /// records, so an operator knows which key file opens it.
+        pub fn key(&self) -> Option<String> {
+            self.sealed.as_ref().map(|sealed| hex_id(&sealed.operator))
+        }
+        /// The name of the file of `hash` with `extension`: its hash in the clear, the backup's
+        /// keyed name of it sealed.
+        fn name(&self, hash: &ContentHash, extension: &str) -> Result<String, BackupError> {
+            use std::fmt::Write as _;
+            let Some(sealed) = &self.sealed else {
+                return Ok(format!("{hash}.{extension}"));
+            };
+            let name = sealed.names.name(&hash.0)?;
+            let mut text = String::new();
+            text.try_reserve_exact(name.len().saturating_mul(2).saturating_add(extension.len()).saturating_add(1))
+                .map_err(|_| BackupError::Capacity)?;
+            for byte in name {
+                write!(text, "{byte:02x}").map_err(|_| BackupError::Capacity)?;
+            }
+            text.push('.');
+            text.push_str(extension);
+            Ok(text)
+        }
+        /// `bytes` installed durably at `path` in the form: sealed whole first where the backup
+        /// seals, the sealed copy charged to `budget` while it is held.
+        fn install<M: BackupMedium>(
+            &self,
+            medium: &mut M,
+            path: &Path,
+            bytes: &[u8],
+            budget: &MemoryBudget,
+        ) -> Result<(), BackupError> {
+            let Some(sealed) = &self.sealed else {
+                return install(medium, path, bytes);
+            };
+            let bound = focal_seal::file::sealed_bound(bytes.len()).ok_or(BackupError::Capacity)?;
+            let _held = budget.reserve(BudgetKind::Recovery, BudgetLane::Completion, bound)?;
+            let file = focal_seal::file::seal(&sealed.key, bytes).map_err(file_error)?;
+            install(medium, path, &file)
+        }
+        /// The file at `path` read whole, at most `most` bytes of plaintext: opened where the
+        /// backup seals, its sealed bytes charged to `budget` while they are held. A sealed file
+        /// that does not open (changed, cut, from another backup) is corrupt.
+        fn read<M: BackupMedium>(
+            &self,
+            medium: &M,
+            path: &Path,
+            most: usize,
+            budget: &MemoryBudget,
+        ) -> Result<Vec<u8>, BackupError> {
+            let Some(sealed) = &self.sealed else {
+                return Ok(medium.read(path, most)?);
+            };
+            let bound = focal_seal::file::sealed_bound(most).ok_or(BackupError::Capacity)?;
+            let _held = budget.reserve(BudgetKind::Recovery, BudgetLane::Completion, bound)?;
+            let file = medium.read(path, bound)?;
+            let mut plain = focal_seal::file::open(&sealed.key, file, most).map_err(file_error)?;
+            Ok(std::mem::take(&mut *plain))
+        }
+    }
+    fn hex_id(id: &KeyId) -> String {
+        use std::fmt::Write as _;
+        let mut text = String::with_capacity(id.0.len().saturating_mul(2));
+        for byte in id.0 {
+            let _ = write!(text, "{byte:02x}");
+        }
+        text
+    }
+    fn file_error(error: focal_seal::file::FileError) -> BackupError {
+        match error {
+            focal_seal::file::FileError::Seal(_) => BackupError::Corrupt("a sealed file does not open"),
+            focal_seal::file::FileError::Bound(_) => BackupError::Corrupt("a sealed file past its bound"),
+        }
+    }
+    fn content_error(error: BackupError) -> ContentError {
+        match error {
+            BackupError::Io(error) => ContentError::Io(error),
+            BackupError::Content(error) => error,
+            BackupError::Capacity | BackupError::Memory(_) => ContentError::Capacity,
+            _ => ContentError::Corrupt,
+        }
+    }
+
+    /// A backup directory as its readers see it (29 §12.8): its medium, its root, its form, and the
+    /// budget the sealed copies of what it reads are charged to while they are held.
+    pub struct BackupFiles<'a, M> {
+        pub medium: &'a M,
+        pub root: &'a Path,
+        pub form: &'a BackupForm,
+        pub budget: &'a MemoryBudget,
+    }
+    impl<M> Clone for BackupFiles<'_, M> {
+        fn clone(&self) -> Self {
+            *self
+        }
+    }
+    impl<M> Copy for BackupFiles<'_, M> {}
+    impl<M: BackupMedium> BackupFiles<'_, M> {
+        fn read(&self, path: &Path, most: usize) -> Result<Vec<u8>, BackupError> {
+            self.form.read(self.medium, path, most, self.budget)
+        }
+        fn seed_path(&self, hash: &ContentHash) -> Result<PathBuf, BackupError> {
+            Ok(self.root.join(SEEDS_DIR).join(self.form.name(hash, "seed")?))
+        }
+        fn cold_path(&self, data: bool, hash: &ContentHash) -> Result<PathBuf, BackupError> {
+            Ok(self
+                .root
+                .join(COLD_DIR)
+                .join(cold_part(data))
+                .join(self.form.name(hash, "seed")?))
+        }
+        fn object_path(&self, root: &ContentHash) -> Result<PathBuf, BackupError> {
+            Ok(self.root.join(CONTENT_DIR).join(self.form.name(root, "manifest")?))
+        }
+        fn chunk_path(&self, hash: &ContentHash) -> Result<PathBuf, BackupError> {
+            Ok(self.root.join(CONTENT_DIR).join(self.form.name(hash, "chunk")?))
+        }
+        /// The backup's manifest: a directory without one is not a backup.
+        pub fn read_manifest(&self) -> Result<BackupManifest, BackupError> {
+            let bytes = match self.read(&self.root.join(MANIFEST_FILE), MAX_MANIFEST_BYTES) {
+                Ok(bytes) => bytes,
+                Err(BackupError::Io(_)) => return Err(BackupError::Missing("manifest")),
+                Err(error) => return Err(error),
+            };
+            BackupManifest::decode(&bytes)
+        }
+        /// The session envelope the backup carries.
+        pub fn read_checkpoint(&self) -> Result<Vec<u8>, BackupError> {
+            self.read(&self.root.join(CHECKPOINT_FILE), MAX_CHECKPOINT_BYTES)
+        }
+    }
+
     /// Where the chunks of a seeded Core root are read from: a replica's seed
     /// store while writing, the backup's seed files while verifying.
     pub trait SeedSource {
@@ -383,25 +665,22 @@ pub mod backup {
             self.read(hash, length)
         }
     }
-    /// The seed files of a backup directory, read through a medium.
-    pub struct BackupSeeds<'m, M> {
-        medium: &'m M,
-        root: PathBuf,
+    /// The seed files of a backup directory, read in its form.
+    pub struct BackupSeeds<'a, M> {
+        files: BackupFiles<'a, M>,
     }
-    impl<'m, M: BackupMedium> BackupSeeds<'m, M> {
-        pub fn new(medium: &'m M, root: &Path) -> Self {
-            Self {
-                medium,
-                root: root.join(SEEDS_DIR),
-            }
+    impl<'a, M: BackupMedium> BackupSeeds<'a, M> {
+        pub fn new(files: BackupFiles<'a, M>) -> Self {
+            Self { files }
         }
     }
     impl<M: BackupMedium> SeedSource for BackupSeeds<'_, M> {
         fn read_seed(&self, hash: ContentHash, length: usize) -> Result<Vec<u8>, ContentError> {
             let bytes = self
-                .medium
-                .read(&self.root.join(format!("{hash}.seed")), length)
-                .map_err(ContentError::Io)?;
+                .files
+                .seed_path(&hash)
+                .and_then(|path| self.files.read(&path, length))
+                .map_err(content_error)?;
             if bytes.len() != length || ContentHash(*blake3::hash(&bytes).as_bytes()) != hash {
                 return Err(ContentError::Corrupt);
             }
@@ -413,14 +692,11 @@ pub mod backup {
             hash: ContentHash,
             length: usize,
         ) -> Result<Vec<u8>, ContentError> {
-            let path = self
-                .root
-                .parent()
-                .ok_or(ContentError::Invalid)?
-                .join(COLD_DIR)
-                .join(cold_part(data))
-                .join(format!("{hash}.seed"));
-            let bytes = self.medium.read(&path, length).map_err(ContentError::Io)?;
+            let bytes = self
+                .files
+                .cold_path(data, &hash)
+                .and_then(|path| self.files.read(&path, length))
+                .map_err(content_error)?;
             if ContentHash(*blake3::hash(&bytes).as_bytes()) != hash {
                 return Err(ContentError::Corrupt);
             }
@@ -494,17 +770,13 @@ pub mod backup {
             self.read_transfer_chunk(transfer, index)
         }
     }
-    /// The content files of a backup directory, read through a medium.
-    pub struct BackupContent<'m, M> {
-        medium: &'m M,
-        root: PathBuf,
+    /// The content files of a backup directory, read in its form.
+    pub struct BackupContent<'a, M> {
+        files: BackupFiles<'a, M>,
     }
-    impl<'m, M: BackupMedium> BackupContent<'m, M> {
-        pub fn new(medium: &'m M, root: &Path) -> Self {
-            Self {
-                medium,
-                root: root.join(CONTENT_DIR),
-            }
+    impl<'a, M: BackupMedium> BackupContent<'a, M> {
+        pub fn new(files: BackupFiles<'a, M>) -> Self {
+            Self { files }
         }
     }
     impl<M: BackupMedium> NativeCustodyReader for BackupContent<'_, M> {
@@ -540,17 +812,19 @@ pub mod backup {
             root: ContentHash,
         ) -> Result<TransferManifest, ContentError> {
             let bytes = self
-                .medium
-                .read(&self.root.join(format!("{root}.manifest")), 1024 * 1024)
-                .map_err(ContentError::Io)?;
+                .files
+                .object_path(&root)
+                .and_then(|path| self.files.read(&path, MAX_TRANSFER_MANIFEST_BYTES))
+                .map_err(content_error)?;
             describe_encoded(domain, root, bytes)
         }
         fn chunk(&self, transfer: &TransferManifest, index: usize) -> Result<Vec<u8>, ContentError> {
             let (hash, length) = transfer.chunk(index)?;
             let bytes = self
-                .medium
-                .read(&self.root.join(format!("{hash}.chunk")), length as usize)
-                .map_err(ContentError::Io)?;
+                .files
+                .chunk_path(&hash)
+                .and_then(|path| self.files.read(&path, length as usize))
+                .map_err(content_error)?;
             if bytes.len() != length as usize
                 || ContentHash(*blake3::hash(&bytes).as_bytes()) != hash
             {
@@ -957,13 +1231,12 @@ pub mod backup {
         /// every object the backup lists is.
         pub fn advance<M: BackupMedium>(
             &mut self,
-            medium: &M,
-            root: &Path,
+            files: BackupFiles<'_, M>,
             manifest: &BackupManifest,
             store: &mut focal_evidence::ContentStore,
-            budget: &MemoryBudget,
             scratch: &mut [u8],
         ) -> Result<Option<u64>, BackupError> {
+            let budget = files.budget;
             if self.current.is_none() {
                 let Some(object) = manifest.content.get(self.object) else {
                     return Ok(Some(self.imported));
@@ -974,12 +1247,10 @@ pub mod backup {
                     length: object.length,
                     class: object.class,
                 };
-                let encoded = medium
-                    .read(
-                        &root.join(CONTENT_DIR).join(format!("{}.manifest", object.root)),
-                        1024 * 1024,
-                    )
-                    .map_err(ContentError::Io)?;
+                let encoded = files.read(
+                    &files.object_path(&object.root)?,
+                    MAX_TRANSFER_MANIFEST_BYTES,
+                )?;
                 let descriptor = budget
                     .reserve(
                         BudgetKind::Recovery,
@@ -1010,7 +1281,7 @@ pub mod backup {
                         .checked_mul(2)
                         .ok_or(BackupError::Capacity)?,
                 )?;
-                let bytes = BackupContent::new(medium, root).chunk(&current.transfer, current.next)?;
+                let bytes = BackupContent::new(files).chunk(&current.transfer, current.next)?;
                 store.import_chunk(&current.transfer, current.next, &bytes)?;
                 current.next = current.next.checked_add(1).ok_or(BackupError::Capacity)?;
                 return Ok(None);
@@ -1039,13 +1310,11 @@ pub mod backup {
     /// store already holds are verified in place. At once: a
     /// [`ContentImport`] to its end, for a caller that holds the store alone.
     pub fn import_content<M: BackupMedium>(
-        medium: &M,
-        root: &Path,
+        files: BackupFiles<'_, M>,
         manifest: &BackupManifest,
         store: &mut focal_evidence::ContentStore,
-        budget: &MemoryBudget,
     ) -> Result<u64, BackupError> {
-        let _scratch = budget.reserve(
+        let _scratch = files.budget.reserve(
             BudgetKind::Recovery,
             BudgetLane::Completion,
             store.max_chunk_bytes(),
@@ -1072,9 +1341,7 @@ pub mod backup {
         let mut import = ContentImport::new();
         let mut taken = 0u64;
         while taken < slices {
-            if let Some(imported) =
-                import.advance(medium, root, manifest, store, budget, &mut scratch)?
-            {
+            if let Some(imported) = import.advance(files, manifest, store, &mut scratch)? {
                 return Ok(imported);
             }
             taken = taken.saturating_add(1);
@@ -1085,15 +1352,14 @@ pub mod backup {
     /// `target` (`cold/<session>`), each verified against its name (doc 31 M2, A2), in the form
     /// `form` under the data directory's `keys` (29 §12.6).
     pub fn import_cold<M: BackupMedium>(
-        medium: &M,
-        root: &Path,
+        files: BackupFiles<'_, M>,
         manifest: &BackupManifest,
         target: &Path,
         disk: &focal_memory::DiskBudget,
         keys: &focal_seal::DataKeys,
         form: focal_evidence::ContentForm,
     ) -> Result<u64, BackupError> {
-        let seeds = BackupSeeds::new(medium, root);
+        let seeds = BackupSeeds::new(files);
         let mut installed = 0u64;
         for (data, chunks) in [(true, &manifest.cold_data), (false, &manifest.cold_marks)] {
             for chunk in chunks {
@@ -1113,12 +1379,11 @@ pub mod backup {
     }
     /// Install every seed chunk a backup lists into `sink`.
     pub fn import_seeds<M: BackupMedium>(
-        medium: &M,
-        root: &Path,
+        files: BackupFiles<'_, M>,
         manifest: &BackupManifest,
         sink: &mut focal_evidence::SeedStore,
     ) -> Result<u64, BackupError> {
-        let seeds = BackupSeeds::new(medium, root);
+        let seeds = BackupSeeds::new(files);
         let mut installed = 0u64;
         for chunk in &manifest.seeds {
             let bytes = seeds.read_seed(chunk.hash, chunk.length as usize)?;
@@ -1136,9 +1401,11 @@ pub mod backup {
         pub bytes: u64,
         pub bundles: u64,
     }
-    /// Write a backup of `image` under `root`: the envelope, the seed chunks
-    /// it names, the exact tree of every object its prefix names, and the
-    /// manifest last. Refuses a directory that already holds a manifest.
+    /// Write a backup of `image` under `root` in `form`: the envelope, the
+    /// seed chunks it names, the exact tree of every object its prefix names,
+    /// and the manifest last; sealed, its `ENCRYPTION-INFO` before any of them
+    /// (29 §12.8). Refuses a directory that already holds a manifest, or part
+    /// of a backup sealed under another key.
     #[allow(
         clippy::too_many_arguments,
         reason = "one bounded pass over borrowed sources; nothing is retained"
@@ -1146,6 +1413,7 @@ pub mod backup {
     pub fn write<M: BackupMedium, S: ObjectSource>(
         medium: &mut M,
         root: &Path,
+        form: &BackupForm,
         image: &BackupImage,
         seeds: &impl SeedSource,
         source: &S,
@@ -1175,9 +1443,21 @@ pub mod backup {
             return Err(BackupError::Corrupt("image coordinates"));
         }
         medium.create_dir(root)?;
+        // Sealed, the key's record first: no sealed file stands without the record that opens it.
+        // A record already there is this backup's, from a write a crash cut, when it is the same.
+        if let Some(sealed) = &form.sealed {
+            let path = root.join(ENCRYPTION_INFO_FILE);
+            if medium.exists(&path)? {
+                if medium.read(&path, KEY_INFO)? != sealed.info {
+                    return Err(BackupError::Exists);
+                }
+            } else {
+                install(medium, &path, &sealed.info)?;
+            }
+        }
         medium.create_dir(&root.join(SEEDS_DIR))?;
         medium.create_dir(&root.join(CONTENT_DIR))?;
-        install(medium, &root.join(CHECKPOINT_FILE), &image.checkpoint)?;
+        form.install(medium, &root.join(CHECKPOINT_FILE), &image.checkpoint, budget)?;
         let mut files = 1u64;
         let mut bytes = image.checkpoint.len() as u64;
         // The cold streams' chunks, every one the envelope names (doc 31 M2, A2).
@@ -1196,13 +1476,14 @@ pub mod backup {
                     let _scratch =
                         budget.reserve(BudgetKind::Recovery, BudgetLane::Completion, length)?;
                     let read = seeds.read_cold(data, chunk.hash, length)?;
-                    install(
+                    form.install(
                         medium,
                         &root
                             .join(COLD_DIR)
                             .join(cold_part(data))
-                            .join(format!("{}.seed", chunk.hash)),
+                            .join(form.name(&chunk.hash, "seed")?),
                         &read,
+                        budget,
                     )?;
                     files = files.saturating_add(1);
                     bytes = bytes.saturating_add(u64::from(chunk.length));
@@ -1224,7 +1505,12 @@ pub mod backup {
             if read.len() != length || ContentHash(*blake3::hash(&read).as_bytes()) != chunk.hash {
                 return Err(BackupError::Corrupt("seed chunk"));
             }
-            install(medium, &root.join(SEEDS_DIR).join(format!("{}.seed", chunk.hash)), &read)?;
+            form.install(
+                medium,
+                &root.join(SEEDS_DIR).join(form.name(&chunk.hash, "seed")?),
+                &read,
+                budget,
+            )?;
             files = files.saturating_add(1);
             bytes = bytes.saturating_add(u64::from(chunk.length));
             seed_entries.push(BackupChunk {
@@ -1245,10 +1531,11 @@ pub mod backup {
                 BudgetLane::Completion,
                 transfer.resident_bytes()?,
             )?;
-            install(
+            form.install(
                 medium,
-                &root.join(CONTENT_DIR).join(format!("{object}.manifest")),
+                &root.join(CONTENT_DIR).join(form.name(object, "manifest")?),
                 transfer.encoded(),
+                budget,
             )?;
             files = files.saturating_add(1);
             let mut chunks = Vec::new();
@@ -1264,7 +1551,12 @@ pub mod backup {
                         length as usize,
                     )?;
                     let read = source.chunk(&transfer, index)?;
-                    install(medium, &root.join(CONTENT_DIR).join(format!("{hash}.chunk")), &read)?;
+                    form.install(
+                        medium,
+                        &root.join(CONTENT_DIR).join(form.name(&hash, "chunk")?),
+                        &read,
+                        budget,
+                    )?;
                     files = files.saturating_add(1);
                     bytes = bytes.saturating_add(u64::from(length));
                 }
@@ -1305,7 +1597,7 @@ pub mod backup {
             cold_marks,
         };
         manifest.validate()?;
-        install(medium, &root.join(MANIFEST_FILE), &manifest.encode()?)?;
+        form.install(medium, &root.join(MANIFEST_FILE), &manifest.encode()?, budget)?;
         files = files.saturating_add(1);
         Ok(BackupReport {
             manifest,
@@ -1341,20 +1633,15 @@ pub mod backup {
             }
         }
     }
-    /// Verify a backup under `root` file by file, then rebuild its envelope
-    /// against its own content files and compare what it names with what
-    /// the manifest lists. Nothing is written.
+    /// Verify a backup file by file in its form (29 §12.8), then rebuild its
+    /// envelope against its own content files and compare what it names with
+    /// what the manifest lists. Nothing is written.
     pub fn verify<M: BackupMedium>(
-        medium: &M,
-        root: &Path,
+        files: BackupFiles<'_, M>,
         native_decoder: [u8; 32],
-        budget: &MemoryBudget,
     ) -> Result<VerifyReport, BackupError> {
-        let manifest = BackupManifest::decode(
-            &medium
-                .read(&root.join(MANIFEST_FILE), MAX_MANIFEST_BYTES)
-                .map_err(|_| BackupError::Missing("manifest"))?,
-        )?;
+        let budget = files.budget;
+        let manifest = files.read_manifest()?;
         // The backup names its own domain: verification is possible on any
         // machine that carries the decoder, not only the node that wrote it.
         let limits = NativeSessionLimits::standard(manifest.domain);
@@ -1371,7 +1658,7 @@ pub mod backup {
             manifest,
         };
         let manifest = &report.manifest;
-        let checkpoint = match medium.read(&root.join(CHECKPOINT_FILE), MAX_CHECKPOINT_BYTES) {
+        let checkpoint = match files.read_checkpoint() {
             Ok(bytes) => bytes,
             Err(error) => {
                 let mut report = report;
@@ -1387,10 +1674,10 @@ pub mod backup {
         }
         let mut seeds_verified = 0u64;
         for chunk in &manifest.seeds {
-            match medium.read(
-                &root.join(SEEDS_DIR).join(format!("{}.seed", chunk.hash)),
-                chunk.length as usize,
-            ) {
+            match files
+                .seed_path(&chunk.hash)
+                .and_then(|path| files.read(&path, chunk.length as usize))
+            {
                 Ok(bytes)
                     if bytes.len() == chunk.length as usize
                         && ContentHash(*blake3::hash(&bytes).as_bytes()) == chunk.hash =>
@@ -1402,7 +1689,7 @@ pub mod backup {
             }
         }
         // The cold streams' chunks (doc 31 M2, A2), each against its name.
-        let backup_seeds = BackupSeeds::new(medium, root);
+        let backup_seeds = BackupSeeds::new(files);
         for (data, chunks) in [(true, &manifest.cold_data), (false, &manifest.cold_marks)] {
             for chunk in chunks {
                 match backup_seeds.read_cold(data, chunk.hash, chunk.length as usize) {
@@ -1415,7 +1702,7 @@ pub mod backup {
             }
         }
         let domain = manifest.domain;
-        let content = BackupContent::new(medium, root);
+        let content = BackupContent::new(files);
         let mut objects_verified = 0u64;
         let mut chunks_verified = 0u64;
         let mut bytes_verified = 0u64;
@@ -1470,7 +1757,7 @@ pub mod backup {
             }
         }
         let inventory_matches = if checkpoint_ok && problems.is_empty() {
-            let seeds = BackupSeeds::new(medium, root);
+            let seeds = BackupSeeds::new(files);
             {
                 match inventory(&checkpoint, &seeds, &content, limits, budget) {
                     Ok(inventory) => {

@@ -422,3 +422,41 @@ fn test_directories_share_one_root_key_file_and_keep_keys_of_their_own() {
     let sealed = a.key(Store::Journal).unwrap().wrap(&probe).unwrap();
     assert!(b.key(Store::Journal).unwrap().unwrap(&sealed).is_err());
 }
+
+/// Do: make two key files as an operator does and read each as an operator key, one twice; make a
+/// child key under one; loosen one file's mode; cut one short. Expect: a file read again is the
+/// same key under the same ID, another file another ID, and the ID is no part of the key; what one
+/// key wraps opens under it read again and under no other; a file another principal may read, or
+/// of another length, is refused as a node's root key file is.
+#[test]
+fn an_operators_key_file_is_named_by_a_hash_of_its_key_and_refused_unless_owner_only_and_whole() {
+    let d = dirs();
+    let (a, b) = (d.key.with_file_name("a.key"), d.key.with_file_name("b.key"));
+    create_root_key(&a).unwrap();
+    create_root_key(&b).unwrap();
+    let first = operator_key(&a).unwrap();
+    let again = operator_key(&a).unwrap();
+    let other = operator_key(&b).unwrap();
+    assert_eq!(first.id(), again.id());
+    assert_ne!(first.id(), other.id());
+    let bytes = std::fs::read(&a).unwrap();
+    assert!(!bytes.windows(16).any(|window| window == first.id().0));
+    let (secret, record) = first.make_child().unwrap();
+    assert_eq!(again.unwrap(&record).unwrap().bytes(), secret.bytes());
+    assert!(other.unwrap(&record).is_err());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            operator_key(&a),
+            Err(SealSetupError::Seal(SealError::Source(_)))
+        ));
+        std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    std::fs::write(&a, &bytes[..31]).unwrap();
+    assert!(matches!(
+        operator_key(&a),
+        Err(SealSetupError::Seal(SealError::Source(_)))
+    ));
+}

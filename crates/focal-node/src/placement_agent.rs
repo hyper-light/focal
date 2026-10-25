@@ -2580,7 +2580,10 @@ impl PlacementAgent {
         use crate::backup::RestoreDecision;
         let node = self.state.node;
         let cluster = self.state.genesis.founder.cluster;
-        let verification = crate::backup::verify(&request.input)?;
+        // The backup verified whole, a sealed one's every file opened under the key file, before
+        // anything is written here (29 §12.8): a backup without its key file, with another, or with
+        // a file changed or swapped is refused with the node untouched.
+        let verification = crate::backup::verify(&request.input, request.key_file.as_deref())?;
         if !verification.complete {
             return Err(AgentError::Restore(if verification.decoder_supported {
                 "the backup does not verify; run `verify backup` for the problems"
@@ -2588,7 +2591,7 @@ impl PlacementAgent {
                 "this binary does not carry the decoder the backup's log promised"
             }));
         }
-        let manifest = crate::backup::read_manifest(&request.input)?;
+        let manifest = crate::backup::read_manifest(&request.input, request.key_file.as_deref())?;
         let ledger = manifest.prefix.ledger;
         let group = match &request.decision {
             RestoreDecision::SameIncarnation { .. } => manifest.prefix.group.0,
@@ -2662,7 +2665,11 @@ impl PlacementAgent {
             .await?;
         let objects_imported = handles
             .content
-            .restore_content(request.input.clone(), manifest.clone())
+            .restore_content(
+                request.input.clone(),
+                manifest.clone(),
+                request.key_file.clone(),
+            )
             .await?;
         let domain = focal_model::ContentDomainId(ledger.tenant.0);
         // The restore reads and installs the backup's checkpoint: what the restored session's
@@ -2681,20 +2688,26 @@ impl PlacementAgent {
         let disk = self.storage.disk_budget();
         let content_root = self.root.join("content");
         let input = request.input.clone();
+        let key_file = request.key_file.clone();
         let manifest_for_rewrite = manifest.clone();
         let work = tenant.clone();
         let keys = self.keys.clone();
         let at_rest = crate::storage_level::at_rest_form(&self.root)
             .map_err(|error| AgentError::Level(Box::new(error)))?;
         let (rewritten, seeds_installed) = focal_rt::on_pool(&focal_rt::WORK, move || {
-            use focal_ledger::backup::{
-                BackupContent, BackupMedium as _, BackupSeeds, FileMedium, Incarnation,
+            use focal_ledger::backup::{BackupFiles, BackupSeeds, FileMedium, Incarnation};
+            // The backup's files in their form, read under the restore's own budget.
+            let form = crate::backup::form(&input, key_file.as_deref())?;
+            let files = BackupFiles {
+                medium: &FileMedium,
+                root: &input,
+                form: &form,
+                budget: &work,
             };
             // The session's cold streams, where its restored checkpoint names them (doc 31 M2,
             // A2).
             focal_ledger::backup::import_cold(
-                &FileMedium,
-                &input,
+                files,
                 &manifest_for_rewrite,
                 &cold_root,
                 &disk,
@@ -2702,25 +2715,15 @@ impl PlacementAgent {
                 at_rest,
             )?;
             let mut sink = focal_evidence::SeedStore::open(seed_root, disk, &keys, at_rest)?;
-            let seeds_installed = focal_ledger::backup::import_seeds(
-                &FileMedium,
-                &input,
-                &manifest_for_rewrite,
-                &mut sink,
-            )?;
-            let checkpoint = FileMedium
-                .read(
-                    &input.join(focal_ledger::backup::CHECKPOINT_FILE),
-                    focal_ledger::backup::MAX_CHECKPOINT_BYTES,
-                )
-                .map_err(focal_ledger::backup::BackupError::Io)?;
+            let seeds_installed =
+                focal_ledger::backup::import_seeds(files, &manifest_for_rewrite, &mut sink)?;
+            let checkpoint = files.read_checkpoint()?;
             // Recovery reads every live artifact's object: the node's own
             // store holds them now, imported above.
             let reader = focal_evidence::ContentReader::open(content_root, keys)?;
-            let _ = BackupContent::new(&FileMedium, &input);
             let rewritten = focal_ledger::backup::rewrite(
                 &checkpoint,
-                &BackupSeeds::new(&FileMedium, &input),
+                &BackupSeeds::new(files),
                 &reader,
                 Incarnation {
                     cluster,
