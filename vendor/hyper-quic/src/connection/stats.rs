@@ -230,6 +230,8 @@ pub struct PathStats {
     pub warm_up_pending: bool,
     /// The number of times a black hole was detected in the path
     pub black_holes_detected: u64,
+    /// The number of times the path was found degrading (`Event::PathDegrading`)
+    pub path_degradings: u64,
     /// Largest UDP payload size the path currently supports
     pub current_mtu: u16,
 }

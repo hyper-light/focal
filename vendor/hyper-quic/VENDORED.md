@@ -1604,3 +1604,35 @@ trip. The connection's statistics, and hyper-transport's `PathFacts::pacing_rate
 a BBR connection paced at zero bits a second while it paced at its start-up's rate. `metrics` now
 gives `pacing_rate`'s. Test: `congestion::bbr::tests::the_rate_reported_is_the_rate_paced_at` (before:
 `(None, Some(0))` where `(None, None)`).
+
+## 45. A client told when its path is degrading (2026-10-25, found by focal)
+
+`connection/mod.rs`, `connection/timer.rs`, `connection/packet_builder.rs`: quinn-proto tells its
+application nothing between a peer that answers and a connection that idles out, so a client whose
+server went without a word (a killed process, a host down, a path cut) learned it only at the idle
+timeout: two minutes at focal's bus, whose client kept sending into a leader killed with kill -9
+while the group had elected another. Chromium's QUIC tells its session (quiche,
+`QuicNetworkBlackholeDetector`): a client's path is degrading once nothing it sent has been
+acknowledged for four probe timeouts (`kNumProbeTimeoutsForPathDegradingDelay`, "kPDE4 is the
+default. We have the experiments with kPDE4."; `GetPathDegradingDelay()`,
+`num_ptos_for_path_degrading_ * GetPtoDelay()`), and the session may move to another path
+(`OnPathDegrading`); it is told when the path makes progress again
+(`OnForwardProgressMadeAfterPathDegrading`), and the connection is not closed. TCP has the same
+step: past R1, at least three retransmissions, "TCP SHOULD inform the application of the delivery
+problem ... when R1 is reached and before R2", the close (RFC 1122 §4.2.3.5).
+
+The connection now runs quiche's detection on a client once its handshake is confirmed (its
+Handshake keys discarded on HANDSHAKE_DONE): `Timer::PathDegrading` is armed when an ack-eliciting
+packet is sent and the timer is not running, at four times the application space's probe timeout at
+its current backoff; any packet newly acknowledged restarts it while ack-eliciting packets are in
+flight, and quiescence stops it, where an acknowledgement leaves none in flight and where packets
+declared lost by time leave none (`set_loss_detection_timer`, quiche's `StopDetection`). On expiry
+the application is told `Event::PathDegrading` and no detection runs until the peer acknowledges a
+packet, which tells `Event::ForwardProgress`. `PathStats::path_degradings` counts them. A server is
+never told, as quiche's is not: it cannot go elsewhere. Tests (`tests/path_degrading.rs`): told
+exactly four probe timeouts after the first packet nothing acknowledged, once however long the
+silence, progress once the server answers and the data delivered, and again on a second silence;
+never over a 100 ms round trip with a server that answers; never on the server; and nothing told
+after a packet lost by time left nothing in flight (without the quiescence stop it told one four
+probe timeouts after the lost packet's send, `(1, 0)`, found by
+`a_retired_cid_routes_for_three_probe_timeouts`, whose drive the running timer kept from idling).

@@ -71,3 +71,6 @@ focal-log = { version = "0.1.0", path = "../focal-log", features = ["test-suppor
 focal-evidence = { version = "0.1.0", path = "../focal-evidence", features = ["test-support"] }
 tempfile.workspace = true
 rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "aws_lc_rs", "x509-parser"] }
+# A bus group's client driven in a test, as focal-bus's own tests drive one (tests/bus_failover.rs).
+hyper-transport.workspace = true
+hyper-rt-transport.workspace = true

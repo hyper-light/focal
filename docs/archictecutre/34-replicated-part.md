@@ -43,7 +43,7 @@ replicas, and what every publish, acknowledgement and delivery does on the way.
 | # | Decision | Grounds |
 |---|---|---|
 | P1 | A part is one Raft group of the nodes that hold it | JetStream's stream group, Kafka's partition; hyper-durable's `Owner` holds an owner thread's groups in one arena |
-| P2 | Publishes go to the part's leader. A node that does not lead refuses, naming the leader it knows and that leader's term; a client takes the name only where the term advances its view | Kafka's `NOT_LEADER_OR_FOLLOWER` with KIP-951's leader and epoch, and its epoch rule. JetStream's forwarding costs a hop and the forwarder's buffering on every publish |
+| P2 | Publishes go to the part's leader. A node that does not lead refuses, naming the leader it knows and that leader's term; a client takes the name only where the term advances its view. A client that cannot hear the node it sends to (its path degrading, its connection closed, a dial to it failed) asks another node of the group; one that names no leader, or names the unheard leader at the term the client knows, is asked again, the next in turn, after a back-off | Kafka's `NOT_LEADER_OR_FOLLOWER` with KIP-951's leader and epoch, and its epoch rule; its producer's metadata refresh from another broker on a disconnect or a request timeout, backed off per KIP-580. JetStream's forwarding costs a hop and the forwarder's buffering on every publish |
 | P3 | The group's entries are the batches: the same bytes proposed, replicated, written and applied | doc 32 D4 |
 | P4 | The state machine is the part: applying an entry appends its batch to the part's log and streams, which the node delivers from | doc 32 §3; one copy into the segment the delivery reads |
 | P5 | A publish is acknowledged by a frame of its own when its leader applies it: stream, base offset, records, and the class achieved | Kafka's produce response (base offset), JetStream's PubAck (stream, sequence); doc 33 §4.8's typed acknowledgement |
@@ -71,7 +71,12 @@ replicas, and what every publish, acknowledgement and delivery does on the way.
 ## 5. Failures
 
 - **A leader lost.** The stream suspects it within its stated bound; a follower campaigns, and the
-  elected one's clients are redirected (P2) by the first refusal they meet.
+  elected one's clients are redirected (P2) by the first refusal they meet. A client learns that it
+  cannot hear the lost leader from its own endpoint: a killed process sends nothing, and four probe
+  timeouts with nothing it sent acknowledged tell it the path is degrading (hyper-transport's
+  `Degrading`, hyper-raft docs/transport.md §4ai, quiche's rule), where a Kafka producer has TCP's
+  RST from a live host's kernel and otherwise its request timeout (30 s). It then asks another node
+  (P2), which names the leader or, while the group has not yet elected one, is asked again.
 - **A publish whose acknowledgement was lost.** Its client sends it again to the new leader; the
   part acknowledges it with the offsets it took, or appends it if no majority took it (P6).
 - **A node restarted.** hyper-log replays its group; the part is rebuilt from the committed entries
@@ -205,3 +210,54 @@ Found on the way, each root-caused:
   full, the publisher let go at once, then every queued batch in order and the notice naming the
   leader and the offset after the last batch, and nothing delivered after; without the move the
   publisher stays held and the test stops.
+- **A client never left a killed leader** (2026-10-25, found by Quiver on fedora: three
+  `focal start bus` units, a client publishing 1,000 a second, kill -9 of its leader at 25 s). The
+  survivors elected another within about 110 ms of suspecting the first, and the client kept
+  publishing into the dead connection to the end of its run, 4,096 publishes unacknowledged. A
+  publisher learned leaders only from redirects, which a dead node sends none of, and its only
+  judgement of a silent node was QUIC's idle timeout, two minutes (`limits::IDLE_TIMEOUT`, RFC 4787
+  REQ-5): QUIC carries nothing from a host whose endpoint is gone. `tests/group.rs` hid it, its
+  harness switching the client to a survivor by hand and reading the leader from the nodes for its
+  consumer. Fixed at both causes. The transport tells a dialer when its peer stops acknowledging, as
+  Chromium's QUIC tells its session (hyper-raft's path-degrading detection, docs/transport.md §4ai:
+  four probe timeouts, RFC 1122 §4.2.3.5's "inform the application ... when R1 is reached"). And the
+  decision is focal-bus's client's (`client::Client::group`, P2): told it cannot hear the node it
+  sends to, it asks the next node of the group at once; a node naming the leader at a newer term is
+  followed, and dialed afresh where its connection went (a restarted node resets what its last run
+  held); a node naming no leader, or the unheard one at the term the client knows, is asked again,
+  the next in turn, after Kafka's back-off (100 ms doubled to 1 s, `limits::ASK_BACKOFF_FIRST`,
+  KIP-580, drawn within a fifth of it, one step a round of asking however many batches the node
+  redirected in it), the unheard leader dialed beside the asking where it has no connection; a node
+  it asked that acknowledges leads; while it asks it sends only its oldest batch. A degrading path is a reason to look elsewhere, not to give the
+  connection up: a node just restarted held its loop 169 ms (`busy_most_ns`), past four probe
+  timeouts of loopback (about 104 ms), and a client that disconnected its leader on it churned, its
+  owed answers and its consumer's subscription dropped with the connection. The leader is followed
+  again once heard (`Progressing`), and its connection is given up only when the client follows
+  another (named at a newer term, or acknowledging), as a Kafka client disconnects a broker whose
+  request timed out. The caller is handed `Delivery::Rerouted` and sends the node what it owes, the
+  part recognising what it took (P6), and `Delivery::Lost { node }` for each node whose connection
+  ended, told by the epochs it saw up so a close the endpoint folded into a later state is told too,
+  on which it subscribes again wherever it held a subscription: a subscription lives on its
+  connection, which ends it with no exchange left to refuse. focal-compare's bus modes use the client
+  (and its endpoint, `client::endpoint`). Tests: `tests/group.rs`, with no hand-switching and its
+  consumer subscribing where the client sends, the leader killed with its socket gone and nothing
+  said, every batch after acknowledged once at the offsets that follow and the client sending to the
+  new leader (on this Mac: acknowledged again 30 to 178 ms after the kill, fifteen kills), and the three nodes
+  restarted one at a time under publishing and consuming, the client and the consumer finding each
+  next leader themselves; the harness counts a batch sent again and acknowledged as taken without
+  its offsets (not its session's newest, P6) as acknowledged, where it had waited for offsets it
+  never gets. `focal-node/tests/bus_failover.rs`: three `focal start bus` processes and the client,
+  kill -9 of the leader's process, every batch acknowledged and the stream holding each once and in
+  order (on this Mac, four runs: the first acknowledgement 0.45 to 4.5 s after the kill, the group's
+  own election 0.3 to 3.6 s of it, each survivor's suspicion, and the client's remainder 0.15 to
+  0.9 s). Open: the client waits out the group's election by asking again on Kafka's back-off, so it
+  hears the new leader up to a second after the group elected it; a node that held a client's ask
+  until its term passed the one the client knew would answer as the election ends (a leadership ask,
+  not yet in the protocol). a dial to a node whose host is gone ends only at the idle timeout, the transport
+  having no deadline for a handshake (Chromium's `kMaxTimeForCryptoHandshakeSecs`, 10 s; Kafka's
+  `socket.connection.setup.timeout.ms`, 10 s doubled to 30 s, KIP-601), so a client whose first
+  configured node is down waits two minutes before it asks the next; a subscriber learns of its
+  leader's death only from what it sends (window updates while it is delivered, or a keep-alive
+  within 15 s, `limits::KEEP_ALIVE`, on a quiet stream) or from the client's following another; and
+  a connection's second subscribe to a stream it is subscribed to makes a second subscription, so a
+  subscriber must not ask again on a connection whose loss it was not told of.

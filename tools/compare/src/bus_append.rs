@@ -5,10 +5,12 @@
 //! the other systems are held to (Kafka `acks=all` with `flush.messages=1`, JetStream `sync: always`,
 //! Redis `appendfsync always` with `WAITAOF`).
 //!
-//! The publisher dials the first node and follows each redirect to the leader a node names, taking
-//! a leader only where its term is past what it knew (KIP-951's rule); a batch redirected, refused
-//! out of its session's order, not acknowledged when the leader's connection ends, or unanswered for a
-//! serve period, is sent again to the leader it then knows, and the part recognises a batch it took.
+//! The publisher is focal-bus's client of the group (`client::Client::group`): it dials the first
+//! node, follows each leader a node names where its term is past what it knew (KIP-951's rule), and
+//! asks another node when it cannot hear the one it sends to (its path degrading, its connection
+//! closed); a batch redirected, refused out of its session's order, owed when the client is
+//! rerouted, or unanswered for a serve period, is sent again to the node the client then sends to,
+//! and the part recognises a batch it took.
 //! It publishes on a session of its own, begun at sequence zero (Kafka's producer takes a fresh
 //! producer id), and sends in its session's order: a batch waiting to go again holds every batch
 //! after it, which the part would refuse past the gap (doc 34 P6). It gathers the records due each
@@ -27,13 +29,12 @@ use focal_bus::client::{Client, Delivery};
 use focal_bus::directory::BusDirectory;
 use focal_bus::limits::{IO, SERVE_PERIOD};
 use focal_bus::pki;
-use focal_bus::wire::{self, Ack, Bus, Durability, Role};
+use focal_bus::wire::{self, Ack, Bus, Durability};
 use focal_memory::MemoryBudget;
 use hdrhistogram::Histogram;
 use hyper_rt::runtime::LocalRuntime;
 use hyper_rt_transport::Driver;
-use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer, Tls};
-use hyper_transport::{Config, Endpoint, Event, Refusal};
+use hyper_transport::{Endpoint, Event, Refusal};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::{Future, poll_fn};
 use std::net::SocketAddr;
@@ -48,10 +49,6 @@ type Drv = Driver<Bus, BusBudget, BusDirectory>;
 const STREAM: u64 = 1;
 /// Format: the publisher's client identity.
 const PUBLISHER: usize = 0;
-/// Cited: Kafka's client's first backoff after a retriable error, `retry.backoff.ms` (100 ms).
-const RETRY_BACKOFF: Duration = Duration::from_millis(100);
-/// Cited: the most it backs off, `retry.backoff.max.ms` (1,000 ms, KIP-580).
-const RETRY_BACKOFF_MAX: Duration = Duration::from_millis(1_000);
 
 /// One `append` run's terms on the bus.
 pub struct Run {
@@ -94,39 +91,8 @@ pub fn run(run: Run) -> Result<(Histogram<u64>, Tally), CompareError> {
         .and_then(|bytes| usize::try_from(bytes).ok())
         .ok_or_else(|| fail("the machine's memory could not be read"))?;
     let budget = MemoryBudget::new(envelope, 0).map_err(|error| fail(format!("{error:?}")))?;
-    let identity = local
-        .clients
-        .get(PUBLISHER)
-        .ok_or_else(|| fail("no client identity"))?;
-    let mut directory = BusDirectory::new(nodes);
-    for n in 1..=nodes {
-        let n = u64::try_from(n).map_err(fail)?;
-        let node = local.node(n).ok_or_else(|| fail("a node's identity"))?;
-        directory
-            .enroll(&node.certificate, n, Role::Node, &pki::node_name(n))
-            .map_err(fail)?;
-    }
-    let tls = Tls::mutual(
-        &Credentials {
-            chain: vec![CertificateDer::from(identity.certificate.clone())],
-            key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.key.clone())),
-            roots: vec![CertificateDer::from(local.root.clone())],
-        },
-        false,
-    )
-    .map_err(|error| fail(format!("{error:?}")))?;
-    let endpoint = Endpoint::new(
-        Config {
-            tls,
-            role: Role::Client,
-            limits: focal_bus::limits::client_of(nodes).map_err(fail)?,
-            congestion: Default::default(),
-        },
-        BusBudget::new(budget),
-        directory,
-        Instant::now(),
-    )
-    .map_err(|error| fail(format!("{error:?}")))?;
+    let endpoint = focal_bus::client::endpoint(&local, PUBLISHER, nodes, budget, Instant::now())
+        .map_err(fail)?;
     let producer = session()?;
     let mut runtime = LocalRuntime::new(&focal_rt::local_config()).map_err(fail)?;
     runtime
@@ -141,20 +107,19 @@ async fn publish(
 ) -> Result<(Histogram<u64>, Tally), CompareError> {
     let any: SocketAddr = "0.0.0.0:0".parse().map_err(fail)?;
     let mut driver: Drv = Driver::bind(endpoint, any, IO).map_err(fail)?;
-    let address = |node: u64| -> Result<SocketAddr, CompareError> {
-        usize::try_from(node)
-            .ok()
-            .and_then(|n| n.checked_sub(1))
-            .and_then(|at| run.nodes.get(at))
-            .copied()
-            .ok_or_else(|| fail("a node the client does not know"))
-    };
-    let mut leader = 1_u64;
-    let mut term = 0_u64;
+    // Node n of the group at the run's n-th address, node 1 first.
+    let mut nodes = Vec::with_capacity(run.nodes.len());
+    for (at, address) in run.nodes.iter().enumerate() {
+        let node = at
+            .checked_add(1)
+            .and_then(|n| u64::try_from(n).ok())
+            .ok_or_else(|| fail("a node's number"))?;
+        nodes.push((node, *address));
+    }
+    let mut client = Client::group(&nodes).map_err(fail)?;
     let now = driver.clock().map_err(fail)?;
-    driver
-        .endpoint()
-        .connect(now, leader, address(leader)?)
+    client
+        .dial(driver.endpoint(), now)
         .map_err(|error| fail(format!("{error:?}")))?;
     let mut histogram = Histogram::<u64>::new_with_bounds(1_000, HIGHEST_NS, 3)
         .map_err(|error| fail(error.to_string()))?;
@@ -173,14 +138,9 @@ async fn publish(
     let batch_bound = usize::try_from(wire::BATCH_BOUND).map_err(fail)?;
     let mut builder = BatchBuilder::new();
     // Every batch made and not acknowledged, by its first record's sequence; and those to send, again
-    // or for the first time, to the leader the client now knows, in their session's order.
+    // or for the first time, to the node the client now sends to, in their session's order.
     let mut flying: BTreeMap<u32, Flying> = BTreeMap::new();
     let mut pending: BTreeSet<u32> = BTreeSet::new();
-    // A redirect that names no leader (an election under way) holds what goes again until a node
-    // names one or the backoff passes, as Kafka's client backs off a retriable error: from
-    // `retry.backoff.ms`, 100 ms, doubling to `retry.backoff.max.ms`, 1,000 ms (KIP-580's defaults).
-    let mut held_until: Option<Instant> = None;
-    let mut backoff = RETRY_BACKOFF;
     let mut in_flight = 0_usize;
     let mut sequence = 0_u32;
     let began = Instant::now();
@@ -286,13 +246,16 @@ async fn publish(
             flying.insert(first, Flying { bytes, records });
             pending.insert(first);
         }
-        // What waits goes to the leader known now, in order, once no backoff holds it: a lane with
-        // no room, or a connection not made yet, keeps it and everything after it for the next turn.
-        let client = Client::new(leader);
-        let backing_off = held_until.is_some_and(|until| Instant::now() < until);
-        if !backing_off {
+        // What waits goes to the node the client sends to now, in order, once no back-off holds it
+        // (the client's, after a node named no leader it could take): a lane with no room, or a
+        // connection not made yet, keeps it and everything after it for the next turn.
+        let now = Instant::now();
+        if client.ready(now) {
+            // While the client asks a node about the leader, only the oldest batch owed goes: its
+            // answer names the leader or acknowledges it.
+            let sends = if client.asking() { 1 } else { pending.len() };
             // Bounded: each turn takes one batch out of `pending`, or stops.
-            for _ in 0..pending.len() {
+            for _ in 0..sends {
                 let Some(&first) = pending.first() else {
                     break;
                 };
@@ -304,7 +267,12 @@ async fn publish(
                     Ok(()) => {
                         pending.remove(&first);
                     }
-                    Err(Refusal::LaneFull | Refusal::NotConnected) => break,
+                    Err(Refusal::LaneFull) => break,
+                    Err(Refusal::NotConnected) => {
+                        // A dial refused (the endpoint's peers all held) is made again here.
+                        let _ = client.dial(driver.endpoint(), now);
+                        break;
+                    }
                     Err(error) => return Err(fail(format!("publish refused: {error:?}"))),
                 }
             }
@@ -341,17 +309,16 @@ async fn publish(
             events.push(event);
         }
         for event in events {
-            let mut client = Client::new(leader);
+            let now = Instant::now();
             let mut acked: Vec<Ack> = Vec::new();
             let mut redirected: Vec<wire::Redirect> = Vec::new();
-            let mut lost = false;
-            client.on_event(driver.endpoint(), event, |delivery| match delivery {
+            let mut rerouted = false;
+            client.on_event(driver.endpoint(), event, now, |delivery| match delivery {
                 Delivery::Acked(ack) => acked.push(ack),
                 Delivery::Redirected(redirect) => redirected.push(redirect),
-                Delivery::Lost(_) => lost = true,
+                Delivery::Rerouted { .. } => rerouted = true,
                 _ => {}
             });
-            let now = Instant::now();
             for ack in acked {
                 if ack.class == Ack::OUT_OF_ORDER {
                     // Past a gap in the session: everything from the sequence the part waits for
@@ -408,33 +375,12 @@ async fn publish(
                 }
             }
             for redirect in redirected {
-                match redirect.leader.node {
-                    Some(node) if redirect.leader.term > term => {
-                        leader = node;
-                        term = redirect.leader.term;
-                        let _ = driver.endpoint().connect(now, leader, address(leader)?);
-                        // A leader named: what waits goes at once.
-                        held_until = None;
-                        backoff = RETRY_BACKOFF;
-                    }
-                    Some(_) => {}
-                    None => {
-                        if held_until.is_none_or(|until| now >= until) {
-                            held_until = now.checked_add(backoff);
-                            backoff = backoff.saturating_mul(2).min(RETRY_BACKOFF_MAX);
-                        }
-                    }
-                }
                 if flying.contains_key(&redirect.sequence) {
                     pending.insert(redirect.sequence);
                 }
             }
-            if lost {
-                // The leader's connection ended: what it did not acknowledge goes again, to the
-                // next node, which redirects to the leader it knows.
-                let count = u64::try_from(run.nodes.len()).unwrap_or(1).max(1);
-                leader = leader.checked_rem(count).unwrap_or(0).saturating_add(1);
-                let _ = driver.endpoint().connect(now, leader, address(leader)?);
+            // The client sends to another node: what was not acknowledged goes to it again.
+            if rerouted {
                 pending.extend(flying.keys().copied());
             }
         }

@@ -266,6 +266,9 @@ pub struct Connection {
     //
     /// The number of times a PTO has been sent without receiving an ack.
     pto_count: u32,
+    /// Whether the application was told the path is degrading (`Event::PathDegrading`) and the
+    /// peer has acknowledged nothing since: no detection runs until it does
+    path_degrading: bool,
     /// Whether the congestion window was just reduced by a loss, so that one packet may go past
     /// it (RFC 9002 §7.3.2): the retransmission of what was lost, sent without waiting for the
     /// in-flight bytes to drain below the reduced window
@@ -427,6 +430,7 @@ impl Connection {
             next_bundled_ack_time: None,
 
             pto_count: 0,
+            path_degrading: false,
             recovery_packet: false,
 
             app_limited: false,
@@ -1862,6 +1866,7 @@ impl Connection {
                 }
             }
             Timer::RetiredCid => self.on_retired_cid_timeout(now),
+            Timer::PathDegrading => self.on_path_degrading_timeout(),
             Timer::MaxAckDelay => {
                 trace!("max ack delay reached");
                 // This timer is only armed in the Data space
@@ -2241,6 +2246,7 @@ impl Connection {
         if self.peer_completed_address_validation() {
             self.pto_count = 0;
         }
+        self.on_forward_progress(now);
 
         // Explicit congestion notification
         if self.path.sending_ecn {
@@ -2512,6 +2518,13 @@ impl Connection {
     #[cfg(test)]
     pub(crate) fn pto_state(&self) -> (u32, u64) {
         (self.pto_count, self.path.in_flight.ack_eliciting)
+    }
+
+    /// The application space's probe timeout before backoff: what a test of the path-degrading
+    /// delay measures against.
+    #[cfg(test)]
+    pub(crate) fn data_pto(&self) -> Duration {
+        self.pto(SpaceId::Data)
     }
 
     fn on_loss_detection_timeout(&mut self, now: Instant) {
@@ -2950,6 +2963,12 @@ impl Connection {
             // reordered packet being handled by state-insensitive code.
             return;
         }
+        // Quiescence stops the path-degrading detection (quiche's `StopDetection` where nothing is
+        // in flight): what was declared lost by time, after later packets were acknowledged, is
+        // not waited for
+        if self.path.in_flight.ack_eliciting == 0 {
+            self.timers.stop(Timer::PathDegrading);
+        }
 
         if let Some((loss_time, _)) = self.loss_time_and_space() {
             // Time threshold loss detection.
@@ -2987,6 +3006,72 @@ impl Connection {
         };
         // A delay: saturating can only lengthen it
         self.path.rtt.pto_base().saturating_add(max_ack_delay)
+    }
+
+    /// Whether the path-degrading detection may run (quiche's `ShouldDetectPathDegrading`): on a
+    /// client, the side that can go elsewhere, once its handshake is confirmed (its Handshake keys
+    /// discarded on HANDSHAKE_DONE, RFC 9001 §4.1.2 and §4.9.2), while no degrading path told waits
+    /// for the peer's next acknowledgement
+    fn detects_path_degrading(&self) -> bool {
+        self.side.is_client()
+            && !self.state.is_closed()
+            && !self.path_degrading
+            && self.spaces.get(SpaceId::Handshake).crypto.is_none()
+            && self.spaces.get(SpaceId::Data).crypto.is_some()
+    }
+
+    /// Places the path-degrading deadline [`PATH_DEGRADING_PROBE_TIMEOUTS`] probe timeouts from
+    /// `now`, each the application space's at its current backoff (quiche's
+    /// `GetPathDegradingDelay`, `num_ptos_for_path_degrading_ * GetPtoDelay()`), where the
+    /// detection may run; otherwise none
+    fn arm_path_degrading(&mut self, now: Instant) {
+        let backoff = 2u32.saturating_pow(self.pto_count.min(MAX_BACKOFF_EXPONENT));
+        // A delay: saturating can only lengthen it; a deadline past the clock's range is never
+        // reached, so it is no deadline
+        let deadline = self.detects_path_degrading().then(|| {
+            now.checked_add(
+                self.pto(SpaceId::Data)
+                    .saturating_mul(backoff)
+                    .saturating_mul(PATH_DEGRADING_PROBE_TIMEOUTS),
+            )
+        });
+        match deadline.flatten() {
+            Some(deadline) => self.timers.set(Timer::PathDegrading, deadline),
+            None => self.timers.stop(Timer::PathDegrading),
+        }
+    }
+
+    /// An ack-eliciting packet was sent at `now`: the detection starts unless it runs already,
+    /// for then nothing has been acknowledged since it began (quiche's `OnPacketSent`)
+    pub(super) fn on_ack_eliciting_sent(&mut self, now: Instant) {
+        if self.timers.get(Timer::PathDegrading).is_none() {
+            self.arm_path_degrading(now);
+        }
+    }
+
+    /// The peer acknowledged packets not acknowledged before (quiche's `OnForwardProgressMade`):
+    /// a degrading path told is told progressing, and the detection starts again from `now` while
+    /// ack-eliciting packets are in flight, or stops in quiescence
+    fn on_forward_progress(&mut self, now: Instant) {
+        if self.path_degrading {
+            self.path_degrading = false;
+            self.events.push_back(Event::ForwardProgress);
+        }
+        if self.path.in_flight.ack_eliciting > 0 {
+            self.arm_path_degrading(now);
+        } else {
+            self.timers.stop(Timer::PathDegrading);
+        }
+    }
+
+    /// The path-degrading deadline passed with nothing acknowledged since the detection began
+    /// (quiche's `OnPathDegradingDetected`): the application is told, the connection stays open
+    fn on_path_degrading_timeout(&mut self) {
+        if self.detects_path_degrading() {
+            self.path_degrading = true;
+            self.stats.path.path_degradings = self.stats.path.path_degradings.saturating_add(1);
+            self.events.push_back(Event::PathDegrading);
+        }
     }
 
     fn on_packet_authenticated(
@@ -5739,12 +5824,25 @@ pub enum Event {
     DatagramReceived,
     /// One or more application datagrams have been sent after blocking
     DatagramsUnblocked,
+    /// A client's path is degrading: nothing it sent was acknowledged for
+    /// [`PATH_DEGRADING_PROBE_TIMEOUTS`] probe timeouts. The connection stays open; told once, and
+    /// not again until the peer acknowledges a packet ([`Event::ForwardProgress`]).
+    PathDegrading,
+    /// The peer acknowledged a packet after [`Event::PathDegrading`] was told.
+    ForwardProgress,
 }
 
 fn get_max_ack_delay(params: &TransportParameters) -> Duration {
     // The parameter is in milliseconds
     Duration::from_millis(params.max_ack_delay.0)
 }
+
+/// Cited: the probe timeouts in which nothing a client sent is acknowledged before its path is
+/// degrading: quiche's default (`kNumProbeTimeoutsForPathDegradingDelay`, "The default number of
+/// PTOs to trigger path degrading", 4, quic_sent_packet_manager.cc: "kPDE4 is the default. We
+/// have the experiments with kPDE4."), Chromium's QUIC, whose session is told
+/// (`OnPathDegrading`) and may move to another path.
+pub const PATH_DEGRADING_PROBE_TIMEOUTS: u32 = 4;
 
 // Prevents overflow and improves behavior in extreme circumstances
 /// The largest PTO backoff exponent, which prevents overflow and improves behavior in extreme circumstances (upstream's value)

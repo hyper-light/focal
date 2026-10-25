@@ -17,7 +17,10 @@
 //!   owner polls the peer's frames;
 //! - a peer's lifecycle waits as one event, its latest state with its epoch: a change while it
 //!   waits replaces it and moves it to the back, after the refusals of the exchanges a closed
-//!   connection carried; its entry in the peer table is held until the owner polls it.
+//!   connection carried; its entry in the peer table is held until the owner polls it;
+//! - so does the path of a peer's newest connection, degrading or progressing again
+//!   ([`Event::Degrading`], [`Event::Progressing`]): a change while it waits replaces it, one back
+//!   to what the owner was told takes it away, and the connection's close takes it away.
 //!
 //! A table at its bound refuses, typed, the stream, the connection or the dial that would need one
 //! more seat ([`Refusal::Exchanges`], [`Refusal::Events`]); no event is ever dropped, and nothing
@@ -155,17 +158,19 @@ pub enum AskQueue {
 impl Limits {
     /// The most events the endpoint holds for its owner at once: [`EXCHANGE_EVENTS`] for every
     /// exchange the table holds, and, for every entry of the peer table (the larger of the
-    /// identity and connection bounds), its one lifecycle event, its lanes' windows of frames and
-    /// one [`Event::LaneRoom`] a lane.
+    /// identity and connection bounds), its one lifecycle event, its one path event
+    /// ([`Event::Degrading`] or [`Event::Progressing`]), its lanes' windows of frames and one
+    /// [`Event::LaneRoom`] a lane.
     /// The queue never holds more (the module's documentation says how).
     pub fn event_bound(&self) -> usize {
         let peers = self.admission.identities.max(self.admission.connections);
         let lanes = usize::try_from(self.lanes_per_peer).unwrap_or(usize::MAX);
         let frames = lanes.saturating_mul(self.lane_window);
-        // A peer's lifecycle event, its lanes' frames, and a room event of each lane to it.
+        // A peer's lifecycle event and its path event, its lanes' frames, and a room event of each
+        // lane to it.
         EXCHANGE_EVENTS
             .saturating_mul(self.exchanges)
-            .saturating_add(peers.saturating_mul(frames.saturating_add(lanes).saturating_add(1)))
+            .saturating_add(peers.saturating_mul(frames.saturating_add(lanes).saturating_add(2)))
     }
 
     fn validate(&self) -> Result<(), Refusal> {
@@ -481,6 +486,15 @@ struct PeerEntry<R> {
     reported: Option<Lifecycle>,
     /// The state of the lifecycle event waiting for the owner, if one does.
     waiting: Option<Lifecycle>,
+    /// Whether its newest connection's path is degrading (hyper-quic's `PathDegrading`): nothing
+    /// sent on it acknowledged for the path-degrading delay, until the peer acknowledges again or
+    /// the connection goes.
+    degrading: bool,
+    /// The path state of its newest connection the owner was last told, by the
+    /// [`Event::Degrading`] or [`Event::Progressing`] it polled last: degrading or not.
+    path_reported: bool,
+    /// The path state of the event waiting for the owner, if one does.
+    path_waiting: Option<bool>,
     /// Frames of its lanes waiting for the owner, on any of its connections, live or gone.
     frames: usize,
     /// Its lanes not read for want of a seat for their next frame.
@@ -505,6 +519,9 @@ impl<R> PeerEntry<R> {
             closed: None,
             reported: None,
             waiting: None,
+            degrading: false,
+            path_reported: false,
+            path_waiting: None,
             frames: 0,
             paused: 0,
         }
@@ -521,7 +538,11 @@ impl<R> PeerEntry<R> {
     }
     /// Whether the entry must stay: a connection or a dial needs it, or events wait in it.
     fn pinned(&self) -> bool {
-        self.held > 0 || self.dialing || self.waiting.is_some() || self.frames > 0
+        self.held > 0
+            || self.dialing
+            || self.waiting.is_some()
+            || self.path_waiting.is_some()
+            || self.frames > 0
     }
 }
 
@@ -539,6 +560,12 @@ impl<C: Classes> Waiting<C> {
         matches!(self.event,
             Event::Connected { peer: of, .. } | Event::Closed { peer: of, .. } | Event::Unreachable { peer: of, .. }
                 if of == peer)
+    }
+
+    /// Whether this is a path event of `peer`.
+    fn path_of(&self, peer: PeerId) -> bool {
+        matches!(self.event,
+            Event::Degrading { peer: of, .. } | Event::Progressing { peer: of, .. } if of == peer)
     }
 }
 
@@ -1310,6 +1337,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             | Event::Closed { peer, .. }
             | Event::Unreachable { peer, .. } => {
                 self.core.lifecycle_polled(peer);
+            }
+            Event::Degrading { peer, .. } | Event::Progressing { peer, .. } => {
+                self.core.path_polled(peer);
             }
             Event::Frame { peer, .. } => {
                 if let Some((key, serial, stream)) = lane {
@@ -2598,6 +2628,61 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         }
     }
 
+    /// The path of `peer`'s newest connection may have changed: the event of it waiting for the
+    /// owner, if any, is replaced by its state now and moved to the back, after every event queued
+    /// before the change; a state the owner was already told waits as nothing.
+    fn report_path(&mut self, peer: PeerId) {
+        let Ok(at) = self.peers.binary_search_by_key(&peer, |entry| entry.peer) else {
+            return;
+        };
+        let Some(entry) = self.peers.get_mut(at) else {
+            return;
+        };
+        let state = entry.degrading;
+        if entry.path_waiting == Some(state) {
+            return;
+        }
+        if entry.path_waiting.take().is_some()
+            && let Some(index) = self.events.iter().position(|waiting| waiting.path_of(peer))
+        {
+            let _ = self.events.remove(index);
+        }
+        if state == entry.path_reported {
+            return;
+        }
+        let epoch = entry.epoch;
+        let event = if state {
+            Event::Degrading { peer, epoch }
+        } else {
+            Event::Progressing { peer, epoch }
+        };
+        entry.path_waiting = Some(state);
+        self.events.push_back(Waiting { event, lane: None });
+    }
+
+    /// The owner polled `peer`'s path event: what it was told is the state that waited.
+    fn path_polled(&mut self, peer: PeerId) {
+        if let Some(entry) = self.peer_entry_mut(peer) {
+            entry.path_reported = entry.path_waiting.take().unwrap_or(entry.path_reported);
+        }
+    }
+
+    /// Connection `key`'s path became degrading, or made progress again: told of the peer's newest
+    /// connection only, the one its exchanges and lanes are on.
+    fn path_changed(&mut self, key: usize, conn: &Conn<C::Role>, degrading: bool) {
+        let Some((peer, _)) = conn.peer else {
+            return;
+        };
+        let Some(entry) = self.peer_entry_mut(peer) else {
+            return;
+        };
+        if entry.connection != Some(key) {
+            return;
+        }
+        entry.degrading = degrading;
+        self.report_path(peer);
+    }
+
     /// Queue an event of exchange `id`, holding its slot; nothing when `id` names no exchange.
     fn push_exchange(&mut self, id: u64, event: Event<C>) {
         if self.exchanges.hold(id) {
@@ -2634,6 +2719,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 self.lost_for(key, conn, refusal);
             }
             QuicEvent::Stream(event) => self.on_stream(now, key, conn, event),
+            QuicEvent::PathDegrading => self.path_changed(key, conn, true),
+            QuicEvent::ForwardProgress => self.path_changed(key, conn, false),
             QuicEvent::HandshakeDataReady
             | QuicEvent::DatagramReceived
             | QuicEvent::DatagramsUnblocked => {}
@@ -2772,6 +2859,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
             // A connection the peer opened leaves a dial to it in progress, and its entry held.
             entry.dialing &= !dialed;
             entry.unreachable = None;
+            // A new connection's path is told from its own acknowledgements.
+            entry.degrading = false;
+            entry.path_reported = false;
             entry.epoch
         });
         conn.epoch = epoch;
@@ -2847,8 +2937,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                     if entry.connection == Some(key) {
                         entry.connection = None;
                         entry.closed = refusal;
+                        // Its close says more than its path did: no path event of it waits.
+                        entry.degrading = false;
+                        entry.path_reported = false;
                     }
                 }
+                self.report_path(peer);
                 self.report_lifecycle(peer);
             }
             (None, Some(peer)) => {

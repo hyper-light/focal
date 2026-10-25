@@ -301,6 +301,26 @@ pub enum Event<C: Classes> {
         /// (the path, a timeout, a reset).
         refusal: Option<Refusal>,
     },
+    /// Nothing this side sent on its connection of `epoch` to `peer`, the one it dialed, was
+    /// acknowledged for four probe timeouts (hyper-quic's `PathDegrading`, quiche's default): the
+    /// peer, or the path to it, may be gone. The connection stays open, and its exchanges and lanes
+    /// with it; told once, and not again until the peer acknowledges ([`Event::Progressing`]). Its
+    /// close says more and replaces it. A dialer that can go elsewhere may ask another peer, as
+    /// Chromium's QUIC session moves to another path when told its path is degrading.
+    Degrading {
+        /// The peer.
+        peer: PeerId,
+        /// The epoch of the connection whose path is degrading.
+        epoch: Epoch,
+    },
+    /// The peer acknowledged again on the connection of `epoch` after [`Event::Degrading`] was
+    /// told of it.
+    Progressing {
+        /// The peer.
+        peer: PeerId,
+        /// The epoch of the connection that made progress.
+        epoch: Epoch,
+    },
 }
 
 impl<C: Classes> Debug for Event<C> {
@@ -372,6 +392,12 @@ impl<C: Classes> Debug for Event<C> {
                     formatter,
                     "Unreachable {{ peer: {peer}, refusal: {refusal:?} }}"
                 )
+            }
+            Self::Degrading { peer, epoch } => {
+                write!(formatter, "Degrading {{ peer: {peer}, epoch: {epoch} }}")
+            }
+            Self::Progressing { peer, epoch } => {
+                write!(formatter, "Progressing {{ peer: {peer}, epoch: {epoch} }}")
             }
         }
     }

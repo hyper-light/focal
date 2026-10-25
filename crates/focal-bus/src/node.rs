@@ -312,7 +312,9 @@ impl Node {
             | Event::BodyReady { .. }
             | Event::Writable { .. }
             | Event::Refused { .. }
-            | Event::Unreachable { .. } => {}
+            | Event::Unreachable { .. }
+            | Event::Degrading { .. }
+            | Event::Progressing { .. } => {}
         }
     }
 

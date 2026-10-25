@@ -102,6 +102,22 @@ pub const REDIAL_FIRST: Duration = Duration::from_secs(1);
 /// connection closed as it came up, waits this long.
 pub const REDIAL_MOST: Duration = Duration::from_secs(3);
 
+/// Cited: what a client of a part's group waits before it asks a node again, when the node it asked
+/// named no leader it could take (an election under way, or the leader it cannot hear named at the
+/// term it knows): at first Kafka's producer's back-off after a retriable error (`retry.backoff.ms`,
+/// 100 ms), doubled after each (KIP-580) to [`ASK_BACKOFF_MOST`].
+pub const ASK_BACKOFF_FIRST: Duration = Duration::from_millis(100);
+
+/// Cited: the most a client's asks are spaced by: Kafka's `retry.backoff.max.ms`, 1,000 ms
+/// (KIP-580).
+pub const ASK_BACKOFF_MOST: Duration = Duration::from_millis(1_000);
+
+/// Cited: how far each wait is drawn from its back-off, in thousandths either side: Kafka's
+/// `RETRY_BACKOFF_JITTER`, 0.2, its `ExponentialBackoff` drawing a factor from [1 - jitter,
+/// 1 + jitter] for each (KIP-580), so the clients a leader's loss turned away together do not ask
+/// again together.
+pub const ASK_BACKOFF_JITTER_PERMILLE: u64 = 200;
+
 /// The period an exchange is judged at, the idle timeout: an exchange whose peer sends nothing for
 /// a period ends (hyper-transport `progress`), so a shorter one would end a stalled peer's subscribe
 /// sooner than its connection would end, which is the transport's whole judgement of a peer. The

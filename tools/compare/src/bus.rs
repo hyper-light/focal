@@ -24,13 +24,12 @@ use focal_bus::client::{Client, Delivery};
 use focal_bus::directory::BusDirectory;
 use focal_bus::limits::{IDLE_TIMEOUT, IO, SERVE_PERIOD};
 use focal_bus::pki;
-use focal_bus::wire::{self, Bus, Role};
+use focal_bus::wire::{self, Bus};
 use focal_memory::MemoryBudget;
 use hyper_rt::runtime::{LocalRuntime, RuntimeConfig};
 use hyper_rt::sync::{OneshotReceiver, OneshotSender, SyncError, oneshot};
 use hyper_rt_transport::Driver;
-use hyper_transport::tls::{CertificateDer, Credentials, PrivateKeyDer, PrivatePkcs8KeyDer, Tls};
-use hyper_transport::{Config, Endpoint, Event, Refusal};
+use hyper_transport::{Endpoint, Event, Refusal};
 use std::future::{Future, poll_fn};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -69,46 +68,15 @@ fn nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// Client `index`'s endpoint, its bytes charged to `budget`.
+/// Client `index`'s endpoint, the lone node (`NODE`) the one it dials, its bytes charged to
+/// `budget`.
 fn endpoint(
     local: &pki::Local,
     index: usize,
     budget: &MemoryBudget,
 ) -> Result<Endpoint<Bus, BusBudget, BusDirectory>, CompareError> {
-    let identity = local
-        .clients
-        .get(index)
-        .ok_or_else(|| fail("no such client identity"))?;
-    let mut directory = BusDirectory::new(1);
-    directory
-        .enroll(
-            &local
-                .node(NODE)
-                .ok_or_else(|| fail("no node identity"))?
-                .certificate,
-            NODE,
-            Role::Node,
-            &pki::node_name(NODE),
-        )
-        .map_err(fail)?;
-    let credentials = Credentials {
-        chain: vec![CertificateDer::from(identity.certificate.clone())],
-        key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.key.clone())),
-        roots: vec![CertificateDer::from(local.root.clone())],
-    };
-    let tls = Tls::mutual(&credentials, false).map_err(|error| fail(format!("{error:?}")))?;
-    Endpoint::new(
-        Config {
-            tls,
-            role: Role::Client,
-            limits: focal_bus::limits::client().map_err(fail)?,
-            congestion: Default::default(),
-        },
-        BusBudget::new(budget.clone()),
-        directory,
-        Instant::now(),
-    )
-    .map_err(|error| fail(format!("{error:?}")))
+    let nodes = usize::try_from(NODE).map_err(fail)?;
+    focal_bus::client::endpoint(local, index, nodes, budget.clone(), Instant::now()).map_err(fail)
 }
 
 /// `endpoint`'s driver, bound on the current shard and dialing the node.
@@ -345,7 +313,8 @@ fn subscriber(
                     if let Event::Connected { .. } = &event {
                         connected = true;
                     }
-                    client.on_event(driver.endpoint(), event, |delivery| match delivery {
+                    let now = Instant::now();
+                    client.on_event(driver.endpoint(), event, now, |delivery| match delivery {
                         Delivery::Batch(batch) => {
                             let arrived = Instant::now();
                             for record in batch.records().flatten() {
@@ -377,8 +346,9 @@ fn subscriber(
                         Delivery::Unsubscribed { refusal, .. } => {
                             outcome = Err(fail(format!("the subscribe was refused: {refusal:?}")));
                         }
-                        Delivery::Lost(why) => {
-                            outcome = Err(fail(format!("the node's connection ended: {why:?}")));
+                        Delivery::Lost { refusal, .. } => {
+                            outcome =
+                                Err(fail(format!("the node's connection ended: {refusal:?}")));
                         }
                         // The lone node this mode runs leads every stream and acknowledges
                         // nothing; a redirect or an acknowledgement here is a node of a group.
@@ -391,6 +361,9 @@ fn subscriber(
                         }
                         Delivery::Redirected(redirect) => {
                             outcome = Err(fail(format!("a publish was redirected: {redirect:?}")));
+                        }
+                        Delivery::Rerouted { node } => {
+                            outcome = Err(fail(format!("the client was rerouted to {node}")));
                         }
                         Delivery::Acked(_) => {}
                     });
@@ -674,13 +647,14 @@ fn publisher(
                 if let Some(event) = event {
                     let mut lost = None;
                     let mut take = |delivery: Delivery<'_>| {
-                        if let Delivery::Lost(why) = delivery {
-                            lost = Some(why);
+                        if let Delivery::Lost { refusal, .. } = delivery {
+                            lost = Some(refusal);
                         }
                     };
-                    client.on_event(driver.endpoint(), event, &mut take);
+                    let now = Instant::now();
+                    client.on_event(driver.endpoint(), event, now, &mut take);
                     while let Some(event) = driver.endpoint().poll_event() {
-                        client.on_event(driver.endpoint(), event, &mut take);
+                        client.on_event(driver.endpoint(), event, now, &mut take);
                     }
                     if let Some(why) = lost {
                         return Err(fail(format!("the node's connection ended: {why:?}")));

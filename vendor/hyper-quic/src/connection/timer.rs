@@ -24,11 +24,14 @@ pub(crate) enum Timer {
     Copies = 9,
     /// When a connection ID the peer retired stops routing to the connection
     RetiredCid = 10,
+    /// When a client's path is degrading: what it sent has made no forward progress for the
+    /// path-degrading delay
+    PathDegrading = 11,
 }
 
 impl Timer {
     /// Every timer
-    pub(crate) const VALUES: [Self; 11] = [
+    pub(crate) const VALUES: [Self; 12] = [
         Self::LossDetection,
         Self::Idle,
         Self::Close,
@@ -40,13 +43,14 @@ impl Timer {
         Self::MaxAckDelay,
         Self::Copies,
         Self::RetiredCid,
+        Self::PathDegrading,
     ];
 }
 
 /// A table of data associated with each distinct kind of `Timer`
 #[derive(Debug, Copy, Clone, Default)]
 pub(crate) struct TimerTable {
-    data: [Option<Instant>; 11],
+    data: [Option<Instant>; 12],
 }
 
 impl TimerTable {
@@ -55,7 +59,7 @@ impl TimerTable {
     }
 
     pub(super) fn get(&self, timer: Timer) -> Option<Instant> {
-        let [a, b, c, d, e, f, g, h, i, j, k] = &self.data;
+        let [a, b, c, d, e, f, g, h, i, j, k, l] = &self.data;
         *match timer {
             Timer::LossDetection => a,
             Timer::Idle => b,
@@ -68,6 +72,7 @@ impl TimerTable {
             Timer::MaxAckDelay => i,
             Timer::Copies => j,
             Timer::RetiredCid => k,
+            Timer::PathDegrading => l,
         }
     }
 
@@ -77,7 +82,7 @@ impl TimerTable {
 
     /// Each timer's slot, found by destructuring so that no lookup can miss
     fn slot_mut(&mut self, timer: Timer) -> &mut Option<Instant> {
-        let [a, b, c, d, e, f, g, h, i, j, k] = &mut self.data;
+        let [a, b, c, d, e, f, g, h, i, j, k, l] = &mut self.data;
         match timer {
             Timer::LossDetection => a,
             Timer::Idle => b,
@@ -90,6 +95,7 @@ impl TimerTable {
             Timer::MaxAckDelay => i,
             Timer::Copies => j,
             Timer::RetiredCid => k,
+            Timer::PathDegrading => l,
         }
     }
 

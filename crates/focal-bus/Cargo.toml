@@ -11,6 +11,7 @@ license.workspace = true
 crc-fast = { version = "1.10", default-features = false, features = ["std", "vpclmulqdq"] }
 # What every segment, table and transport byte is charged to.
 focal-memory = { version = "0.1.0", path = "../focal-memory" }
+getrandom.workspace = true
 # The bus's wire: exchanges and lanes over QUIC (vendor/hyper-transport), driven on a hyper-rt
 # shard over its batched UDP socket (hyper-rt-transport).
 hyper-transport.workspace = true

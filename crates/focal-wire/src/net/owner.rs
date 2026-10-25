@@ -1233,6 +1233,10 @@ impl Owner {
             } => self.frame(peer, kind, frame),
             // A lane that refused a frame has room: what waits for it goes now.
             Event::LaneRoom { .. } => self.flush_parked(),
+            // A dialed peer's path degrading, or making progress again (hyper-transport §4ai): what
+            // waits on the connection is judged by its exchanges' periods and its idle timeout, as
+            // before; the bus's client is the owner that goes elsewhere on it.
+            Event::Degrading { .. } | Event::Progressing { .. } => {}
             Event::Refused {
                 exchange, refusal, ..
             } => {

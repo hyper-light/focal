@@ -321,41 +321,51 @@ impl Harness {
             if let Event::Connected { .. } = &event {
                 seen.connected += 1;
             }
-            client.on_event(driver.endpoint(), event, |delivery| match delivery {
-                Delivery::Batch(batch) => seen.order.push(Item::Batch {
-                    base: batch.base_offset(),
-                    end: batch.end_offset(),
-                    sequence: batch.sequence().into(),
-                }),
-                Delivery::Gap(gap) => seen.order.push(Item::Gap {
-                    from: gap.from,
-                    to: gap.to,
-                }),
-                Delivery::Subscribed { subscribed, .. } => {
-                    seen.subscribed = true;
-                    seen.replies.push(subscribed);
-                }
-                Delivery::Refused(_) => seen.refused += 1,
-                Delivery::Unsubscribed { refusal, .. } => {
-                    panic!("a subscribe refused: {refusal:?}")
-                }
-                Delivery::Lost(why) => panic!("the node's connection ended: {why:?}"),
-                // A node that runs no group leads every stream it holds, and acknowledges nothing:
-                // its class is at most once.
-                Delivery::SubscribeRedirected { leader, .. } => {
-                    panic!("a lone node redirected a subscribe to {leader:?}")
-                }
-                // A lone node moves a subscription only where a test tells it it stopped leading,
-                // as a group's member does (doc 34 P7).
-                Delivery::Moved(moved) => seen.order.push(Item::Moved {
-                    next: moved.next,
-                    leader: moved.leader,
-                }),
-                Delivery::Acked(ack) => panic!("a lone node acknowledged {ack:?}"),
-                Delivery::Redirected(redirect) => {
-                    panic!("a lone node redirected a publish: {redirect:?}")
-                }
-            });
+            client.on_event(
+                driver.endpoint(),
+                event,
+                Instant::now(),
+                |delivery| match delivery {
+                    Delivery::Batch(batch) => seen.order.push(Item::Batch {
+                        base: batch.base_offset(),
+                        end: batch.end_offset(),
+                        sequence: batch.sequence().into(),
+                    }),
+                    Delivery::Gap(gap) => seen.order.push(Item::Gap {
+                        from: gap.from,
+                        to: gap.to,
+                    }),
+                    Delivery::Subscribed { subscribed, .. } => {
+                        seen.subscribed = true;
+                        seen.replies.push(subscribed);
+                    }
+                    Delivery::Refused(_) => seen.refused += 1,
+                    Delivery::Unsubscribed { refusal, .. } => {
+                        panic!("a subscribe refused: {refusal:?}")
+                    }
+                    Delivery::Lost { refusal, .. } => {
+                        panic!("the node's connection ended: {refusal:?}")
+                    }
+                    // A node that runs no group leads every stream it holds, and acknowledges nothing:
+                    // its class is at most once.
+                    Delivery::SubscribeRedirected { leader, .. } => {
+                        panic!("a lone node redirected a subscribe to {leader:?}")
+                    }
+                    // A lone node moves a subscription only where a test tells it it stopped leading,
+                    // as a group's member does (doc 34 P7).
+                    Delivery::Moved(moved) => seen.order.push(Item::Moved {
+                        next: moved.next,
+                        leader: moved.leader,
+                    }),
+                    Delivery::Acked(ack) => panic!("a lone node acknowledged {ack:?}"),
+                    Delivery::Redirected(redirect) => {
+                        panic!("a lone node redirected a publish: {redirect:?}")
+                    }
+                    Delivery::Rerouted { node } => {
+                        panic!("a lone node's client rerouted to {node}")
+                    }
+                },
+            );
         };
         handle(event, driver);
         while let Some(event) = driver.endpoint().poll_event() {

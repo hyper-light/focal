@@ -272,6 +272,7 @@ impl PacketBuilder {
                     conn.reset_idle_timeout(now, space_id);
                 }
                 conn.permit_idle_reset = false;
+                conn.on_ack_eliciting_sent(now);
             }
             conn.set_loss_detection_timer(now);
             conn.path.pacing.on_transmit(size);

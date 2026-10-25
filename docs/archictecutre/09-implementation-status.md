@@ -17146,3 +17146,57 @@ the clear.
   restart with the kept key, and only at its idle timeout (12 s) with another. `tests/loopback.rs`:
   a subscriber whose node stops leading told where it left off once its lane has room, nothing
   delivered after. `wire`: a `Moved` notice round-trips and only a node sends one.
+
+### 2026-10-25 — A bus group's client finds its new leader when the old one is killed
+
+A client of a replicated bus part learned its leader only from redirects, and its only judgement of
+a node that went silent was QUIC's idle timeout, two minutes: a node killed with kill -9 sends
+nothing, and nothing authenticated comes back from a host whose endpoint is gone. In Quiver's run on
+fedora (three `focal start bus` units, focal-compare publishing 1,000 a second, kill -9 of its
+leader at 25 s) the two survivors elected another leader within about 110 ms of suspecting the
+first, and the client kept publishing into the dead connection to the end of its run, 4,096
+publishes unacknowledged. The bus's group test had hidden it: its harness switched the client to a
+survivor by hand, and its consumer read the leader from the nodes.
+
+- **The transport says when a dialed peer stops acknowledging** (hyper-raft, docs/transport.md §4ai,
+  hyper-quic VENDORED.md §45): quiche's path-degrading detection, four probe timeouts with nothing
+  the client sent acknowledged, tells the owner `Degrading`, the connection kept, and `Progressing`
+  once the peer acknowledges again (RFC 1122 §4.2.3.5: "inform the application of the delivery
+  problem ... when R1 is reached and before R2").
+- **The decision is focal-bus's client's** (`client::Client::group`, doc 34 P2). Told it cannot hear
+  the node it sends to (its path degrading, its connection closed, a dial failed), it asks the next
+  node of the group; a node naming a leader at a newer term is followed (KIP-951), dialed afresh
+  where its connection went; a node naming none, or the unheard leader at the term the client knows,
+  is asked again, the next in turn, after Kafka's back-off (100 ms doubled to 1 s, drawn within a
+  fifth, KIP-580; one step a round of asking), the unheard leader dialed beside the asking where it
+  has no connection; a node asked that acknowledges leads; while it asks the client sends only its
+  oldest batch. A degrading path is a reason to look elsewhere and nothing more: the leader is
+  followed again once heard, and its connection given up only when the client follows another, as a
+  Kafka client disconnects a broker whose request timed out. The caller is handed `Rerouted`, and
+  sends the node what it owes, the part recognising what it took (P6), and `Lost { node }` for each
+  node whose connection ended, on which it subscribes again where it held a subscription.
+- **Found on the way.** A client that gave its leader's connection up on a degrading path churned
+  under load: a node just restarted held its loop 169 ms, past four probe timeouts of loopback
+  (about 104 ms), and the connection, the answers it owed and the consumer's subscription went with
+  it. A subscription lost with its node's connection was never told (its subscribe exchange ends
+  with its reply), and its consumer waited for deliveries that could not come. And the group harness
+  counted only acknowledgements that carry offsets, where a batch sent again after a failover, not
+  its session's newest, is acknowledged as taken without them (P6). And each batch an asked node
+  redirected stepped the back-off, so one round of asking took it to its bound: the first
+  real-process run heard its new leader 390 ms after the group elected it.
+- **Tests.** `tests/group.rs`, its hand-switching removed: the leader killed (its socket gone,
+  nothing said), every batch after acknowledged once at the offsets that follow, the client at the
+  new leader (on this Mac, acknowledged again 30 to 178 ms after the kill, fifteen kills); the three
+  nodes restarted one at a time under publishing and consuming, the client and its consumer finding
+  each next leader themselves. `focal-node/tests/bus_failover.rs`: three `focal start bus`
+  processes, kill -9 of the leader's process under the client, every batch acknowledged, and a
+  subscription from the stream's start delivered each batch once and in order (four runs: the first
+  acknowledgement 0.45 to 4.5 s after the kill, of which the group's election 0.3 to 3.6 s, its
+  survivors' suspicion, and the client's 0.15 to 0.9 s).
+- **Open.** The client waits out an election by asking again on Kafka's back-off, so it hears the
+  new leader up to a second after the group elected it; a node that held the client's ask until its
+  term passed the client's would answer as the election ends. A dial to a node whose host is gone
+  ends only at the idle timeout: the transport has no deadline for a handshake (Chromium's
+  `kMaxTimeForCryptoHandshakeSecs`, 10 s; Kafka's `socket.connection.setup.timeout.ms`, 10 s doubled
+  to 30 s, KIP-601). A subscriber on a quiet stream learns of its leader's death from its keep-alive
+  (15 s) or from its client's following another.

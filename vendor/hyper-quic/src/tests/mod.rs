@@ -27,6 +27,7 @@ use util::*;
 
 mod first_flight;
 mod node_tls;
+mod path_degrading;
 mod token;
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]

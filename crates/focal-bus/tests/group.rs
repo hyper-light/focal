@@ -2,13 +2,16 @@
 //! endpoints driven by one task on one hyper-rt shard, each node's log a sealed hyper-log file in a
 //! directory of its own (doc 34, step 3b.3).
 //!
-//! The nodes elect a leader by their liveness stream; a client publishes to whichever node it knows,
-//! follows each redirect to the leader the node names, and every batch it publishes is
-//! acknowledged, persisted, at the offsets the part gave it, in order. A subscriber of the leader is
-//! delivered every batch, in order. The leader is killed: the two others elect one of themselves,
-//! the client follows, sends again what was not acknowledged, and is acknowledged once for each
-//! batch: every batch acknowledged before the kill is in the new leader's part, at the offsets it
-//! was acknowledged at, and a batch sent again is recognised and not appended twice.
+//! The nodes elect a leader by their liveness stream; the client is focal-bus's client of the group
+//! (`Client::group`): it publishes to whichever node it knows, follows each redirect to the leader the
+//! node names, and every batch it publishes is acknowledged, persisted, at the offsets the part gave
+//! it, in order. A subscriber of the leader is delivered every batch, in order. The leader is killed,
+//! its socket gone with nothing said, as a kill -9 leaves it: the two others elect one of
+//! themselves, and the client, told by its endpoint that it cannot hear the leader, asks the others
+//! until one names the new leader, follows it, sends again what was not acknowledged, and is
+//! acknowledged once for each batch: every batch acknowledged before the kill is in the new leader's
+//! part, at the offsets it was acknowledged at, and a batch sent again is recognised and not
+//! appended twice. Nothing tells the client where the leader went but the nodes.
 
 #![allow(
     clippy::unwrap_used,
@@ -21,7 +24,7 @@
     clippy::too_many_lines
 )]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::{Future, poll_fn};
 use std::net::SocketAddr;
 use std::path::Path;
@@ -241,6 +244,10 @@ struct Running {
 #[derive(Default)]
 struct Seen {
     acked: BTreeMap<u32, (u64, u16)>,
+    /// Batches acknowledged as taken already without their offsets: a batch sent again that was not
+    /// its session's newest (doc 34 P6, Kafka's `DUPLICATE_SEQUENCE_NUMBER`), as one a failover left
+    /// unacknowledged is.
+    taken: BTreeSet<u32>,
     again: u64,
     delivered: Vec<(u64, u32)>,
     subscribed: bool,
@@ -251,18 +258,35 @@ struct Seen {
     /// Each moved subscription's next offset, as its node told it (doc 34 P7).
     moves: Vec<u64>,
     redirects: u64,
+    /// Times the client sent to another node (`Delivery::Rerouted`).
+    reroutes: u64,
+    /// Each node whose connection the client was told ended (`Delivery::Lost`), in order: what a
+    /// subscription there was is gone.
+    lost: Vec<u64>,
     /// Answers that the part waits for an earlier sequence of the session (KIP-98's
     /// OUT_OF_ORDER_SEQUENCE_NUMBER): every batch not yet acknowledged goes again at the next step.
     out_of_order: u64,
+}
+
+impl Seen {
+    /// The batches acknowledged, at their offsets or as taken already.
+    fn acknowledged(&self) -> usize {
+        self.acked.len()
+            + self
+                .taken
+                .iter()
+                .filter(|sequence| !self.acked.contains_key(sequence))
+                .count()
+    }
 }
 
 struct World {
     nodes: Vec<Option<Running>>,
     addresses: Vec<SocketAddr>,
     client: Drv,
-    /// The node the client believes leads, and the term it believes so in.
-    leader: u64,
-    term: u64,
+    /// The client of the group: the node it sends to, the leader it follows and the term it was
+    /// named at, as its own events taught it.
+    bus: Client,
     /// Every batch published and not yet acknowledged, by sequence.
     unacked: BTreeMap<u32, Vec<u8>>,
     seen: Seen,
@@ -301,11 +325,13 @@ impl World {
     /// What a stalled run leaves to read: the client's view and each node's role, term and
     /// statistics, its log's, window's, parked and owed among them.
     fn diagnose(&self) -> String {
+        let (leader, term) = self.bus.leader();
         let mut out = format!(
-            "client: leader {} term {}, {} acknowledged, {} unacknowledged, {} sent; {} \
-             delivered, subscribed {}, {} subscriptions ended, {} of them moved, {} gaps",
-            self.leader,
-            self.term,
+            "client: sends to {}, leader {leader} term {term}, {} reroutes, {} acknowledged, {} \
+             unacknowledged, {} sent; {} delivered, subscribed {}, {} subscriptions ended, {} of \
+             them moved, {} gaps",
+            self.bus.node(),
+            self.seen.reroutes,
             self.seen.acked.len(),
             self.unacked.len(),
             self.sent,
@@ -315,10 +341,27 @@ impl World {
             self.seen.moves.len(),
             self.seen.gaps
         );
+        let unacked: Vec<u32> = self.unacked.keys().copied().take(8).collect();
+        out.push_str(&format!(
+            "\nclient: unacknowledged {unacked:?}, {} taken without offsets, {} out of order, lost \
+             {:?}",
+            self.seen.taken.len(),
+            self.seen.out_of_order,
+            self.seen.lost
+        ));
         for running in self.nodes.iter().flatten() {
             let member = &running.member;
+            let part = member.node().part();
+            let verdicts: Vec<String> = unacked
+                .iter()
+                .map(|sequence| {
+                    let verdict = part.judge(STREAM, CLIENT, PRODUCER, u64::from(*sequence), 1);
+                    format!("{sequence}: {verdict:?}")
+                })
+                .collect();
             out.push_str(&format!(
-                "\nnode {}: leads {}, term {}: {:?}\n  its part: {:?}",
+                "\nnode {}: leads {}, term {}: {:?}\n  its part: {:?}\n  its sessions judge \
+                 the unacknowledged: {verdicts:?}",
                 member.id(),
                 member.is_leader(),
                 member.term(),
@@ -407,79 +450,79 @@ impl World {
     }
 
     fn client_event(&mut self, event: Event<Bus>) {
-        let mut client = Client::new(self.leader);
-        let mut redirected = Vec::new();
         let seen = &mut self.seen;
         let unacked = &mut self.unacked;
         let class = self.class;
-        client.on_event(self.client.endpoint(), event, |delivery| match delivery {
-            Delivery::Acked(ack) if ack.class == wire::Ack::OUT_OF_ORDER => seen.out_of_order += 1,
-            Delivery::Acked(ack) => {
-                assert_eq!(ack.stream, STREAM);
-                assert_eq!(ack.producer, PRODUCER);
-                assert_eq!(Durability::of(ack.class), Some(class), "{ack:?}");
-                unacked.remove(&ack.sequence);
-                if ack.count == 0 || seen.acked.contains_key(&ack.sequence) {
-                    seen.again += 1;
+        let endpoint = self.client.endpoint();
+        self.bus
+            .on_event(endpoint, event, Instant::now(), |delivery| match delivery {
+                Delivery::Acked(ack) if ack.class == wire::Ack::OUT_OF_ORDER => {
+                    seen.out_of_order += 1
                 }
-                if ack.count > 0 {
-                    let first = seen.acked.insert(ack.sequence, (ack.base, ack.count));
-                    if let Some(first) = first {
-                        assert_eq!(first, (ack.base, ack.count), "acknowledged at one offset");
+                Delivery::Acked(ack) => {
+                    assert_eq!(ack.stream, STREAM);
+                    assert_eq!(ack.producer, PRODUCER);
+                    assert_eq!(Durability::of(ack.class), Some(class), "{ack:?}");
+                    unacked.remove(&ack.sequence);
+                    if ack.count == 0 || seen.acked.contains_key(&ack.sequence) {
+                        seen.again += 1;
+                    }
+                    if ack.count > 0 {
+                        let first = seen.acked.insert(ack.sequence, (ack.base, ack.count));
+                        if let Some(first) = first {
+                            assert_eq!(first, (ack.base, ack.count), "acknowledged at one offset");
+                        }
+                    } else {
+                        seen.taken.insert(ack.sequence);
                     }
                 }
-            }
-            Delivery::Redirected(redirect) => {
-                seen.redirects += 1;
-                redirected.push(redirect);
-            }
-            Delivery::Batch(batch) => seen.delivered.push((batch.base_offset(), batch.sequence())),
-            Delivery::Subscribed { .. } => seen.subscribed = true,
-            Delivery::SubscribeRedirected { .. } | Delivery::Unsubscribed { .. } => {
-                seen.subscribed = false;
-                seen.subscription_ends += 1;
-            }
-            Delivery::Moved(moved) => {
-                assert_eq!(moved.stream, STREAM);
-                seen.subscribed = false;
-                seen.subscription_ends += 1;
-                seen.moves.push(moved.next);
-            }
-            Delivery::Gap(_) => seen.gaps += 1,
-            Delivery::Refused(_) | Delivery::Lost(_) => {}
-        });
-        for redirect in redirected {
-            self.follow(redirect.leader);
-        }
+                Delivery::Redirected(_) => seen.redirects += 1,
+                Delivery::Rerouted { .. } => seen.reroutes += 1,
+                Delivery::Batch(batch) => {
+                    seen.delivered.push((batch.base_offset(), batch.sequence()))
+                }
+                Delivery::Subscribed { .. } => seen.subscribed = true,
+                Delivery::SubscribeRedirected { .. } | Delivery::Unsubscribed { .. } => {
+                    seen.subscribed = false;
+                    seen.subscription_ends += 1;
+                }
+                Delivery::Moved(moved) => {
+                    assert_eq!(moved.stream, STREAM);
+                    seen.subscribed = false;
+                    seen.subscription_ends += 1;
+                    seen.moves.push(moved.next);
+                }
+                Delivery::Gap(_) => seen.gaps += 1,
+                Delivery::Lost { node, .. } => seen.lost.push(node),
+                Delivery::Refused(_) => {}
+            });
     }
 
-    /// Takes a leader a node named, where its term is past what the client knew (KIP-951's rule).
-    fn follow(&mut self, leader: wire::Leader) {
-        if let Some(node) = leader.node
-            && leader.term > self.term
-        {
-            self.leader = node;
-            self.term = leader.term;
-            let at = NODES.iter().position(|n| *n == node).unwrap();
-            let _ = self
-                .client
-                .endpoint()
-                .connect(Instant::now(), node, self.addresses[at]);
-        }
-    }
-
-    /// Sends the leader the client knows every batch not yet acknowledged, and new ones up to
-    /// `until`.
+    /// Sends the node the client sends to every batch not yet acknowledged, and new ones up to
+    /// `until`, unless the client's back-off holds them; a node not connected is dialed.
     fn publish(&mut self, until: u32) {
         while self.sent < until {
             let bytes = sized_batch(&mut self.builder, self.sent, self.payload);
             self.unacked.insert(self.sent, bytes);
             self.sent += 1;
         }
-        let client = Client::new(self.leader);
-        for bytes in self.unacked.values() {
-            match client.publish(self.client.endpoint(), bytes) {
-                Ok(()) | Err(Refusal::NotConnected) => {}
+        let now = Instant::now();
+        if !self.bus.ready(now) {
+            return;
+        }
+        // While the client asks a node about the leader, only the oldest batch owed goes.
+        let sends = if self.bus.asking() {
+            1
+        } else {
+            self.unacked.len()
+        };
+        for bytes in self.unacked.values().take(sends) {
+            match self.bus.publish(self.client.endpoint(), bytes) {
+                Ok(()) => {}
+                Err(Refusal::NotConnected) => {
+                    let _ = self.bus.dial(self.client.endpoint(), now);
+                    return;
+                }
                 Err(Refusal::LaneFull) => return,
                 Err(other) => panic!("publish refused: {other:?}"),
             }
@@ -580,11 +623,11 @@ fn a_steady_stream_writes_its_commits_with_its_entries() {
             let mut world =
                 open_world(&ids, dir.path(), &[], Durability::Persisted, 64 << 20, 128).await;
             let mut wait = ProgressDeadline::begin(&[0], u64::MAX, FROZEN);
-            while world.seen.acked.len() < BATCHES as usize {
-                let acked = u32::try_from(world.seen.acked.len()).unwrap();
+            while world.seen.acknowledged() < BATCHES as usize {
+                let acked = u32::try_from(world.seen.acknowledged()).unwrap();
                 world.publish((acked + 4).min(BATCHES));
                 world.step().await;
-                wait.check(&[world.seen.acked.len() as u64])
+                wait.check(&[world.seen.acknowledged() as u64])
                     .expect("the stream was not acknowledged");
             }
             for running in world.running() {
@@ -634,12 +677,12 @@ fn a_part_whose_publishes_pass_its_logs_bound_lets_its_log_go_and_takes_them() {
             // Charged to the acknowledgements alone: a group that stops taking writes and elects
             // again and again redirects its publisher every time, which is no progress.
             let mut wait = ProgressDeadline::begin(&[0], u64::MAX, FROZEN);
-            while world.seen.acked.len() < BATCHES as usize {
+            while world.seen.acknowledged() < BATCHES as usize {
                 // A publisher's window of four batches in flight, as a client holds its lane's.
-                let acked = u32::try_from(world.seen.acked.len()).unwrap();
+                let acked = u32::try_from(world.seen.acknowledged()).unwrap();
                 world.publish((acked + 4).min(BATCHES));
                 world.step().await;
-                if let Err(frozen) = wait.check(&[world.seen.acked.len() as u64]) {
+                if let Err(frozen) = wait.check(&[world.seen.acknowledged() as u64]) {
                     panic!(
                         "the batches past the log's bound were not acknowledged: {frozen:?}\n{}",
                         world.diagnose()
@@ -722,12 +765,12 @@ async fn open_world(
         IO,
     )
     .unwrap();
+    let group: Vec<(u64, SocketAddr)> = NODES.iter().copied().zip(addresses.clone()).collect();
     let mut world = World {
         nodes,
         addresses: addresses.clone(),
         client,
-        leader: NODES[0],
-        term: 0,
+        bus: Client::group(&group).unwrap(),
         unacked: BTreeMap::new(),
         seen: Seen::default(),
         waker,
@@ -742,11 +785,7 @@ async fn open_world(
     for running in world.running() {
         running.member.connect(running.driver.endpoint(), now);
     }
-    world
-        .client
-        .endpoint()
-        .connect(now, NODES[0], addresses[0])
-        .unwrap();
+    world.bus.dial(world.client.endpoint(), now).unwrap();
     // A leader is elected: the wait is charged to the terms the nodes reach.
     let mut wait = ProgressDeadline::begin(&[world.terms()], u64::MAX, FROZEN);
     while world.leader_now().is_none() {
@@ -766,15 +805,14 @@ fn group_keeps_what_it_acknowledged(fates: &[(u64, u64)], class: Durability) {
     runtime
         .block_on(async move {
             let mut world = open_world(&ids, dir.path(), &fates, class, NODE_MEMORY, 0).await;
-            let addresses = world.addresses.clone();
 
             // A hundred batches, each acknowledged persisted at the offsets the part gave it, in
             // order; the client follows the redirect of a node that does not lead.
             let mut wait = ProgressDeadline::begin(&[0], u64::MAX, FROZEN);
-            while world.seen.acked.len() < 100 {
+            while world.seen.acknowledged() < 100 {
                 world.publish(100);
                 world.step().await;
-                wait.check(&[world.seen.acked.len() as u64 + world.seen.redirects])
+                wait.check(&[world.seen.acknowledged() as u64 + world.seen.redirects])
                     .expect("the batches were not acknowledged");
             }
             for (sequence, (base, count)) in &world.seen.acked {
@@ -786,12 +824,16 @@ fn group_keeps_what_it_acknowledged(fates: &[(u64, u64)], class: Durability) {
             }
 
             // A subscriber of the leader is delivered every batch, in order.
-            let leader = world.leader;
-            let subscribing = Client::new(leader);
+            let leader = world.bus.node();
+            assert_eq!(
+                Some(leader),
+                world.leader_now(),
+                "the client learned the leader"
+            );
             let mut wait = ProgressDeadline::begin(&[0], u64::MAX, FROZEN);
             while world.seen.delivered.len() < 100 {
                 if world.subscribe_at.is_none() {
-                    let asked = subscribing.subscribe(
+                    let asked = world.bus.subscribe(
                         world.client.endpoint(),
                         Instant::now(),
                         STREAM,
@@ -810,19 +852,12 @@ fn group_keeps_what_it_acknowledged(fates: &[(u64, u64)], class: Durability) {
                 assert_eq!((*base, *sequence), (at as u64, at as u32));
             }
 
-            // The leader is killed. The two others elect one of themselves; the client follows the
-            // redirects and sends again what was not acknowledged.
+            // The leader is killed: its socket goes with nothing said, as a kill -9 leaves it, and
+            // its connection to the client stays open on the client's side. The two others elect one
+            // of themselves; the client, told its path to the leader is degrading, asks them, follows
+            // the leader they name and sends again what was not acknowledged. Nothing else tells it.
             let killed = NODES.iter().position(|n| *n == leader).unwrap();
             world.nodes[killed] = None;
-            world.client.endpoint().disconnect(Instant::now(), leader);
-            let survivor = NODES.iter().copied().find(|n| *n != leader).unwrap();
-            world.leader = survivor;
-            let at = NODES.iter().position(|n| *n == survivor).unwrap();
-            world
-                .client
-                .endpoint()
-                .connect(Instant::now(), survivor, addresses[at])
-                .unwrap();
             let mut wait = ProgressDeadline::begin(&[world.terms()], u64::MAX, FROZEN);
             while world.leader_now().is_none_or(|l| l == leader) {
                 world.step().await;
@@ -831,14 +866,35 @@ fn group_keeps_what_it_acknowledged(fates: &[(u64, u64)], class: Durability) {
             }
 
             // A hundred more, every one acknowledged; the batches acknowledged before the kill keep
-            // their offsets, and the next batch's offset follows them.
+            // their offsets, and the next batch's offset follows them. Charged to what the client
+            // hears and does: acknowledgements, redirects, and the nodes it turns to.
+            let killed_at = Instant::now();
             let mut wait = ProgressDeadline::begin(&[0], u64::MAX, FROZEN);
-            while world.seen.acked.len() < 200 {
+            while world.seen.acknowledged() < 200 {
                 world.publish(200);
                 world.step().await;
-                wait.check(&[world.seen.acked.len() as u64 + world.seen.redirects])
+                wait.check(&[world.seen.acknowledged() as u64
+                    + world.seen.redirects
+                    + world.seen.reroutes])
                     .expect("the batches after the kill were not acknowledged");
             }
+            let new_leader = world.leader_now().unwrap();
+            assert_eq!(
+                world.bus.node(),
+                new_leader,
+                "the client sends to the new leader\n{}",
+                world.diagnose()
+            );
+            assert!(
+                world.seen.reroutes > 0,
+                "the client turned away from the killed leader"
+            );
+            eprintln!(
+                "acknowledged again {:?} after the kill: {} reroutes, {} redirects",
+                killed_at.elapsed(),
+                world.seen.reroutes,
+                world.seen.redirects
+            );
             for (sequence, (base, count)) in &world.seen.acked {
                 assert_eq!(
                     (*base, *count),
@@ -858,7 +914,6 @@ fn group_keeps_what_it_acknowledged(fates: &[(u64, u64)], class: Durability) {
                 wait.check(&[world.seen.again])
                     .expect("the batch sent again was not acknowledged");
             }
-            let new_leader = world.leader_now().unwrap();
             let at = NODES.iter().position(|n| *n == new_leader).unwrap();
             let bounds = world.nodes[at]
                 .as_ref()
@@ -985,6 +1040,8 @@ struct Consumer {
     read: usize,
     /// How many of the client's moved subscriptions it has read.
     moves: usize,
+    /// How many of the client's lost connections it has read.
+    lost: usize,
 }
 
 /// Publishes up to `until` with four batches in flight, as [`publish_until`] does, while the
@@ -993,14 +1050,27 @@ struct Consumer {
 /// acknowledgements and the offsets delivered.
 async fn serve_until(world: &mut World, consumer: &mut Consumer, until: u32) {
     let progress =
-        |world: &World, consumer: &Consumer| [world.seen.acked.len() as u64, consumer.next];
+        |world: &World, consumer: &Consumer| [world.seen.acknowledged() as u64, consumer.next];
     let mut wait = ProgressDeadline::begin(&progress(world, consumer), u64::MAX, FROZEN);
     let mut ends = world.seen.subscription_ends;
-    while world.seen.acked.len() < until as usize || consumer.next < u64::from(until) {
-        let acked = u32::try_from(world.seen.acked.len()).unwrap();
+    while world.seen.acknowledged() < until as usize || consumer.next < u64::from(until) {
+        let acked = u32::try_from(world.seen.acknowledged()).unwrap();
         if acked < until {
             world.publish((acked + 4).min(until));
         }
+        // A subscription whose connection went (its node restarted or killed, or given up by the
+        // client as degrading) is gone with it: the consumer subscribes again.
+        for node in &world.seen.lost[consumer.lost..] {
+            if consumer.at == Some(*node) {
+                eprintln!(
+                    "the connection to node {node} holding the subscription went: subscribing \
+                     again from {}",
+                    consumer.next
+                );
+                consumer.at = None;
+            }
+        }
+        consumer.lost = world.seen.lost.len();
         // A subscription its node moved as it stopped leading (doc 34 P7), or a subscribe
         // redirected or refused, is no subscription: the consumer subscribes again at the leader.
         if world.seen.subscription_ends != ends {
@@ -1018,25 +1088,20 @@ async fn serve_until(world: &mut World, consumer: &mut Consumer, until: u32) {
             "a node let offsets go before the subscriber took them\n{}",
             world.diagnose()
         );
-        if consumer.at.is_none()
-            && let Some(leader) = world.leader_now()
-        {
-            let asked = Client::new(leader).subscribe(
+        // Where the client sends, as its own events taught it: the nodes' redirects and moves.
+        let now = Instant::now();
+        if consumer.at.is_none() && world.bus.ready(now) {
+            let asked = world.bus.subscribe(
                 world.client.endpoint(),
-                Instant::now(),
+                now,
                 STREAM,
                 wire::From::Offset(consumer.next),
                 focal_bus::limits::SERVE_PERIOD,
             );
             if asked.is_ok() {
-                consumer.at = Some(leader);
+                consumer.at = Some(world.bus.node());
             } else {
-                let at = NODES.iter().position(|n| *n == leader).unwrap();
-                let _ =
-                    world
-                        .client
-                        .endpoint()
-                        .connect(Instant::now(), leader, world.addresses[at]);
+                let _ = world.bus.dial(world.client.endpoint(), now);
             }
         }
         world.step().await;
@@ -1071,11 +1136,11 @@ async fn serve_until(world: &mut World, consumer: &mut Consumer, until: u32) {
 /// batch to it is acknowledged; charged to the acknowledgements.
 async fn publish_until(world: &mut World, until: u32) {
     let mut wait = ProgressDeadline::begin(&[0], u64::MAX, FROZEN);
-    while world.seen.acked.len() < until as usize {
-        let acked = u32::try_from(world.seen.acked.len()).unwrap();
+    while world.seen.acknowledged() < until as usize {
+        let acked = u32::try_from(world.seen.acknowledged()).unwrap();
         world.publish((acked + 4).min(until));
         world.step().await;
-        if let Err(frozen) = wait.check(&[world.seen.acked.len() as u64]) {
+        if let Err(frozen) = wait.check(&[world.seen.acknowledged() as u64]) {
             panic!(
                 "the batches were not acknowledged: {frozen:?}\n{}",
                 world.diagnose()
@@ -1198,6 +1263,7 @@ fn a_group_kept_in_the_clear_seals_its_files_as_its_nodes_restart() {
                 next: 60,
                 read: world.seen.delivered.len(),
                 moves: world.seen.moves.len(),
+                lost: world.seen.lost.len(),
             };
             // It first asks a node that does not lead, as a client that knows no leader does: the
             // node redirects it, and it subscribes again at the leader (`serve_until`). Unless that
@@ -1239,23 +1305,11 @@ fn a_group_kept_in_the_clear_seals_its_files_as_its_nodes_restart() {
             let mut until = 60;
             for id in NODES {
                 let at = NODES.iter().position(|n| *n == id).unwrap();
-                if consumer.at == Some(id) {
-                    consumer.at = None;
-                }
                 let floor = floor_of(&world, id);
                 assert!(floor > 0, "node {id}'s window let batches go");
-                // The client leaves the node going down for another, whose redirect it follows.
-                let other = NODES.iter().copied().find(|n| *n != id).unwrap();
-                let other_at = NODES.iter().position(|n| *n == other).unwrap();
-                world.client.endpoint().disconnect(Instant::now(), id);
-                if world.leader == id {
-                    world.leader = other;
-                }
-                let _ = world.client.endpoint().connect(
-                    Instant::now(),
-                    other,
-                    world.addresses[other_at],
-                );
+                // The node goes down with nothing said; the client and the consumer learn it from
+                // their endpoint (the restarted node resets what its last run held, or its path is
+                // degrading first) and from the nodes.
                 world.nodes[at] = None;
                 unseal_node(dir.path(), id);
                 // The node starts as its service does: its identity read from the directory.
