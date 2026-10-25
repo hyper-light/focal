@@ -16858,3 +16858,105 @@ shared with seeds), and `inspect node --gc` gives the cold directories beside th
   cross-form assertion (a sealed replica cuts what a clear one cuts) added after, and fmt, the
   contracts, Clippy, the production check and focal-evidence's tests run again; after the Windows
   fix, the same and `cli_archive`, `cli_retention`, `cli_backup` and `cli_seeds_at_rest`.
+
+### 2026-10-24 — A content store's staging, parts and custody records are sealed from the at-rest level
+
+A content store's objects are sealed from the content level (29 §12.4), and the files beside them
+lay on the volume in the clear (29 §12's inventory, "clear"): an upload being staged (its part, its
+metadata, the terminal record that fences its identity once it is finished), a chunk a transfer
+receives in parts (`objects/<domain>/<hash>.part`, named by the chunk's hash), and the custody
+records (`checkpoints/`, `custody/`, `receipts/`). From the at-rest level they are sealed (29
+§12.7): staging and each kind of record a key directory of its own, every file under its
+directory's keyed name; a part a record file (§12.6's, `FCLPART1`) sealed as it is written, under a
+key derived from its directory's key, its file's ID and its owner (the upload, the chunk), its
+header tagged under that key; metadata, terminal records and custody records sealed whole. Below
+the level every file is written byte for byte as before. A store in the clear converts them while
+it serves, counted and tallied with its objects, so `inspect node --gc` and the metrics page cover
+them as they cover objects.
+
+- **A form of their own.** The first cut sealed these files with the objects, from the content
+  level. A binary of the content level reads staging and custody records only in the clear, so a
+  node rolled back to it from this binary would have met staging it could not read while its fence
+  (9) said it could run that binary. They take the at-rest level's form (`ContentStore::open_forms`),
+  marked apart from the objects' (`REST_SEALING`, `REST_SEALED`), and convert alone where the
+  objects are sealed already.
+- **Interrupted, resumed from sealed bytes.** An upload or a transfer goes on from its sealed part
+  across a restart. A part whose last append a crash cut short is written again whole, under a new
+  ID and a new key, before anything is appended: what the cut append left of its blocks may lie on
+  the volume, and no key and nonce seal two plaintexts. Damage further back than one append is no
+  crash's and is refused. A chunk's part, opened at every part a sender sends, is read by its
+  length blocks alone; an upload's, opened once a start, is read through whole.
+- **A part under another's name is refused.** In the first cut a part carried under another chunk's
+  name failed its first record, read as a part cut short and was emptied and begun again, silently.
+  A part's header now carries a tag sealed under the key bound to its owner, so it is refused at
+  its header.
+- **Each record keyed by its own bytes.** A receipt is replaced under one name as its copy's
+  standing changes; each version is sealed keyed by its own bytes, so no two share a key, and
+  replacing one removes its name in the clear, where a reader looks first.
+- **Where it departs from the plan.** The plan sealed the custody records through
+  `focal_seal::file`, which makes a sealed file whole in memory and opens one from its whole bytes
+  (two copies of an 8 MiB checkpoint record at once) under one key for every kind. They are sealed
+  by the content store's own key path instead: a key directory a kind, so a record carried between
+  kinds is refused at the seal, each record sealed as it is written, read through one copy of its
+  plaintext and converted through the owner's chunk of scratch.
+- **Counted as they move.** The count takes these files with the objects, and what changes them
+  while the store converts keeps it exact: a part growing, an upload finished in the clear, a
+  terminal record released, a receipt replaced, each a hook on the tally, and a directory changed
+  while the count lists it is listed again. Counting each directory as a pass first met it let a
+  file appear between counts; counting first, with the hooks, keeps counted equal to converted,
+  gone and left at every step. An empty store sealed at once looked at its objects alone; the
+  collector's records phase, skipped while they convert, skipped the quarantine's expiry with it,
+  and rounds now expire once the count is taken.
+- **Measured** (`crates/focal-evidence/benches/content.rs` with `FOCAL_BENCH_UPLOADS=none|clear|content|sealed`,
+  release, each form a process of its own, 6 rounds interleaved with the order rotated, on
+  adas-mac-studio-3, an M4 Max at load 2; CPU is the process's user and system time from
+  `/usr/bin/time -l` less the `none` process's, which only makes the bytes, and wall time less
+  its time too; medians):
+
+  | Uploads | Clear | Objects sealed (content level) | Staging sealed too (at-rest level) | Sealed / content level |
+  |---|---|---|---|---|
+  | 32 of 8 MiB, CPU ms a MiB | 8.44 | 9.88 | 10.33 | 1.045 |
+  | 32 of 8 MiB, wall ms each | 193.3 | 204.2 | 205.5 | 1.006 |
+  | 256 of 64 KiB, CPU ms each | 7.48 | 8.38 | 9.41 | 1.124 |
+  | 256 of 64 KiB, wall ms each | 52.1 | 52.6 | 54.1 | 1.028 |
+
+  By the core's counters, staging sealed adds 1.8 M cycles a MiB to a large upload (two passes of
+  AES-GCM: a part sealed as it is written and opened as it is sealed), and about one more blocking
+  wait to each small one. Wall time is the disk's flushes. Where a small upload's extra millisecond
+  goes is not measured apart: besides a part's key, header and records and its sealed metadata and
+  terminal record, an upload looks staging's key up from its record four or five times, as an
+  object's install looks its domain's key up for each file; one look an operation is the next
+  lever to measure. On this Mac under other sessions' load (7 to 41) the same runs spread
+  two-fold from round to round, and the pinned Linux run waits for fedora.
+- **Tests.** focal-evidence (123): the record file's resume (a part opened again goes on under its
+  key; one cut short is written again under a new key; damage behind its last append, another
+  kind's file and a part past its bound refused); an upload staged sealed and resumed across a
+  restart with nothing of staging's in the clear at any point, a part cut short, a changed or moved
+  part or metadata refused, a sealed terminal record's crash windows, staging converted while its
+  upload goes on, the tally agreeing with the files in the clear at every step, and staging's
+  conversion cut at any step; a chunk received in parts across a restart with nothing in the
+  clear, a part moved under another chunk's name refused and one cut short gone on under a new key,
+  a part in the clear converted while its transfer goes on; records sealed under keyed names and
+  read in either form, a changed or carried record refused, records converted while one is
+  replaced with the tally exact at every step; the whole of it (a staged upload, a finished one, a
+  chunk's part, a record of each kind) cut after every step in turn and resumed; the level's rule.
+  The cut tests now assert they reached the conversion's end rather than their loop's bound. The
+  real binary: `cli_content_form` has a second journey, a node founded below the at-rest level
+  holding beside its sealed objects 400 uploads' terminal records, an upload half sent, a chunk half
+  received and a record of each kind in the clear; they stay in the clear below the fence; the
+  fence raised, the node started again converts them while `inspect node --gc` and the metrics
+  page are read at every step (78 looks mid-conversion), counting and converting exactly the 406
+  files, and the upload, the transfer and the records go on from their sealed form, every finished
+  upload's identity still fenced. Its first run caught the test's own reckoning: a sealed staging
+  file's keyed name has as many hex digits as a name in the clear, so a file in the clear is told by
+  its stem being an upload's identity. With it `cli_archive`, `cli_backup`, `cli_gc`,
+  `cli_native_a1` to `a4`, `cli_seeds_at_rest`, `cli_transfer`, `evidence_quic` and
+  `placement_binary`.
+- **Gate.** fmt, the contracts, Clippy on every target, the production check and cargo-deny on
+  the final tree. The workspace's tests: a first run stopped at `cli_restore` (80 binaries, 3,173
+  passed, 1 failed): at load 41, another session's release build beside the suite,
+  `a_backup_restores_onto_a_fresh_cluster_as_a_recovery_incarnation` had the restored session's
+  read answered `unavailable` while the node held the session ready and led it, the signature of
+  the restore-reopen defect open since 2026-10-19; alone it passed 3 of 3 at load 9 to 15. Run
+  again whole with `--no-fail-fast`: 175 test binaries, 3,667 passed, 0 failed, 31 ignored. The
+  measurements went into the docs during that run, and fmt and the contracts ran again.
