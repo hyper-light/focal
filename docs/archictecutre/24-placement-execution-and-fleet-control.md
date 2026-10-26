@@ -209,7 +209,15 @@ does at most one thing:
    signs the session fact with the root owner's `prepare_session_proof`, and
    creates the session descriptor. Once the directory holds the session the
    agent never captures the plan again, so a session whose log has moved past
-   its creation fence is not a registration conflict.
+   its creation fence is not a registration conflict. A registration a
+   restart cut after the session recorded its `Created` placement proposes
+   that request again, exactly as recorded (`HostedSessionFacts::created`),
+   never one made from a policy the node committed since: that one would
+   conflict with the record on every pass, and every step after the
+   registration, load reports among them, would never run (2026-10-25, a
+   deployment committing a home region before the first start's
+   registration ended, found on a slow disk). The policy committed since
+   reaches the session as a plan's placement change.
 3. **Report load.** Whenever the node has no load row, the row holds
    another enrollment generation or another capability level than the
    node's own (§21), or 30 s passed since its last committed report — a

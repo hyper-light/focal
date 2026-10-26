@@ -236,6 +236,14 @@ impl Session {
             .as_ref()
             .map(|record| &record.record.request.placement)
     }
+    /// The request the active record committed, whole: what a registration a restart cut after
+    /// its first placement proposes again, so the record answers it.
+    pub fn active_request(&self) -> Option<&SessionPlacementRequest> {
+        self.placement_state
+            .active
+            .as_ref()
+            .map(|record| &record.record.request)
+    }
     pub fn placement_receipt(
         &self,
         request: &SessionPlacementRequest,

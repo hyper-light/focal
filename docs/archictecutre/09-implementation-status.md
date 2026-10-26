@@ -17233,3 +17233,17 @@ node whose fence rose as it ran both seal from the moment the fence opens the le
   write beside its install's 8.4 ms of flushes but at a journal's 1 MiB bound (+1.4 ms, the seal
   790 µs); a conversion of 41 node files, every kind and a record for each partition a node may
   host, takes 357 ms, once.
+
+### 2026-10-25 — A session's registration cut by a restart resumes with the placement it recorded
+
+Found by at-rest step 6's real-binary test on Linux CI and reproduced on fedora with `/tmp` on its
+disk and two CPUs (3 runs in 7): a node founded, a deployment committing its home region applied
+before the first start's session registration ended, the node restarted, and its placement agent
+never reported its load again. The registration rebuilt its `Created` request from the policy the
+node had committed since, the session's log refused it against the request it recorded
+(`PlacementConflict`) on every pass, and the error ended each pass before the load report (24 §7,
+step 2). The registration now proposes the recorded request again (`Session::active_request`,
+`HostedSessionFacts::created`), and the policy committed since reaches the session as a plan's
+change. Tests: `session_registration_tests`, a plan captured from another policy after the first
+placement prepares the recorded request; `cli_node_files_at_rest`, 8 of 8 under the conditions that
+failed 3 of 7.

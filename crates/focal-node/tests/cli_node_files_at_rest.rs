@@ -296,7 +296,12 @@ fn a_nodes_small_files_in_the_clear_convert_at_its_start_once_the_fence_opens_th
         {
             break;
         }
-        assert!(deadline.open(), "the node never reported the at-rest level");
+        assert!(
+            deadline.open(),
+            "the node never reported the at-rest level: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         std::thread::sleep(Duration::from_millis(200));
     }
     let activated = admin(root, &home, &["activate", "upgrade", "--fence", &level]);

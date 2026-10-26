@@ -66,6 +66,10 @@ pub struct HostedSessionFacts {
     pub placement: Option<focal_directory::SessionFence>,
     /// The activated placement and its members.
     pub active: Option<(focal_directory::SessionFence, PlacementSpec)>,
+    /// The request the session's first placement recorded, while that record is the active one:
+    /// what its registration proposes again after a restart cut it, whatever the node's policy
+    /// became since.
+    pub created: Option<SessionPlacementRequest>,
     pub sequence: SessionSeq,
     pub authoritative: bool,
 }
@@ -86,6 +90,10 @@ impl HostedSessionFacts {
                 .active_fence()
                 .cloned()
                 .zip(session.active_placement().cloned()),
+            created: session
+                .active_request()
+                .filter(|request| request.kind == SessionFenceKind::Created)
+                .cloned(),
             sequence: session.sequence(),
             authoritative: session.is_authoritative(),
         })
@@ -105,6 +113,9 @@ pub struct FirstSessionPlan {
     client: [u8; 16],
     durability: Durability,
     placement: ConfigPlacement,
+    /// The placement this registration proposed before a restart cut it, recorded by the session:
+    /// proposed again as it was, never one made from a policy committed since.
+    recorded: Option<SessionPlacementRequest>,
     required_memory: u64,
     _allocation: Allocation,
 }
@@ -218,6 +229,10 @@ impl FirstSessionPlan {
             )?,
             durability: settings.durability.clone(),
             placement: settings.placement.clone(),
+            recorded: facts
+                .created
+                .clone()
+                .filter(|request| request.operation == operation),
             required_memory,
             _allocation: allocation,
         })
@@ -268,50 +283,60 @@ impl FirstSessionPlan {
         let node = context.founder(&self.founder, now)?;
         let mut allocation = reserve(budget, MAX_POLICY_BYTES)?;
         let members = BTreeMap::from([(self.founder.node, node.enrollment.generation)]);
-        let spec = PlacementSpec {
-            policy: PlacementPolicy {
-                durability: DurabilityIntent {
-                    survive: match self.durability.survive {
-                        FailureDomain::Node => FailureClass::Node,
-                        FailureDomain::Zone => FailureClass::Zone,
-                        FailureDomain::Region => FailureClass::Region,
+        let request = match &self.recorded {
+            // A registration a restart cut after its first placement proposes the request the
+            // session recorded then, so its record answers it and the registration goes on. One
+            // made from a policy committed since conflicts with the record on every pass, and the
+            // node's agent never reports its load again; the policy committed since reaches the
+            // session as a plan's placement change.
+            Some(recorded) => recorded.clone(),
+            None => {
+                let spec = PlacementSpec {
+                    policy: PlacementPolicy {
+                        durability: DurabilityIntent {
+                            survive: match self.durability.survive {
+                                FailureDomain::Node => FailureClass::Node,
+                                FailureDomain::Zone => FailureClass::Zone,
+                                FailureDomain::Region => FailureClass::Region,
+                            },
+                            max_failures: self.durability.max_failures,
+                        },
+                        residency: resolve_regions(&self.placement.residency, directory)?,
+                        home_regions: resolve_regions(&self.placement.home_regions, directory)?,
+                        required_memory: self.required_memory,
                     },
-                    max_failures: self.durability.max_failures,
-                },
-                residency: resolve_regions(&self.placement.residency, directory)?,
-                home_regions: resolve_regions(&self.placement.home_regions, directory)?,
-                required_memory: self.required_memory,
-            },
-            placement: Placement {
-                voters: members.clone(),
-                materializers: members.clone(),
-                content_copies: members.clone(),
-                preferred_leader: self.founder.node,
-            },
-        };
-        focal_directory::verify_placement(
-            &spec,
-            &BTreeMap::from([(
-                self.founder.node,
-                NodeRecord {
-                    enrollment: node.enrollment.clone(),
-                    load: None,
-                    liveness: None,
-                },
-            )]),
-            1,
-        )
-        .map_err(|_| SessionRegistrationError::PolicyUnsatisfied)?;
-        let request = SessionPlacementRequest {
-            expected_index: 0,
-            expected_configuration_index: self.configuration_index,
-            operation: self.operation,
-            kind: SessionFenceKind::Created,
-            from_route: RouteEpoch(0),
-            to_route: RouteEpoch(1),
-            membership_epoch: 1,
-            placement_epoch: 1,
-            placement: spec,
+                    placement: Placement {
+                        voters: members.clone(),
+                        materializers: members.clone(),
+                        content_copies: members.clone(),
+                        preferred_leader: self.founder.node,
+                    },
+                };
+                focal_directory::verify_placement(
+                    &spec,
+                    &BTreeMap::from([(
+                        self.founder.node,
+                        NodeRecord {
+                            enrollment: node.enrollment.clone(),
+                            load: None,
+                            liveness: None,
+                        },
+                    )]),
+                    1,
+                )
+                .map_err(|_| SessionRegistrationError::PolicyUnsatisfied)?;
+                SessionPlacementRequest {
+                    expected_index: 0,
+                    expected_configuration_index: self.configuration_index,
+                    operation: self.operation,
+                    kind: SessionFenceKind::Created,
+                    from_route: RouteEpoch(0),
+                    to_route: RouteEpoch(1),
+                    membership_epoch: 1,
+                    placement_epoch: 1,
+                    placement: spec,
+                }
+            }
         };
         request.validate()?;
         let grant = GroupAuthorityGrant {

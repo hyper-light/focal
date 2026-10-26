@@ -369,6 +369,98 @@ fn founder_registration_preserves_existing_application_and_replays_exact_metadat
     .unwrap()
 }
 
+/// A registration a restart cut after its first placement proposes that placement again, whatever
+/// policy the node committed since: a plan captured afterwards from another policy prepares the
+/// request the session recorded, so the record answers it. Made afresh, the request conflicted with
+/// the record on every pass of the node's agent, and the node never reported its load again
+/// (found by `cli_node_files_at_rest` on a slow disk: a deployment committed a home region before
+/// the first start's registration ended).
+#[test]
+fn a_registration_cut_after_its_first_placement_proposes_what_the_session_recorded() {
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let (network, settings, mut session, _partition_plan) = setup(directory.path()).await;
+        let memory = budget();
+        let limit = session.memory_stats().limit as u64;
+        let plan =
+            FirstSessionPlan::capture(&session, &network.state.genesis, &settings, limit, &memory)
+                .unwrap();
+        let client = plan.client();
+        let (host, owner, outgoing) = ControlHost::spawn(
+            network.control,
+            NoDirectoryAuthority,
+            ControlHostConfig::new(network.state.genesis.root_namespace),
+            budget(),
+        )
+        .unwrap();
+        let observation = host.observe_root().await.unwrap();
+        let now = unix_time().unwrap();
+        let initial = plan.prepare(&observation, now, &memory).unwrap();
+        let operator = peer(network.state.genesis.root_namespace, ParticipantId(client));
+        host.submit(
+            operator,
+            ControlRequest {
+                id: ControlRequestId {
+                    client,
+                    sequence: 1,
+                },
+                acknowledged_through: 0,
+                command: initial.root_command().unwrap().clone(),
+            },
+        )
+        .await
+        .unwrap();
+        session
+            .propose_placement(initial.placement_request())
+            .unwrap();
+        for _ in 0..8 {
+            session.poll().unwrap();
+        }
+        assert!(
+            session
+                .placement_witness(initial.placement_request())
+                .unwrap()
+                .is_some()
+        );
+
+        // The node's policy changed before its agent went on (here, the memory the session asks
+        // for): a plan captured now prepares the request the session recorded, which its record
+        // answers, never another the record refuses.
+        let changed = FirstSessionPlan::capture(
+            &session,
+            &network.state.genesis,
+            &settings,
+            limit + 1,
+            &memory,
+        )
+        .unwrap();
+        let refreshed = host.observe_root().await.unwrap();
+        let resumed = changed.prepare(&refreshed, now, &memory).unwrap();
+        assert_eq!(resumed.placement_request(), initial.placement_request());
+        assert!(
+            session
+                .placement_witness(resumed.placement_request())
+                .unwrap()
+                .is_some()
+        );
+        host.stop().await.unwrap();
+        owner.join().unwrap();
+        drop((
+            host,
+            outgoing,
+            observation,
+            refreshed,
+            plan,
+            changed,
+            initial,
+            resumed,
+            session,
+        ));
+        assert_eq!(memory.stats().used, 0);
+    })
+    .unwrap()
+}
+
 #[test]
 fn registration_refuses_stronger_policy_foreign_identity_and_expired_node_grants() {
     focal_rt::block_on(async move {
