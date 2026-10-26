@@ -777,8 +777,10 @@ impl PlacementAgent {
         .await
         .unwrap_or(Err(AgentError::Runtime))
     }
-    fn pending_retires_path(&self) -> PathBuf {
-        self.root.join("cluster").join("pending-retires")
+    /// The node's small files, the pending retirements among them, sealed from the at-rest level
+    /// (29 §12.10).
+    fn files(&self) -> crate::node_files::NodeFiles {
+        crate::node_files::NodeFiles::new(&self.root, Some(self.keys.clone()))
     }
     /// Partition ids whose host must be retired after a committed merge. A merge
     /// commits the Absorb durably (in the intent journal) and then deletes the
@@ -788,7 +790,7 @@ impl PlacementAgent {
     fn load_pending_retires(&self) -> Vec<PartitionId> {
         // Best effort: a missing or unreadable list means nothing is pending; the
         // record is only a retry hint, and the retire it drives is idempotent.
-        let Ok(bytes) = std::fs::read(self.pending_retires_path()) else {
+        let Ok(Some(bytes)) = self.files().read(PENDING_RETIRES, PENDING_RETIRES_BYTES) else {
             return Vec::new();
         };
         bytes
@@ -799,7 +801,7 @@ impl PlacementAgent {
             .collect()
     }
     fn store_pending_retires(&self, ids: &[PartitionId]) -> Result<(), AgentError> {
-        let path = self.pending_retires_path();
+        let path = self.root.join(PENDING_RETIRES);
         if ids.is_empty() {
             return match std::fs::remove_file(&path) {
                 Ok(()) => Ok(()),
@@ -814,10 +816,15 @@ impl PlacementAgent {
         for id in ids {
             bytes.extend_from_slice(&id.0);
         }
+        if bytes.len() > PENDING_RETIRES_BYTES {
+            return Err(AgentError::Capacity);
+        }
         if let Some(parent) = path.parent() {
             crate::embedded::durable_dir(parent).map_err(|_| AgentError::Capacity)?;
         }
-        atomic_file(&path, &bytes).map_err(|_| AgentError::Capacity)
+        self.files()
+            .write(PENDING_RETIRES, &bytes)
+            .map_err(|_| AgentError::Capacity)
     }
     /// Record a source for retirement durably, before its host record is deleted.
     fn record_pending_retire(&self, source: PartitionId) -> Result<(), AgentError> {
@@ -3767,4 +3774,22 @@ fn intent_kind(command: &ControlCommand) -> &'static str {
         },
         _ => "control",
     }
+}
+
+/// The node file the partitions whose host must be retired are kept in.
+const PENDING_RETIRES: &str = "cluster/pending-retires";
+
+/// Derived: the most the pending retirements' file holds: a 16-byte partition ID for each partition
+/// the node may host (`deployment::plan::MAX_PARTITIONS`).
+pub(crate) const PENDING_RETIRES_BYTES: usize = crate::deployment::plan::MAX_PARTITIONS * 16;
+
+/// Whether `bytes` are the pending retirements' file's: whole partition IDs, no more than the node
+/// may host. What a conversion of the node's files checks before it seals one.
+pub(crate) fn check_pending_retires(bytes: &[u8]) -> Result<(), crate::embedded::NodeError> {
+    if bytes.len() > PENDING_RETIRES_BYTES || !bytes.len().is_multiple_of(16) {
+        return Err(crate::embedded::NodeError::Corrupt(
+            "the pending retirements",
+        ));
+    }
+    Ok(())
 }

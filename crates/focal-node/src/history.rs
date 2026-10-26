@@ -82,7 +82,9 @@ pub fn offline_native_publications(
     let consensus = storage
         .storage
         .open_member(config, &budget, focal_ledger::entry_needs)?;
-    let limits = crate::memory_envelope::founded_limits(root)
+    let files =
+        crate::node_files::NodeFiles::new(root, Some(focal_seal::DataKeys::new(root, key_file)));
+    let limits = crate::memory_envelope::founded_limits(&files)
         .map_err(|error| PublicationsError::Allowance(Box::new(error)))?;
     let rule = crate::storage_level::seal_rule(root)
         .map_err(|error| PublicationsError::Storage(Box::new(error)))?;

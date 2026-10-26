@@ -86,6 +86,16 @@ pub enum NodeError {
     /// A record of the data directory that is there and does not read whole.
     #[error("corrupt node record: {0}")]
     Corrupt(&'static str),
+    /// A file of the data directory holding more than the most its reader takes: refused before
+    /// it is read.
+    #[error("{} holds more than the {most} bytes it may", path.display())]
+    PastBound {
+        path: std::path::PathBuf,
+        most: usize,
+    },
+    /// What the node could not make room for: memory refused, or a bound past what it counts.
+    #[error("no room for {0}")]
+    Capacity(&'static str),
     #[error("deployment cannot satisfy its configured guarantee: {0}")]
     Placement(String),
     #[error("this embedded owner requires local operation; use the network host for peers")]
@@ -97,6 +107,20 @@ pub enum NodeError {
     /// The data directory's keys did not open or could not be made (29 §2).
     #[error("the data directory's keys: {0}")]
     Keys(#[from] focal_seal::SealSetupError),
+    /// A sealed node file that did not open under the data directory's keys: changed, cut, or
+    /// sealed under another directory's (29 §12.10).
+    #[error("a sealed node file: {0}")]
+    SealedFile(#[from] focal_seal::file::FileError),
+    /// A node file in the clear in a data directory marked sealed: what a planted or restored-over
+    /// file is, refused (29 §12.10).
+    #[error("the node file {0} is in the clear in a data directory whose node files are sealed")]
+    ClearAfterSealed(String),
+    /// A sealed node file whose seal names another file: moved to its name (29 §12.10).
+    #[error("the sealed node file {0} holds another file's frame")]
+    MovedNodeFile(String),
+    /// A sealed node file in a data directory read without its keys.
+    #[error("a sealed node file read without the data directory's keys")]
+    SealedWithoutKeys,
 }
 impl From<focal_consensus::storage_open::OpenError> for NodeError {
     fn from(error: focal_consensus::storage_open::OpenError) -> Self {
@@ -139,7 +163,7 @@ impl EmbeddedNode {
         let identity = directory.identity().clone();
         // An initialized store's committed policy is checked before anything
         // else: a differing file is refused by its field, never re-solved.
-        let committed = check_policy(root, settings)?;
+        let committed = check_policy(directory.files(), settings)?;
         let facts = [NodeFacts {
             id: identity.node,
             topology: settings.topology.clone(),
@@ -149,7 +173,7 @@ impl EmbeddedNode {
         placement::plan(&facts, &settings.durability, &settings.placement)
             .map_err(|e| NodeError::Placement(e.to_string()))?;
         if committed.is_none() {
-            install_policy(root, settings)?;
+            install_policy(directory.files(), settings)?;
         }
         // An embedded node is its own cluster: the level its binary announces is its fence, the
         // storage level among it, so its groups live on the shell from its first start.
@@ -188,7 +212,7 @@ impl EmbeddedNode {
             crate::storage_level::content_form_at(level),
             crate::storage_level::at_rest_form_at(level),
         )?;
-        let limits = crate::memory_envelope::found_limits(root, settings, &consensus)?;
+        let limits = crate::memory_envelope::found_limits(directory.files(), settings, &consensus)?;
         let rule = if level >= crate::upgrade::SEAL_LEVEL {
             focal_ledger::SealRule::Anchored
         } else {
@@ -302,8 +326,19 @@ pub(crate) fn new_identity() -> Result<NodeIdentity, NodeError> {
         root: RootCommandId(random_id()?),
     })
 }
-pub fn decode_identity(path: &Path) -> Result<NodeIdentity, NodeError> {
-    let bytes = read_bounded(path, 4096)?;
+/// Derived: the most bytes a node's `IDENTITY` holds: its magic, its hash and its identity's
+/// encoding, well within one 4 KiB page.
+pub(crate) const IDENTITY_BYTES: usize = 4096;
+
+/// Whether `bytes` are a node identity file's, as [`decode_identity_bytes`] holds them to: what a
+/// conversion checks before it seals one.
+pub(crate) fn check_identity(bytes: &[u8]) -> Result<(), NodeError> {
+    decode_identity_bytes(bytes).map(|_| ())
+}
+
+/// The identity a node identity file's `bytes` hold: its magic, the hash of its payload, and the
+/// payload, a valid identity and nothing after it.
+pub(crate) fn decode_identity_bytes(bytes: &[u8]) -> Result<NodeIdentity, NodeError> {
     let payload = bytes.get(40..).ok_or(NodeError::Identity)?;
     if bytes.get(..8) != Some(IDENTITY_MAGIC)
         || Some(blake3::hash(payload).as_bytes().as_slice()) != bytes.get(8..40)
@@ -318,20 +353,20 @@ pub fn decode_identity(path: &Path) -> Result<NodeIdentity, NodeError> {
     Ok(id)
 }
 pub(crate) fn read_bounded(path: &Path, max: usize) -> Result<Vec<u8>, NodeError> {
+    let past = || NodeError::PastBound {
+        path: path.to_path_buf(),
+        most: max,
+    };
     let file = File::open(path)?;
-    if file.metadata()?.len() > max as u64 {
-        return Err(NodeError::Identity);
+    let most = u64::try_from(max).map_err(|_| past())?;
+    if file.metadata()?.len() > most {
+        return Err(past());
     }
     let mut bytes = Vec::new();
-    file.take(
-        u64::try_from(max)
-            .ok()
-            .and_then(|n| n.checked_add(1))
-            .ok_or(NodeError::Identity)?,
-    )
-    .read_to_end(&mut bytes)?;
+    file.take(most.checked_add(1).ok_or_else(past)?)
+        .read_to_end(&mut bytes)?;
     if bytes.len() > max {
-        return Err(NodeError::Identity);
+        return Err(past());
     }
     Ok(bytes)
 }
@@ -342,13 +377,12 @@ pub(crate) fn read_bounded(path: &Path, max: usize) -> Result<Vec<u8>, NodeError
 /// select a new guarantee. Existing policy bytes keep their original
 /// serialized format.
 pub(crate) fn install_policy(
-    root: &Path,
+    files: &crate::node_files::NodeFiles,
     settings: &Settings,
 ) -> Result<crate::config::CommittedPolicy, NodeError> {
     Ok(crate::config::policy::install_or_check(
-        root,
+        files,
         &settings.policy_intent(),
-        atomic_file,
     )?)
 }
 /// The committed policy of an initialized store; `None` for a fresh
@@ -359,10 +393,10 @@ pub(crate) fn install_policy(
 /// from ever restarting after a sanctioned apply). Config resolution
 /// already yields the committed value for a start; this only reads it.
 pub(crate) fn check_policy(
-    root: &Path,
+    files: &crate::node_files::NodeFiles,
     _settings: &Settings,
 ) -> Result<Option<crate::config::CommittedPolicy>, NodeError> {
-    Ok(crate::config::policy::read_committed(root)?)
+    Ok(crate::config::policy::read_committed(files)?)
 }
 pub(crate) fn durable_dir(path: &Path) -> Result<(), std::io::Error> {
     focal_platform::fs::create_dir_all_private(path)
@@ -545,12 +579,16 @@ mod tests {
         ));
         drop(node);
         assert_eq!(EmbeddedNode::open(&settings).unwrap().identity, id);
+        // Founded at this binary's level, the node sealed its identity (29 §12.10): a changed byte
+        // is refused as the seal refuses one. A changed clear identity is refused as an identity
+        // (`node_directory`'s legacy identity test).
         let mut bytes = fs::read(dir.path().join("IDENTITY")).unwrap();
+        assert!(bytes.starts_with(crate::node_files::SEALED_MAGIC));
         bytes[45] ^= 1;
         fs::write(dir.path().join("IDENTITY"), bytes).unwrap();
         assert!(matches!(
             EmbeddedNode::open(&settings),
-            Err(NodeError::Identity)
+            Err(NodeError::SealedFile(_))
         ));
     }
 
@@ -574,7 +612,7 @@ mod tests {
             ));
             assert!(!dir.path().join("POLICY").exists());
             assert_eq!(
-                decode_identity(&dir.path().join("IDENTITY")).unwrap(),
+                crate::node_files::read_identity(&settings, dir.path()).unwrap(),
                 identity
             );
         }
@@ -591,13 +629,13 @@ mod tests {
                 .unwrap();
         fs::write(dir.path().join("POLICY"), &original).unwrap();
         // The old format is accepted and gains the marker without rewriting it.
-        install_policy(directory.root(), &settings).unwrap();
+        install_policy(directory.files(), &settings).unwrap();
         assert_eq!(fs::read(dir.path().join("POLICY")).unwrap(), original);
         assert!(dir.path().join("POLICY.initialized").is_file());
         let mut changed = settings.clone();
         changed.durability.max_failures = 1;
         assert!(matches!(
-            install_policy(directory.root(), &changed),
+            install_policy(directory.files(), &changed),
             Err(NodeError::Config(
                 crate::config::ConfigError::CommittedPolicyChange {
                     field: "durability.max_failures"
@@ -619,10 +657,10 @@ mod tests {
         let mut settings = Settings::default();
         settings.node.data_dir = Some(fresh.path().to_owned());
         let directory = crate::node_directory::NodeDirectory::open(&settings).unwrap();
-        let committed = install_policy(directory.root(), &settings).unwrap();
+        let committed = install_policy(directory.files(), &settings).unwrap();
         assert_eq!(committed.revision, crate::config::PolicyRevision(1));
         assert_eq!(
-            crate::config::policy::read_committed(directory.root()).unwrap(),
+            crate::config::policy::read_committed(directory.files()).unwrap(),
             Some(committed)
         );
     }

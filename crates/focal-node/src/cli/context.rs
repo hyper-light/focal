@@ -18,7 +18,7 @@ const MARKER: &str = "CLIENT.contexts.initialized";
 const LIMIT: usize = 60 * 1024;
 /// The contexts a client data directory keeps, removed ones included (their names stay bound to
 /// their connections): what the catalogue's one record of `LIMIT` bytes holds.
-const MAX_CONTEXTS: usize = 64;
+const MAX_CONTEXTS: usize = focal_node::network_join::MAX_CONTEXTS;
 
 /// The refusal of a context past what a client data directory keeps.
 fn catalogue_full() -> CliError {
@@ -575,6 +575,9 @@ pub(super) struct Adoption {
     /// The verifier's report of the connector bound last.
     roots: Mutex<Option<focal_wire::AdoptedRoots>>,
     directory: PathBuf,
+    /// The keys of the data directory the enrollment lives in, which its adoptions are sealed
+    /// under from the at-rest level (29 §12.10).
+    keys: focal_seal::DataKeys,
 }
 impl Adoption {
     /// Read what the verifier of the connector now bound reports.
@@ -595,7 +598,9 @@ impl Adoption {
         let Some(adopted) = adopted else {
             return;
         };
-        if let Err(error) = focal_node::network_join::adopt_issuer(&self.directory, &adopted) {
+        if let Err(error) =
+            focal_node::network_join::adopt_issuer(&self.keys, &self.directory, &adopted)
+        {
             let _ = writeln!(
                 std::io::stderr().lock(),
                 "focal: [trust_not_adopted] the issuer verified through its predecessor's endorsement was not recorded in {}: {error}",
@@ -717,6 +722,7 @@ pub(super) fn connect(settings: &Settings, profile: Profile, history: PathBuf) -
             let adoption = Adoption {
                 roots: Mutex::new(None),
                 directory: pending.directory().to_path_buf(),
+                keys: keys.clone(),
             };
             let remake_limits = limits.clone();
             let remake: MakeTls = Box::new(move || {

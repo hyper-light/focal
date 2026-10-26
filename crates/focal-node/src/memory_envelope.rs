@@ -59,21 +59,30 @@ pub(crate) fn session_bytes(required_memory: u64) -> usize {
     usize::try_from(required_memory).unwrap_or(usize::MAX)
 }
 
-/// Where the node keeps the allowance of the session it founded.
+/// Where the node keeps the allowance of the session it founded: one of its small files, sealed from
+/// the at-rest level (29 §12.10).
 const FOUNDED_FILE: &str = "SESSION.memory";
+
+/// Format: the most bytes the founded allowance's file holds: a `u64` in decimal (twenty digits at
+/// most) and its line's end.
+pub(crate) const FOUNDED_BYTES: usize = 21;
 
 /// The limits of the session this node founded, as it was founded: the
 /// allowance recorded when its log was new, or the standard allowance for a
 /// session founded before allowances were recorded. Read-only.
 pub(crate) fn founded_limits(
-    root: &std::path::Path,
+    files: &crate::node_files::NodeFiles,
 ) -> Result<SessionLimits, crate::embedded::NodeError> {
-    let path = root.join(FOUNDED_FILE);
-    match std::fs::read(&path) {
-        Ok(bytes) => Ok(SessionLimits::within(session_bytes(parse(&bytes)?))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(SessionLimits::default()),
-        Err(error) => Err(error.into()),
+    match files.read(FOUNDED_FILE, FOUNDED_BYTES)? {
+        Some(bytes) => Ok(SessionLimits::within(session_bytes(parse(&bytes)?))),
+        None => Ok(SessionLimits::default()),
     }
+}
+
+/// Whether `bytes` are the founded allowance's file's, as the node reads it: what a conversion of
+/// the node's files checks before it seals one.
+pub(crate) fn check(bytes: &[u8]) -> Result<(), crate::embedded::NodeError> {
+    parse(bytes).map(|_| ())
 }
 
 /// The limits of the session this node founds over `consensus`: a log no
@@ -82,17 +91,17 @@ pub(crate) fn founded_limits(
 /// open, and every replica the session's committed requirement seats, holds
 /// the same allowance. An existing session keeps the one it was founded with.
 pub(crate) fn found_limits(
-    root: &std::path::Path,
+    files: &crate::node_files::NodeFiles,
     settings: &Settings,
     consensus: &focal_consensus::DurableNode,
 ) -> Result<SessionLimits, crate::embedded::NodeError> {
-    let path = root.join(FOUNDED_FILE);
     let status = consensus.status();
-    if status.term == 0 && status.committed_index == 0 && !path.exists() {
+    if status.term == 0 && status.committed_index == 0 && !files.root().join(FOUNDED_FILE).exists()
+    {
         let bytes = founded_session_bytes(settings);
-        crate::embedded::atomic_file(&path, format!("{bytes}\n").as_bytes())?;
+        files.write(FOUNDED_FILE, format!("{bytes}\n").as_bytes())?;
     }
-    founded_limits(root)
+    founded_limits(files)
 }
 
 fn parse(bytes: &[u8]) -> Result<u64, crate::embedded::NodeError> {

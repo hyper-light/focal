@@ -128,9 +128,10 @@ async fn submit(
     operation: PartitionOperation,
 ) {
     let now = unix_time().unwrap();
-    let cluster = crate::embedded::decode_identity(&data_dir(running).join("IDENTITY"))
-        .unwrap()
-        .cluster;
+    let cluster =
+        crate::node_files::read_identity(&crate::config::Settings::default(), &data_dir(running))
+            .unwrap()
+            .cluster;
     let evidence = control_evidence(
         installed,
         cluster,
@@ -839,7 +840,8 @@ async fn join_peer_inner(
     name: &str,
     peer_settings: &crate::network_service::tests::TestSettings,
 ) -> (Running, u64) {
-    let identity = crate::embedded::decode_identity(&founder_dir.join("IDENTITY")).unwrap();
+    let identity =
+        crate::node_files::read_identity(&crate::config::Settings::default(), founder_dir).unwrap();
     let admin = focal_wire::LocalRemote::new(
         founder.status.admin_socket.as_ref().unwrap(),
         crate::network_admin::admin_wire_limits(),

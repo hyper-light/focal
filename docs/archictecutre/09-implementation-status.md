@@ -17200,3 +17200,36 @@ survivor by hand, and its consumer read the leader from the nodes.
   `kMaxTimeForCryptoHandshakeSecs`, 10 s; Kafka's `socket.connection.setup.timeout.ms`, 10 s doubled
   to 30 s, KIP-601). A subscriber on a quiet stream learns of its leader's death from its keep-alive
   (15 s) or from its client's following another.
+
+### 2026-10-25 — A node's small files are sealed from the at-rest level
+
+A node's identity, committed policy, network state, founded allowance, root's genesis, partition
+records, deployment plans and journals, pending retirements, and the issuers its data directory's
+client enrollments adopted were written in the clear (29 §12's inventory, "Node files"). Each is now
+one of the node's files (`node_files::NodeFiles`, 29 §12.10): below the at-rest level byte for byte
+as before; from it sealed whole under the data directory's journal key, its name bound inside the
+seal, a clear `FCLNSEAL` saying only what it is. The form is read from the recorded fence at each
+write, so a node founded at the level, which writes its identity before its fence is recorded, and a
+node whose fence rose as it ran both seal from the moment the fence opens the level.
+
+- **Converted at the start, before the node serves.** Under the data directory's lock, where every
+  start opens its directory and where a start first records a fence at the level: each file in the
+  clear checked by its own reader's rule and written sealed through its atomic replace, one sealed
+  already opened and left, a cut install's temporary removed, then the directory marked
+  (`FILES.SEALED`). A cut anywhere leaves each file whole in one form or the other and the next
+  start finishes; from the mark a file in the clear is refused by name.
+- **The identity no longer names the keys.** A directory whose keys an earlier binary made under
+  the file named for its node found them by reading its identity; before the identity is sealed
+  the key file is linked under the name its root key's ID gives it, as every directory made since
+  is found. The identity's reader by path is gone: the load tool's driver read it so, and would have
+  refused every node founded at the level.
+- **Found on the way.** The founded allowance, the pending retirements and each partition record
+  were read whole with no bound (now within 21 bytes, a partition ID for each partition a node may
+  host, and a record's own fields and a group checkpoint's `IMAGE_BYTES`, where the record's bound
+  had cited another thing's; the root's genesis is bounded the same way); a file past its bound was
+  refused as a corrupt identity or policy whichever it was, and is refused by its path and bound; a
+  node file that could not be looked for read as absent. Deployment plans are never pruned (open).
+- **Measured** (this Mac, release, medians of 101): sealing adds nothing measurable to a node file's
+  write beside its install's 8.4 ms of flushes but at a journal's 1 MiB bound (+1.4 ms, the seal
+  790 µs); a conversion of 41 node files, every kind and a record for each partition a node may
+  host, takes 357 ms, once.

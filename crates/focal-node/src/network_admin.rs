@@ -1091,6 +1091,9 @@ fn validate_name(name: &str) -> Result<(), AccessError> {
 #[derive(Clone)]
 pub struct LocalNetworkAdmin {
     directory: PathBuf,
+    /// The node's small files, its network state among them, sealed from the at-rest level
+    /// (29 §12.10).
+    files: crate::node_files::NodeFiles,
     identity: NodeIdentity,
     root: ControlIdentity,
     /// The founder's node: the issuer's key is held there (24 §11).
@@ -1136,6 +1139,7 @@ impl LocalNetworkAdmin {
         }
         Ok(Self {
             directory: directory.root().to_path_buf(),
+            files: directory.files().clone(),
             identity: directory.identity().clone(),
             root,
             founder: state.genesis.founder.node,
@@ -1177,6 +1181,7 @@ impl LocalNetworkAdmin {
         }
         Ok(Self {
             directory: directory.root().to_path_buf(),
+            files: directory.files().clone(),
             identity: directory.identity().clone(),
             root,
             founder: state.genesis.founder.node,
@@ -2146,7 +2151,7 @@ impl LocalNetworkAdmin {
             }
             _ => return Err(AccessError::InvalidRequest),
         };
-        let state = NetworkState::load_from(&self.directory, &self.identity)
+        let state = NetworkState::load_from(&self.files, &self.identity)
             .map_err(|_| AccessError::Unavailable)?
             .ok_or(AccessError::Unavailable)?;
         if state.genesis.root != self.root
@@ -2189,7 +2194,7 @@ impl LocalNetworkAdmin {
     }
     /// The founding node of this cluster, from the saved network state.
     fn founder(&self) -> Result<u64, AccessError> {
-        let state = NetworkState::load_from(&self.directory, &self.identity)
+        let state = NetworkState::load_from(&self.files, &self.identity)
             .map_err(|_| AccessError::Unavailable)?
             .ok_or(AccessError::Unavailable)?;
         if state.genesis.root != self.root {

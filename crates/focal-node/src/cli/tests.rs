@@ -333,7 +333,7 @@ fn joined_markers_reject_manual_context_before_journaling_or_transmission() {
             );
             assert!(!directory.path().join("client").exists());
             assert_eq!(
-                decode_identity(&directory.path().join("IDENTITY")).unwrap(),
+                focal_node::node_files::read_identity(&settings, directory.path()).unwrap(),
                 identity
             );
             std::fs::remove_file(path).unwrap();

@@ -16,7 +16,7 @@ use cli::cluster::ClusterCommand;
 use focal_model::*;
 use focal_node::{
     config::Settings,
-    embedded::{EmbeddedNode, decode_identity},
+    embedded::EmbeddedNode,
     host::LocalHost,
     network_admin::{
         ADMIN_SOCKET, AdminCommand, LOCAL_SOCKET, admin_wire_limits, local_sockets_fit,
@@ -358,15 +358,12 @@ fn load_settings(
         .map(|(settings, presence)| (settings, presence));
     // The data directory decides which committed policy applies; an
     // unreadable one is reported by the commands that open the store.
-    let committed = focal_node::config::resolve(&overrides, file, None)?
-        .settings
-        .data_dir()
-        .ok()
-        .and_then(|root| {
-            focal_node::config::policy::read_committed(&root)
-                .ok()
-                .flatten()
-        });
+    let base = focal_node::config::resolve(&overrides, file, None)?.settings;
+    let committed = base.data_dir().ok().and_then(|root| {
+        focal_node::config::policy::read_committed_in(&base, &root)
+            .ok()
+            .flatten()
+    });
     let resolved = match resolution {
         Resolution::Start => {
             focal_node::config::resolve_start(&overrides, file, committed.as_ref())?
@@ -468,7 +465,10 @@ async fn run(args: Args) -> Result<()> {
             node.checkpoint()?;
             print_json(&report)
         }
-        Commands::Identity => print_json(&decode_identity(&settings.data_dir()?.join("IDENTITY"))?),
+        Commands::Identity => print_json(&focal_node::node_files::read_identity(
+            &settings,
+            &settings.data_dir()?,
+        )?),
         Commands::Schema {
             command:
                 cli::discovery::SchemaCommand::Validate {
@@ -617,7 +617,7 @@ async fn start(settings: Settings) -> Result<()> {
 }
 async fn invite(settings: &Settings, name: &str, output: &Path) -> Result<()> {
     let root = settings.data_dir()?;
-    let identity = decode_identity(&root.join("IDENTITY"))?;
+    let identity = focal_node::node_files::read_identity(settings, &root)?;
     let command = AdminCommand::invitation(name)?;
     let request = command.request(&identity)?;
     let reply = LocalRemote::new(root.join(ADMIN_SOCKET), admin_wire_limits())?

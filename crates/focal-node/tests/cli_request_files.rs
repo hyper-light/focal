@@ -347,7 +347,13 @@ fn raw_send_and_legacy_path_retry_reuse_exact_file_across_server_restart() {
     let request: RequestEnvelope = serde_json::from_slice(&bytes).unwrap();
     // The offline checker is intentionally narrower than the legacy sender.
     // Protocol-2 read-only managed state must still reach real authenticated ingress.
-    let identity = focal_node::embedded::decode_identity(&root.path().join("IDENTITY")).unwrap();
+    let identity = {
+        // Its identity, one of the node's small files, sealed from the at-rest level (29 §12.10),
+        // read as a command line beside the node reads it.
+        let mut settings = focal_node::config::Settings::default();
+        settings.node.data_dir = Some(root.path().to_path_buf());
+        focal_node::node_files::read_identity(&settings, root.path()).unwrap()
+    };
     let managed = RequestEnvelope {
         protocol: focal_wire::MANAGED_PROTOCOL_VERSION,
         request_id: RequestId::from_u128(899),

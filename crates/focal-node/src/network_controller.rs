@@ -2119,7 +2119,10 @@ impl NetworkController {
                 sponsor.validate().map_err(|_| ControllerError::Identity)?;
                 self.state.sponsor = sponsor;
                 self.state
-                    .write(&self.root)
+                    .write(&crate::node_files::NodeFiles::new(
+                        &self.root,
+                        Some(self.keys.clone()),
+                    ))
                     .map_err(|_| ControllerError::Identity)?;
             }
         }

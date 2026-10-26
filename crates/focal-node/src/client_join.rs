@@ -72,35 +72,85 @@ pub struct PendingClientJoin {
     key: JoinKey,
     _journal: PrivateJournal,
     directory: std::path::PathBuf,
+    /// The keys of the data directory the join lives in, which its adoptions are sealed under from
+    /// the at-rest level (29 §12.10).
+    keys: focal_seal::DataKeys,
 }
+/// The contexts a client data directory keeps, removed ones included (their names stay bound to
+/// their connections): what the catalogue's one record holds, each with its enrollment's
+/// directory, which a conversion of the node's files lists within this bound.
+pub const MAX_CONTEXTS: usize = 64;
 /// The issuers a client adopted beside its journal (24 §11): issuers its
 /// verified chains carried endorsed by a root it held, kept so a later
 /// succession — endorsed by the adopted issuer, not by the one the
 /// invitation carried — still verifies. Bounded by the roots a verifier
 /// holds; the newest adoptions stay.
 const ADOPTED_FILE: &str = "trust-adopted.bin";
-const ADOPTED_TEMPORARY: &str = "trust-adopted.bin.next";
+/// What an earlier binary staged an adoption through, which a cut could leave in the clear beside
+/// it: removed by the conversion of the node's files (29 §12.10).
+pub(crate) const ADOPTED_TEMPORARY: &str = "trust-adopted.bin.next";
 const ADOPTED_MAGIC: &[u8; 8] = b"FCLTRST1";
 /// The most the file may be: the roots a verifier holds, each an issuer's
 /// certificate and endorsement at the registry's bound, and the envelope.
-const MAX_ADOPTED_BYTES: usize = focal_wire::MAX_TRUST_ROOTS * 2 * 4096 + 1024;
+pub(crate) const MAX_ADOPTED_BYTES: usize = focal_wire::MAX_TRUST_ROOTS * 2 * 4096 + 1024;
 #[derive(Serialize, Deserialize)]
 struct AdoptedTrust {
     schema: u16,
     issuers: Vec<focal_enrollment::IssuerRecord>,
 }
+/// The node files of the data directory whose keys are `keys`, and the name among them of the
+/// adoptions of the join in `directory`: one of the node's small files where the join lives in a
+/// node's data directory, sealed from its at-rest level (29 §12.10). Each path is resolved through
+/// its links first: a command line names its enrollment by the data directory it canonicalized,
+/// and its keys by the one it was given (macOS's temporary directories are `/var` and
+/// `/private/var` of one directory).
+fn adopted_file(
+    keys: &focal_seal::DataKeys,
+    directory: &Path,
+) -> Result<(crate::node_files::NodeFiles, String), JoinError> {
+    let data_dir = keys.data_dir.canonicalize()?;
+    let directory = directory.canonicalize()?;
+    let relative = directory
+        .strip_prefix(&data_dir)
+        .map_err(|_| JoinError::Invalid)?;
+    let mut name = String::new();
+    for part in relative.components() {
+        let std::path::Component::Normal(part) = part else {
+            return Err(JoinError::Invalid);
+        };
+        name.push_str(part.to_str().ok_or(JoinError::Invalid)?);
+        name.push('/');
+    }
+    name.push_str(ADOPTED_FILE);
+    Ok((
+        crate::node_files::NodeFiles::new(&keys.data_dir, Some(keys.clone())),
+        name,
+    ))
+}
 /// The issuers adopted in `directory`, newest last; none when nothing was.
-pub fn adopted_issuers(directory: &Path) -> Result<Vec<focal_enrollment::IssuerRecord>, JoinError> {
-    let path = directory.join(ADOPTED_FILE);
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error.into()),
-    };
-    if !metadata.is_file() || metadata.len() > MAX_ADOPTED_BYTES as u64 {
+pub fn adopted_issuers(
+    keys: &focal_seal::DataKeys,
+    directory: &Path,
+) -> Result<Vec<focal_enrollment::IssuerRecord>, JoinError> {
+    let (files, name) = adopted_file(keys, directory)?;
+    match files.read(&name, MAX_ADOPTED_BYTES)? {
+        Some(bytes) => decode_adopted(&bytes),
+        None => Ok(Vec::new()),
+    }
+}
+/// Whether `bytes` are an adoptions file's, as [`decode_adopted`] holds them to: what a conversion
+/// of the node's files checks before it seals one.
+pub(crate) fn check_adopted(bytes: &[u8]) -> Result<(), crate::embedded::NodeError> {
+    decode_adopted(bytes)
+        .map(|_| ())
+        .map_err(|_| crate::embedded::NodeError::Corrupt("a client's adopted issuers"))
+}
+/// The issuers an adoptions file's `bytes` hold: its magic, the hash of its payload, and the
+/// payload, each issuer what its certificate says.
+fn decode_adopted(bytes: &[u8]) -> Result<Vec<focal_enrollment::IssuerRecord>, JoinError> {
+    if bytes.len() > MAX_ADOPTED_BYTES {
         return Err(JoinError::Invalid);
     }
-    let bytes = fs::read(&path)?;
     let payload = bytes.get(40..).ok_or(JoinError::Invalid)?;
     if bytes.get(..8) != Some(ADOPTED_MAGIC.as_slice())
         || bytes.get(8..40) != Some(blake3::hash(payload).as_bytes().as_slice())
@@ -130,14 +180,18 @@ pub fn adopted_issuers(directory: &Path) -> Result<Vec<focal_enrollment::IssuerR
 /// which anchors the same key and name. Written beside the journal and
 /// replaced atomically; the oldest adoption leaves when the bound is full.
 /// `false` when it was adopted already.
-pub fn adopt_issuer(directory: &Path, adopted: &focal_wire::Adopted) -> Result<bool, JoinError> {
+pub fn adopt_issuer(
+    keys: &focal_seal::DataKeys,
+    directory: &Path,
+    adopted: &focal_wire::Adopted,
+) -> Result<bool, JoinError> {
     let record = match &adopted.issuer {
         Some(issuer) => {
             focal_enrollment::IssuerRecord::of(issuer, Some(adopted.anchor.as_slice()))?
         }
         None => focal_enrollment::IssuerRecord::of(&adopted.anchor, None)?,
     };
-    let mut issuers = adopted_issuers(directory)?;
+    let mut issuers = adopted_issuers(keys, directory)?;
     if issuers
         .iter()
         .any(|known| known.fingerprint == record.fingerprint)
@@ -155,19 +209,8 @@ pub fn adopt_issuer(directory: &Path, adopted: &focal_wire::Adopted) -> Result<b
     let mut bytes = ADOPTED_MAGIC.to_vec();
     bytes.extend_from_slice(blake3::hash(&payload).as_bytes());
     bytes.extend_from_slice(&payload);
-    let temporary = directory.join(ADOPTED_TEMPORARY);
-    match fs::remove_file(&temporary) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    {
-        use std::io::Write;
-        let mut file = focal_platform::fs::create_private_new(&temporary, false, true)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-    }
-    focal_platform::fs::atomic_replace(&temporary, &directory.join(ADOPTED_FILE))?;
+    let (files, name) = adopted_file(keys, directory)?;
+    files.write(&name, &bytes)?;
     Ok(true)
 }
 /// An enrolled client's way to the cluster ([`PendingClientJoin::remote_client`]).
@@ -302,6 +345,7 @@ impl PendingClientJoin {
             bundle,
             key,
             directory: path.to_path_buf(),
+            keys: keys.clone(),
             _journal: journal,
         })
     }
@@ -315,7 +359,7 @@ impl PendingClientJoin {
     /// first, within the bound a verifier holds.
     pub fn trust_roots(&self) -> Result<Vec<Vec<u8>>, JoinError> {
         let mut roots = self.bundle.invitation().trust().root_certificates();
-        for issuer in adopted_issuers(&self.directory)? {
+        for issuer in adopted_issuers(&self.keys, &self.directory)? {
             if roots.len() >= focal_wire::MAX_TRUST_ROOTS {
                 break;
             }

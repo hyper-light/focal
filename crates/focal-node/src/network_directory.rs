@@ -208,6 +208,9 @@ pub(super) struct DirectoryStartup {
     storage: focal_consensus::NodeStorage,
     budget: MemoryBudget,
     root: PathBuf,
+    /// The node's small files, its partition records among them, sealed from the at-rest level
+    /// (29 §12.10).
+    files: crate::node_files::NodeFiles,
 }
 impl DirectoryStartup {
     pub(super) fn new(
@@ -216,8 +219,9 @@ impl DirectoryStartup {
         founder: u64,
         storage: focal_consensus::NodeStorage,
         budget: MemoryBudget,
-        root: PathBuf,
+        files: crate::node_files::NodeFiles,
     ) -> Result<(DirectoryHandle, Self), DirectoryBootstrapError> {
+        let root = files.root().to_path_buf();
         let plan = PartitionPlan::derive(cluster, founder)?;
         let capacity = |_| DirectoryBootstrapError::Capacity;
         let (state, receiver) = watch::channel(None).map_err(capacity)?;
@@ -246,6 +250,7 @@ impl DirectoryStartup {
             storage,
             budget,
             root,
+            files,
         };
         Ok((handle, startup))
     }
@@ -302,7 +307,7 @@ impl DirectoryStartup {
         // At most one drive a partition, and no more partitions than the owner registry's slots.
         let mut extras: focal_rt::Concurrent<HostedFuture<'_>> =
             focal_rt::Concurrent::new(MAX_HOSTED_PARTITIONS)?;
-        let records = load_records(&self.root, self.plan, self.node)?;
+        let records = load_records(&self.files, self.plan, self.node)?;
         let hosted = &self.hosted;
         let pending = &self.pending;
         let (storage, budget, plan_root) = (&self.storage, &self.budget, &self.root);
@@ -354,7 +359,7 @@ impl DirectoryStartup {
                                 continue;
                             }
                             let image = image.map(|image| *image);
-                            record(plan_root, *plan, image.as_ref())?;
+                            record(&self.files, *plan, image.as_ref())?;
                             driving.insert(plan.partition());
                             extras.push(Box::pin(drive_hosted(
                                 *plan, image, root, pool, owners, storage, budget, hosted, pending,
@@ -597,11 +602,11 @@ fn record_path(root: &Path, partition: PartitionId) -> PathBuf {
     ))
 }
 fn record(
-    root: &Path,
+    files: &crate::node_files::NodeFiles,
     plan: PartitionPlan,
     image: Option<&PartitionCheckpoint>,
 ) -> Result<(), ServiceError> {
-    let directory = root.join(RECORD_DIRECTORY);
+    let directory = files.root().join(RECORD_DIRECTORY);
     std::fs::create_dir_all(&directory)?;
     let bytes = postcard::to_stdvec(&HostedRecord {
         schema: RECORD_SCHEMA,
@@ -616,18 +621,89 @@ fn record(
             .flatten(),
     })
     .map_err(|_| ServiceError::Owner("hosted partition record"))?;
-    crate::embedded::atomic_file(&record_path(root, plan.partition()), &bytes)?;
+    files.write(&record_name(plan.partition()), &bytes)?;
     Ok(())
 }
+/// The node file of `partition`'s record.
+fn record_name(partition: PartitionId) -> String {
+    format!(
+        "{RECORD_DIRECTORY}/{:032x}.partition",
+        u128::from_be_bytes(partition.0)
+    )
+}
+/// The record a partition record's `bytes` hold, of any schema it was written in: schema 1 named no
+/// host (the founder's own split destinations), schema 2 named the host and no founding elsewhere.
+fn decode_record(bytes: &[u8]) -> Result<HostedRecord, ServiceError> {
+    let record = match postcard::from_bytes::<HostedRecord>(bytes) {
+        Ok(record) if record.schema == RECORD_SCHEMA => record,
+        _ => match postcard::from_bytes::<HostedRecordV2>(bytes) {
+            Ok(old) if old.schema == 2 => HostedRecord {
+                schema: RECORD_SCHEMA,
+                cluster: old.cluster,
+                founder_node: old.founder_node,
+                delegation: old.delegation,
+                image: old.image,
+                host: old.host,
+                founded_elsewhere: None,
+            },
+            _ => {
+                let old: HostedRecordV1 = postcard::from_bytes(bytes)
+                    .map_err(|_| ServiceError::Owner("hosted partition record is corrupt"))?;
+                if old.schema != 1 {
+                    return Err(ServiceError::Owner("hosted partition record is corrupt"));
+                }
+                HostedRecord {
+                    schema: RECORD_SCHEMA,
+                    cluster: old.cluster,
+                    founder_node: old.founder_node,
+                    delegation: old.delegation,
+                    image: Some(old.image),
+                    host: old.founder_node,
+                    founded_elsewhere: None,
+                }
+            }
+        },
+    };
+    Ok(record)
+}
+
+/// Whether `bytes` are a partition record's, as [`decode_record`] holds them to: what a conversion of
+/// the node's files checks before it seals one.
+pub(crate) fn check_record(bytes: &[u8]) -> Result<(), crate::embedded::NodeError> {
+    decode_record(bytes)
+        .map(|_| ())
+        .map_err(|_| crate::embedded::NodeError::Corrupt("a hosted partition record"))
+}
+
+/// Bytes a varint of a 64-bit integer takes at most (postcard's LEB128), and of a 16-bit one.
+const VARINT: usize = 10;
+const VARINT_16: usize = 3;
+/// Derived: the most a namespace range takes: its start key (32 bytes), and its end's option tag
+/// and key.
+const RANGE_BYTES: usize = 32 + 1 + 32;
+/// Derived: the most a delegation takes: its range; its partition, region and group (16 bytes
+/// each); its epoch; and its fence's option tag and fence: its cluster, operation, source and
+/// destination (16 bytes each), its range, its two epochs and sealed revision, and its two hashes.
+const DELEGATION_BYTES: usize =
+    RANGE_BYTES + 3 * 16 + VARINT + 1 + (4 * 16 + RANGE_BYTES + 3 * VARINT + 2 * 32);
+/// Derived: a record's own fields at their largest: its schema; its cluster (16 bytes); its founder
+/// and host; its delegation; its image's option tag; and its founded-elsewhere option tag, genesis
+/// and digest (32 bytes each). An earlier schema's fields are a part of these.
+const RECORD_FIELDS_BYTES: usize = VARINT_16 + 16 + 2 * VARINT + DELEGATION_BYTES + 1 + 1 + 2 * 32;
+/// Derived: the most a partition record holds: its own fields, and its image, a partition's
+/// checkpoint, which every group's checkpoint holds whole (`ControlBootstrap::Partition`) and
+/// focal-consensus refuses past `IMAGE_BYTES` (`begin_checkpoint_from`, restore).
+pub(crate) const RECORD_BYTES: usize = focal_consensus::IMAGE_BYTES + RECORD_FIELDS_BYTES;
+
 /// Every recorded partition, re-planned from its record; a record that no
 /// longer plans (a foreign cluster, a corrupt image) ends startup rather than
 /// silently dropping a partition this node committed to host.
 fn load_records(
-    root: &Path,
+    files: &crate::node_files::NodeFiles,
     first: PartitionPlan,
     node: u64,
 ) -> Result<Vec<(PartitionPlan, Option<PartitionCheckpoint>)>, ServiceError> {
-    let directory = root.join(RECORD_DIRECTORY);
+    let directory = files.root().join(RECORD_DIRECTORY);
     let entries = match std::fs::read_dir(&directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -646,39 +722,11 @@ fn load_records(
         if records.len() >= MAX_HOSTED_PARTITIONS {
             return Err(ServiceError::Owner("too many hosted partition records"));
         }
-        let bytes = std::fs::read(entry.path())?;
-        // Schema 1 named no host: the founder's own split destinations;
-        // schema 2 named the host and no founding elsewhere.
-        let record: HostedRecord = match postcard::from_bytes::<HostedRecord>(&bytes) {
-            Ok(record) if record.schema == RECORD_SCHEMA => record,
-            _ => match postcard::from_bytes::<HostedRecordV2>(&bytes) {
-                Ok(old) if old.schema == 2 => HostedRecord {
-                    schema: RECORD_SCHEMA,
-                    cluster: old.cluster,
-                    founder_node: old.founder_node,
-                    delegation: old.delegation,
-                    image: old.image,
-                    host: old.host,
-                    founded_elsewhere: None,
-                },
-                _ => {
-                    let old: HostedRecordV1 = postcard::from_bytes(&bytes)
-                        .map_err(|_| ServiceError::Owner("hosted partition record is corrupt"))?;
-                    if old.schema != 1 {
-                        return Err(ServiceError::Owner("hosted partition record is corrupt"));
-                    }
-                    HostedRecord {
-                        schema: RECORD_SCHEMA,
-                        cluster: old.cluster,
-                        founder_node: old.founder_node,
-                        delegation: old.delegation,
-                        image: Some(old.image),
-                        host: old.founder_node,
-                        founded_elsewhere: None,
-                    }
-                }
-            },
-        };
+        let name = format!("{RECORD_DIRECTORY}/{}", entry.file_name().to_string_lossy());
+        let bytes = files.read(&name, RECORD_BYTES)?.ok_or(ServiceError::Owner(
+            "hosted partition record went as it was read",
+        ))?;
+        let record = decode_record(&bytes)?;
         if record.cluster != first.cluster()
             || record.founder_node != first.founder_node()
             || record.host != node
@@ -798,7 +846,7 @@ async fn refresh_authority(
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects
 )]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use focal_directory::{
         ClusterId, DelegationFence, NamespaceKey, NamespaceRange, OperationId, PartitionId,
@@ -865,24 +913,82 @@ mod tests {
         })
         .unwrap();
         std::fs::write(records.join("old.partition"), old).unwrap();
-        // The founder loads its old record as its own split destination.
-        let loaded = load_records(dir.path(), first, 7).unwrap();
+        // The founder loads its old record as its own split destination; with no fence recorded,
+        // its records are in the clear, as every earlier binary wrote them (29 §12.10).
+        let files = crate::node_files::NodeFiles::new(dir.path(), None);
+        let loaded = load_records(&files, first, 7).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].0.host(), 7);
         assert_eq!(loaded[0].0.partition(), PartitionId([9; 16]));
         assert_eq!(loaded[0].1.as_ref(), Some(&image));
         // Another node is not named by it.
-        assert!(load_records(dir.path(), first, 8).is_err());
+        assert!(load_records(&files, first, 8).is_err());
         // A member's replica of the first partition is recorded without an
         // image and loaded as the first plan hosted by it.
         let member = tempfile::tempdir().unwrap();
-        record(member.path(), first.hosted_by(8), None).unwrap();
-        let loaded = load_records(member.path(), first, 8).unwrap();
+        let member_files = crate::node_files::NodeFiles::new(member.path(), None);
+        record(&member_files, first.hosted_by(8), None).unwrap();
+        let loaded = load_records(&member_files, first, 8).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].0.host(), 8);
         assert_eq!(loaded[0].0.partition(), first.partition());
         assert_eq!(loaded[0].0.identity().unwrap(), first.identity().unwrap());
         assert!(loaded[0].1.is_none());
-        assert!(load_records(member.path(), first, 7).is_err());
+        assert!(load_records(&member_files, first, 7).is_err());
+    }
+
+    /// A record's own fields at their largest (every integer its largest, every option present,
+    /// no image) encode to `RECORD_FIELDS_BYTES` exactly, so the bound a reader holds a record to
+    /// follows a field added to it; a record of an earlier schema at its largest takes no more.
+    #[test]
+    fn a_records_own_fields_at_their_largest_are_its_derived_bound() {
+        let range = NamespaceRange {
+            start: NamespaceKey([0xff; 32]),
+            end: Some(NamespaceKey([0xff; 32])),
+        };
+        let delegation = Delegation {
+            namespace: range,
+            partition: PartitionId([0xff; 16]),
+            region: RegionId([0xff; 16]),
+            log_group: focal_directory::LogGroupId([0xff; 16]),
+            epoch: u64::MAX,
+            activation: Some(DelegationFence {
+                cluster: ClusterId([0xff; 16]),
+                operation: OperationId([0xff; 16]),
+                source: PartitionId([0xff; 16]),
+                destination: PartitionId([0xff; 16]),
+                namespace: range,
+                from_epoch: u64::MAX,
+                to_epoch: u64::MAX,
+                sealed_revision: u64::MAX,
+                checkpoint: focal_model::ContentHash([0xff; 32]),
+                destination_ready: focal_model::ContentHash([0xff; 32]),
+            }),
+        };
+        let largest = HostedRecord {
+            schema: u16::MAX,
+            cluster: [0xff; 16],
+            founder_node: u64::MAX,
+            delegation,
+            image: None,
+            host: u64::MAX,
+            founded_elsewhere: Some(([0xff; 32], focal_model::ContentHash([0xff; 32]))),
+        };
+        assert_eq!(
+            postcard::to_stdvec(&largest).unwrap().len(),
+            RECORD_FIELDS_BYTES
+        );
+        assert_eq!(
+            RECORD_BYTES,
+            focal_consensus::IMAGE_BYTES + RECORD_FIELDS_BYTES
+        );
+    }
+
+    /// A member's record of the first partition of a cluster, written through `files` as hosting
+    /// writes one: what a test of the node's files plants (29 §12.10). Its name among the files.
+    pub(crate) fn plant_record(files: &crate::node_files::NodeFiles) -> String {
+        let first = PartitionPlan::derive([3; 16], 7).unwrap();
+        record(files, first.hosted_by(8), None).unwrap();
+        record_name(first.partition())
     }
 }

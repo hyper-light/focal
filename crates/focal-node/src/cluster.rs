@@ -1,6 +1,6 @@
 //! Founding root metadata and enrollment owner. Public decisions use a distinct
 //! Raft group on the node's shared WAL; private CA/draft custody stays local.
-use crate::embedded::{EmbeddedNode, NodeIdentity, atomic_file, durable_dir, read_bounded};
+use crate::embedded::{EmbeddedNode, NodeIdentity, atomic_file, durable_dir};
 use focal_consensus::NodeConfig;
 use focal_control::*;
 use focal_directory::{AuthorityVerifier, DirectoryError, RootConfig, RootDirectory};
@@ -119,51 +119,18 @@ impl RootEnrollment {
         let group = group_id(identity.cluster);
         let budget = MemoryBudget::new(64 * 1024 * 1024, 16 * 1024 * 1024)
             .map_err(|_| ClusterError::Bootstrap)?;
-        let path = directory.join("BOOTSTRAP");
+        // The root's genesis, one of the node's small files, sealed from the at-rest level
+        // (29 §12.10).
+        let files = crate::node_files::NodeFiles::new(root, Some(keys.clone()));
         let marker = directory.join("BOOTSTRAP.initialized");
-        let genesis = if path.exists() {
-            let bytes = read_bounded(&path, 8 * 1024 * 1024)?;
-            let payload = bytes.get(40..).ok_or(ClusterError::Bootstrap)?;
-            if bytes.get(..8) != Some(b"FCLROOT1".as_slice())
-                || Some(blake3::hash(payload).as_bytes().as_slice()) != bytes.get(8..40)
-            {
-                return Err(ClusterError::Bootstrap);
-            }
-            postcard::from_bytes::<Genesis>(payload).map_err(|_| ClusterError::Bootstrap)?
+        let genesis = if let Some(bytes) = files.read(BOOTSTRAP, GENESIS_BYTES)? {
+            decode_genesis(&bytes)?
         } else {
             if marker.exists() {
                 return Err(ClusterError::Bootstrap);
             }
-            // The existing founding node ID is reserved. A newly enrolled peer
-            // must never receive that identity merely because it joined first.
-            let next_node = identity
-                .node
-                .checked_add(1)
-                .ok_or(ClusterError::Bootstrap)?;
-            let registry = EnrollmentRegistry::new(
-                identity.cluster,
-                authority.ca_certificate().to_vec(),
-                next_node,
-                EnrollmentLimits::default(),
-            )?;
-            let directory = RootDirectory::new(
-                focal_directory::ClusterId(identity.cluster),
-                RootConfig::default(),
-                budget.clone(),
-            )
-            .map_err(|_| ClusterError::Bootstrap)?;
-            let genesis = Genesis {
-                schema: 1,
-                cluster: identity.cluster,
-                founder: identity.node,
-                group,
-                bootstrap: ControlBootstrap::root(&directory, &registry)?,
-            };
-            let bytes = postcard::to_stdvec(&genesis).map_err(|_| ClusterError::Bootstrap)?;
-            let mut framed = b"FCLROOT1".to_vec();
-            framed.extend_from_slice(blake3::hash(&bytes).as_bytes());
-            framed.extend_from_slice(&bytes);
-            atomic_file(&path, &framed)?;
+            let genesis = founding_genesis(identity, authority.ca_certificate(), group, &budget)?;
+            files.write(BOOTSTRAP, &encode_genesis(&genesis)?)?;
             genesis
         };
         if genesis.schema != 1
@@ -442,5 +409,158 @@ impl JoinHandler for EnrollmentHost {
                 }
             }
         })
+    }
+}
+
+/// The node file the root's genesis is kept in.
+const BOOTSTRAP: &str = "cluster/BOOTSTRAP";
+
+/// Format: what a genesis file begins with, then the hash of its payload and the payload.
+const GENESIS_MAGIC: &[u8; 8] = b"FCLROOT1";
+
+/// Derived: a genesis file's framing and own fields at their largest: its magic (8 bytes) and its
+/// payload's hash (32), its schema (a varint of a 16-bit integer), its cluster and group (16 bytes
+/// each), and its founder (a varint of a 64-bit one).
+const GENESIS_FIELDS_BYTES: usize = 8 + 32 + 3 + 16 + 16 + 10;
+
+/// Derived: the most a genesis file holds: its own fields, and the root's founding bootstrap, the
+/// state its control group founds on and checkpoints whole, which focal-consensus refuses past
+/// `IMAGE_BYTES`.
+pub(crate) const GENESIS_BYTES: usize = focal_consensus::IMAGE_BYTES + GENESIS_FIELDS_BYTES;
+
+/// The root's genesis for the founder `identity` names, its enrollment authority's certificate
+/// `ca`: its control group `group` founded on an empty directory and a registry whose next node
+/// follows the founder's.
+fn founding_genesis(
+    identity: &NodeIdentity,
+    ca: &[u8],
+    group: [u8; 16],
+    budget: &MemoryBudget,
+) -> Result<Genesis, ClusterError> {
+    // The existing founding node ID is reserved. A newly enrolled peer
+    // must never receive that identity merely because it joined first.
+    let next_node = identity
+        .node
+        .checked_add(1)
+        .ok_or(ClusterError::Bootstrap)?;
+    let registry = EnrollmentRegistry::new(
+        identity.cluster,
+        ca.to_vec(),
+        next_node,
+        EnrollmentLimits::default(),
+    )?;
+    let directory = RootDirectory::new(
+        focal_directory::ClusterId(identity.cluster),
+        RootConfig::default(),
+        budget.clone(),
+    )
+    .map_err(|_| ClusterError::Bootstrap)?;
+    Ok(Genesis {
+        schema: 1,
+        cluster: identity.cluster,
+        founder: identity.node,
+        group,
+        bootstrap: ControlBootstrap::root(&directory, &registry)?,
+    })
+}
+
+/// A genesis file's bytes: its magic, the hash of its payload, and the payload.
+fn encode_genesis(genesis: &Genesis) -> Result<Vec<u8>, ClusterError> {
+    let bytes = postcard::to_stdvec(genesis).map_err(|_| ClusterError::Bootstrap)?;
+    let mut framed = Vec::new();
+    framed
+        .try_reserve_exact(
+            GENESIS_MAGIC
+                .len()
+                .saturating_add(32)
+                .saturating_add(bytes.len()),
+        )
+        .map_err(|_| ClusterError::Bootstrap)?;
+    framed.extend_from_slice(GENESIS_MAGIC);
+    framed.extend_from_slice(blake3::hash(&bytes).as_bytes());
+    framed.extend_from_slice(&bytes);
+    Ok(framed)
+}
+
+/// The genesis a genesis file's `bytes` hold: its magic, the hash of its payload, and the payload.
+fn decode_genesis(bytes: &[u8]) -> Result<Genesis, ClusterError> {
+    let payload = bytes.get(40..).ok_or(ClusterError::Bootstrap)?;
+    if bytes.get(..8) != Some(GENESIS_MAGIC.as_slice())
+        || Some(blake3::hash(payload).as_bytes().as_slice()) != bytes.get(8..40)
+    {
+        return Err(ClusterError::Bootstrap);
+    }
+    postcard::from_bytes::<Genesis>(payload).map_err(|_| ClusterError::Bootstrap)
+}
+
+/// Whether `bytes` are a genesis file's, as [`decode_genesis`] holds them to: what a conversion of
+/// the node's files checks before it seals one.
+pub(crate) fn check_genesis(bytes: &[u8]) -> Result<(), crate::embedded::NodeError> {
+    decode_genesis(bytes)
+        .map(|_| ())
+        .map_err(|_| crate::embedded::NodeError::Corrupt("the root's genesis"))
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    /// A founder's identity, the root's group of its cluster and its founding bootstrap, its
+    /// enrollment authority made beside `root`.
+    fn founding(root: &Path) -> (NodeIdentity, Genesis) {
+        let identity = crate::embedded::new_identity().unwrap();
+        let authority = BootstrapAuthority::open_or_create(
+            root.join("planted-root-authority"),
+            &focal_seal::test_keys(root).unwrap(),
+            identity.cluster,
+            vec!["localhost".into()],
+            1_783_000_000,
+        )
+        .unwrap();
+        let budget = MemoryBudget::new(64 * 1024 * 1024, 16 * 1024 * 1024).unwrap();
+        let genesis = founding_genesis(
+            &identity,
+            authority.ca_certificate(),
+            group_id(identity.cluster),
+            &budget,
+        )
+        .unwrap();
+        (identity, genesis)
+    }
+
+    /// The root's genesis of a founder whose node files are `files`, written as its root's
+    /// enrollment writes it: what a test of the node's files plants (29 §12.10). Its name among
+    /// the files.
+    pub(crate) fn plant_genesis(files: &crate::node_files::NodeFiles) -> String {
+        let (_, genesis) = founding(files.root());
+        std::fs::create_dir_all(files.root().join("cluster")).unwrap();
+        files
+            .write(BOOTSTRAP, &encode_genesis(&genesis).unwrap())
+            .unwrap();
+        BOOTSTRAP.to_owned()
+    }
+
+    /// A genesis file's framing and own fields at their largest (every integer its largest) take
+    /// `GENESIS_FIELDS_BYTES` beside its bootstrap exactly, so the bound a reader holds a genesis
+    /// to follows a field added to it; and a founding genesis reads back as written.
+    #[test]
+    fn a_genesis_files_own_fields_at_their_largest_are_its_derived_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, genesis) = founding(dir.path());
+        let bootstrap = postcard::to_stdvec(&genesis.bootstrap).unwrap().len();
+        let largest = Genesis {
+            schema: u16::MAX,
+            cluster: [0xff; 16],
+            founder: u64::MAX,
+            group: [0xff; 16],
+            bootstrap: genesis.bootstrap,
+        };
+        let framed = encode_genesis(&largest).unwrap();
+        assert_eq!(framed.len(), GENESIS_FIELDS_BYTES + bootstrap);
+        assert!(check_genesis(&framed).is_ok());
+        assert_eq!(
+            GENESIS_BYTES,
+            focal_consensus::IMAGE_BYTES + GENESIS_FIELDS_BYTES
+        );
     }
 }

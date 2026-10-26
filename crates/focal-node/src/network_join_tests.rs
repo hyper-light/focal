@@ -699,7 +699,10 @@ fn a_client_adopts_the_endorsed_issuers_it_did_not_hold_within_the_bound_and_ref
     let dir = tempfile::tempdir().unwrap();
     let directory = dir.path().join("enrollment-alice");
     std::fs::create_dir_all(&directory).unwrap();
-    assert!(adopted_issuers(&directory).unwrap().is_empty());
+    // The data directory's keys, which its adoptions are sealed under from its at-rest level; with
+    // no fence recorded, written in the clear, as every earlier binary wrote them (29 §12.10).
+    let keys = focal_seal::test_keys(dir.path()).unwrap();
+    assert!(adopted_issuers(&keys, &directory).unwrap().is_empty());
     let authority_at = |name: &str| {
         focal_enrollment::BootstrapAuthority::open_or_create(
             dir.path().join(name),
@@ -715,9 +718,9 @@ fn a_client_adopts_the_endorsed_issuers_it_did_not_hold_within_the_bound_and_ref
         anchor: first.ca_certificate().to_vec(),
         issuer: None,
     };
-    assert!(adopt_issuer(&directory, &adopted).unwrap());
-    assert!(!adopt_issuer(&directory, &adopted).unwrap());
-    let recorded = adopted_issuers(&directory).unwrap();
+    assert!(adopt_issuer(&keys, &directory, &adopted).unwrap());
+    assert!(!adopt_issuer(&keys, &directory, &adopted).unwrap());
+    let recorded = adopted_issuers(&keys, &directory).unwrap();
     assert_eq!(recorded.len(), 1);
     assert_eq!(recorded[0], first.issuer_record().unwrap());
     // The bound: the oldest adoption leaves for the newest.
@@ -726,6 +729,7 @@ fn a_client_adopts_the_endorsed_issuers_it_did_not_hold_within_the_bound_and_ref
         let authority = authority_at(name);
         assert!(
             adopt_issuer(
+                &keys,
                 &directory,
                 &focal_wire::Adopted {
                     anchor: authority.ca_certificate().to_vec(),
@@ -736,7 +740,7 @@ fn a_client_adopts_the_endorsed_issuers_it_did_not_hold_within_the_bound_and_ref
         );
         fingerprints.push(authority.issuer_record().unwrap().fingerprint);
     }
-    let recorded = adopted_issuers(&directory).unwrap();
+    let recorded = adopted_issuers(&keys, &directory).unwrap();
     assert_eq!(recorded.len(), focal_wire::MAX_TRUST_ROOTS);
     assert_eq!(
         recorded
@@ -752,7 +756,7 @@ fn a_client_adopts_the_endorsed_issuers_it_did_not_hold_within_the_bound_and_ref
     bytes[last] ^= 0x01;
     std::fs::write(&path, &bytes).unwrap();
     assert!(matches!(
-        adopted_issuers(&directory),
+        adopted_issuers(&keys, &directory),
         Err(JoinError::Invalid)
     ));
 }

@@ -2,15 +2,21 @@
 //! placement intent pinned when the store was created and changed since
 //! only by plan and apply, kept in the data directory's `POLICY` file with
 //! a revision and a hash. A missing policy beside an existing store is
-//! data loss, never permission to choose a new guarantee.
+//! data loss, never permission to choose a new guarantee. The file is one
+//! of the node's small files, sealed from the at-rest level (29 §12.10).
 use super::{ConfigError, Durability, Placement};
+use crate::node_files::NodeFiles;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// `FCLPOL2`: the committed policy with its revision; the original file
 /// held the bare `(durability, placement)` pair, which reads as revision 1.
 const MAGIC: &[u8; 8] = b"FCLPOL2\0";
-const MAX_BYTES: usize = 64 * 1024;
+/// Derived: the most a `POLICY` file holds: an intent's durability and placement, its revision and
+/// hash, its regions and residency at their configured bounds, within 64 KiB.
+pub(crate) const MAX_BYTES: usize = 64 * 1024;
+/// The node file the committed policy is kept in.
+const POLICY: &str = "POLICY";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyIntent {
@@ -93,37 +99,38 @@ impl CommittedPolicy {
     }
 }
 
-fn policy_path(root: &Path) -> std::path::PathBuf {
-    root.join("POLICY")
-}
 fn marker_path(root: &Path) -> std::path::PathBuf {
     root.join("POLICY.initialized")
 }
-fn read_bounded(path: &Path) -> Result<Vec<u8>, ConfigError> {
-    use std::io::Read as _;
-    let mut file = std::fs::File::open(path)
-        .map_err(|error| ConfigError::PolicyEncoding(error.to_string()))?;
-    let mut bytes = Vec::new();
-    file.by_ref()
-        .take((MAX_BYTES as u64).saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|error| ConfigError::PolicyEncoding(error.to_string()))?;
-    if bytes.len() > MAX_BYTES {
-        return Err(ConfigError::PolicyEncoding("policy file too large".into()));
-    }
-    Ok(bytes)
+/// Whether `bytes` are a `POLICY` file's, as [`CommittedPolicy::decode`] holds them to: what a
+/// conversion of the node's files checks before it seals one.
+pub(crate) fn check(bytes: &[u8]) -> Result<(), crate::embedded::NodeError> {
+    CommittedPolicy::decode(bytes)
+        .map(|_| ())
+        .map_err(crate::embedded::NodeError::from)
 }
-/// The committed policy of the store under `root`, `None` before one is
-/// pinned. A marker without a file is a lost policy.
-pub fn read_committed(root: &Path) -> Result<Option<CommittedPolicy>, ConfigError> {
-    let path = policy_path(root);
-    if path.exists() {
-        return CommittedPolicy::decode(&read_bounded(&path)?).map(Some);
+/// The committed policy of the store whose node files are `files`, `None`
+/// before one is pinned. A marker without a file is a lost policy.
+pub fn read_committed(files: &NodeFiles) -> Result<Option<CommittedPolicy>, ConfigError> {
+    match files
+        .read(POLICY, MAX_BYTES)
+        .map_err(|error| ConfigError::PolicyEncoding(error.to_string()))?
+    {
+        Some(bytes) => CommittedPolicy::decode(&bytes).map(Some),
+        None if marker_path(files.root()).exists() => Err(ConfigError::PolicyMissing),
+        None => Ok(None),
     }
-    if marker_path(root).exists() {
-        return Err(ConfigError::PolicyMissing);
-    }
-    Ok(None)
+}
+/// [`read_committed`] of the data directory `root` beside its running owner, or before one starts:
+/// its node files opened under the keys `settings` finds for it, made nowhere.
+pub fn read_committed_in(
+    settings: &super::Settings,
+    root: &Path,
+) -> Result<Option<CommittedPolicy>, ConfigError> {
+    let keys = settings
+        .found_data_keys(root)
+        .map_err(|error| ConfigError::PolicyEncoding(error.to_string()))?;
+    read_committed(&NodeFiles::new(root, keys))
 }
 /// Whether the directory already holds a store the policy must have been
 /// pinned for.
@@ -136,20 +143,22 @@ fn store_exists(root: &Path) -> bool {
 /// of an existing one: a difference is refused by the field that differs,
 /// never overwritten. Existing policy bytes keep their original encoding.
 pub fn install_or_check(
-    root: &Path,
+    files: &NodeFiles,
     intent: &PolicyIntent,
-    write: impl Fn(&Path, &[u8]) -> Result<(), std::io::Error>,
 ) -> Result<CommittedPolicy, ConfigError> {
-    let path = policy_path(root);
+    let root = files.root();
     let marker = marker_path(root);
-    match read_committed(root)? {
+    let write_marker = || {
+        crate::embedded::atomic_file(&marker, b"deployment policy installed")
+            .map_err(|error| ConfigError::PolicyEncoding(error.to_string()))
+    };
+    match read_committed(files)? {
         Some(committed) => {
             if let Some(field) = committed.intent.differing_field(intent) {
                 return Err(ConfigError::CommittedPolicyChange { field });
             }
             if !marker.exists() {
-                write(&marker, b"deployment policy installed")
-                    .map_err(|error| ConfigError::PolicyEncoding(error.to_string()))?;
+                write_marker()?;
             }
             Ok(committed)
         }
@@ -162,10 +171,10 @@ pub fn install_or_check(
                 hash: intent.hash()?,
                 intent: intent.clone(),
             };
-            write(&path, &committed.encode()?)
+            files
+                .write(POLICY, &committed.encode()?)
                 .map_err(|error| ConfigError::PolicyEncoding(error.to_string()))?;
-            write(&marker, b"deployment policy installed")
-                .map_err(|error| ConfigError::PolicyEncoding(error.to_string()))?;
+            write_marker()?;
             Ok(committed)
         }
     }
@@ -173,12 +182,11 @@ pub fn install_or_check(
 /// Commit a new revision of the policy (plan and apply, doc 08 §9): the
 /// next revision of the current one, written atomically by `write`.
 pub fn commit(
-    root: &Path,
+    files: &NodeFiles,
     intent: &PolicyIntent,
     expected: PolicyRevision,
-    write: impl FnOnce(&Path, &[u8]) -> Result<(), std::io::Error>,
 ) -> Result<CommittedPolicy, ConfigError> {
-    let current = read_committed(root)?.ok_or(ConfigError::PolicyMissing)?;
+    let current = read_committed(files)?.ok_or(ConfigError::PolicyMissing)?;
     if current.revision != expected {
         return Err(ConfigError::PolicyEncoding(format!(
             "policy revision {} is not the expected {}",
@@ -190,7 +198,8 @@ pub fn commit(
         hash: intent.hash()?,
         intent: intent.clone(),
     };
-    write(&policy_path(root), &committed.encode()?)
+    files
+        .write(POLICY, &committed.encode()?)
         .map_err(|error| ConfigError::PolicyEncoding(error.to_string()))?;
     Ok(committed)
 }

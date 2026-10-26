@@ -34,8 +34,10 @@ const MAGIC: &[u8; 8] = b"FCLINV01";
 const CLIENT_MAGIC: &[u8; 8] = b"FCLCLI01";
 #[path = "client_join.rs"]
 mod client;
+pub(crate) use client::{ADOPTED_TEMPORARY, MAX_ADOPTED_BYTES, check_adopted};
 pub use client::{
-    ClientInvitation, EnrolledClient, PendingClientJoin, adopt_issuer, adopted_issuers,
+    ClientInvitation, EnrolledClient, MAX_CONTEXTS, PendingClientJoin, adopt_issuer,
+    adopted_issuers,
 };
 #[path = "joined_context.rs"]
 mod joined_context;

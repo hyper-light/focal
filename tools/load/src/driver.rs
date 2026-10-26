@@ -30,11 +30,7 @@ use focal_model::{
     ClaimId, LedgerId, ParticipantId, RequestEpoch, RequestId, RequestKey, RootCommandId,
     RouteEpoch, SessionSeq,
 };
-use focal_node::{
-    config::Settings,
-    embedded::{EmbeddedNode, decode_identity},
-    host::LocalHost,
-};
+use focal_node::{config::Settings, embedded::EmbeddedNode, host::LocalHost};
 use focal_wire::{
     AccessError, AuthenticatedPeer, NativeClaimExpand, NativeErrorCode, NativeMutationReply,
     NativeObject, NativeReadQuery, NativeReadRequest, NativeRefusalKind, Operation, PeerGrant,
@@ -1976,7 +1972,7 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
             settings.node.data_dir = Some(root.clone());
             focal_node::native_activation::activate_local(&settings, profile)?;
             let hosted = Hosted::open(&settings, &limits)?;
-            let identity = decode_identity(&root.join("IDENTITY"))?;
+            let identity = focal_node::node_files::read_identity(&settings, &root)?;
             let names = Names {
                 ledger: identity.ledger,
                 issuer: identity.issuer,
@@ -1995,7 +1991,7 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
                 .data_dir
                 .clone()
                 .ok_or_else(|| LoadError::Shape("transport unix needs data_dir".into()))?;
-            let identity = decode_identity(&root.join("IDENTITY"))?;
+            let identity = focal_node::node_files::read_identity(&settings, &root)?;
             let now = i64::try_from(
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)

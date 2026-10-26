@@ -603,7 +603,22 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
     assert_eq!(control["partitions"][0]["tolerates_node"], 1, "{control}");
     let journal = founder.join("cluster/apply").join(&plan_id);
     assert!(journal.join("JOURNAL").is_file());
-    assert_eq!(std::fs::read(journal.join("PLAN")).unwrap(), bytes);
+    // The plan kept beside its journal is the plan applied: one of the node's small files, sealed
+    // from the at-rest level (29 §12.10), read under the node's keys as a command line reads it.
+    let mut settings = focal_node::config::Settings::default();
+    settings.node.data_dir = Some(founder.to_path_buf());
+    let node_files =
+        focal_node::node_files::NodeFiles::new(founder, settings.found_data_keys(founder).unwrap());
+    assert_eq!(
+        node_files
+            .read(
+                &format!("cluster/apply/{plan_id}/PLAN"),
+                focal_node::deployment::plan::MAX_PLAN_BYTES
+            )
+            .unwrap()
+            .unwrap(),
+        bytes
+    );
     let active = session(&placement(founder).unwrap()).unwrap().clone();
     assert_eq!(active["pending"], Value::Null, "{active}");
     assert_eq!(active["route_epoch"], 2);

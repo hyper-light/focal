@@ -121,7 +121,8 @@ fn expansion_rejects_missing_policy_before_creating_network_credentials() {
         assert!(!directory.path().join("POLICY").exists());
         assert!(!directory.path().join("cluster/network").exists());
         assert_eq!(
-            crate::embedded::decode_identity(&directory.path().join("IDENTITY")).unwrap(),
+            crate::node_files::read_identity(&crate::config::Settings::default(), directory.path())
+                .unwrap(),
             identity
         );
     })

@@ -12,7 +12,7 @@ pub mod observe;
 pub mod plan;
 pub mod render;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use crate::config::{ConfigError, FailureDomain};
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,11 @@ pub enum DeploymentError {
     Admin(#[from] crate::cluster_admin::ClusterAdminError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// A plan or journal, one of the node's small files, refused as its node files refuse one
+    /// (29 §12.10): sealed and not opening under the directory's keys, or in the clear after the
+    /// directory's mark.
+    #[error(transparent)]
+    Node(#[from] crate::embedded::NodeError),
     #[error("deployment artifact encoding: {0}")]
     Encoding(String),
     #[error("deployment artifact is corrupt: {0}")]
@@ -77,7 +82,18 @@ impl DeploymentError {
                 exit_code: 6,
             },
             Self::NoConfig | Self::Render(_) => Failure::error("invalid_input", 2),
-            Self::Config(_) | Self::Admin(_) | Self::Io(_) => Failure::error("deployment", 1),
+            // A plan or journal refused as a node file: changed, moved, carried in, past its
+            // bound, or in the clear after its directory's mark.
+            Self::Node(
+                crate::embedded::NodeError::SealedFile(_)
+                | crate::embedded::NodeError::ClearAfterSealed(_)
+                | crate::embedded::NodeError::MovedNodeFile(_)
+                | crate::embedded::NodeError::PastBound { .. }
+                | crate::embedded::NodeError::Corrupt(_),
+            ) => Failure::error("plan_corrupt", 2),
+            Self::Config(_) | Self::Admin(_) | Self::Io(_) | Self::Node(_) => {
+                Failure::error("deployment", 1)
+            }
         }
     }
 }

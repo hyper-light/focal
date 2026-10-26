@@ -290,7 +290,7 @@ async fn explain(
     // when one exists; every value names its source (doc 08 §9).
     let (committed, sources) = {
         let root = settings.data_dir()?;
-        let committed = focal_node::config::policy::read_committed(&root)
+        let committed = focal_node::config::policy::read_committed_in(settings, &root)
             .ok()
             .flatten();
         let file = inputs.config.and_then(|path| {

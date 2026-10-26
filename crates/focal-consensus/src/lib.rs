@@ -133,7 +133,7 @@ pub(crate) fn check_restore_image(image: &RestoredLog) -> Result<(), ConsensusEr
 pub(crate) const COMMITTED_PAGE_BYTES: u64 = 16 * 1024 * 1024;
 /// The most bytes of the application's state a snapshot, a checkpoint or a
 /// restored image holds.
-pub(crate) const IMAGE_BYTES: usize = 8 * 1024 * 1024;
+pub const IMAGE_BYTES: usize = 8 * 1024 * 1024;
 /// The largest entry any group may be configured to take (`NodeConfig::max_entry_bytes`): what a
 /// frame of the node's log holds alone, whichever group writes it.
 pub const MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;

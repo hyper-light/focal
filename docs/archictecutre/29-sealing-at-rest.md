@@ -281,7 +281,7 @@ private journals (`focal_enrollment::PrivateJournal`), sealed with the private d
 | Bus identities | the bus's identity directory | its local CA's and members' keys | focal-bus `pki` | sealed (§12.9) |
 | Bus part | a part's `part.image`, the node's `run` | streams' floors, producers' sessions; the node's run | focal-bus `group`, `member` | sealed (§12.9) |
 | Client stores | a client's data directory (`client/…`), `MCP.operations/` | requests, receipts, pending writes, artifact uploads | focal-client `operation_store`, `native_store`, `pending`, `artifact_transfer`, `managed_store` | clear |
-| Node files | `IDENTITY`, `POLICY`, `NETWORK`, `SESSION.memory`, `trust-adopted.bin`, `cluster/partitions/*.partition`, `cluster/BOOTSTRAP`, `cluster/apply/<plan>/{PLAN,JOURNAL}`, `cluster/pending-retires/` | the node's identity, policy, network state, founded allowance, adopted trust, partition records, the root's genesis, deployment journals, retirements to finish | focal-node | clear |
+| Node files | `IDENTITY`, `POLICY`, `NETWORK`, `SESSION.memory`, `trust-adopted.bin`, `cluster/partitions/*.partition`, `cluster/BOOTSTRAP`, `cluster/apply/<plan>/{PLAN,JOURNAL}`, `cluster/pending-retires` | the node's identity, policy, network state, founded allowance, adopted trust, partition records, the root's genesis, deployment journals, retirements to finish | focal-node `node_files` | sealed from the at-rest level (§12.10) |
 
 **In the clear by design**, each for what it is:
 
@@ -293,8 +293,9 @@ private journals (`focal_enrollment::PrivateJournal`), sealed with the private d
   opens one; a level and its CRC.
 - Locks (`LOCK`, `*.lock`) and markers: empty files held for their locks, `*.initialized` files a
   writer leaves to say its store was made (a fixed sentence each), and the empty `SEALING` and
-  `SEALED` of a store converting and converted, and a content store's `REST_SEALING` and
-  `REST_SEALED` for its files beside its objects (§12.7).
+  `SEALED` of a store converting and converted, a content store's `REST_SEALING` and
+  `REST_SEALED` for its files beside its objects (§12.7), and the empty `FILES.SEALED` of a data
+  directory whose node files are sealed (§12.10).
 - What an operator asks for in the clear, outside any data directory: an artifact downloaded to a
   file it names, a trace written where it says, a deployment plan's output, and an invitation
   bundle handed to a joiner, a bearer credential kept owner-only and spent once.
@@ -954,3 +955,95 @@ and clients share in the bus's standalone mode. Each is now sealed:
   opened with no temporary of it left (`tests/group.rs`). The transport's own test: a peer
   told its connection closed within a keep-alive of a restart with the kept key, and only at its
   idle timeout with another (hyper-raft `exchange::a_restarted_endpoint_resets_what_its_last_run_held`).
+
+### 12.10 A node's small files, sealed (2026-10-25)
+
+A node keeps a handful of small files beside its stores: its identity (`IDENTITY`), its committed
+policy (`POLICY`), its network state (`NETWORK`), the allowance of the session it founded
+(`SESSION.memory`), its root's genesis (`cluster/BOOTSTRAP`), each partition it hosts
+(`cluster/partitions/*.partition`), each deployment it applied (`cluster/apply/<plan>/PLAN` and
+`JOURNAL`), the partitions whose host it has to retire (`cluster/pending-retires`), and the issuers
+each client enrollment in its data directory adopted (`CLIENT.contexts/enrollment-*/trust-adopted.bin`).
+Each was written in the clear through the atomic replace every node file is written by. Each is now
+one of the node's files (`node_files::NodeFiles`), sealed once the fence the directory records opens
+the at-rest level:
+
+- **Sealed whole, its name bound.** A node file is sealed whole through `focal_seal::file` under
+  the directory's journal key (`Store::Journal`), unwrapped for each write and dropped after (a
+  conversion unwraps it once for every file it seals). Its plaintext is a frame: `FCLNFIL1`, its
+  name's length and its name relative to the data directory, then the file's bytes as its writer
+  made them. A file moved to another's name opens to a frame naming another file, and one carried
+  in from another directory opens under no key of this one's, so both are refused, as a changed
+  byte is. A sealed file begins with `FCLNSEAL` in the clear, which says what it is and nothing of
+  what it holds, so either form is told from the file alone (a sealed file's own header has no
+  magic, and some node files, the allowance and the partition records, have none either).
+- **The form read at each write.** Below the level a node file is written byte for byte as every
+  earlier binary wrote it, so a binary below the level may still be rolled back to. The form is
+  read from the fence the directory records (`STORAGE.level`) at each write, not fixed when the
+  directory opened: a node founded at the level writes its identity before its fence is recorded,
+  and a node whose fence rose while it ran seals what it writes from then on.
+- **Converted at the start, under the lock, before the node serves.** `NodeFiles::convert` visits
+  every node file: one in the clear is checked by the rule its own reader holds it to, written
+  sealed through the atomic replace that writes it, and the directory is then marked
+  (`FILES.SEALED`, empty, in the clear by design); one sealed already, by a conversion a crash cut
+  or a write since the fence rose, is opened to check it and left. What a cut install left beside a
+  file, its temporary holding it in the clear, is removed (`.install`, and an earlier binary's
+  `trust-adopted.bin.next`). A cut anywhere leaves each file whole in one form or the other, and the
+  next start finishes. It runs where every start opens its directory, under the directory's lock
+  (`NodeDirectory`), and where a start first records a fence at the level (`storage_start`), so a
+  node founded at the level, or joining a cluster at it, seals its files during its first start.
+  The partition records are listed within the partitions a node may host, the enrollments within
+  the contexts a data directory keeps; every plan the directory holds is converted, none skipped,
+  as one left in the clear would be refused once the directory is marked.
+- **Refused in the clear after the mark.** Before the mark a reader takes either form; from it a
+  node file in the clear is refused by name (`NodeError::ClearAfterSealed`). A mark or a file that
+  cannot be looked for is an error, never its absence: a policy whose file could not be looked for
+  would read as no policy, and a mark as no mark.
+- **The identity no longer names the keys.** A directory whose keys an earlier binary made under
+  the root key file named for its node (`<node>.key`) found that file by reading its identity. The
+  identity sealed, the keys would be found by what they open. Before the identity is sealed, the
+  key file is linked under the name its root key's ID gives it (`Settings::name_key_file`: one key,
+  two names; copied where the file system holds no links), the name every directory made since is
+  found by, and a sealed identity names no legacy file.
+- **One reader of the identity.** The identity was read by its path in seven places of focal-node's
+  tests and two of the load tool's driver (`embedded::decode_identity`), which would have refused
+  every node founded at the level. The path reader is gone; every reader opens the directory's node
+  files (`node_files::read_identity`), in either form.
+- **A client's own data directory.** A data directory that hosts no node records no fence, and the
+  issuers its enrollments adopted stay in the clear until its client stores are sealed (step 7).
+- **Found on the way.** Three node files were read whole with no bound: the founded allowance and
+  the pending retirements (`std::fs::read`), and each partition record. Each is read within its
+  bound now: 21 bytes; a partition ID for each partition a node may host; and a partition record's
+  own fields at their largest (452 bytes, pinned to its types by a test) and its image, a
+  partition's checkpoint, which every group's checkpoint holds whole and focal-consensus refuses
+  past `IMAGE_BYTES` (8 MiB). The record's bound had cited the root authority's checkpoint bound,
+  of the same size and another thing; the root's genesis is held the same way, its fields (85
+  bytes) beside the founding bootstrap its control group founds on. A file past its bound was refused as "node identity or
+  stored policy is corrupt or incompatible", whichever file it was; it is refused by its path and
+  bound now (`NodeError::PastBound`). And the plans a node applied are never pruned: `cluster/apply`
+  grows with every apply (`inspect deployment` lists 64 of them, an undrived bound). Open.
+- **Measured** (this Mac, release, medians of 101 rounds interleaved with the same bytes installed
+  in the clear, under other sessions' load; `measure_node_files`): sealing adds nothing measurable to
+  a node file's write, whose install's flushes take about 8.4 ms here, but at a journal's bound. The
+  journal key's unwrap takes 64 to 74 µs a write and the seal 21 µs at 21 and 256 bytes, 73 µs at
+  64 KiB and 790 µs at 1 MiB; written sealed 8.38, 8.63, 8.54 and 9.75 ms, in the clear 8.61, 8.29,
+  8.40 and 8.39 ms. A conversion of a directory holding every kind of node file and a record for
+  each partition a node may host, 41 files, takes 357 ms (the median of 11), one install a file,
+  once, at the node's first start at the level.
+
+Tests (`node_files.rs`): a file written byte for byte as before below the level and sealed from it;
+every file of a directory converted and marked, each read back whole, a second conversion doing
+nothing; a conversion cut at every point between its files' sealed writes and its mark (none
+sealed, the first, the first two, ..., all and no mark), an install's temporary and an earlier
+binary's staged adoption left in the clear beside them, each finished by the next start with
+nothing lost; a planted, moved, carried and changed file refused after the mark; a legacy key file
+named for its root key before the identity is sealed, and the keys found without the identity
+after; a partition record's and a genesis file's own fields at their largest equal to their
+derived bounds (`network_directory`, `cluster`). `cli_node_files_at_rest.rs`, the real binary: a node founded below the
+level, which applies a deployment committing its home region there, its files in their clear forms
+(its identity, policy, network state and founded allowance, and the deployment's plan and
+journal; the root's genesis is an embedded root's enrollment's, which the binary does not found
+with, and `node_files`'s tests plant it); the fence raised and recorded; started again, every file sealed and the
+directory marked before it served, its identity, committed policy and deployment read back
+unchanged; a clear identity planted after the mark refused by name, and read again once its sealed
+form is back.

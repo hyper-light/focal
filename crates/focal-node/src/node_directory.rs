@@ -2,7 +2,11 @@
 //! enrollment installation and restart. The directory lease outlives its stores.
 use crate::{
     config::Settings,
-    embedded::{NodeError, NodeIdentity, atomic_file, decode_identity, durable_dir, new_identity},
+    embedded::{
+        IDENTITY_BYTES, NodeError, NodeIdentity, atomic_file, decode_identity_bytes, durable_dir,
+        new_identity,
+    },
+    node_files::NodeFiles,
 };
 use std::{
     fs::OpenOptions,
@@ -11,12 +15,12 @@ use std::{
 
 pub struct NodeDirectory {
     identity: NodeIdentity,
-    root: PathBuf,
+    files: NodeFiles,
     _lock: focal_platform::FileLock,
 }
 /// Owns the physical directory before a joining node has an assigned identity.
 pub struct JoinDirectory {
-    root: PathBuf,
+    files: NodeFiles,
     existing: Option<NodeIdentity>,
     lock: focal_platform::FileLock,
 }
@@ -26,12 +30,12 @@ impl JoinDirectory {
         if root.join("JOIN.initialized").exists() && !root.join("JOIN/journal.bin").is_file() {
             return Err(NodeError::Identity);
         }
-        let path = root.join("IDENTITY");
-        let existing = if path.exists() {
+        let files = open_files(settings, &root)?;
+        let existing = if let Some(identity) = read_identity(&files)? {
             if !root.join("JOIN").is_dir() {
                 return Err(NodeError::Identity);
             }
-            Some(decode_identity(&path)?)
+            Some(identity)
         } else {
             for name in [
                 "IDENTITY.initialized",
@@ -50,13 +54,13 @@ impl JoinDirectory {
             None
         };
         Ok(Self {
-            root,
+            files,
             existing,
             lock,
         })
     }
     pub fn root(&self) -> &Path {
-        &self.root
+        self.files.root()
     }
     pub fn install(self, identity: NodeIdentity) -> Result<NodeDirectory, NodeError> {
         identity.validate()?;
@@ -65,12 +69,12 @@ impl JoinDirectory {
                 return Err(NodeError::Identity);
             }
         } else {
-            save(&self.root.join("IDENTITY"), &identity)?;
+            save(&self.files, &identity)?;
         }
-        mark_initialized(&self.root)?;
+        mark_initialized(self.files.root())?;
         Ok(NodeDirectory {
             identity,
-            root: self.root,
+            files: self.files,
             _lock: self.lock,
         })
     }
@@ -80,9 +84,9 @@ impl NodeDirectory {
     /// Network authority is validated by the network owner before opening groups.
     pub fn open(settings: &Settings) -> Result<Self, NodeError> {
         let (root, lock) = acquire(settings)?;
-        let path = root.join("IDENTITY");
-        let identity = if path.exists() {
-            decode_identity(&path)?
+        let files = open_files(settings, &root)?;
+        let identity = if let Some(identity) = read_identity(&files)? {
+            identity
         } else {
             // Interrupted enrollment is not a fresh standalone deployment.
             // Recovery must finish its original join, never invent a new cluster.
@@ -103,7 +107,7 @@ impl NodeDirectory {
                 }
             }
             let identity = new_identity()?;
-            save(&path, &identity)?;
+            save(&files, &identity)?;
             identity
         };
         // A successfully opened identity cannot later be replaced merely
@@ -111,7 +115,7 @@ impl NodeDirectory {
         mark_initialized(&root)?;
         Ok(Self {
             identity,
-            root,
+            files,
             _lock: lock,
         })
     }
@@ -120,10 +124,10 @@ impl NodeDirectory {
     /// exclusive lock used by normal startup. Never replace an existing node.
     pub fn install_joined(settings: &Settings, identity: NodeIdentity) -> Result<Self, NodeError> {
         let (root, lock) = acquire(settings)?;
-        let path = root.join("IDENTITY");
+        let files = open_files(settings, &root)?;
         identity.validate()?;
-        if path.exists() {
-            if decode_identity(&path)? != identity {
+        if let Some(existing) = read_identity(&files)? {
+            if existing != identity {
                 return Err(NodeError::Identity);
             }
         } else {
@@ -141,12 +145,12 @@ impl NodeDirectory {
                     return Err(NodeError::Identity);
                 }
             }
-            save(&path, &identity)?;
+            save(&files, &identity)?;
         }
         mark_initialized(&root)?;
         Ok(Self {
             identity,
-            root,
+            files,
             _lock: lock,
         })
     }
@@ -154,8 +158,32 @@ impl NodeDirectory {
         &self.identity
     }
     pub fn root(&self) -> &Path {
-        &self.root
+        self.files.root()
     }
+    /// The node's small files, sealed from the at-rest level (29 §12.10).
+    pub(crate) fn files(&self) -> &NodeFiles {
+        &self.files
+    }
+}
+/// The node files of `root` under the directory's keys, converted where the fence it records opens
+/// the at-rest level (29 §12.10): what every start takes under the directory's lock, before it reads
+/// any of them. A directory whose keys an earlier binary made under the file named for its node has
+/// that file named for its root key's ID first, so its keys are found without its identity once the
+/// identity is sealed.
+fn open_files(settings: &Settings, root: &Path) -> Result<NodeFiles, NodeError> {
+    let keys = settings.data_keys(root)?;
+    settings.name_key_file(root, &keys)?;
+    let files = NodeFiles::new(root, Some(keys));
+    files.convert()?;
+    Ok(files)
+}
+/// The identity the directory's `IDENTITY` holds, in either form its node files take; none where
+/// it has none.
+fn read_identity(files: &NodeFiles) -> Result<Option<NodeIdentity>, NodeError> {
+    files
+        .read("IDENTITY", IDENTITY_BYTES)?
+        .map(|bytes| decode_identity_bytes(&bytes))
+        .transpose()
 }
 fn mark_initialized(root: &Path) -> Result<(), NodeError> {
     let path = root.join("IDENTITY.initialized");
@@ -192,14 +220,15 @@ fn acquire(settings: &Settings) -> Result<(PathBuf, focal_platform::FileLock), N
     })?;
     Ok((root, lock))
 }
-fn save(path: &Path, identity: &NodeIdentity) -> Result<(), NodeError> {
+/// Writes `identity` as the directory's `IDENTITY`: its magic, the hash of its payload, and the
+/// payload, through the node files, in the form they write.
+pub(crate) fn save(files: &NodeFiles, identity: &NodeIdentity) -> Result<(), NodeError> {
     identity.validate()?;
     let payload = postcard::to_stdvec(identity)?;
     let mut bytes = b"FOCALND1".to_vec();
     bytes.extend_from_slice(blake3::hash(&payload).as_bytes());
     bytes.extend_from_slice(&payload);
-    atomic_file(path, &bytes)?;
-    Ok(())
+    files.write("IDENTITY", &bytes)
 }
 
 #[cfg(test)]
@@ -303,7 +332,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.node.data_dir = Some(root.path().to_owned());
         let identity = new_identity().unwrap();
-        save(&root.path().join("IDENTITY"), &identity).unwrap();
+        save(&NodeFiles::new(root.path(), None), &identity).unwrap();
         assert_eq!(
             NodeDirectory::open(&settings).unwrap().identity(),
             &identity

@@ -179,7 +179,7 @@ impl FoundingNetwork {
                 4 * 1024 * 1024,
             )?
             .commit();
-        let committed = crate::embedded::check_policy(directory.root(), settings)?;
+        let committed = crate::embedded::check_policy(directory.files(), settings)?;
         // The founder pins its policy alone, so the first start must be
         // satisfiable by this node's own facts. A committed policy is the
         // directory's to satisfy: `apply deployment` commits stronger
@@ -196,7 +196,7 @@ impl FoundingNetwork {
                 &settings.durability,
                 &settings.placement,
             )?;
-            install_policy(directory.root(), settings)?;
+            install_policy(directory.files(), settings)?;
         }
         let now = unix_time()?;
         let names = vec![format!("cluster-{}.focal.internal", hex(&identity.cluster))];

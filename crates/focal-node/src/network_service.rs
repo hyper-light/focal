@@ -51,7 +51,7 @@ use std::{
 };
 
 #[path = "network_directory.rs"]
-mod network_directory;
+pub(crate) mod network_directory;
 use network_directory::DirectoryStartup;
 pub use network_directory::{
     DirectoryHandle, HostRequest, HostedPartition, HostingAttempt, MAX_HOSTED_PARTITIONS,
@@ -726,6 +726,9 @@ impl NetworkService {
         // Every owner of the node's groups opens them through one handle (27 §15.11); the
         // registry holds what was opened, and closes the shell's log after every owner.
         let storage = opened.storage.clone();
+        // The node's small files, sealed from the at-rest level, as the directory opened them
+        // (29 §12.10); the directory itself goes to the owners, who let its lock go last.
+        let files = directory.files().clone();
         owners.hold(directory, opened)?;
         let founder = identity.node == state.genesis.founder.node;
         let (directory, directory_startup) = DirectoryStartup::new(
@@ -734,7 +737,7 @@ impl NetworkService {
             state.genesis.founder.node,
             storage.clone(),
             budget.child(192 * 1024 * 1024, 64 * 1024 * 1024)?,
-            root.clone(),
+            files.clone(),
         )?;
         let authority = FounderControlAuthority::from_genesis(&state.genesis)?;
         let registry = PeerRegistry::new(4096)?;
@@ -934,8 +937,11 @@ impl NetworkService {
                         focal_ledger::entry_needs,
                     )?;
                     consensus.set_raft_wire(crate::storage_level::member_wire(&root)?)?;
-                    let limits = crate::memory_envelope::found_limits(&root, &settings, &consensus)
-                        .map_err(ServiceError::from)?;
+                    let files =
+                        crate::node_files::NodeFiles::new(&root, Some(settings.data_keys(&root)?));
+                    let limits =
+                        crate::memory_envelope::found_limits(&files, &settings, &consensus)
+                            .map_err(ServiceError::from)?;
                     let hosting = native_hosting(
                         &root,
                         &identity,

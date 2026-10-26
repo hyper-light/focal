@@ -532,7 +532,7 @@ impl LocalNetworkAdmin {
         // policy promises, by the rule the sessions are measured by. A
         // node without a committed policy, or one whose root could not be
         // observed, does not satisfy it.
-        let committed = crate::config::policy::read_committed(&self.directory)
+        let committed = crate::config::policy::read_committed(&self.files)
             .ok()
             .flatten();
         let control_satisfied = placement

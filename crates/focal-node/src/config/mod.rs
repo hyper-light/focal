@@ -365,18 +365,44 @@ impl Settings {
         &self,
         root: &std::path::Path,
     ) -> Result<focal_seal::DataKeys, crate::embedded::NodeError> {
-        let identity = root.join("IDENTITY");
-        let legacy = if identity.is_file() {
-            let node = crate::embedded::decode_identity(&identity)?.node;
-            focal_seal::default_key_file(&format!("{node:016x}"))
-        } else {
-            None
-        };
         Ok(focal_seal::resolve(
             root,
             self.node.root_key.as_deref(),
-            legacy,
+            legacy_key_file(root)?,
         )?)
+    }
+    /// Names the root key file of `root`'s keys for its root key's ID, where an earlier binary made
+    /// them under the file named for its node (29 §12.10): the directory's identity is sealed from
+    /// the at-rest level, and its keys are found without it from then on. The file is linked, its
+    /// one key under two names, or copied where the file system holds no links; one configured by
+    /// the operator, or named so already, is left.
+    pub fn name_key_file(
+        &self,
+        root: &std::path::Path,
+        keys: &focal_seal::DataKeys,
+    ) -> Result<(), crate::embedded::NodeError> {
+        if self.node.root_key.is_some() {
+            return Ok(());
+        }
+        let Some(id) = focal_seal::recorded_root(root)? else {
+            return Ok(());
+        };
+        let Some(named) = focal_seal::key_file_for(id) else {
+            return Ok(());
+        };
+        if named == keys.key_file || named.try_exists()? {
+            return Ok(());
+        }
+        if std::fs::hard_link(&keys.key_file, &named).is_err() {
+            let key = std::fs::read(&keys.key_file)?;
+            let mut file = focal_platform::fs::create_private_new(&named, false, true)?;
+            std::io::Write::write_all(&mut file, &key)?;
+            file.sync_all()?;
+        }
+        if let Some(parent) = named.parent() {
+            focal_platform::sync_dir(parent)?;
+        }
+        Ok(())
     }
     /// [`Self::data_keys`] of a data directory that has keys, made nowhere: none where it has none
     /// yet. What a command line beside the directory's running owner opens its records with.
@@ -384,17 +410,10 @@ impl Settings {
         &self,
         root: &std::path::Path,
     ) -> Result<Option<focal_seal::DataKeys>, crate::embedded::NodeError> {
-        let identity = root.join("IDENTITY");
-        let legacy = if identity.is_file() {
-            let node = crate::embedded::decode_identity(&identity)?.node;
-            focal_seal::default_key_file(&format!("{node:016x}"))
-        } else {
-            None
-        };
         Ok(focal_seal::find(
             root,
             self.node.root_key.as_deref(),
-            legacy,
+            legacy_key_file(root)?,
         )?)
     }
     pub fn data_dir(&self) -> Result<PathBuf, ConfigError> {
@@ -573,4 +592,26 @@ mod tests {
             serde_saphyr::from_str("version: 1\nplacement:\n  home_regions: [elsewhere]").unwrap();
         assert!(bad.apply(&old).is_err());
     }
+}
+
+/// The root key file an earlier binary named for `root`'s node, where its `IDENTITY` is in the
+/// clear: what finds the keys of a directory made before key files were named for their root key's
+/// ID. A sealed identity (29 §12.10) names none: its directory's key file was named for its root
+/// key before its identity was sealed ([`Settings::name_key_file`]).
+fn legacy_key_file(
+    root: &std::path::Path,
+) -> Result<Option<std::path::PathBuf>, crate::embedded::NodeError> {
+    let identity = root.join("IDENTITY");
+    if !identity.is_file() {
+        return Ok(None);
+    }
+    let bytes = crate::embedded::read_bounded(
+        &identity,
+        crate::node_files::on_disk_bound("IDENTITY", crate::embedded::IDENTITY_BYTES)?,
+    )?;
+    if bytes.starts_with(crate::node_files::SEALED_MAGIC) {
+        return Ok(None);
+    }
+    let node = crate::embedded::decode_identity_bytes(&bytes)?.node;
+    Ok(focal_seal::default_key_file(&format!("{node:016x}")))
 }

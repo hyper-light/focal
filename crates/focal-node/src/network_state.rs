@@ -2,8 +2,9 @@
 //! invents a replacement deployment beside an enrolled identity or durable WAL.
 use crate::{
     config::Settings,
-    embedded::{NodeError, NodeIdentity, atomic_file, read_bounded},
+    embedded::{NodeError, NodeIdentity, atomic_file},
     node_directory::NodeDirectory,
+    node_files::NodeFiles,
 };
 use focal_control::{ControlBootstrap, ControlIdentity, ControlScope};
 use focal_enrollment::{EnrollmentLimits, EnrollmentRegistry, EnrollmentRole};
@@ -198,22 +199,27 @@ async fn resolve_first(endpoint: &str, what: &str) -> Result<SocketAddr, std::io
 }
 impl NetworkState {
     pub fn load(directory: &NodeDirectory) -> Result<Option<Self>, NodeError> {
-        Self::load_from(directory.root(), directory.identity())
+        Self::load_from(directory.files(), directory.identity())
     }
     /// Read-only metadata access for an owned service component. Its physical
     /// node owner retains the directory LOCK throughout this call and use.
     pub(crate) fn load_from(
-        root: &Path,
+        files: &NodeFiles,
         identity: &NodeIdentity,
     ) -> Result<Option<Self>, NodeError> {
-        let path = root.join("NETWORK");
-        if !path.exists() {
-            if root.join("NETWORK.initialized").exists() {
+        let Some(bytes) = files.read("NETWORK", MAX_BYTES)? else {
+            if files.root().join("NETWORK.initialized").exists() {
                 return Err(NodeError::Identity);
             }
             return Ok(None);
-        }
-        let bytes = read_bounded(&path, MAX_BYTES)?;
+        };
+        let state = Self::decode(&bytes)?;
+        state.validate(identity)?;
+        Ok(Some(state))
+    }
+    /// The state a `NETWORK` file's `bytes` hold, of any schema it was written in: its magic, the
+    /// hash of its payload, and the payload, nothing after it.
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, NodeError> {
         let payload = bytes.get(40..).ok_or(NodeError::Identity)?;
         if bytes.get(..8) != Some(MAGIC.as_slice())
             || bytes.get(8..40) != Some(blake3::hash(payload).as_bytes().as_slice())
@@ -276,8 +282,7 @@ impl NetworkState {
             }
             _ => return Err(NodeError::Identity),
         };
-        state.validate(identity)?;
-        Ok(Some(state))
+        Ok(state)
     }
     /// Install this state, or adopt restated reachability over a saved one
     /// (24 §24): the identity, sponsor and genesis never change; the
@@ -287,9 +292,9 @@ impl NetworkState {
         self.validate(directory.identity())?;
         match Self::load(directory)? {
             Some(existing) if existing == *self => {}
-            Some(existing) if existing.same_identity(self) => self.write(directory.root())?,
+            Some(existing) if existing.same_identity(self) => self.write(directory.files())?,
             Some(_) => return Err(NodeError::Identity),
-            None => self.write(directory.root())?,
+            None => self.write(directory.files())?,
         }
         atomic_file(
             &directory.root().join("NETWORK.initialized"),
@@ -307,7 +312,7 @@ impl NetworkState {
     }
     /// Write this state over the saved one: the controller adopts the
     /// sponsor's pins the registry names (24 §11).
-    pub(crate) fn write(&self, root: &Path) -> Result<(), NodeError> {
+    pub(crate) fn write(&self, files: &NodeFiles) -> Result<(), NodeError> {
         let length = postcard::experimental::serialized_size(self)?;
         if length > MAX_BYTES.checked_sub(40).ok_or(NodeError::Identity)? {
             return Err(NodeError::Identity);
@@ -316,8 +321,7 @@ impl NetworkState {
         let mut bytes = MAGIC.to_vec();
         bytes.extend_from_slice(blake3::hash(&payload).as_bytes());
         bytes.extend_from_slice(&payload);
-        atomic_file(&root.join("NETWORK"), &bytes)?;
-        Ok(())
+        files.write("NETWORK", &bytes)
     }
     pub fn validate(&self, identity: &NodeIdentity) -> Result<(), NodeError> {
         if self.schema != NETWORK_STATE_SCHEMA
@@ -439,4 +443,10 @@ fn valid_listen(address: SocketAddr) -> bool {
 }
 fn valid_advertise(address: SocketAddr) -> bool {
     valid_listen(address) && !address.ip().is_unspecified()
+}
+
+/// Whether `bytes` are a `NETWORK` file's, as [`NetworkState::decode`] holds them to: what a
+/// conversion of the node's files checks before it seals one.
+pub(crate) fn check(bytes: &[u8]) -> Result<(), NodeError> {
+    NetworkState::decode(bytes).map(|_| ())
 }

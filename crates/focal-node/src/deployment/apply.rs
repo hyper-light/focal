@@ -6,6 +6,7 @@ use super::{
     plan::{Change, DeploymentPlan, Observation, ObservedControl, ObservedSession},
     survive_code,
 };
+use crate::node_files::NodeFiles;
 use crate::{
     cluster_admin::{ClusterAdmin, ClusterAdminError},
     config::policy::{self, PolicyRevision},
@@ -305,33 +306,37 @@ fn partition_name(partition: &[u8; 16]) -> String {
 pub fn journal_dir(root: &Path, plan_id: &[u8; 16]) -> PathBuf {
     root.join("cluster").join("apply").join(hex(plan_id))
 }
-fn write_journal(dir: &Path, journal: &Journal) -> Result<(), DeploymentError> {
-    crate::embedded::durable_dir(dir)?;
-    crate::embedded::atomic_file(&dir.join("JOURNAL"), &journal.encode()?)?;
+/// The node file of the plan `plan_id`'s `file` (`PLAN` or `JOURNAL`): one of the node's small
+/// files, sealed from the at-rest level (29 §12.10).
+fn plan_file(plan_id: &[u8; 16], file: &str) -> String {
+    format!("cluster/apply/{}/{file}", hex(plan_id))
+}
+fn write_journal(files: &NodeFiles, journal: &Journal) -> Result<(), DeploymentError> {
+    crate::embedded::durable_dir(&journal_dir(files.root(), &journal.plan_id))?;
+    files.write(&plan_file(&journal.plan_id, "JOURNAL"), &journal.encode()?)?;
     Ok(())
 }
-fn read_file(path: &Path, max: usize) -> Result<Option<Vec<u8>>, DeploymentError> {
-    use std::io::Read;
-    let mut file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let length = usize::try_from(file.metadata()?.len()).map_err(|_| DeploymentError::Capacity)?;
-    if length > max {
-        return Err(DeploymentError::Capacity);
-    }
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(length)
-        .map_err(|_| DeploymentError::Capacity)?;
-    file.read_to_end(&mut bytes)?;
-    Ok(Some(bytes))
+/// Whether `bytes` are a plan file's, as [`DeploymentPlan::decode`] holds them to: what a
+/// conversion of the node's files checks before it seals one.
+pub(crate) fn check_plan(bytes: &[u8]) -> Result<(), crate::embedded::NodeError> {
+    DeploymentPlan::decode(bytes)
+        .map(|_| ())
+        .map_err(|_| crate::embedded::NodeError::Corrupt("a deployment plan"))
+}
+/// Whether `bytes` are a journal file's, as [`Journal::decode`] holds them to: what a conversion of
+/// the node's files checks before it seals one.
+pub(crate) fn check_journal(bytes: &[u8]) -> Result<(), crate::embedded::NodeError> {
+    Journal::decode(bytes)
+        .map(|_| ())
+        .map_err(|_| crate::embedded::NodeError::Corrupt("a deployment journal"))
 }
 /// Load a plan's journal, or start one and keep the plan beside it.
-fn open_journal(root: &Path, plan: &DeploymentPlan, now: u64) -> Result<Journal, DeploymentError> {
-    let dir = journal_dir(root, &plan.plan_id);
-    match read_file(&dir.join("JOURNAL"), MAX_JOURNAL_BYTES)? {
+fn open_journal(
+    files: &NodeFiles,
+    plan: &DeploymentPlan,
+    now: u64,
+) -> Result<Journal, DeploymentError> {
+    match files.read(&plan_file(&plan.plan_id, "JOURNAL"), MAX_JOURNAL_BYTES)? {
         Some(bytes) => {
             let journal = Journal::decode(&bytes)?;
             // A plan's identity is its body (facts and request); the same
@@ -344,9 +349,9 @@ fn open_journal(root: &Path, plan: &DeploymentPlan, now: u64) -> Result<Journal,
         }
         None => {
             let journal = Journal::new(plan, now)?;
-            crate::embedded::durable_dir(&dir)?;
-            crate::embedded::atomic_file(&dir.join("PLAN"), &plan.encode()?)?;
-            write_journal(&dir, &journal)?;
+            crate::embedded::durable_dir(&journal_dir(files.root(), &plan.plan_id))?;
+            files.write(&plan_file(&plan.plan_id, "PLAN"), &plan.encode()?)?;
+            write_journal(files, &journal)?;
             Ok(journal)
         }
     }
@@ -401,6 +406,7 @@ pub async fn apply(
     wait: Duration,
 ) -> Result<ApplyReport, DeploymentError> {
     let root = admin.root();
+    let files = admin.files();
     if plan.body.deployment.cluster != admin.identity().cluster {
         return Err(DeploymentError::WrongDeployment);
     }
@@ -415,10 +421,7 @@ pub async fn apply(
     let observation = observe(admin, network).await?;
     // The journal exists only once the plan passed preflight at least once,
     // so a stale plan leaves nothing behind.
-    let existing = match read_file(
-        &journal_dir(root, &plan.plan_id).join("JOURNAL"),
-        MAX_JOURNAL_BYTES,
-    )? {
+    let existing = match files.read(&plan_file(&plan.plan_id, "JOURNAL"), MAX_JOURNAL_BYTES)? {
         Some(bytes) => Some(Journal::decode(&bytes)?),
         None => None,
     };
@@ -429,8 +432,7 @@ pub async fn apply(
         &Current::of(&observation),
     )?;
     let now = now_ms()?;
-    let mut journal = open_journal(root, plan, now)?;
-    let dir = journal_dir(root, &plan.plan_id);
+    let mut journal = open_journal(&files, plan, now)?;
     let mut current = Current::of(&observation);
     let deadline = Instant::now().checked_add(wait);
     for (index, change) in (0u32..).zip(&plan.body.changes) {
@@ -447,17 +449,12 @@ pub async fn apply(
                     .is_none_or(|phase| phase < Phase::Committed)
                 {
                     journal.record(index, Phase::Prepared, None, now_ms()?)?;
-                    write_journal(&dir, &journal)?;
-                    policy::commit(
-                        root,
-                        &plan.body.requested,
-                        PolicyRevision(*from_revision),
-                        crate::embedded::atomic_file,
-                    )?;
+                    write_journal(&files, &journal)?;
+                    policy::commit(&files, &plan.body.requested, PolicyRevision(*from_revision))?;
                     journal.record(index, Phase::Committed, None, now_ms()?)?;
-                    write_journal(&dir, &journal)?;
+                    write_journal(&files, &journal)?;
                 }
-                let committed = policy::read_committed(root)?
+                let committed = policy::read_committed(&files)?
                     .ok_or(crate::config::ConfigError::PolicyMissing)?;
                 if committed.revision.0 != *to_revision || committed.hash != plan.body.policy_hash {
                     journal.outcome = Outcome::Stale {
@@ -465,17 +462,17 @@ pub async fn apply(
                         subject: "policy".into(),
                         field: "committed_revision".into(),
                     };
-                    write_journal(&dir, &journal)?;
+                    write_journal(&files, &journal)?;
                     return Err(stale("policy".into(), "committed_revision"));
                 }
                 current.policy_revision = committed.revision.0;
                 journal.record(index, Phase::Complete, None, now_ms()?)?;
-                write_journal(&dir, &journal)?;
+                write_journal(&files, &journal)?;
             }
             Change::PlanRoot { voters, .. } => {
                 if journal.phase(index).is_none() {
                     journal.record(index, Phase::Prepared, None, now_ms()?)?;
-                    write_journal(&dir, &journal)?;
+                    write_journal(&files, &journal)?;
                 }
                 // Each planned voter the root does not hold as a voter yet is
                 // promoted once the root holds it as a learner (the
@@ -492,7 +489,7 @@ pub async fn apply(
                     let next = voters.iter().copied().find(|voter| !voting.contains(voter));
                     let Some(node) = next else {
                         journal.record(index, Phase::Complete, None, now_ms()?)?;
-                        write_journal(&dir, &journal)?;
+                        write_journal(&files, &journal)?;
                         break;
                     };
                     let mut advanced = false;
@@ -510,7 +507,7 @@ pub async fn apply(
                         {
                             Ok(_) => {
                                 journal.record(index, Phase::Committed, None, now_ms()?)?;
-                                write_journal(&dir, &journal)?;
+                                write_journal(&files, &journal)?;
                                 advanced = true;
                             }
                             Err(
@@ -539,7 +536,7 @@ pub async fn apply(
             } => {
                 if journal.phase(index).is_none() {
                     journal.record(index, Phase::Prepared, None, now_ms()?)?;
-                    write_journal(&dir, &journal)?;
+                    write_journal(&files, &journal)?;
                 }
                 // Each planned voter the group does not hold is admitted as
                 // a learner first — no controller admits partition learners
@@ -557,7 +554,7 @@ pub async fn apply(
                         .find(|voter| !configuration.voters.contains(voter));
                     let Some(node) = next else {
                         journal.record(index, Phase::Complete, None, now_ms()?)?;
-                        write_journal(&dir, &journal)?;
+                        write_journal(&files, &journal)?;
                         break;
                     };
                     let mut advanced = false;
@@ -577,7 +574,7 @@ pub async fn apply(
                         {
                             Ok(_) => {
                                 journal.record(index, Phase::Committed, None, now_ms()?)?;
-                                write_journal(&dir, &journal)?;
+                                write_journal(&files, &journal)?;
                                 advanced = true;
                             }
                             Err(
@@ -622,7 +619,7 @@ pub async fn apply(
                     .is_none_or(|phase| phase < Phase::Committed)
                 {
                     journal.record(index, Phase::Prepared, None, now_ms()?)?;
-                    write_journal(&dir, &journal)?;
+                    write_journal(&files, &journal)?;
                     // The seats the directory would plan now, journaling
                     // nothing: the plan's, or the plan is stale before any
                     // side effect. A session that re-fenced under the plan
@@ -648,7 +645,7 @@ pub async fn apply(
                             subject: name.clone(),
                             field: "voters".into(),
                         };
-                        write_journal(&dir, &journal)?;
+                        write_journal(&files, &journal)?;
                         return Err(stale(name, "voters"));
                     }
                     current = Current::of(&observe(admin, network).await?);
@@ -671,11 +668,11 @@ pub async fn apply(
                             subject: name.clone(),
                             field: "voters".into(),
                         };
-                        write_journal(&dir, &journal)?;
+                        write_journal(&files, &journal)?;
                         return Err(stale(name, "voters"));
                     }
                     journal.record(index, Phase::Committed, Some(reply.operation), now_ms()?)?;
-                    write_journal(&dir, &journal)?;
+                    write_journal(&files, &journal)?;
                 }
                 let committed = journal.operation(index).unwrap_or(*operation);
                 loop {
@@ -688,7 +685,7 @@ pub async fn apply(
                     let recorded = journal.phase(index).unwrap_or(Phase::Committed);
                     if progress > recorded {
                         journal.record(index, progress, None, now_ms()?)?;
-                        write_journal(&dir, &journal)?;
+                        write_journal(&files, &journal)?;
                     }
                     if progress == Phase::Complete
                         || deadline.is_none_or(|deadline| Instant::now() >= deadline)
@@ -703,7 +700,7 @@ pub async fn apply(
             }
             Change::NoChange { .. } => {
                 journal.record(index, Phase::Complete, None, now_ms()?)?;
-                write_journal(&dir, &journal)?;
+                write_journal(&files, &journal)?;
             }
         }
         if journal.phase(index) != Some(Phase::Complete) {
@@ -720,7 +717,7 @@ pub async fn apply(
     } else {
         Outcome::InProgress
     };
-    write_journal(&dir, &journal)?;
+    write_journal(&files, &journal)?;
     Ok(report("deployment_applied", root, plan, &journal))
 }
 
@@ -732,6 +729,7 @@ pub async fn status(
     plan_id: Option<[u8; 16]>,
 ) -> Result<Vec<ApplyReport>, DeploymentError> {
     let root = admin.root();
+    let files = admin.files();
     let base = root.join("cluster").join("apply");
     let mut ids = Vec::new();
     match plan_id {
@@ -762,17 +760,19 @@ pub async fn status(
         .map_err(|_| DeploymentError::Capacity)?;
     let mut observation = None;
     for id in ids {
-        let dir = journal_dir(root, &id);
-        let Some(plan_bytes) = read_file(&dir.join("PLAN"), super::plan::MAX_PLAN_BYTES)? else {
+        let Some(plan_bytes) = files.read(&plan_file(&id, "PLAN"), super::plan::MAX_PLAN_BYTES)?
+        else {
             if plan_id.is_some() {
                 return Err(DeploymentError::Corrupt("no journal for this plan"));
             }
             continue;
         };
         let plan = DeploymentPlan::decode(&plan_bytes)?;
-        let journal_bytes = read_file(&dir.join("JOURNAL"), MAX_JOURNAL_BYTES)?.ok_or(
-            DeploymentError::Corrupt("journal file missing beside its plan"),
-        )?;
+        let journal_bytes = files
+            .read(&plan_file(&id, "JOURNAL"), MAX_JOURNAL_BYTES)?
+            .ok_or(DeploymentError::Corrupt(
+                "journal file missing beside its plan",
+            ))?;
         let mut journal = Journal::decode(&journal_bytes)?;
         if journal.plan_id != id || plan.plan_id != id {
             return Err(DeploymentError::Corrupt("journal names another plan"));
@@ -853,7 +853,7 @@ pub async fn status(
                 changed = true;
             }
             if changed {
-                write_journal(&dir, &journal)?;
+                write_journal(&files, &journal)?;
             }
         }
         reports.push(report("deployment_status", root, &plan, &journal));

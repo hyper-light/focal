@@ -437,7 +437,13 @@ fn an_embedded_node_seals_its_closed_generations_and_retires_released_families()
     assert_eq!(activation["activated"], true, "{activation}");
     let server = start(root, None);
     // The founder issues to the worker identity its data directory names.
-    let identity = focal_node::embedded::decode_identity(&root.join("IDENTITY")).unwrap();
+    let identity = {
+        // Its identity, one of the node's small files, sealed from the at-rest level (29 §12.10),
+        // read as a command line beside the node reads it.
+        let mut settings = focal_node::config::Settings::default();
+        settings.node.data_dir = Some(root.to_path_buf());
+        focal_node::node_files::read_identity(&settings, root).unwrap()
+    };
     let worker: String = identity
         .worker
         .0

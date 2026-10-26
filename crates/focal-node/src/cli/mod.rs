@@ -39,7 +39,7 @@ pub(super) fn check_request_file(path: &std::path::Path) -> Result<()> {
 }
 use focal_client::{Client, ClientError, LocalTransport, RetryPolicy, input::*, pending::*};
 use focal_model::*;
-use focal_node::{config::Settings, embedded::decode_identity};
+use focal_node::config::Settings;
 use focal_wire::*;
 pub(super) use mcp::{CodeCommand, code, serve};
 use std::{io::Write, path::PathBuf};
@@ -147,8 +147,8 @@ impl Context {
         let root = settings
             .data_dir()
             .map_err(|e| CliError::Other(Box::new(e)))?;
-        let identity =
-            decode_identity(&root.join("IDENTITY")).map_err(|e| CliError::Other(Box::new(e)))?;
+        let identity = focal_node::node_files::read_identity(settings, &root)
+            .map_err(|e| CliError::Other(Box::new(e)))?;
         // NETWORK also proves joined identity if its private JOIN files are
         // lost. Never fall back to the founder's issuer in that case.
         // The data directory's keys where it has them, made nowhere: this command runs beside the

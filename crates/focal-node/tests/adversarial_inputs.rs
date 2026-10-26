@@ -13,7 +13,8 @@
 )]
 //! Adversarial node inputs (R11 §3): the node's own on-disk decoders — the
 //! `POLICY` file (`CommittedPolicy::decode`) and the `IDENTITY` file
-//! (`decode_identity`) — reject a malformed or maliciously length-inflated file
+//! (`node_files::read_identity`, which takes either form and decodes the
+//! clear one) — reject a malformed or maliciously length-inflated file
 //! without allocating a buffer for an attacker's declared length. A counting
 //! global allocator in this test binary makes the bound machine-checked: peak
 //! heap growth during a decode stays within a small fixed budget, never the
@@ -24,7 +25,8 @@
 //! One `#[test]` function only: the counters are process-global, so a second
 //! concurrent test in the same binary would race them.
 use focal_node::config::CommittedPolicy;
-use focal_node::embedded::decode_identity;
+use focal_node::config::Settings;
+use focal_node::node_files::read_identity;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -126,6 +128,7 @@ fn assert_bounded(what: &str, len: usize, baseline: usize) {
 fn node_on_disk_decoders_are_bounded_and_never_panic_on_any_input() {
     let dir = tempfile::tempdir().unwrap();
     let identity_path = dir.path().join("IDENTITY");
+    let settings = Settings::default();
     for body in corpus() {
         // POLICY: both framings the decoder accepts — the `FCLPOL2\0` magic
         // prefix and the legacy magic-less pair — each reaches postcard with
@@ -144,7 +147,7 @@ fn node_on_disk_decoders_are_bounded_and_never_panic_on_any_input() {
         // valid identity; each is refused, none over-allocates.
         std::fs::write(&identity_path, &body).unwrap();
         let baseline = reset_peak();
-        let result = decode_identity(&identity_path);
+        let result = read_identity(&settings, dir.path());
         assert_bounded("identity", body.len(), baseline);
         assert!(
             result.is_err(),

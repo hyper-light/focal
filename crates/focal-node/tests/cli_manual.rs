@@ -187,7 +187,13 @@ fn remote_recovery_reads_are_authenticated_preserve_journals_and_survive_restart
         &["submit", "claim", "--json", &claim(100).to_string()],
         &path,
     );
-    let identity = focal_node::embedded::decode_identity(&root.path().join("IDENTITY")).unwrap();
+    let identity = {
+        // Its identity, one of the node's small files, sealed from the at-rest level (29 §12.10),
+        // read as a command line beside the node reads it.
+        let mut settings = focal_node::config::Settings::default();
+        settings.node.data_dir = Some(root.path().to_path_buf());
+        focal_node::node_files::read_identity(&settings, root.path()).unwrap()
+    };
     let context = OperationContext {
         cluster: identity.cluster,
         ledger: identity.ledger,

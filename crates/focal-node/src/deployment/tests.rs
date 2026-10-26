@@ -625,3 +625,22 @@ fn the_root_group_is_planned_before_the_sessions_and_its_promise_is_stated_apart
     assert_eq!(root.level(FailureDomain::Zone).max_failures, 0);
     assert_eq!(root.level(FailureDomain::Node).max_failures, 0);
 }
+
+/// A plan and the journal its apply starts, as the node keeps them beside each other: what a test of
+/// the node's files plants (29 §12.10).
+pub(crate) fn plan_and_journal() -> (DeploymentPlan, Journal) {
+    let observation = observation(vec![session(2, Some(GuaranteeLevel::NONE))]);
+    let plan = compose(
+        &observation,
+        &intent(FailureDomain::Node, 1),
+        &[Proposal::Planned {
+            operation: [4; 16],
+            voters: vec![7, 8, 9],
+        }],
+        &ControlProposal::Unobserved,
+        10,
+    )
+    .unwrap();
+    let journal = Journal::new(&plan, 5).unwrap();
+    (plan, journal)
+}

@@ -287,7 +287,13 @@ fn cli_native_creates_are_linearizable_against_the_offline_log() {
     let server = start(root, &advertise);
 
     // The founder authenticates as the issuer; the worker is the claim target.
-    let identity = focal_node::embedded::decode_identity(&root.join("IDENTITY")).unwrap();
+    let identity = {
+        // Its identity, one of the node's small files, sealed from the at-rest level (29 §12.10),
+        // read as a command line beside the node reads it.
+        let mut settings = focal_node::config::Settings::default();
+        settings.node.data_dir = Some(root.to_path_buf());
+        focal_node::node_files::read_identity(&settings, root).unwrap()
+    };
     let issuer = identity.issuer;
     let worker = identity.worker.to_string();
 

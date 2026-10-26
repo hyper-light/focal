@@ -17,7 +17,7 @@ use std::{collections::BTreeSet, time::Duration};
 
 /// The node id of the founder whose data directory is `dir`.
 fn founder_node(dir: &std::path::Path) -> u64 {
-    crate::embedded::decode_identity(&dir.join("IDENTITY"))
+    crate::node_files::read_identity(&crate::config::Settings::default(), dir)
         .unwrap()
         .node
 }
@@ -30,9 +30,10 @@ fn founder_receipt_path(dir: &std::path::Path) -> std::path::PathBuf {
 }
 /// The enrollment registry as the root has committed it.
 async fn root_registry(founder: &Running, founder_dir: &std::path::Path) -> EnrollmentRegistry {
-    let cluster = crate::embedded::decode_identity(&founder_dir.join("IDENTITY"))
-        .unwrap()
-        .cluster;
+    let cluster =
+        crate::node_files::read_identity(&crate::config::Settings::default(), founder_dir)
+            .unwrap()
+            .cluster;
     let observation = founder.handles.control.observe_root().await.unwrap();
     let focal_control::ControlBootstrap::Root { enrollment, .. } = &observation.snapshot().state
     else {
@@ -43,7 +44,8 @@ async fn root_registry(founder: &Running, founder_dir: &std::path::Path) -> Enro
 
 /// The founder's own runtime reads its root state.
 fn root_reader(founder: &Running, founder_dir: &std::path::Path) -> AuthenticatedPeer {
-    let identity = crate::embedded::decode_identity(&founder_dir.join("IDENTITY")).unwrap();
+    let identity =
+        crate::node_files::read_identity(&crate::config::Settings::default(), founder_dir).unwrap();
     AuthenticatedPeer::local(PeerGrant {
         principal: signer_principal(identity.cluster),
         tenants: BTreeSet::from([founder.status.ledger.tenant]),

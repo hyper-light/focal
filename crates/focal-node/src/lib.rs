@@ -56,6 +56,7 @@ pub mod network_listener;
 pub mod network_service;
 pub mod network_state;
 pub mod node_directory;
+pub mod node_files;
 pub(crate) mod owner_steps;
 mod pace;
 pub mod placement;

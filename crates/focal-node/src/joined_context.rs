@@ -1,5 +1,14 @@
 use super::*;
-use crate::embedded::{NodeIdentity, decode_identity};
+use crate::embedded::NodeIdentity;
+use crate::node_files::NodeFiles;
+
+/// The identity the directory's `IDENTITY` holds, in either form its node files take (29 §12.10).
+fn identity_in(files: &NodeFiles) -> Result<NodeIdentity, JoinError> {
+    let bytes = files
+        .read("IDENTITY", crate::embedded::IDENTITY_BYTES)?
+        .ok_or(crate::embedded::NodeError::Identity)?;
+    Ok(crate::embedded::decode_identity_bytes(&bytes)?)
+}
 use focal_model::ParticipantId;
 
 /// Select the local Unix principal without treating lost joined credentials as
@@ -11,7 +20,8 @@ pub fn local_unix_principal(
     identity: &NodeIdentity,
     now: i64,
 ) -> Result<ParticipantId, JoinError> {
-    let state = NetworkState::load_from(root, identity)?;
+    let files = NodeFiles::new(root, keys.cloned());
+    let state = NetworkState::load_from(&files, identity)?;
     let mut joined = state
         .as_ref()
         .is_some_and(|state| state.genesis.founder.node != identity.node);
@@ -24,7 +34,7 @@ pub fn local_unix_principal(
     }
     if joined {
         joined_unix_principal(root, keys, identity, now)
-    } else if decode_identity(&root.join("IDENTITY"))? == *identity {
+    } else if identity_in(&files)? == *identity {
         Ok(identity.issuer)
     } else {
         Err(JoinError::Conflict)
@@ -40,7 +50,8 @@ pub fn joined_unix_principal(
     identity: &NodeIdentity,
     now: i64,
 ) -> Result<ParticipantId, JoinError> {
-    if decode_identity(&root.join("IDENTITY"))? != *identity
+    let files = NodeFiles::new(root, keys.cloned());
+    if identity_in(&files)? != *identity
         || crate::embedded::read_bounded(&root.join("JOIN.initialized"), 64)?.as_slice()
             != b"durable join intent installed"
     {
@@ -53,7 +64,7 @@ pub fn joined_unix_principal(
     }
     let bundle = validate_journal(&journal)?;
     let pin = journal.key.as_ref().ok_or(JoinError::Pending)?;
-    let state = NetworkState::load_from(root, identity)?.ok_or(JoinError::Pending)?;
+    let state = NetworkState::load_from(&files, identity)?.ok_or(JoinError::Pending)?;
     if state.genesis != bundle.genesis
         || state.sponsor != *bundle.invitation.trust()
         || state.listen != journal.listen

@@ -2,7 +2,7 @@
 //! Filesystem work stays on the caller's thread, between bounded network waits.
 use crate::{
     config::Settings,
-    embedded::{NodeIdentity, decode_identity},
+    embedded::NodeIdentity,
     network_admin::{ADMIN_SOCKET, AdminCommand, AdminRead, admin_principal, admin_wire_limits},
 };
 use focal_client::admin::{
@@ -953,18 +953,30 @@ impl ClusterAdmin {
     }
     pub fn open(settings: &Settings) -> Result<Self> {
         let root = settings.data_dir()?;
-        let identity = decode_identity(&root.join("IDENTITY"))?;
+        // A directory with no identity has no node to administer: refused as it was before the
+        // identity could be sealed, by the file it lacks.
+        std::fs::metadata(root.join("IDENTITY")).map_err(crate::embedded::NodeError::Io)?;
         // The data directory's keys where it has them, made nowhere: this command runs beside the
         // node that owns them, and one asked while that node founds itself, its identity written
-        // and its keys not yet made, finds none and makes none in its place.
+        // and its keys not yet made (as an earlier binary founded), finds none and makes none in
+        // its place.
         let keys = settings
             .found_data_keys(&root)?
             .ok_or_else(|| ClusterAdminError::Unkeyed(root.clone()))?;
+        // Its identity, one of the node's small files, sealed from the at-rest level (29 §12.10).
+        let bytes = crate::node_files::NodeFiles::new(&root, Some(keys.clone()))
+            .read("IDENTITY", crate::embedded::IDENTITY_BYTES)?
+            .ok_or(crate::embedded::NodeError::Identity)?;
+        let identity = crate::embedded::decode_identity_bytes(&bytes)?;
         Ok(Self {
             root,
             identity,
             keys,
         })
+    }
+    /// The node's small files, opened under its data directory's keys (29 §12.10).
+    pub fn files(&self) -> crate::node_files::NodeFiles {
+        crate::node_files::NodeFiles::new(&self.root, Some(self.keys.clone()))
     }
     pub fn root(&self) -> &Path {
         &self.root

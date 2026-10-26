@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 /// promise a level nothing was asked to provide.
 pub async fn observe(admin: &ClusterAdmin, network: bool) -> Result<Observation, DeploymentError> {
     let committed =
-        read_committed(admin.root())?.ok_or(crate::config::ConfigError::PolicyMissing)?;
+        read_committed(&admin.files())?.ok_or(crate::config::ConfigError::PolicyMissing)?;
     let identity = admin.identity();
     let deployment = DeploymentIdentity {
         cluster: identity.cluster,

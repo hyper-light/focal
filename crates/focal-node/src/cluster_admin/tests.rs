@@ -465,8 +465,9 @@ fn the_same_membership_change_asked_again_resumes_its_unsettled_request() {
 }
 
 /// An operator's command beside a node that has written its identity and not yet its keys, a
-/// founder between the two, finds no keys and makes none: it is refused `not_ready` for the
-/// moment, where it made the directory's keys in its node's place.
+/// founder between the two as an earlier binary founded (one now makes its keys first), finds no
+/// keys and makes none: it is refused `not_ready` for the moment, where it made the directory's
+/// keys in its node's place.
 #[test]
 fn an_admin_command_beside_a_founding_directory_makes_no_keys() {
     let disk = tempfile::tempdir().unwrap();
@@ -474,7 +475,11 @@ fn an_admin_command_beside_a_founding_directory_makes_no_keys() {
     let mut settings = Settings::default();
     settings.node.data_dir = Some(disk.path().into());
     // The founder's directory: its identity written, its keys not yet made.
-    let directory = crate::node_directory::NodeDirectory::open(&settings).unwrap();
+    crate::node_directory::save(
+        &crate::node_files::NodeFiles::new(disk.path(), None),
+        &crate::embedded::new_identity().unwrap(),
+    )
+    .unwrap();
     assert!(settings.found_data_keys(disk.path()).unwrap().is_none());
     let refused = ClusterAdmin::open(&settings).err();
     assert!(
@@ -490,5 +495,4 @@ fn an_admin_command_beside_a_founding_directory_makes_no_keys() {
         settings.found_data_keys(disk.path()).unwrap().is_none(),
         "the command made the directory's keys"
     );
-    drop(directory);
 }

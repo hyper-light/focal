@@ -7,9 +7,6 @@ fn yaml(text: &str) -> (Settings, resolve::FilePresence) {
         resolve::FilePresence::of(text).unwrap(),
     )
 }
-fn write(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
-    std::fs::write(path, bytes)
-}
 
 #[test]
 fn an_unknown_key_fails_by_its_full_path_before_the_typed_parse() {
@@ -142,32 +139,35 @@ fn a_committed_policy_wins_over_omitted_fields_and_refuses_a_conflicting_file_by
 fn the_committed_policy_file_keeps_its_original_form_and_advances_by_revision() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    assert_eq!(policy::read_committed(root).unwrap(), None);
+    // A directory with no keys and no fence keeps its node files in the clear, as every earlier
+    // binary did (29 §12.10).
+    let files = crate::node_files::NodeFiles::new(root, None);
+    assert_eq!(policy::read_committed(&files).unwrap(), None);
     let intent = Settings::default().policy_intent();
-    let first = policy::install_or_check(root, &intent, write).unwrap();
+    let first = policy::install_or_check(&files, &intent).unwrap();
     assert_eq!(first.revision, PolicyRevision(1));
     assert_eq!(first.hash, intent.hash().unwrap());
     assert!(root.join("POLICY.initialized").is_file());
-    assert_eq!(policy::read_committed(root).unwrap(), Some(first.clone()));
+    assert_eq!(policy::read_committed(&files).unwrap(), Some(first.clone()));
     // The same intent checks; a differing one is refused and not written.
     let bytes = std::fs::read(root.join("POLICY")).unwrap();
-    assert_eq!(policy::install_or_check(root, &intent, write).unwrap(), first);
+    assert_eq!(policy::install_or_check(&files, &intent).unwrap(), first);
     let mut other = intent.clone();
     other.placement.residency = vec!["a".into()];
     assert!(matches!(
-        policy::install_or_check(root, &other, write),
+        policy::install_or_check(&files, &other),
         Err(ConfigError::CommittedPolicyChange {
             field: "placement.residency"
         })
     ));
     assert_eq!(std::fs::read(root.join("POLICY")).unwrap(), bytes);
     // Plan and apply commit the next revision under the expected one.
-    assert!(policy::commit(root, &other, PolicyRevision(2), write).is_err());
-    let second = policy::commit(root, &other, PolicyRevision(1), write).unwrap();
+    assert!(policy::commit(&files, &other, PolicyRevision(2)).is_err());
+    let second = policy::commit(&files, &other, PolicyRevision(1)).unwrap();
     assert_eq!(second.revision, PolicyRevision(2));
     assert_eq!(second.intent, other);
-    assert_eq!(policy::read_committed(root).unwrap(), Some(second.clone()));
-    assert_eq!(policy::install_or_check(root, &other, write).unwrap(), second);
+    assert_eq!(policy::read_committed(&files).unwrap(), Some(second.clone()));
+    assert_eq!(policy::install_or_check(&files, &other).unwrap(), second);
     // The original bare pair reads as revision 1 with the same hash rule.
     let legacy = postcard::to_stdvec(&(&intent.durability, &intent.placement)).unwrap();
     let decoded = CommittedPolicy::decode(&legacy).unwrap();
@@ -177,13 +177,13 @@ fn the_committed_policy_file_keeps_its_original_form_and_advances_by_revision() 
     // A lost policy beside an existing store is never recreated.
     std::fs::remove_file(root.join("POLICY")).unwrap();
     assert!(matches!(
-        policy::read_committed(root),
+        policy::read_committed(&files),
         Err(ConfigError::PolicyMissing)
     ));
     let fresh = tempfile::tempdir().unwrap();
     std::fs::create_dir(fresh.path().join("wal")).unwrap();
     assert!(matches!(
-        policy::install_or_check(fresh.path(), &intent, write),
+        policy::install_or_check(&crate::node_files::NodeFiles::new(fresh.path(), None), &intent),
         Err(ConfigError::PolicyMissing)
     ));
 }

@@ -47,6 +47,11 @@ pub(crate) fn open(
     if genesis_level >= crate::upgrade::RAFT_KEPT_LEVEL {
         crate::storage_level::record(root, genesis_level)?;
     }
+    // A node whose fence opens the at-rest level from this start, founded there or joining a
+    // cluster at it, seals its small files now, under its directory's lock and before it serves
+    // (29 §12.10); a node whose fence opened it before converted them as its directory opened.
+    crate::node_files::NodeFiles::new(root, Some(focal_seal::DataKeys::new(root, key_file)))
+        .convert()?;
     let disk = crate::network_service::disk_budget().map_err(NodeError::Content)?;
     let fence_open = crate::storage_level::storage_opened(root)?;
     let mut opened = focal_consensus::storage_open::open_node_storage(

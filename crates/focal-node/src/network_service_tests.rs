@@ -789,8 +789,11 @@ fn joined_service_receives_committed_root_learner_and_restarts_without_ledger_po
         let peer_dir = tempfile::tempdir().unwrap();
         let founder_settings = settings(founder_dir.path());
         let founder = Running::start(&founder_settings).await;
-        let identity =
-            crate::embedded::decode_identity(&founder_dir.path().join("IDENTITY")).unwrap();
+        let identity = crate::node_files::read_identity(
+            &crate::config::Settings::default(),
+            founder_dir.path(),
+        )
+        .unwrap();
         let admin = LocalRemote::new(
             founder.status.admin_socket.as_ref().unwrap(),
             admin_wire_limits(),
@@ -1135,7 +1138,10 @@ fn a_founder_restarts_from_its_stale_seed_file_after_a_stronger_policy_was_appli
         let founder = Running::start(&settings).await;
         founder.stop().await;
         let root = settings.node.data_dir.clone().unwrap();
-        let seeded = read_committed(&root)
+        // Its policy is one of the node's small files, sealed from the at-rest level (29 §12.10).
+        let files =
+            crate::node_files::NodeFiles::new(&root, settings.found_data_keys(&root).unwrap());
+        let seeded = read_committed(&files)
             .unwrap()
             .expect("first start committed the seed");
         assert_eq!(seeded.revision, PolicyRevision(1));
@@ -1143,18 +1149,12 @@ fn a_founder_restarts_from_its_stale_seed_file_after_a_stronger_policy_was_appli
         let mut stronger = seeded.intent.clone();
         stronger.durability.survive = crate::config::FailureDomain::Zone;
         stronger.durability.max_failures = 1;
-        let applied = commit(
-            &root,
-            &stronger,
-            PolicyRevision(1),
-            crate::embedded::atomic_file,
-        )
-        .unwrap();
+        let applied = commit(&files, &stronger, PolicyRevision(1)).unwrap();
         assert_eq!(applied.revision, PolicyRevision(2));
         // The same stale file starts the founder again: it carries the committed
         // policy instead of refusing it.
         let founder = Running::start(&settings).await;
-        let carried = read_committed(&root)
+        let carried = read_committed(&files)
             .unwrap()
             .expect("the committed policy survives the restart");
         assert_eq!(
