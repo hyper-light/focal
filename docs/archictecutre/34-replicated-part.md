@@ -242,8 +242,8 @@ Found on the way, each root-caused:
   (and its endpoint, `client::endpoint`). Tests: `tests/group.rs`, with no hand-switching and its
   consumer subscribing where the client sends, the leader killed with its socket gone and nothing
   said, every batch after acknowledged once at the offsets that follow and the client sending to the
-  new leader (on this Mac: acknowledged again 30 to 178 ms after the kill, fifteen kills), and the three nodes
-  restarted one at a time under publishing and consuming, the client and the consumer finding each
+  new leader (on this Mac: acknowledged again 30 to 178 ms after the kill, fifteen kills), and the
+  three nodes restarted one at a time under publishing and consuming, the client and the consumer finding each
   next leader themselves; the harness counts a batch sent again and acknowledged as taken without
   its offsets (not its session's newest, P6) as acknowledged, where it had waited for offsets it
   never gets. `focal-node/tests/bus_failover.rs`: three `focal start bus` processes and the client,
@@ -253,7 +253,7 @@ Found on the way, each root-caused:
   0.9 s). Open: the client waits out the group's election by asking again on Kafka's back-off, so it
   hears the new leader up to a second after the group elected it; a node that held a client's ask
   until its term passed the one the client knew would answer as the election ends (a leadership ask,
-  not yet in the protocol). a dial to a node whose host is gone ends only at the idle timeout, the transport
+  not yet in the protocol). A dial to a node whose host is gone ends only at the idle timeout, the transport
   having no deadline for a handshake (Chromium's `kMaxTimeForCryptoHandshakeSecs`, 10 s; Kafka's
   `socket.connection.setup.timeout.ms`, 10 s doubled to 30 s, KIP-601), so a client whose first
   configured node is down waits two minutes before it asks the next; a subscriber learns of its
@@ -261,3 +261,19 @@ Found on the way, each root-caused:
   within 15 s, `limits::KEEP_ALIVE`, on a quiet stream) or from the client's following another; and
   a connection's second subscribe to a stream it is subscribed to makes a second subscription, so a
   subscriber must not ask again on a connection whose loss it was not told of.
+- **A restarted follower behind a full lane was never caught up** (2026-10-25, found by Quiver's
+  crash test of images and compaction on its lab branch, kiln's CP-T2.2, Focal's condition 3). A
+  Raft frame that finds its member's lane full waits in the member's outbox, sent as the lane makes
+  room. A follower whose loop stalled until its lane from the leader filled, then killed and
+  reopened, dialed its leader (the lesser of a pair dials), and its new connection took the old
+  one's place. The endpoint tells its owner its peer's newest connection, so the old one's close
+  was never told, and the outbox, which only that close cleared, kept the frames for the stalled
+  process's lane: every later frame, the probe the leader sends a restarted follower among them,
+  queued behind them for room the new lane, never full, never makes. The leader held the follower
+  paused in probe until the old connection's idle timeout. Fixed at the cause, two ways, either of
+  which ends this stall alone: a member's restart (the liveness stream's `Change::Restarted`) clears
+  its outbox, whose frames were for the process that stopped, and a member's new connection flushes
+  what waited, which also serves a connection that took another's place with no restart. Test:
+  `tests/group.rs`, a follower below its leader stalled until a frame for it waits in the leader's
+  outbox (`MemberStats::outboxed`, new), then killed and reopened, comes to hold every batch (before
+  the fix it held none for 30 s, the test's frozen bound; after, in 2 to 6 s on this Mac, seven runs).

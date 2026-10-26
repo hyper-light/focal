@@ -17247,3 +17247,15 @@ step 2). The registration now proposes the recorded request again (`Session::act
 change. Tests: `session_registration_tests`, a plan captured from another policy after the first
 placement prepares the recorded request; `cli_node_files_at_rest`, 8 of 8 under the conditions that
 failed 3 of 7.
+
+### 2026-10-25 — A follower restarted behind a full lane is caught up again
+
+Found by Quiver's crash test of images and compaction (kiln's CP-T2.2, Focal's condition 3): a
+follower whose loop stalled until its lane from the leader filled, then killed and reopened, was
+never caught up. Its new connection took the old one's place, the endpoint telling its owner only
+its peer's newest connection, so the leader's outbox for it, which only the old connection's close
+cleared, kept frames for the stopped process's lane, and every later frame queued behind them for
+room the new lane never makes (34 §8). A member's restart now clears its outbox and a member's new
+connection flushes it, either alone ending the stall; `MemberStats::outboxed` counts what waited.
+Test: `tests/group.rs`, the follower below its leader stalled, killed and reopened, comes to hold
+every batch (before: none for 30 s; after: 2 to 6 s on this Mac).

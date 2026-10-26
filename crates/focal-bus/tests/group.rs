@@ -299,6 +299,9 @@ struct World {
     class: Durability,
     /// Each batch's record's bytes (`sized_batch`).
     payload: usize,
+    /// The node whose loop stalls, if one does: not polled, so its socket goes unread, and nothing
+    /// of it turns.
+    paused: Option<usize>,
 }
 
 impl World {
@@ -375,10 +378,13 @@ impl World {
     /// Handles every event that is ready, then gives each node its turn; waits at most until the
     /// soonest of the nodes' deadlines, or a tick.
     async fn step(&mut self) {
+        let paused = self.paused;
         let soonest = self
             .nodes
             .iter()
-            .flatten()
+            .enumerate()
+            .filter(|(at, _)| Some(*at) != paused)
+            .filter_map(|(_, running)| running.as_ref())
             .filter_map(|running| running.member.deadline())
             .min();
         let wait_ns = soonest
@@ -394,7 +400,8 @@ impl World {
         let found = poll_fn(|context| {
             let mut found: Vec<(Option<usize>, Event<Bus>)> = Vec::new();
             for (at, running) in nodes.iter_mut().enumerate() {
-                if let Some(running) = running
+                if Some(at) != paused
+                    && let Some(running) = running
                     && let Poll::Ready(event) = running.driver.poll_event(context)
                 {
                     found.push((Some(at), event.unwrap()));
@@ -412,8 +419,12 @@ impl World {
         let now = Instant::now();
         // Each node is told how late it came to its stream's wake, before anything the wait
         // brought is fed (`Member::waited`).
-        for running in self.nodes.iter_mut().flatten() {
-            running.member.waited(began, now);
+        for (at, running) in self.nodes.iter_mut().enumerate() {
+            if Some(at) != paused
+                && let Some(running) = running
+            {
+                running.member.waited(began, now);
+            }
         }
         for (whose, event) in found {
             self.events += 1;
@@ -423,7 +434,9 @@ impl World {
             }
         }
         for at in 0..self.nodes.len() {
-            if let Some(running) = self.nodes[at].as_mut() {
+            if Some(at) != paused
+                && let Some(running) = self.nodes[at].as_mut()
+            {
                 while let Some(event) = running.driver.endpoint().poll_event() {
                     running
                         .member
@@ -607,6 +620,117 @@ fn a_part_held_across_three_fates_acknowledges_replicated_and_keeps_it_past_its_
     group_keeps_what_it_acknowledged(&[(1, 1), (2, 2), (3, 3)], Durability::Replicated);
 }
 
+/// Do: with the leader above a follower, stop driving that follower, as a node whose loop stalled:
+/// its socket goes unread and its lane from the leader fills until the leader's outbox for it is at
+/// its bound. Then kill it, reopen it on its directory and publish on. Expect: the reopened
+/// follower comes to hold every batch. It dials its leader (the lesser of a pair dials), so its new
+/// connection takes the old one's place and no close of the old is told; what waited for the
+/// stalled process's lane holds neither the probe the leader sends the new one nor any frame after
+/// it (found by Quiver's crash test on its lab branch, kiln's CP-T2.2, Focal's condition 3).
+#[test]
+fn a_follower_reopened_after_its_lane_filled_comes_to_hold_every_batch() {
+    const PAYLOAD: usize = 64 << 10;
+    let ids = Identities::new();
+    let dir = tempfile::tempdir().unwrap();
+    let mut runtime = LocalRuntime::new(&runtime()).unwrap();
+    runtime
+        .block_on(async move {
+            let mut world = open_world(
+                &ids,
+                dir.path(),
+                &[],
+                Durability::Persisted,
+                NODE_MEMORY,
+                PAYLOAD,
+            )
+            .await;
+            let reopen = |world: &mut World, at: usize| {
+                let id = NODES[at];
+                world.nodes[at] = None;
+                let budget = MemoryBudget::new(64 << 20, 0).unwrap();
+                let driver = ids.bind_node(id, &budget, world.addresses[at]);
+                let mut running = open_node(
+                    &ids,
+                    id,
+                    dir.path(),
+                    &world.addresses,
+                    driver,
+                    &[],
+                    NODE_MEMORY,
+                );
+                running
+                    .member
+                    .connect(running.driver.endpoint(), Instant::now());
+                world.nodes[at] = Some(running);
+            };
+            let mut until = 20;
+            publish_until(&mut world, until).await;
+            // The lowest node follows: a leader there is killed and reopened until another leads.
+            while world.leader_now() == Some(NODES[0]) {
+                world.nodes[0] = None;
+                let mut wait = ProgressDeadline::begin(&[world.terms()], u64::MAX, FROZEN);
+                while world.leader_now().is_none_or(|l| l == NODES[0]) {
+                    world.step().await;
+                    wait.check(&[world.terms()])
+                        .expect("no leader was elected after the kill");
+                }
+                reopen(&mut world, 0);
+                until += 10;
+                publish_until(&mut world, until).await;
+            }
+            let leader = world.leader_now().unwrap();
+            let leader_at = NODES.iter().position(|n| *n == leader).unwrap();
+            let outboxed = |world: &World| {
+                world.nodes[leader_at]
+                    .as_ref()
+                    .map_or(0, |running| running.member.stats().outboxed)
+            };
+
+            // The follower's loop stalls: publishing goes on, acknowledged on the leader and the
+            // other follower, until a frame for the stalled one waits in the leader's outbox. Its
+            // lane fills within the window the stalled node last granted, at most the transport's
+            // stream window ceiling: that many batches of this payload, and the one its sending
+            // side holds beyond, bound the wait.
+            world.paused = Some(0);
+            let before = outboxed(&world);
+            let most =
+                usize::try_from(hyper_transport::stream_window_ceiling()).unwrap() / PAYLOAD + 2;
+            for _ in 0..most {
+                if outboxed(&world) > before {
+                    break;
+                }
+                until += 1;
+                publish_until(&mut world, until).await;
+            }
+            assert!(
+                outboxed(&world) > before,
+                "no frame for the stalled follower waited in {most} batches\n{}",
+                world.diagnose()
+            );
+
+            // Killed and reopened on its directory: it comes to hold every batch.
+            world.paused = None;
+            reopen(&mut world, 0);
+            until += 20;
+            publish_until(&mut world, until).await;
+            let mut wait = ProgressDeadline::begin(&ends(&world), u64::MAX, FROZEN);
+            loop {
+                let reached = ends(&world);
+                if reached.iter().all(|end| *end >= u64::from(until)) {
+                    break;
+                }
+                world.step().await;
+                if let Err(frozen) = wait.check(&ends(&world)) {
+                    panic!(
+                        "the reopened follower never came to hold every batch: {frozen:?}\n{}",
+                        world.diagnose()
+                    );
+                }
+            }
+        })
+        .unwrap();
+}
+
 /// A steady stream of publishes is written with its commits riding its entries: each node's commit
 /// that moved alone waits for its next write within the node's period, the interval its liveness
 /// stream sends at (`Member::restate_period`), and is written alone only once a period passed with
@@ -780,6 +904,7 @@ async fn open_world(
         subscribe_at: None,
         class,
         payload,
+        paused: None,
     };
     let now = Instant::now();
     for running in world.running() {

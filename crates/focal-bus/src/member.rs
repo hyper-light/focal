@@ -211,6 +211,8 @@ pub struct MemberStats {
     pub dropped_records: u64,
     /// Raft messages dropped for a full outbox: Raft sends them again.
     pub dropped_messages: u64,
+    /// Raft messages that waited in their member's outbox for its lane to make room.
+    pub outboxed: u64,
     /// Heartbeats the stream refused (stale, unknown peer).
     pub refused_heartbeats: u64,
     /// Drives of the replica.
@@ -1267,6 +1269,10 @@ impl Member {
                     link.up = Some(now);
                     link.next = None;
                 }
+                // A connection that took another's place takes what waited for the old one's lane:
+                // no lane of the new one was full, so no room it makes would flush the outbox, and
+                // every later frame would queue behind what waited.
+                self.flush_outbox(endpoint, peer);
             }
             Event::Closed { peer, .. } if self.is_node(peer) => {
                 // What waited for the lane goes with the connection; Raft sends it again.
@@ -1622,6 +1628,7 @@ impl Member {
             return;
         }
         queue.push_back(self.encoded.clone());
+        self.stats.outboxed = self.stats.outboxed.saturating_add(1);
     }
 
     /// Sends what waited in `peer`'s outbox while its lane has room.
@@ -1780,6 +1787,12 @@ impl Member {
                 }
                 Change::Restarted { .. } => {
                     tell(&GroupEvent::Restarted { peer });
+                    // What waited for the lane of the process that stopped is moot, and the replica
+                    // probes the new one from what it holds: kept, the probe and every frame after
+                    // it would queue behind it for a room no event of the old connection brings.
+                    if let Some(waiting) = self.outbox.get_mut(&peer) {
+                        waiting.clear();
+                    }
                     self.replica.restarted(peer)
                 }
             };
