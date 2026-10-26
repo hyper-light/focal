@@ -158,6 +158,47 @@ pub fn at_rest_form(root: &Path) -> Result<focal_evidence::ContentForm, NodeErro
     Ok(at_rest_form_at(known(root)?.unwrap_or(0)))
 }
 
+/// The fence the client stores at `root`, in the data directory `data_dir`, are held to (29
+/// §12.11): the higher of the fence the data directory records (its node's, where a node lives in
+/// it) and the one recorded beside the stores (the fence a client's context learned from the
+/// cluster it addresses, `root` its history). A fence never falls, so neither does this.
+pub fn client_level(data_dir: &Path, root: &Path) -> Result<u32, NodeError> {
+    let own = known(data_dir)?.unwrap_or(0);
+    if root == data_dir {
+        return Ok(own);
+    }
+    Ok(own.max(known(root)?.unwrap_or(0)))
+}
+
+/// How client stores held to the fence at `level` keep their records at rest (29 §12.11), under
+/// their data directory's keys `keys` as found there: sealed once the level opens the at-rest form,
+/// in the clear below it. A store past the level without keys is refused: it could be neither
+/// sealed nor read.
+pub fn client_at_rest(
+    level: u32,
+    keys: Option<focal_seal::DataKeys>,
+) -> Result<focal_client::at_rest::AtRest, NodeError> {
+    let seal = at_rest_form_at(level) == focal_evidence::ContentForm::Sealed;
+    if seal && keys.is_none() {
+        return Err(NodeError::ClientStoresWithoutKeys);
+    }
+    Ok(focal_client::at_rest::AtRest::new(keys, seal))
+}
+
+/// How the client stores at `root` in the data directory `data_dir` keep their records at rest
+/// ([`client_level`], [`client_at_rest`]), with the keys `settings` finds there, made nowhere: a
+/// node's start made a node's, a client's enrollment a client's.
+pub fn client_at_rest_in(
+    settings: &crate::config::Settings,
+    data_dir: &Path,
+    root: &Path,
+) -> Result<focal_client::at_rest::AtRest, NodeError> {
+    client_at_rest(
+        client_level(data_dir, root)?,
+        settings.found_data_keys(data_dir)?,
+    )
+}
+
 /// The at-rest form a fence at `level` opens.
 pub fn at_rest_form_at(level: u32) -> focal_evidence::ContentForm {
     if level >= crate::upgrade::AT_REST_LEVEL {

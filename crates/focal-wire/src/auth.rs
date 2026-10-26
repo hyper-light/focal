@@ -852,6 +852,7 @@ fn request_shape(
             }
             1
         }
+        Operation::Fence => 1,
         Operation::Select(query) => {
             query.validate(request.ledger, limits)?;
             u64::from(query.query.max_visits.max(query.query.max_items))

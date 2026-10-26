@@ -211,6 +211,8 @@ pub(crate) struct DataService {
     /// a node the detector still sees alive at its committed address is
     /// refused (24 §24), so a clone never displaces a live node.
     liveness: crate::liveness::LivenessHandle,
+    /// The node's data directory, whose recorded fence a client asks for (29 §12.11).
+    root: PathBuf,
 }
 /// What the root does with a contact announcement that names another
 /// address than the node's committed one (24 §24).
@@ -305,6 +307,17 @@ impl RequestHandler for DataService {
     }
     fn handle_accounted<'a>(&'a self, request: &'a VerifiedRequest) -> OwnedHandlerFuture<'a> {
         Box::pin(async move {
+            // The fence this node last recorded, answered by the node itself from no session: a
+            // client whose own data directory hosts no node records it as a node does (29 §12.11).
+            if matches!(request.request().operation, Operation::Fence) {
+                let response = match crate::storage_level::known(&self.root) {
+                    Ok(level) => Response::Fence {
+                        level: level.unwrap_or(0),
+                    },
+                    Err(_) => Response::Error(AccessError::Unavailable),
+                };
+                return OwnedResponse::new(request.request().reply(response));
+            }
             let group = match &request.request().operation {
                 Operation::Control { group, .. }
                 | Operation::PeerControl { group, .. }
@@ -1248,6 +1261,7 @@ impl NetworkService {
             root_group: state.genesis.root.group,
             directory: directory.clone(),
             liveness: liveness_handle.clone(),
+            root: root.clone(),
             ledger: ManagedService::new(fleet.clone(), content.clone(), coordinator.clone())
                 .with_signing(control.clone(), placement_handle.clone(), directory.clone())
                 .with_liveness(liveness_handle.clone())

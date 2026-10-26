@@ -607,7 +607,7 @@ fn legacy_key_file(
     }
     let bytes = crate::embedded::read_bounded(
         &identity,
-        crate::node_files::on_disk_bound("IDENTITY", crate::embedded::IDENTITY_BYTES)?,
+        crate::node_files::on_disk_bound(crate::embedded::IDENTITY_BYTES)?,
     )?;
     if bytes.starts_with(crate::node_files::SEALED_MAGIC) {
         return Ok(None);

@@ -13,6 +13,7 @@
 //! Embedded and remote clients preserving durable request identities across retries.
 pub mod admin;
 pub mod artifact_transfer;
+pub mod at_rest;
 mod client;
 pub mod failure;
 mod file_lock;

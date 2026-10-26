@@ -50,7 +50,14 @@ fn receipt_for(
     }
 }
 fn create(root: &Path) -> ManagedOperationStore {
-    let store = ManagedOperationStore::create(root, context(), limits(), registration()).unwrap();
+    let store = ManagedOperationStore::create(
+        root,
+        context(),
+        limits(),
+        registration(),
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap();
     let stream = store.status().unwrap().stream;
     store
         .record_registration(receipt_for(
@@ -158,14 +165,23 @@ fn explicit_namespace_round_trips_and_rejects_aliases() {
 fn registration_reservations_and_intent_survive_reopen_without_expanding_again() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("managed");
-    let store = ManagedOperationStore::create(&root, context(), limits(), registration()).unwrap();
+    let store = ManagedOperationStore::create(
+        &root,
+        context(),
+        limits(),
+        registration(),
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap();
     assert!(matches!(
         store.reserve(RequestId::from_u128(20)),
         Err(ManagedStoreError::NotRegistered)
     ));
     assert_eq!(store.registration().unwrap(), registration());
     drop(store);
-    let store = ManagedOperationStore::open(&root, context(), limits()).unwrap();
+    let store =
+        ManagedOperationStore::open(&root, context(), limits(), crate::at_rest::AtRest::clear())
+            .unwrap();
     let stream = store.status().unwrap().stream;
     let registered = receipt_for(
         &registration(),
@@ -184,7 +200,9 @@ fn registration_reservations_and_intent_survive_reopen_without_expanding_again()
     assert_eq!(store.outstanding().unwrap(), vec![id]);
     let original = store.prepare(id, intent(), |key| Ok(request(key))).unwrap();
     drop(store);
-    let store = ManagedOperationStore::open(&root, context(), limits()).unwrap();
+    let store =
+        ManagedOperationStore::open(&root, context(), limits(), crate::at_rest::AtRest::clear())
+            .unwrap();
     let saved = store
         .prepare(id, intent(), |_| panic!("retry expanded"))
         .unwrap();
@@ -234,8 +252,13 @@ fn ack_retires_only_contiguous_results_and_reclaims_capacity_without_id_reuse() 
         Err(ManagedStoreError::Retired)
     ));
     drop(store);
-    let store =
-        ManagedOperationStore::open(temp.path().join("managed"), context(), limits()).unwrap();
+    let store = ManagedOperationStore::open(
+        temp.path().join("managed"),
+        context(),
+        limits(),
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap();
     assert!(matches!(
         store.prepare(first, intent(), |_| panic!("retired ID expanded")),
         Err(ManagedStoreError::Retired)
@@ -255,7 +278,9 @@ fn unknown_seal_ack_and_close_replies_preserve_exact_controls_and_gap_identity()
         Err(ManagedStoreError::Stopped)
     ));
     drop(store);
-    let store = ManagedOperationStore::open(&root, context(), limits()).unwrap();
+    let store =
+        ManagedOperationStore::open(&root, context(), limits(), crate::at_rest::AtRest::clear())
+            .unwrap();
     assert_eq!(store.pending_control().unwrap(), Some(control.clone()));
     assert!(matches!(
         store.prepare_acknowledgment(RequestId::from_u128(31), 2),
@@ -297,7 +322,9 @@ fn unknown_seal_ack_and_close_replies_preserve_exact_controls_and_gap_identity()
     ack(&store, 31, 12);
     let control = store.prepare_close(RequestId::from_u128(32)).unwrap();
     drop(store);
-    let store = ManagedOperationStore::open(&root, context(), limits()).unwrap();
+    let store =
+        ManagedOperationStore::open(&root, context(), limits(), crate::at_rest::AtRest::clear())
+            .unwrap();
     assert_eq!(store.pending_control().unwrap(), Some(control.clone()));
     let stream = store.status().unwrap().stream;
     let closed = receipt_for(
@@ -370,10 +397,25 @@ fn missing_initialized_or_prepared_state_fails_closed_and_another_store_cannot_a
         store.reserve(RequestId::from_u128(21)),
         Err(ManagedStoreError::Corrupt)
     ));
-    assert!(ManagedOperationStore::open(&root, context(), limits()).is_err());
-    assert!(ManagedOperationStore::create(&root, context(), limits(), registration()).is_err());
+    assert!(
+        ManagedOperationStore::open(&root, context(), limits(), crate::at_rest::AtRest::clear())
+            .is_err()
+    );
+    assert!(
+        ManagedOperationStore::create(
+            &root,
+            context(),
+            limits(),
+            registration(),
+            crate::at_rest::AtRest::clear()
+        )
+        .is_err()
+    );
     std::fs::remove_file(root.join(STATE)).unwrap();
-    assert!(ManagedOperationStore::open(&root, context(), limits()).is_err());
+    assert!(
+        ManagedOperationStore::open(&root, context(), limits(), crate::at_rest::AtRest::clear())
+            .is_err()
+    );
 }
 
 #[test]
@@ -381,7 +423,9 @@ fn independently_opened_handles_serialize_allocation_and_release_lock_before_net
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("managed");
     let one = create(&root);
-    let two = ManagedOperationStore::open(&root, context(), limits()).unwrap();
+    let two =
+        ManagedOperationStore::open(&root, context(), limits(), crate::at_rest::AtRest::clear())
+            .unwrap();
     let first = one.reserve(RequestId::from_u128(20)).unwrap();
     // The first request may remain unknown while another owner reserves work.
     let _waiting_request = one
@@ -389,7 +433,7 @@ fn independently_opened_handles_serialize_allocation_and_release_lock_before_net
         .unwrap();
     let second = two.reserve(RequestId::from_u128(21)).unwrap();
     assert_ne!(first.key(context()).ordinal, second.key(context()).ordinal);
-    let lock = Directory::open_managed(&root).unwrap();
+    let lock = Directory::open_managed(&root, crate::at_rest::AtRest::clear()).unwrap();
     assert!(matches!(
         one.status(),
         Err(ManagedStoreError::Store(StoreError::Locked))
@@ -426,7 +470,13 @@ fn prepared_and_receipt_publication_crash_cuts_recover_without_expansion() {
     // ACK publication precedes deletion; reopening resumes the bounded cleanup.
     assert!(store.root().join(prepared_name(1)).exists());
     assert!(store.root().join(receipt_name(1)).exists());
-    let reopened = ManagedOperationStore::open(store.root(), context(), limits()).unwrap();
+    let reopened = ManagedOperationStore::open(
+        store.root(),
+        context(),
+        limits(),
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap();
     assert!(matches!(
         reopened.request(id),
         Err(ManagedStoreError::Retired)
@@ -518,8 +568,18 @@ fn private_files_reject_symlinks_and_preserve_legacy_layout_separation() {
     let store = create(&root);
     let alias = temp.path().join("alias");
     symlink(&root, &alias).unwrap();
-    assert!(ManagedOperationStore::open(alias, context(), limits()).is_err());
-    assert!(crate::operation_store::OperationStore::open(&root, Default::default()).is_err());
+    assert!(
+        ManagedOperationStore::open(alias, context(), limits(), crate::at_rest::AtRest::clear())
+            .is_err()
+    );
+    assert!(
+        crate::operation_store::OperationStore::open(
+            &root,
+            Default::default(),
+            crate::at_rest::AtRest::clear()
+        )
+        .is_err()
+    );
     let id = store.reserve(RequestId::from_u128(20)).unwrap();
     store.prepare(id, intent(), |key| Ok(request(key))).unwrap();
     std::fs::set_permissions(
@@ -544,7 +604,12 @@ fn allocation_process_child() {
         .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let store = loop {
-        match ManagedOperationStore::open(&root, context(), ManagedStoreLimits::default()) {
+        match ManagedOperationStore::open(
+            &root,
+            context(),
+            ManagedStoreLimits::default(),
+            crate::at_rest::AtRest::clear(),
+        ) {
             Ok(store) => break store,
             Err(ManagedStoreError::Store(StoreError::Locked))
                 if std::time::Instant::now() < deadline =>
@@ -578,8 +643,14 @@ fn concurrent_processes_issue_distinct_durable_ordinals() {
     if let RequestStreamCommand::Register { window, .. } = &mut registration.command {
         *window = limits.window;
     }
-    let store =
-        ManagedOperationStore::create(&root, context(), limits, registration.clone()).unwrap();
+    let store = ManagedOperationStore::create(
+        &root,
+        context(),
+        limits,
+        registration.clone(),
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap();
     store
         .record_registration(receipt_for(
             &registration,
@@ -670,6 +741,7 @@ fn only_committed_later_registration_establishes_old_generation_retirement() {
         context(),
         limits(),
         registration.clone(),
+        crate::at_rest::AtRest::clear(),
     )
     .unwrap();
     assert!(matches!(
@@ -693,4 +765,131 @@ fn only_committed_later_registration_establishes_old_generation_retirement() {
         later.prepare(old, intent(), |_| panic!("old generation expanded")),
         Err(ManagedStoreError::Retired)
     ));
+}
+
+/// A registered store kept as `rest` says.
+fn create_in(root: &Path, rest: crate::at_rest::AtRest) -> ManagedOperationStore {
+    let store =
+        ManagedOperationStore::create(root, context(), limits(), registration(), rest).unwrap();
+    let stream = store.status().unwrap().stream;
+    store
+        .record_registration(receipt_for(
+            &registration(),
+            10,
+            RequestStreamControlOutcome::Registered(RequestStreamState::Active {
+                stream,
+                owner: RequestId::from_u128(6),
+                revision: 1,
+                window: limits().window,
+                acknowledged_through: 0,
+            }),
+        ))
+        .unwrap();
+    store
+}
+
+/// A managed store below the at-rest level holding an operation answered and one prepared and
+/// pending, converted at its open and cut after each of its steps in turn: the next open finishes;
+/// then every record is sealed, nothing of them in the clear; the answer is kept; the pending
+/// request is the one prepared before, never expanded again, and its receipt bound once (29
+/// §12.11).
+#[test]
+fn a_managed_store_converts_through_a_cut_at_any_step() {
+    use crate::at_rest::support::{assert_sealed_under, below, directory, sealing};
+    for cut in 0.. {
+        let (data, keys) = directory();
+        let root = data.path().join("managed");
+        let store = create_in(&root, below(&keys));
+        let answered = store.reserve(RequestId::from_u128(20)).unwrap();
+        let answer = complete(&store, answered, 11);
+        let pending = store.reserve(RequestId::from_u128(21)).unwrap();
+        let prepared = store
+            .prepare(pending, intent(), |key| Ok(request(key)))
+            .unwrap();
+        drop(store);
+        assert!(
+            std::fs::read(root.join(STATE))
+                .unwrap()
+                .starts_with(STATE_MAGIC)
+        );
+        crate::at_rest::cut::after(cut);
+        let first = ManagedOperationStore::open(&root, context(), limits(), sealing(&keys));
+        let finished = first.is_ok();
+        crate::at_rest::cut::none();
+        let store = match first {
+            Ok(store) => store,
+            Err(_) => {
+                ManagedOperationStore::open(&root, context(), limits(), sealing(&keys)).unwrap()
+            }
+        };
+        assert!(root.join(crate::at_rest::SEALED).exists());
+        assert_sealed_under(&root, &[STATE_MAGIC, PREPARED_MAGIC, RECEIPT_MAGIC]);
+        assert_eq!(store.receipt(answered).unwrap(), Some(answer));
+        let again = store
+            .prepare(pending, intent(), |_| panic!("retry expanded"))
+            .unwrap();
+        assert_eq!(again.request, prepared.request);
+        let bound = receipt(&again.request, 12);
+        store.record_receipt(pending, &bound).unwrap();
+        store.record_receipt(pending, &bound).unwrap();
+        assert_eq!(store.receipt(pending).unwrap(), Some(bound));
+        if finished {
+            assert!(cut > 0, "a conversion of no step");
+            break;
+        }
+    }
+}
+
+/// A sealed managed store's records changed, swapped between operations, or planted in the clear
+/// after its mark are refused; put back, it opens.
+#[test]
+fn a_sealed_managed_stores_records_changed_swapped_or_planted_in_the_clear_are_refused() {
+    use crate::at_rest::AtRestError;
+    use crate::at_rest::support::{directory, flip, sealing, swap};
+    use focal_seal::named::NamedError;
+    let (data, keys) = directory();
+    let root = data.path().join("managed");
+    let store = create_in(&root, sealing(&keys));
+    let first = store.reserve(RequestId::from_u128(20)).unwrap();
+    store
+        .prepare(first, intent(), |key| Ok(request(key)))
+        .unwrap();
+    let second = store.reserve(RequestId::from_u128(21)).unwrap();
+    store
+        .prepare(second, intent(), |key| Ok(request(key)))
+        .unwrap();
+    drop(store);
+    let opens = || {
+        let store = ManagedOperationStore::open(&root, context(), limits(), sealing(&keys))?;
+        store.prepare(first, intent(), |_| panic!("retry expanded"))
+    };
+    let original = opens().unwrap();
+    let one = root.join(prepared_name(1));
+    let two = root.join(prepared_name(2));
+    swap(&one, &two);
+    assert!(matches!(
+        opens(),
+        Err(ManagedStoreError::Store(StoreError::AtRest(
+            AtRestError::Sealed(NamedError::Moved(_))
+        )))
+    ));
+    swap(&one, &two);
+    let state = root.join(STATE);
+    let saved = std::fs::read(&state).unwrap();
+    flip(&state);
+    assert!(matches!(
+        opens(),
+        Err(ManagedStoreError::Store(StoreError::AtRest(
+            AtRestError::Sealed(NamedError::Seal(_))
+        )))
+    ));
+    let clear = data.path().join("clear");
+    drop(create_in(&clear, crate::at_rest::AtRest::clear()));
+    std::fs::write(&state, std::fs::read(clear.join(STATE)).unwrap()).unwrap();
+    assert!(matches!(
+        opens(),
+        Err(ManagedStoreError::Store(StoreError::AtRest(AtRestError::ClearAfterSealed(name)))) if name == STATE
+    ));
+    std::fs::write(&state, &saved).unwrap();
+    assert_eq!(opens().unwrap().request, original.request);
 }

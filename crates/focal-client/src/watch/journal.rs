@@ -493,6 +493,7 @@ impl WatchJournal {
         context: OperationContext,
         options: WatchOptions,
         create: bool,
+        rest: crate::at_rest::AtRest,
     ) -> Result<Self, WatchError> {
         let mut h = blake3::Hasher::new_derive_key("focal.watch.local-name.v1");
         h.update(&encode(&(context, name))?);
@@ -500,7 +501,9 @@ impl WatchJournal {
         let short: String = name_hash.to_hex().chars().take(32).collect();
         let stem = format!("watch-{short}");
         let record = format!("{stem}.watch-owner");
-        let (directory, initialized) = Directory::watch(parent, &stem, create)?;
+        let (directory, initialized) = Directory::watch(parent, &stem, create, rest.clone())?;
+        // Its record to sealed, where the form seals and the watch is not marked yet (29 §12.11).
+        directory.convert([(record.clone(), MAGIC, RECORD_BYTES)])?;
         if !directory.exists(&record)? {
             if initialized || !create {
                 return Err(WatchError::Corrupt);
@@ -571,9 +574,9 @@ impl WatchJournal {
             max_reserved_bytes: 64 * 1024 * 1024,
         };
         let requests = if state.ownership_ready {
-            ManagedRequests::open_existing(parent, &requests_name, context, limits)?
+            ManagedRequests::open_existing(parent, &requests_name, context, limits, rest)?
         } else {
-            ManagedRequests::open(parent, &requests_name, context, limits)?
+            ManagedRequests::open(parent, &requests_name, context, limits, rest)?
         };
         let mut this = Self {
             directory,
@@ -1147,7 +1150,8 @@ mod tests {
         for trailing in [false, true] {
             let root = tempfile::tempdir().unwrap();
             std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-            let store = WatchStore::open(root.path(), context()).unwrap();
+            let store =
+                WatchStore::open(root.path(), context(), crate::at_rest::AtRest::clear()).unwrap();
             let mut journal = store.create("bad", WatchOptions::default()).unwrap();
             let mut bytes = if trailing {
                 encode(&journal.state).unwrap()
@@ -1170,7 +1174,8 @@ mod tests {
     fn ownership_marker_prevents_recreating_lost_managed_allocator() {
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let store = WatchStore::open(root.path(), context()).unwrap();
+        let store =
+            WatchStore::open(root.path(), context(), crate::at_rest::AtRest::clear()).unwrap();
         drop(store.create("owned", WatchOptions::default()).unwrap());
         for entry in std::fs::read_dir(root.path()).unwrap() {
             let path = entry.unwrap().path();
@@ -1188,7 +1193,8 @@ mod tests {
     fn catalogue_and_per_watch_locks_bound_independent_owners() {
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let store = WatchStore::open(root.path(), context()).unwrap();
+        let store =
+            WatchStore::open(root.path(), context(), crate::at_rest::AtRest::clear()).unwrap();
         let first = store.create("one", WatchOptions::default()).unwrap();
         assert!(matches!(
             store.resume("one"),
@@ -1208,5 +1214,97 @@ mod tests {
             store.create("overflow", WatchOptions::default()),
             Err(WatchError::Capacity)
         ));
+    }
+
+    /// A private directory inside a data directory with keys: where watches lie.
+    fn private_in(data: &std::path::Path) -> std::path::PathBuf {
+        let parent = data.join("context");
+        focal_platform::fs::create_dir_private(&parent).unwrap();
+        parent
+    }
+
+    /// Watches below the at-rest level, converted at their opens (the catalogue's, then the
+    /// watch's record and its ownership's) and cut after each step in turn: the next opens finish;
+    /// then nothing of them lies in the clear and the watch resumes where it was (29 §12.11).
+    #[test]
+    fn watches_convert_through_a_cut_at_any_step() {
+        use crate::at_rest::support::{assert_sealed_under, below, directory, sealing};
+        for cut in 0.. {
+            let (data, keys) = directory();
+            let parent = private_in(data.path());
+            let store = WatchStore::open(&parent, context(), below(&keys)).unwrap();
+            let before = store
+                .create("changes", WatchOptions::default())
+                .unwrap()
+                .status();
+            drop(store);
+            crate::at_rest::cut::after(cut);
+            let first = WatchStore::open(&parent, context(), sealing(&keys))
+                .and_then(|store| store.resume("changes").map(|_| store));
+            let finished = first.is_ok();
+            crate::at_rest::cut::none();
+            let store = match first {
+                Ok(store) => store,
+                Err(_) => WatchStore::open(&parent, context(), sealing(&keys)).unwrap(),
+            };
+            let watch = store.resume("changes").unwrap();
+            assert_eq!(watch.status(), before);
+            drop(watch);
+            assert_eq!(store.names().unwrap(), vec!["changes".to_owned()]);
+            assert_sealed_under(&parent, &[MAGIC, b"FCLMCO02"]);
+            if finished {
+                assert!(cut > 0, "a conversion of no step");
+                break;
+            }
+        }
+    }
+
+    /// A sealed watch's record changed, swapped with the catalogue's, or planted in the clear after
+    /// its mark is refused; put back, the watch resumes.
+    #[test]
+    fn a_sealed_watch_changed_swapped_or_planted_in_the_clear_is_refused() {
+        use crate::at_rest::AtRestError;
+        use crate::at_rest::support::{directory, flip, sealing, swap};
+        use focal_seal::named::NamedError;
+        let (data, keys) = directory();
+        let parent = private_in(data.path());
+        let store = WatchStore::open(&parent, context(), sealing(&keys)).unwrap();
+        let watch = store.create("changes", WatchOptions::default()).unwrap();
+        let record = parent.join(&watch.record);
+        drop(watch);
+        let saved = std::fs::read(&record).unwrap();
+        flip(&record);
+        assert!(matches!(
+            store.resume("changes"),
+            Err(WatchError::Store(StoreError::AtRest(AtRestError::Sealed(
+                NamedError::Seal(_)
+            ))))
+        ));
+        std::fs::write(&record, &saved).unwrap();
+        let catalogue = parent.join("WATCHES.watch-owner");
+        swap(&record, &catalogue);
+        assert!(matches!(
+            store.resume("changes"),
+            Err(WatchError::Store(StoreError::AtRest(AtRestError::Sealed(
+                NamedError::Moved(_)
+            ))))
+        ));
+        swap(&record, &catalogue);
+        let clear = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(clear.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let plain =
+            WatchStore::open(clear.path(), context(), crate::at_rest::AtRest::clear()).unwrap();
+        let other = plain.create("changes", WatchOptions::default()).unwrap();
+        let planted = std::fs::read(clear.path().join(&other.record)).unwrap();
+        drop(other);
+        std::fs::write(&record, planted).unwrap();
+        assert!(matches!(
+            store.resume("changes"),
+            Err(WatchError::Store(StoreError::AtRest(
+                AtRestError::ClearAfterSealed(_)
+            )))
+        ));
+        std::fs::write(&record, &saved).unwrap();
+        assert_eq!(store.resume("changes").unwrap().status().name, "changes");
     }
 }

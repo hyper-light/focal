@@ -17259,3 +17259,49 @@ room the new lane never makes (34 §8). A member's restart now clears its outbox
 connection flushes it, either alone ending the stall; `MemberStats::outboxed` counts what waited.
 Test: `tests/group.rs`, the follower below its leader stalled, killed and reopened, comes to hold
 every batch (before: none for 30 s; after: 2 to 6 s on this Mac).
+
+### 2026-10-25 — A client's stores are sealed from the at-rest level
+
+A client's requests, receipts, pending writes and uploads were written in the clear (29 §12's
+inventory, "Client stores"): the operation store and each operation's pending journal, the native
+journal, managed ownership and its stores, the watches, and the upload stores with each upload's
+staged bytes. Each is now kept as its data directory's fence says (29 §12.11): below the at-rest
+level byte for byte as before; from it each record sealed whole under the data directory's journal
+key, its path bound inside (`focal_seal::named`, the seal node files take, of a kind of its own), and
+each upload's bytes a part sealed a stage at a time (focal-evidence's record file, shared now through
+a file policy that keeps a client's files owner-private and checked).
+
+- **Converted at the next open.** Each store converts at its open under its own lock: each record in
+  the clear checked by its reader and written sealed through its replace, then the store marked; an
+  upload's payload copied into a part a chunk at a time, hashed against what its state vouches for
+  before anything in the clear goes. A cut at any step leaves each record whole in one form or the
+  other and the next open finishes; from the mark a record in the clear is refused. A request pending
+  across it is retried under its identity and answered once.
+- **The fence a client learns.** A store in a node's data directory follows the node's recorded
+  fence. A client's context records the fence of the cluster it addresses in its history, and a
+  client's own data directory records it as a node does: read from the node's directory for a
+  context through its socket; asked of the cluster (`Operation::Fence`, tag 35, answered by the node
+  from the fence it recorded) once at enrollment and beside the first request of each command while
+  it is below the level, the two in flight together. A node below the level that added the query
+  refuses its kind on its own stream, and the context keeps what it knew. A client's own directory
+  converts the issuers its enrollments adopted at a context's open, under a lock of its own.
+- **Found on the way.** A node's conversion of its files (29 §12.10) took the marker a client's
+  join leaves beside its enrollment (`enrollment-<name>.client-initialized`) for an enrollment's
+  directory and failed on it (`ENOTDIR`): a node data directory holding a client enrollment would
+  have failed its start at the level, as a client's own directory failed its first open in this
+  step's real-binary test. Only directories are visited now. A marked store asked for the clear form
+  would have written records its own reader then refused: a marked store now seals whatever form it
+  is asked for. A store outside the
+  data directory (an operation journal at a path a command named) is bound to its canonical path.
+  A sealed part whose last stage its state never recorded cannot be truncated (its places would be
+  sealed over under one key): it is cut back by writing its kept records into a part of a new key.
+- **Open.** Directory names hold operation identities in the clear; two processes adopting an issuer
+  at once share one temporary.
+- **Measured** (this Mac, release, under other sessions' load): an upload staged sealed takes
+  13.73 ms a 64 KiB stage against 13.71 ms in the clear (+0.6%: a stage's two flushes); a record
+  seals in 54 µs at 256 B and 1.23 ms at 1 MiB; converted once, an upload of 8 MiB in 76 ms and a
+  store of 32 answered operations in 1.06 s.
+- **Tests:** each store below the level converted and cut after each step in turn, pending work
+  answered once, and its sealed records' tampering battery; `cli_client_stores_at_rest.rs`, the real
+  binary, a local client and an enrolled one converted across the fence's rise with every outcome
+  known once, the upload completed and nothing in the clear.

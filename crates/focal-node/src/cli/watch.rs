@@ -61,7 +61,8 @@ pub(super) async fn run(
     command: WatchCommand,
     engine: WatchEngine,
 ) -> Result<()> {
-    let store = WatchStore::open(&context.root, context.operation).map_err(other)?;
+    let store = WatchStore::open(&context.root, context.operation, context.at_rest.clone())
+        .map_err(other)?;
     let (mut journal, follow) = match command {
         WatchCommand::Inspect(args) => {
             let value = if let Some(name) = args.name {

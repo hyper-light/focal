@@ -154,6 +154,14 @@ pub fn wire_coverage(operation: &Operation) -> Coverage {
             "Native profile only; one indexed predicate plus residual filtering within the visit allowance and an authenticated cursor.",
             "NativeListPage with explicit visits and continuation",
         ),
+        Operation::Fence => coverage(
+            "storage.fence",
+            Capability::Actor,
+            Exposure::WireAvailable,
+            false,
+            "Any authenticated participant; answered by the node from the fence it last recorded, from no session.",
+            "The upgrade fence's level, which a client's own data directory records to choose its stores' form at rest",
+        ),
         Operation::NativeWait(_) => coverage(
             "native.wait",
             Capability::Actor,

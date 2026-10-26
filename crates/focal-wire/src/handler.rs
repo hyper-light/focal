@@ -457,6 +457,11 @@ pub fn validate_response(
         }
         Response::Monitor(value) => crate::monitor::validate(request, response, value, limits)?,
         Response::Summary(value) => crate::summary::validate(request, response, value)?,
+        Response::Fence { .. } => {
+            if !matches!(request.operation, Operation::Fence) {
+                return Err(WireError::InvalidFrame);
+            }
+        }
         Response::Traversed(page) => {
             let Operation::Traverse(query) = &request.operation else {
                 return Err(WireError::InvalidFrame);

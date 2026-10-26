@@ -126,7 +126,7 @@ fn case(name: OsString) {
         principal: identity.issuer,
         ledger: identity.ledger,
     };
-    let journal = OperationJournal::open(&operation, &context).unwrap();
+    let journal = OperationJournal::open(&operation, &context, client_rest(&root)).unwrap();
     assert_eq!(journal.stage(), OperationStage::OpenEpoch);
     assert!(journal.receipt().is_none());
     assert!(journal.epoch_receipt().is_none());
@@ -173,7 +173,7 @@ fn case(name: OsString) {
         7,
     );
     assert_eq!(retried, pending);
-    let recovered = OperationJournal::open(&operation, &context).unwrap();
+    let recovered = OperationJournal::open(&operation, &context, client_rest(&root)).unwrap();
     assert_eq!(recovered.stage(), OperationStage::OpenEpoch);
     assert_eq!(recovered.next_request().unwrap(), Some(&request));
     assert_eq!(fs::read(operation.join("state.bin")).unwrap(), saved);
@@ -242,4 +242,12 @@ fn a_data_directory_too_long_for_its_sockets_is_refused_before_it_is_written() {
         assert_eq!(fs::read_dir(&root).unwrap().count(), 0, "{args:?}");
         assert!(!missing.exists());
     }
+}
+
+/// How the client stores in the node's data directory `root` keep their records (29 §12.11), as a
+/// command line beside the node finds them.
+fn client_rest(root: &std::path::Path) -> focal_client::at_rest::AtRest {
+    let mut settings = focal_node::config::Settings::default();
+    settings.node.data_dir = Some(root.to_path_buf());
+    focal_node::storage_level::client_at_rest_in(&settings, root, root).unwrap()
 }

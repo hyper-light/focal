@@ -142,7 +142,7 @@ mod tests {
     #[test]
     fn every_kind_crosses_as_its_code_and_back() {
         let mut kinds = vec![Kind::Hello];
-        kinds.extend((1..=34).map(Kind::Operation));
+        kinds.extend((1..=35).map(Kind::Operation));
         kinds.extend((0..=u8::MAX).map(Kind::Enrollment));
         let mut codes = std::collections::BTreeSet::new();
         for kind in kinds {
@@ -152,7 +152,7 @@ mod tests {
             assert_eq!(FocalClasses::kind_of(code), Some(kind));
         }
         // Codes nothing is registered as name nothing.
-        for code in [0, 35, 0x00ff, 0x0101, 0x0300, u16::MAX] {
+        for code in [0, 36, 0x00ff, 0x0101, 0x0300, u16::MAX] {
             assert_eq!(FocalClasses::kind_of(code), None, "{code:#x}");
         }
     }
@@ -165,7 +165,7 @@ mod tests {
     /// identity). A joiner may only enroll.
     #[test]
     fn every_registered_tag_has_a_class_and_a_joiner_may_only_enroll() {
-        for tag in 1..=34 {
+        for tag in 1..=35 {
             let class = TrafficClass::of_tag(tag).unwrap_or_else(|| panic!("tag {tag}"));
             assert_eq!(
                 FocalClasses::class_of(Kind::Operation(tag), Sender::Node),
@@ -200,6 +200,6 @@ mod tests {
             );
         }
         assert_eq!(TrafficClass::of_tag(0), None);
-        assert_eq!(TrafficClass::of_tag(35), None);
+        assert_eq!(TrafficClass::of_tag(36), None);
     }
 }

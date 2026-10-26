@@ -19,6 +19,11 @@ serde_saphyr.workspace = true
 focal-platform = { version = "0.1.0", path = "../focal-platform" }
 blake3.workspace = true
 getrandom.workspace = true
+# Every store's records sealed under its data directory's journal key from the at-rest level
+# (29 §12.11).
+focal-seal = { version = "0.1.0", path = "../focal-seal" }
+hyper-seal.workspace = true
+zeroize = "1.8"
 
 [dev-dependencies]
 # The keys of a test's data directory, which every content store is sealed under (29 §11).

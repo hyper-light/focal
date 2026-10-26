@@ -569,6 +569,28 @@ pub(super) struct Remote {
     /// context does not hold, is read and recorded (an enrolled context;
     /// 24 §11).
     adoption: Option<Adoption>,
+    /// Where the fence its cluster answers is recorded, while the fence the
+    /// context knows is below the at-rest level (29 §12.11): asked once, beside
+    /// the first request this transport sends, so the asking costs no round
+    /// trip of its own; the stores it opens next take the form it opens.
+    fence: Mutex<Option<Learn>>,
+}
+/// Where a context records the fence it learns from its cluster (29 §12.11): its history, whose
+/// stores follow it, and its data directory where that hosts no node, whose own files (the issuers
+/// its enrollments adopted) follow it as a node's follow the fence the node records.
+pub(super) struct Learn {
+    pub(super) history: PathBuf,
+    pub(super) data_dir: Option<PathBuf>,
+}
+impl Learn {
+    /// The fence at `level` recorded where it is learned for: the record never falls.
+    fn record(&self, level: u32) -> std::result::Result<(), focal_node::embedded::NodeError> {
+        focal_node::storage_level::record(&self.history, level)?;
+        if let Some(data_dir) = &self.data_dir {
+            focal_node::storage_level::record(data_dir, level)?;
+        }
+        Ok(())
+    }
 }
 /// A context's adoption of the endorsed issuers its verifier found.
 pub(super) struct Adoption {
@@ -650,12 +672,20 @@ impl ClientTransport for Transport {
                             .map_err(|_| WireError::Connection)?;
                     }
                 }
-                let answer = remote
-                    .transport
-                    .get()
-                    .ok_or(WireError::Connection)?
-                    .request(route, request)
-                    .await;
+                let transport = remote.transport.get().ok_or(WireError::Connection)?;
+                let learn = remote.fence.lock().ok().and_then(|mut fence| fence.take());
+                let answer = match learn.zip(fence_query(request)) {
+                    Some((learn, query)) => {
+                        let (answer, fence) = hyper_rt::combine::join2(
+                            transport.request(route, request),
+                            transport.request(None, &query),
+                        )
+                        .await;
+                        record_fence(&learn, &query, fence, &remote.limits);
+                        answer
+                    }
+                    None => transport.request(route, request).await,
+                };
                 if answer.is_ok()
                     && let Some(adoption) = &remote.adoption
                 {
@@ -666,7 +696,83 @@ impl ClientTransport for Transport {
         }
     }
 }
-pub(super) fn connect(settings: &Settings, profile: Profile, history: PathBuf) -> Result<Context> {
+/// The fence the node a context addresses through its socket last recorded, recorded where the
+/// context learns it for (29 §12.11): read from the node's own directory, as the node's commands
+/// beside it read it. A context addressing a cluster over the network learns it with its first
+/// request ([`Remote::fence`]).
+pub(super) fn learn_local_fence(profile: &Profile, learn: &Learn) -> Result<()> {
+    if let Profile::Unix { node_data_dir, .. } = profile
+        && let Some(level) = focal_node::storage_level::known(node_data_dir).map_err(other)?
+    {
+        learn.record(level).map_err(other)?;
+    }
+    Ok(())
+}
+
+/// The fence query sent beside `request`: of its ledger, route and epoch, under an identity of its
+/// own, in the profile every connection accepts. None where no identity could be drawn: the fence
+/// is then asked another time.
+fn fence_query(request: &RequestEnvelope) -> Option<RequestEnvelope> {
+    let mut id = [0u8; 16];
+    getrandom::fill(&mut id).ok()?;
+    let request_id = RequestId(id);
+    if request_id.is_zero() {
+        return None;
+    }
+    Some(RequestEnvelope {
+        protocol: focal_wire::PROTOCOL_VERSION,
+        ledger: request.ledger,
+        route_epoch: request.route_epoch,
+        request_epoch: request.request_epoch,
+        request_id,
+        operation: Operation::Fence,
+    })
+}
+
+/// The cluster's answer to the fence query `query`, recorded where the context learns it for, where
+/// it is one: a node below the level that added the query refuses it, and the fence the context knew
+/// stands. A record that fails is reported and the command goes on; the stores keep the form they
+/// were opened in until the fence is recorded.
+fn record_fence(
+    learn: &Learn,
+    query: &RequestEnvelope,
+    answer: std::result::Result<ResponseEnvelope, WireError>,
+    limits: &WireLimits,
+) {
+    let Ok(answer) = answer else {
+        return;
+    };
+    if focal_wire::validate_response(query, &answer, None, limits).is_err() {
+        return;
+    }
+    if let Response::Fence { level } = answer.result {
+        report_unrecorded(learn, learn.record(level));
+    }
+}
+
+/// A fence record that failed, reported: the command goes on.
+fn report_unrecorded(
+    learn: &Learn,
+    recorded: std::result::Result<(), focal_node::embedded::NodeError>,
+) {
+    if let Err(error) = recorded {
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "focal: [fence_not_recorded] the cluster's fence was not recorded in {}: {error}",
+            learn.history.display()
+        );
+    }
+}
+
+/// The context `profile` names, its history at `history` kept as `at_rest` says; `learn` where the
+/// context's fence is still to be learned from its cluster.
+pub(super) fn connect(
+    settings: &Settings,
+    profile: Profile,
+    history: PathBuf,
+    at_rest: focal_client::at_rest::AtRest,
+    learn: Option<Learn>,
+) -> Result<Context> {
     profile.validate()?;
     match profile {
         Profile::Unix {
@@ -678,6 +784,7 @@ pub(super) fn connect(settings: &Settings, profile: Profile, history: PathBuf) -
             settings.node.data_dir = Some(node_data_dir);
             let mut context = Context::open_local(&settings)?;
             context.root = history;
+            context.at_rest = at_rest;
             // The node serves the sessions of every tenant it admits through
             // its local socket; a saved connection may address one of them.
             if let (Some(tenant), Some(session)) = (tenant, session) {
@@ -750,6 +857,7 @@ pub(super) fn connect(settings: &Settings, profile: Profile, history: PathBuf) -
                 initialized: Mutex::new(()),
                 transport: OnceLock::new(),
                 adoption: Some(adoption),
+                fence: Mutex::new(learn),
             }));
             let client = Client::new(transport, RetryPolicy::default(), limits, 1)?;
             let client = match super::trace::sink() {
@@ -763,6 +871,7 @@ pub(super) fn connect(settings: &Settings, profile: Profile, history: PathBuf) -
                 root: history,
                 admin_root: None,
                 invocation: None,
+                at_rest,
             })
         }
         Profile::Quic(profile) => {
@@ -837,6 +946,7 @@ pub(super) fn connect(settings: &Settings, profile: Profile, history: PathBuf) -
                 initialized: Mutex::new(()),
                 transport: OnceLock::new(),
                 adoption: None,
+                fence: Mutex::new(learn),
             }));
             let client = Client::new(transport, RetryPolicy::default(), limits, 1)?;
             let client = match super::trace::sink() {
@@ -850,6 +960,7 @@ pub(super) fn connect(settings: &Settings, profile: Profile, history: PathBuf) -
                 root: history,
                 admin_root: None,
                 invocation: None,
+                at_rest,
             })
         }
     }
@@ -945,7 +1056,45 @@ async fn enroll(settings: &Settings, selected: &str, invitation: &Path) -> Resul
         result
     }
     .await?;
-    super::super::print_json(&serde_json::json!({"condition":"Enrolled","name":selected,"principal":ParticipantId(receipt.identity.principal),"request_id":pending.request_id(),"selected":false})).map_err(CliError::Other)
+    let request_id = pending.request_id();
+    drop(pending);
+    let learn = Learn {
+        history: history.clone(),
+        data_dir: (!focal_node::node_files::hosts_node(&root).map_err(other)?)
+            .then(|| root.clone()),
+    };
+    learn_remote_fence(
+        settings,
+        Profile::Enrolled {
+            enrollment: root.join(CATALOG).join(format!("enrollment-{selected}")),
+            session: None,
+        },
+        &learn,
+    )
+    .await;
+    super::super::print_json(&serde_json::json!({"condition":"Enrolled","name":selected,"principal":ParticipantId(receipt.identity.principal),"request_id":request_id,"selected":false})).map_err(CliError::Other)
+}
+
+/// The fence a newly enrolled context's cluster answers, recorded where the context learns it for
+/// now rather than with its first command's request, so that command's stores take the form it
+/// opens (29 §12.11). A cluster that cannot say leaves it to the first command's request; a record
+/// that fails is reported, and the enrollment stands.
+async fn learn_remote_fence(settings: &Settings, profile: Profile, learn: &Learn) {
+    let Ok(context) = connect(
+        settings,
+        profile,
+        learn.history.clone(),
+        focal_client::at_rest::AtRest::clear(),
+        None,
+    ) else {
+        return;
+    };
+    let Ok(request) = context.envelope(Operation::Fence) else {
+        return;
+    };
+    if let Ok(level) = context.client.fence(request).await {
+        report_unrecorded(learn, learn.record(level));
+    }
 }
 /// A secret credential (a private key) must be reachable only by its owner:
 /// mode `& 0o077 == 0` on Unix; owned by the current user on Windows, where an

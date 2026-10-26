@@ -12,8 +12,7 @@ use crate::{ClientError, Operation, RequestEnvelope, UploadReply, UploadRequest}
 use focal_model::*;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::File,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Seek},
     path::Path,
 };
 
@@ -47,6 +46,8 @@ pub enum TransferError {
     Cancelled,
     #[error("artifact transfer had an ambiguous write; reopen before continuing")]
     Failed,
+    #[error("artifact transfer at rest: {0}")]
+    AtRest(#[from] crate::at_rest::AtRestError),
 }
 
 /// A fixed, persisted capability. Increasing it requires a different transfer;
@@ -198,19 +199,22 @@ impl State {
 pub struct UploadJournal {
     state: State,
     directory: files::Directory,
-    payload: File,
+    /// Its staged bytes: in the clear below the at-rest level, a sealed part from it (29 §12.11).
+    payload: files::Payload,
     failed: bool,
     prefix: blake3::Hasher,
 }
 impl UploadJournal {
     /// Bind caller-known identity and complete stream digest before sending Begin.
-    /// An interrupted creation is never silently recreated by `open`.
+    /// An interrupted creation is never silently recreated by `open`. Its records
+    /// and staged bytes are kept as `rest` says (29 §12.11).
     pub fn begin(
         path: impl AsRef<Path>,
         context: OperationContext,
         spec: UploadSpec,
         route_epoch: RouteEpoch,
         limits: TransferLimits,
+        rest: crate::at_rest::AtRest,
     ) -> Result<Self, TransferError> {
         let state = State {
             version: 1,
@@ -240,7 +244,7 @@ impl UploadJournal {
             return Err(TransferError::Conflict);
         }
         let bytes = encode(&state)?;
-        let (directory, payload) = files::Directory::create(path.as_ref())?;
+        let (directory, payload) = files::Directory::create(path.as_ref(), rest, spec.length)?;
         directory.install(&bytes, true)?;
         Ok(Self {
             state,
@@ -250,8 +254,14 @@ impl UploadJournal {
             prefix: blake3::Hasher::new(),
         })
     }
-    pub fn open(path: impl AsRef<Path>, context: &OperationContext) -> Result<Self, TransferError> {
-        let (directory, mut payload) = files::Directory::open(path.as_ref())?;
+    /// The upload at `path`, converted to sealed first where `rest` seals and it is not marked
+    /// yet (29 §12.11), under its lock.
+    pub fn open(
+        path: impl AsRef<Path>,
+        context: &OperationContext,
+        rest: crate::at_rest::AtRest,
+    ) -> Result<Self, TransferError> {
+        let directory = files::Directory::open(path.as_ref(), rest)?;
         let bytes = directory.read()?;
         let (state, remaining): (State, &[u8]) =
             postcard::take_from_bytes(&bytes).map_err(|_| TransferError::Corrupt)?;
@@ -259,17 +269,26 @@ impl UploadJournal {
             return Err(TransferError::Corrupt);
         }
         state.validate(context)?;
+        if directory.sealing() {
+            // The conversion replaces its state, which needs the creation finished first.
+            directory.recover_marker()?;
+            directory.convert(
+                state.progress.length,
+                state.progress.staged,
+                &state.prefix_hash.0,
+            )?;
+        }
+        let mut payload = directory.payload(state.progress.length)?;
         // A crash can leave bytes written after the last accepted local stage.
         // They were never transmitted: requests use only the saved prefix.
-        let length = payload.metadata()?.len();
+        let length = payload.held()?;
         if length < state.progress.staged || length > state.progress.length {
             return Err(TransferError::Corrupt);
         }
         if length != state.progress.staged {
-            payload.set_len(state.progress.staged)?;
-            payload.sync_all()?;
+            payload = payload.cut(&directory, state.progress.staged)?;
         }
-        let prefix = hash_reader(&mut payload, state.progress.staged)?;
+        let prefix = payload.prefix(&directory, state.progress.staged)?;
         if ContentHash(*prefix.finalize().as_bytes()) != state.prefix_hash {
             return Err(TransferError::Corrupt);
         }
@@ -359,8 +378,7 @@ impl UploadJournal {
         }
         if offset < self.state.progress.staged && end <= self.state.progress.staged {
             let mut saved = buffer(bytes.len())?;
-            self.payload.seek(SeekFrom::Start(offset))?;
-            self.payload.read_exact(&mut saved)?;
+            self.payload.read_at(&self.directory, offset, &mut saved)?;
             return if saved == bytes {
                 Ok(self.state.progress.staged)
             } else {
@@ -376,14 +394,9 @@ impl UploadJournal {
         if end == self.state.progress.length && prefix_hash != self.state.progress.digest {
             return Err(TransferError::Conflict);
         }
-        self.payload.seek(SeekFrom::Start(offset))?;
-        if let Err(error) = self
-            .payload
-            .write_all(bytes)
-            .and_then(|()| self.payload.sync_all())
-        {
+        if let Err(error) = self.payload.append(offset, bytes) {
             self.failed = true;
-            return Err(error.into());
+            return Err(error);
         }
         let mut state = self.state.clone();
         state.progress.staged = end;
@@ -439,8 +452,7 @@ impl UploadJournal {
             },
             PendingRequest::Append { offset, count } => {
                 let mut bytes = buffer(count as usize)?;
-                self.payload.seek(SeekFrom::Start(offset))?;
-                self.payload.read_exact(&mut bytes)?;
+                self.payload.read_at(&self.directory, offset, &mut bytes)?;
                 UploadRequest::Append {
                     upload: p.upload,
                     offset,

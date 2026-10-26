@@ -106,9 +106,17 @@ impl Running {
         configure: impl FnOnce(Backend<Controlled>) -> Backend<Controlled>,
     ) -> Self {
         let store = if reopen {
-            OperationStore::open(path, StoreLimits::default())
+            OperationStore::open(
+                path,
+                StoreLimits::default(),
+                focal_client::at_rest::AtRest::clear(),
+            )
         } else {
-            OperationStore::create(path, StoreLimits::default())
+            OperationStore::create(
+                path,
+                StoreLimits::default(),
+                focal_client::at_rest::AtRest::clear(),
+            )
         }
         .unwrap();
         let (send, requests) = mpsc::sync_channel(4);
@@ -411,7 +419,12 @@ fn unknown_reply_and_eof_leave_exact_epoch_request_recoverable() {
     // refuses the bounded one, which would have waited for it).
     reopened.stop();
     assert!(pending.abandoned());
-    let store = OperationStore::open(&path, StoreLimits::default()).unwrap();
+    let store = OperationStore::open(
+        &path,
+        StoreLimits::default(),
+        focal_client::at_rest::AtRest::clear(),
+    )
+    .unwrap();
     let journal = store.open_existing(OPERATION_ID, &context()).unwrap();
     assert_eq!(journal.next_request().unwrap(), Some(&saved));
 }

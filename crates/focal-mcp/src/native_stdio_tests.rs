@@ -16,9 +16,17 @@ impl crate::NativeJournal for Journal {
     }
     fn open(self: Box<Self>) -> Result<NativeOperationStore, crate::JournalError> {
         if self.path.exists() {
-            NativeOperationStore::open(&self.path, NativeStoreLimits::default())
+            NativeOperationStore::open(
+                &self.path,
+                NativeStoreLimits::default(),
+                focal_client::at_rest::AtRest::clear(),
+            )
         } else {
-            NativeOperationStore::create(&self.path, NativeStoreLimits::default())
+            NativeOperationStore::create(
+                &self.path,
+                NativeStoreLimits::default(),
+                focal_client::at_rest::AtRest::clear(),
+            )
         }
         .map_err(|error| Box::new(error) as crate::JournalError)
     }
@@ -553,7 +561,12 @@ fn legacy_answers_and_an_unreachable_owner_keep_the_v1_catalogue_unless_the_jour
     }
     // Once a native journal exists, an unreachable owner refuses to start
     // the adapter as V1 rather than minting identities in the wrong namespace.
-    NativeOperationStore::create(&journal, NativeStoreLimits::default()).unwrap();
+    NativeOperationStore::create(
+        &journal,
+        NativeStoreLimits::default(),
+        focal_client::at_rest::AtRest::clear(),
+    )
+    .unwrap();
     let operations = root.path().join("operations");
     let running = Running::start_with(&operations, operations.exists(), |backend| {
         backend.with_native_journal(Box::new(Journal {

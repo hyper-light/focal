@@ -117,7 +117,7 @@ fn caller_known_id_survives_both_lost_remote_replies_with_exact_core_receipts() 
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("operations");
     let limits = StoreLimits::default();
-    let store = OperationStore::create(&root, limits).unwrap();
+    let store = OperationStore::create(&root, limits, crate::at_rest::AtRest::clear()).unwrap();
     let canonical = authored().canonical_intent().unwrap();
     let expanded = Cell::new(0);
     let mut journal = store
@@ -133,7 +133,8 @@ fn caller_known_id_survives_both_lost_remote_replies_with_exact_core_receipts() 
         execute(&mut core, journal.next_request().unwrap().unwrap());
         let committed = core.sequence();
         drop(journal);
-        let reopened = OperationStore::open(&root, limits).unwrap();
+        let reopened =
+            OperationStore::open(&root, limits, crate::at_rest::AtRest::clear()).unwrap();
         journal = reopened
             .open_or_create(ID, context(), intent(&canonical), never_expand)
             .unwrap();
@@ -160,7 +161,12 @@ fn caller_known_id_survives_both_lost_remote_replies_with_exact_core_receipts() 
 #[test]
 fn intent_and_context_are_checked_before_expansion_and_journal_lock_is_per_id() {
     let temp = tempfile::tempdir().unwrap();
-    let store = OperationStore::create(temp.path().join("store"), StoreLimits::default()).unwrap();
+    let store = OperationStore::create(
+        temp.path().join("store"),
+        StoreLimits::default(),
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap();
     let canonical = authored().canonical_intent().unwrap();
     let first = store
         .open_or_create(ID, context(), intent(&canonical), || Ok(requests(10)))
@@ -216,14 +222,24 @@ fn intent_and_context_are_checked_before_expansion_and_journal_lock_is_per_id() 
 fn claimed_without_complete_envelopes_never_reruns_generator() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("store");
-    let store = OperationStore::create(&root, StoreLimits::default()).unwrap();
+    let store = OperationStore::create(
+        &root,
+        StoreLimits::default(),
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap();
     let canonical = authored().canonical_intent().unwrap();
     store.fault.set(Some(Fault::Claimed));
     assert!(matches!(
         store.open_or_create(ID, context(), intent(&canonical), never_expand),
         Err(StoreError::Io(_))
     ));
-    let reopened = OperationStore::open(&root, StoreLimits::default()).unwrap();
+    let reopened = OperationStore::open(
+        &root,
+        StoreLimits::default(),
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap();
     assert!(matches!(
         reopened.open_or_create(ID, context(), intent(&canonical), never_expand),
         Err(StoreError::Incomplete)
@@ -250,7 +266,12 @@ fn each_complete_prepared_creation_boundary_recovers_without_reexpansion() {
     for fault in [Fault::Prepared, Fault::Journal, Fault::Ready] {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("store");
-        let store = OperationStore::create(&root, StoreLimits::default()).unwrap();
+        let store = OperationStore::create(
+            &root,
+            StoreLimits::default(),
+            crate::at_rest::AtRest::clear(),
+        )
+        .unwrap();
         let canonical = authored().canonical_intent().unwrap();
         store.fault.set(Some(fault));
         assert!(matches!(
@@ -258,7 +279,12 @@ fn each_complete_prepared_creation_boundary_recovers_without_reexpansion() {
             Err(StoreError::Io(_))
         ));
         drop(store);
-        let store = OperationStore::open(&root, StoreLimits::default()).unwrap();
+        let store = OperationStore::open(
+            &root,
+            StoreLimits::default(),
+            crate::at_rest::AtRest::clear(),
+        )
+        .unwrap();
         let journal = store.open_existing(ID, &context()).unwrap();
         assert_eq!(journal.next_request().unwrap(), Some(&requests(10).0));
         drop(journal);
@@ -277,7 +303,7 @@ fn aggregate_quota_reserves_all_future_journal_generations_including_failed_clai
         max_operations: 8,
         max_reserved_bytes: ROOT_RESERVATION + 2 * OPERATION_RESERVATION,
     };
-    let store = OperationStore::create(&root, limits).unwrap();
+    let store = OperationStore::create(&root, limits, crate::at_rest::AtRest::clear()).unwrap();
     let canonical = authored().canonical_intent().unwrap();
     assert!(matches!(
         store.open_or_create(ID, context(), intent(&canonical), || Err(
@@ -305,13 +331,17 @@ fn aggregate_quota_reserves_all_future_journal_generations_including_failed_clai
         Err(StoreError::Capacity)
     ));
     assert!(matches!(
-        OperationStore::open(&root, StoreLimits::default()),
+        OperationStore::open(
+            &root,
+            StoreLimits::default(),
+            crate::at_rest::AtRest::clear()
+        ),
         Err(StoreError::LimitsMismatch)
     ));
     drop(second);
     drop(store);
     assert_eq!(
-        OperationStore::open(&root, limits)
+        OperationStore::open(&root, limits, crate::at_rest::AtRest::clear())
             .unwrap()
             .usage()
             .unwrap()
@@ -323,7 +353,12 @@ fn aggregate_quota_reserves_all_future_journal_generations_including_failed_clai
 #[test]
 fn oversized_intent_and_invalid_ids_are_rejected_before_catalogue_admission() {
     let temp = tempfile::tempdir().unwrap();
-    let store = OperationStore::create(temp.path().join("store"), StoreLimits::default()).unwrap();
+    let store = OperationStore::create(
+        temp.path().join("store"),
+        StoreLimits::default(),
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap();
     for id in [
         "",
         "../escape",
@@ -359,7 +394,12 @@ fn loss_of_ready_journal_prepared_or_root_catalogue_fails_closed() {
     ] {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("store");
-        let store = OperationStore::create(&root, StoreLimits::default()).unwrap();
+        let store = OperationStore::create(
+            &root,
+            StoreLimits::default(),
+            crate::at_rest::AtRest::clear(),
+        )
+        .unwrap();
         let canonical = authored().canonical_intent().unwrap();
         drop(
             store
@@ -381,12 +421,20 @@ fn loss_of_ready_journal_prepared_or_root_catalogue_fails_closed() {
         ));
         if root.exists() {
             assert!(matches!(
-                OperationStore::create(&root, StoreLimits::default()),
+                OperationStore::create(
+                    &root,
+                    StoreLimits::default(),
+                    crate::at_rest::AtRest::clear()
+                ),
                 Err(StoreError::Exists)
             ));
         } else {
             assert!(matches!(
-                OperationStore::open(&root, StoreLimits::default()),
+                OperationStore::open(
+                    &root,
+                    StoreLimits::default(),
+                    crate::at_rest::AtRest::clear()
+                ),
                 Err(StoreError::Corrupt)
             ));
         }
@@ -399,9 +447,14 @@ fn private_files_catalogue_lock_checksum_and_exact_prepared_journal_binding_are_
     use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("store");
-    let store = OperationStore::create(&root, StoreLimits::default()).unwrap();
+    let store = OperationStore::create(
+        &root,
+        StoreLimits::default(),
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap();
     let canonical = authored().canonical_intent().unwrap();
-    let directory = files::Directory::open(&root).unwrap();
+    let directory = files::Directory::open(&root, crate::at_rest::AtRest::clear()).unwrap();
     assert!(matches!(store.usage(), Err(StoreError::Locked)));
     drop(directory);
     let journal = store
@@ -423,7 +476,16 @@ fn private_files_catalogue_lock_checksum_and_exact_prepared_journal_binding_are_
     );
     fs::remove_dir_all(&path).unwrap();
     let (open, request) = requests(20);
-    drop(OperationJournal::create(&path, context(), open, request).unwrap());
+    drop(
+        OperationJournal::create(
+            &path,
+            context(),
+            open,
+            request,
+            crate::at_rest::AtRest::clear(),
+        )
+        .unwrap(),
+    );
     assert!(matches!(
         store.open_existing(ID, &context()),
         Err(StoreError::Corrupt)
@@ -438,17 +500,30 @@ fn private_files_catalogue_lock_checksum_and_exact_prepared_journal_binding_are_
 fn partial_root_and_partial_journal_are_never_overwritten_as_fresh_operations() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("store");
-    drop(files::Directory::create(&root).unwrap());
+    drop(files::Directory::create(&root, crate::at_rest::AtRest::clear()).unwrap());
     assert!(matches!(
-        OperationStore::open(&root, StoreLimits::default()),
+        OperationStore::open(
+            &root,
+            StoreLimits::default(),
+            crate::at_rest::AtRest::clear()
+        ),
         Err(StoreError::Corrupt)
     ));
     assert!(matches!(
-        OperationStore::create(&root, StoreLimits::default()),
+        OperationStore::create(
+            &root,
+            StoreLimits::default(),
+            crate::at_rest::AtRest::clear()
+        ),
         Err(StoreError::Exists)
     ));
     let root = temp.path().join("second");
-    let store = OperationStore::create(&root, StoreLimits::default()).unwrap();
+    let store = OperationStore::create(
+        &root,
+        StoreLimits::default(),
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap();
     let canonical = authored().canonical_intent().unwrap();
     store.fault.set(Some(Fault::Prepared));
     assert!(
@@ -469,7 +544,12 @@ fn symlinks_hardlinks_and_unindexed_operation_directories_are_rejected() {
     for replacement in ["symlink", "hardlink", "directory"] {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("store");
-        let store = OperationStore::create(&root, StoreLimits::default()).unwrap();
+        let store = OperationStore::create(
+            &root,
+            StoreLimits::default(),
+            crate::at_rest::AtRest::clear(),
+        )
+        .unwrap();
         let canonical = authored().canonical_intent().unwrap();
         drop(
             store
@@ -498,7 +578,12 @@ fn symlinks_hardlinks_and_unindexed_operation_directories_are_rejected() {
     }
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("store");
-    let store = OperationStore::create(&root, StoreLimits::default()).unwrap();
+    let store = OperationStore::create(
+        &root,
+        StoreLimits::default(),
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap();
     fs::DirBuilder::new()
         .mode(0o700)
         .create(root.join(component(parse_id(ID).unwrap())))
@@ -514,14 +599,19 @@ fn symlinks_hardlinks_and_unindexed_operation_directories_are_rejected() {
 fn saved_intent_is_checked_against_catalogue_when_inspecting_without_authored_input() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("store");
-    let store = OperationStore::create(&root, StoreLimits::default()).unwrap();
+    let store = OperationStore::create(
+        &root,
+        StoreLimits::default(),
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap();
     let canonical = authored().canonical_intent().unwrap();
     drop(
         store
             .open_or_create(ID, context(), intent(&canonical), || Ok(requests(10)))
             .unwrap(),
     );
-    let directory = files::Directory::open(&root).unwrap();
+    let directory = files::Directory::open(&root, crate::at_rest::AtRest::clear()).unwrap();
     let mut prepared = store
         .prepared(&directory, parse_id(ID).unwrap(), true)
         .unwrap();
@@ -548,7 +638,12 @@ fn complete_creation_link_window_recovers_catalogue_and_prepared_without_regener
     for catalogue_window in [true, false] {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("store");
-        let store = OperationStore::create(&root, StoreLimits::default()).unwrap();
+        let store = OperationStore::create(
+            &root,
+            StoreLimits::default(),
+            crate::at_rest::AtRest::clear(),
+        )
+        .unwrap();
         let canonical = authored().canonical_intent().unwrap();
         let destination = if catalogue_window {
             root.join(CATALOGUE)
@@ -574,7 +669,12 @@ fn complete_creation_link_window_recovers_catalogue_and_prepared_without_regener
         );
         assert_eq!(fs::metadata(&destination).unwrap().nlink(), 2);
         drop(store);
-        let recovered = OperationStore::open(&root, StoreLimits::default()).unwrap();
+        let recovered = OperationStore::open(
+            &root,
+            StoreLimits::default(),
+            crate::at_rest::AtRest::clear(),
+        )
+        .unwrap();
         if !catalogue_window {
             let journal = recovered
                 .open_or_create(ID, context(), intent(&canonical), never_expand)
@@ -595,7 +695,12 @@ fn prepared_envelopes_resume_each_uninitialized_journal_creation_midpoint() {
     for midpoint in ["directory", "lock", "fragment", "complete_record"] {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("store");
-        let store = OperationStore::create(&root, StoreLimits::default()).unwrap();
+        let store = OperationStore::create(
+            &root,
+            StoreLimits::default(),
+            crate::at_rest::AtRest::clear(),
+        )
+        .unwrap();
         let canonical = authored().canonical_intent().unwrap();
         store.fault.set(Some(Fault::Prepared));
         assert!(
@@ -606,7 +711,16 @@ fn prepared_envelopes_resume_each_uninitialized_journal_creation_midpoint() {
         let journal = store.operation_path(ID).unwrap();
         if midpoint == "complete_record" {
             let (epoch, request) = requests(10);
-            drop(OperationJournal::create(&journal, context(), epoch, request).unwrap());
+            drop(
+                OperationJournal::create(
+                    &journal,
+                    context(),
+                    epoch,
+                    request,
+                    crate::at_rest::AtRest::clear(),
+                )
+                .unwrap(),
+            );
             fs::remove_file(journal.join("INITIALIZED")).unwrap();
         } else {
             fs::DirBuilder::new().mode(0o700).create(&journal).unwrap();
@@ -632,7 +746,12 @@ fn prepared_envelopes_resume_each_uninitialized_journal_creation_midpoint() {
             }
         }
         drop(store);
-        let store = OperationStore::open(&root, StoreLimits::default()).unwrap();
+        let store = OperationStore::open(
+            &root,
+            StoreLimits::default(),
+            crate::at_rest::AtRest::clear(),
+        )
+        .unwrap();
         let recovered = store
             .open_or_create(ID, context(), intent(&canonical), never_expand)
             .unwrap();
@@ -652,7 +771,12 @@ fn creation_link_recovery_rejects_wrong_inodes_extra_links_symlinks_modes_and_ba
         for corruption in ["arbitrary", "third", "inode", "symlink", "mode", "checksum"] {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("store");
-            let store = OperationStore::create(&root, StoreLimits::default()).unwrap();
+            let store = OperationStore::create(
+                &root,
+                StoreLimits::default(),
+                crate::at_rest::AtRest::clear(),
+            )
+            .unwrap();
             let destination = if catalogue_window {
                 root.join(CATALOGUE)
             } else {
@@ -719,10 +843,15 @@ fn linked_catalogue_is_recovered_before_replace_temporary_cleanup() {
     use std::os::unix::fs::MetadataExt;
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("store");
-    let store = OperationStore::create(&root, StoreLimits::default()).unwrap();
+    let store = OperationStore::create(
+        &root,
+        StoreLimits::default(),
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap();
     let destination = root.join(CATALOGUE);
     let pending = destination.with_extension("pending");
-    let directory = files::Directory::open(&root).unwrap();
+    let directory = files::Directory::open(&root, crate::at_rest::AtRest::clear()).unwrap();
     let payload = directory
         .read(CATALOGUE, CATALOGUE_MAGIC, CATALOGUE_BYTES)
         .unwrap();
@@ -749,7 +878,12 @@ fn journal_resume_preserves_corruption_initialization_and_ready_fences() {
     ] {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("store");
-        let store = OperationStore::create(&root, StoreLimits::default()).unwrap();
+        let store = OperationStore::create(
+            &root,
+            StoreLimits::default(),
+            crate::at_rest::AtRest::clear(),
+        )
+        .unwrap();
         let canonical = authored().canonical_intent().unwrap();
         let ready = corruption == "ready_missing_both";
         if !ready {
@@ -776,7 +910,16 @@ fn journal_resume_preserves_corruption_initialization_and_ready_fences() {
             } else {
                 10
             });
-            drop(OperationJournal::create(&path, context(), epoch, request).unwrap());
+            drop(
+                OperationJournal::create(
+                    &path,
+                    context(),
+                    epoch,
+                    request,
+                    crate::at_rest::AtRest::clear(),
+                )
+                .unwrap(),
+            );
         }
         match corruption {
             "corrupt_state" => {
@@ -813,7 +956,12 @@ fn journal_resume_preserves_corruption_initialization_and_ready_fences() {
 #[test]
 fn journal_resume_keeps_valid_receipts_even_before_catalogue_readiness() {
     let temp = tempfile::tempdir().unwrap();
-    let store = OperationStore::create(temp.path().join("store"), StoreLimits::default()).unwrap();
+    let store = OperationStore::create(
+        temp.path().join("store"),
+        StoreLimits::default(),
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap();
     let canonical = authored().canonical_intent().unwrap();
     store.fault.set(Some(Fault::Journal));
     assert!(
@@ -822,7 +970,8 @@ fn journal_resume_keeps_valid_receipts_even_before_catalogue_readiness() {
             .is_err()
     );
     let path = store.operation_path(ID).unwrap();
-    let mut journal = OperationJournal::open(&path, &context()).unwrap();
+    let mut journal =
+        OperationJournal::open(&path, &context(), crate::at_rest::AtRest::clear()).unwrap();
     let mut core = Core::new(context().ledger, Limits::default());
     while let Some(request) = journal.next_request().unwrap() {
         let reply = execute(&mut core, request);
@@ -835,4 +984,229 @@ fn journal_resume_keeps_valid_receipts_even_before_catalogue_readiness() {
     assert_eq!(recovered.receipt(), Some(&receipt));
     assert_eq!(recovered.stage(), OperationStage::Completed);
     assert_eq!(fs::read(path.join("state.bin")).unwrap(), original);
+}
+
+const THIRD: &str = "000000000000000000000000000000ef";
+
+/// A store below the at-rest level holding an answered operation, one whose command committed
+/// with its reply lost, and one claimed and prepared with its journal never made: written as every
+/// earlier binary wrote it. The ledger it ran against comes with it.
+fn clear_store(
+    root: &Path,
+    keys: &focal_seal::DataKeys,
+) -> (Core, RequestEnvelope, MutationReceipt) {
+    let canonical = authored().canonical_intent().unwrap();
+    let store = OperationStore::create(
+        root,
+        StoreLimits::default(),
+        crate::at_rest::support::below(keys),
+    )
+    .unwrap();
+    let mut core = Core::new(context().ledger, Limits::default());
+    let mut answered = store
+        .open_or_create(ID, context(), intent(&canonical), || Ok(requests(10)))
+        .unwrap();
+    for _ in 0..2 {
+        let reply = execute(&mut core, answered.next_request().unwrap().unwrap());
+        answered.record_reply(&reply).unwrap();
+    }
+    let receipt = answered.receipt().unwrap().clone();
+    drop(answered);
+    let mut pending = store
+        .open_or_create(SECOND, context(), intent(&canonical), || Ok(requests(20)))
+        .unwrap();
+    let epoch = execute(&mut core, pending.next_request().unwrap().unwrap());
+    pending.record_reply(&epoch).unwrap();
+    let command = pending.next_request().unwrap().unwrap().clone();
+    execute(&mut core, &command);
+    drop(pending);
+    store.fault.set(Some(Fault::Prepared));
+    assert!(
+        store
+            .open_or_create(THIRD, context(), intent(&canonical), || Ok(requests(30)))
+            .is_err()
+    );
+    (core, command, receipt)
+}
+
+/// A store below the level converted at its open, cut after each of its steps in turn (each
+/// journal, each prepared request, the catalogue): the next open finishes, and then every record is
+/// sealed, nothing of them in the clear, the answered operation's receipt as it was, the pending
+/// command answered once under its identity, and the operation never journaled made sealed from its
+/// prepared requests without expanding again (29 §12.11).
+#[test]
+fn a_store_converts_through_a_cut_at_any_step_and_answers_each_operation_once() {
+    use crate::at_rest::support::{assert_sealed_under, directory, sealing};
+    let canonical = authored().canonical_intent().unwrap();
+    for cut in 0.. {
+        let (data, keys) = directory();
+        let root = data.path().join("operations");
+        let (mut core, command, receipt) = clear_store(&root, &keys);
+        assert!(
+            fs::read(root.join(CATALOGUE))
+                .unwrap()
+                .starts_with(CATALOGUE_MAGIC)
+        );
+        crate::at_rest::cut::after(cut);
+        let first = OperationStore::open(&root, StoreLimits::default(), sealing(&keys));
+        let finished = first.is_ok();
+        crate::at_rest::cut::none();
+        let store = match first {
+            Ok(store) => store,
+            Err(_) => OperationStore::open(&root, StoreLimits::default(), sealing(&keys)).unwrap(),
+        };
+        assert!(root.join(crate::at_rest::SEALED).exists());
+        assert_sealed_under(
+            &root,
+            &[
+                b"the original authored intent",
+                CATALOGUE_MAGIC,
+                PREPARED_MAGIC,
+            ],
+        );
+
+        let answered = store.open_existing(ID, &context()).unwrap();
+        assert_eq!(answered.receipt(), Some(&receipt));
+        drop(answered);
+        let mut pending = store
+            .open_or_create(SECOND, context(), intent(&canonical), never_expand)
+            .unwrap();
+        assert_eq!(pending.next_request().unwrap(), Some(&command));
+        let sequence = core.sequence();
+        let duplicate = execute(&mut core, &command);
+        assert!(matches!(
+            duplicate,
+            MutationReply::Domain(DomainOutcome::Duplicate(_))
+        ));
+        assert_eq!(core.sequence(), sequence, "answered once");
+        assert_eq!(
+            pending.record_reply(&duplicate).unwrap(),
+            OperationStage::Completed
+        );
+        drop(pending);
+        let resumed = store
+            .open_or_create(THIRD, context(), intent(&canonical), never_expand)
+            .unwrap();
+        assert!(resumed.matches_requests(&requests(30).0, &requests(30).1));
+        drop(resumed);
+        assert_sealed_under(&root, &[b"the original authored intent"]);
+        assert_eq!(core.snapshot().claims.len(), 2);
+        if finished {
+            assert!(cut > 0, "a conversion of no step");
+            break;
+        }
+    }
+}
+
+/// A sealed store's records changed, swapped between operations, carried in from another data
+/// directory, or planted in the clear after the mark are refused; put back, the store opens.
+#[test]
+fn a_sealed_stores_records_changed_swapped_carried_or_planted_in_the_clear_are_refused() {
+    use crate::at_rest::AtRestError;
+    use crate::at_rest::support::{directory, flip, sealing, swap};
+    use focal_seal::named::NamedError;
+    let canonical = authored().canonical_intent().unwrap();
+    let (data, keys) = directory();
+    let root = data.path().join("operations");
+    let store = OperationStore::create(&root, StoreLimits::default(), sealing(&keys)).unwrap();
+    for (id, seed) in [(ID, 10), (SECOND, 20)] {
+        drop(
+            store
+                .open_or_create(id, context(), intent(&canonical), || Ok(requests(seed)))
+                .unwrap(),
+        );
+    }
+    let first = root.join(format!("{ID}/{PREPARED}"));
+    let second = root.join(format!("{SECOND}/{PREPARED}"));
+    let catalogue = root.join(CATALOGUE);
+    let saved = fs::read(&catalogue).unwrap();
+    let opens = || {
+        let store = OperationStore::open(&root, StoreLimits::default(), sealing(&keys))?;
+        store.open_or_create(ID, context(), intent(&canonical), never_expand)?;
+        Ok::<_, StoreError>(())
+    };
+    opens().unwrap();
+
+    flip(&catalogue);
+    assert!(matches!(
+        opens(),
+        Err(StoreError::AtRest(AtRestError::Sealed(NamedError::Seal(_))))
+    ));
+    fs::write(&catalogue, &saved).unwrap();
+
+    swap(&first, &second);
+    assert!(matches!(
+        opens(),
+        Err(StoreError::AtRest(AtRestError::Sealed(NamedError::Moved(
+            _
+        ))))
+    ));
+    swap(&first, &second);
+
+    let (far, far_keys) = directory();
+    let far_root = far.path().join("operations");
+    drop(OperationStore::create(&far_root, StoreLimits::default(), sealing(&far_keys)).unwrap());
+    fs::write(&catalogue, fs::read(far_root.join(CATALOGUE)).unwrap()).unwrap();
+    assert!(matches!(
+        opens(),
+        Err(StoreError::AtRest(AtRestError::Sealed(NamedError::Seal(_))))
+    ));
+
+    let clear_root = data.path().join("clear");
+    drop(
+        OperationStore::create(
+            &clear_root,
+            StoreLimits::default(),
+            crate::at_rest::AtRest::clear(),
+        )
+        .unwrap(),
+    );
+    fs::write(&catalogue, fs::read(clear_root.join(CATALOGUE)).unwrap()).unwrap();
+    assert!(matches!(
+        opens(),
+        Err(StoreError::AtRest(AtRestError::ClearAfterSealed(name))) if name == CATALOGUE
+    ));
+
+    fs::write(&catalogue, &saved).unwrap();
+    opens().unwrap();
+}
+
+/// What converting a store costs (29 §12.11): a store of 32 answered operations below the at-rest
+/// level converted at its open (each operation's journal and prepared request, then the
+/// catalogue), the median of 11. Run by hand, in release: `cargo test -p focal-client --release
+/// --lib -- --ignored measure_store_conversion --nocapture`.
+#[test]
+#[ignore = "a measurement, run by hand"]
+fn measure_store_conversion() {
+    use crate::at_rest::support::{below, directory, sealing};
+    let canonical = authored().canonical_intent().unwrap();
+    let mut conversions = Vec::new();
+    for _ in 0..11 {
+        let (data, keys) = directory();
+        let root = data.path().join("operations");
+        let store = OperationStore::create(&root, StoreLimits::default(), below(&keys)).unwrap();
+        let mut core = Core::new(context().ledger, Limits::default());
+        // Within what the default limits reserve: each operation's journal generations.
+        for operation in 0..32u128 {
+            let id = format!("{:032x}", 0x1000 + operation);
+            let mut journal = store
+                .open_or_create(&id, context(), intent(&canonical), || {
+                    Ok(requests(1000 + operation * 10))
+                })
+                .unwrap();
+            for _ in 0..2 {
+                let reply = execute(&mut core, journal.next_request().unwrap().unwrap());
+                journal.record_reply(&reply).unwrap();
+            }
+        }
+        drop(store);
+        let began = std::time::Instant::now();
+        drop(OperationStore::open(&root, StoreLimits::default(), sealing(&keys)).unwrap());
+        conversions.push(began.elapsed());
+    }
+    conversions.sort_unstable();
+    eprintln!(
+        "a store of 32 answered operations converted at its open: {:?}",
+        conversions[conversions.len() / 2]
+    );
 }

@@ -4,6 +4,7 @@ mod maintenance;
 mod state;
 use crate::{
     AccessError, Operation, RequestEnvelope, Response, ResponseEnvelope,
+    at_rest::AtRest,
     input::IdGenerator,
     managed_store::{
         ManagedOperationId, ManagedOperationStore, ManagedStoreError, ManagedStoreLimits,
@@ -61,6 +62,8 @@ pub struct ManagedRequests {
     context: OperationContext,
     limits: ManagedStoreLimits,
     rotation: u64,
+    /// How its owner record and its stores' records are kept at rest (29 §12.11).
+    rest: AtRest,
 }
 impl ManagedRequests {
     pub fn open(
@@ -68,6 +71,7 @@ impl ManagedRequests {
         name: &str,
         context: OperationContext,
         limits: ManagedStoreLimits,
+        rest: AtRest,
     ) -> Result<Self, ManagedRequestsError> {
         Self::open_inner(
             parent.as_ref(),
@@ -76,6 +80,7 @@ impl ManagedRequests {
             limits,
             DEFAULT_ROTATION,
             true,
+            rest,
         )
     }
     pub fn open_existing(
@@ -83,6 +88,7 @@ impl ManagedRequests {
         name: &str,
         context: OperationContext,
         limits: ManagedStoreLimits,
+        rest: AtRest,
     ) -> Result<Self, ManagedRequestsError> {
         Self::open_inner(
             parent.as_ref(),
@@ -91,6 +97,7 @@ impl ManagedRequests {
             limits,
             DEFAULT_ROTATION,
             false,
+            rest,
         )
     }
     /// Open with an explicit rotation bound (ordinals per generation). The
@@ -101,8 +108,9 @@ impl ManagedRequests {
         context: OperationContext,
         limits: ManagedStoreLimits,
         rotation: u64,
+        rest: AtRest,
     ) -> Result<Self, ManagedRequestsError> {
-        Self::open_inner(parent.as_ref(), name, context, limits, rotation, true)
+        Self::open_inner(parent.as_ref(), name, context, limits, rotation, true, rest)
     }
     pub fn open_existing_with(
         parent: impl AsRef<Path>,
@@ -110,8 +118,17 @@ impl ManagedRequests {
         context: OperationContext,
         limits: ManagedStoreLimits,
         rotation: u64,
+        rest: AtRest,
     ) -> Result<Self, ManagedRequestsError> {
-        Self::open_inner(parent.as_ref(), name, context, limits, rotation, false)
+        Self::open_inner(
+            parent.as_ref(),
+            name,
+            context,
+            limits,
+            rotation,
+            false,
+            rest,
+        )
     }
     fn open_inner(
         parent: &Path,
@@ -120,6 +137,7 @@ impl ManagedRequests {
         limits: ManagedStoreLimits,
         rotation: u64,
         create: bool,
+        rest: AtRest,
     ) -> Result<Self, ManagedRequestsError> {
         if !valid_name(name)
             || context.cluster == [0; 16]
@@ -144,9 +162,10 @@ impl ManagedRequests {
             context,
             limits,
             rotation,
+            rest,
         };
         let (directory, initialized) =
-            Directory::coordinator(parent, name, create).map_err(|e| {
+            Directory::coordinator(parent, name, create, this.rest.clone()).map_err(|e| {
                 if matches!(e, StoreError::MissingOperation) {
                     ManagedRequestsError::Missing
                 } else {
@@ -154,6 +173,9 @@ impl ManagedRequests {
                 }
             })?;
         let record = this.record();
+        // The owner record to sealed, where the form seals and the owner is not marked yet (29
+        // §12.11): its active store converts at that store's own open.
+        directory.convert([(record.clone(), MAGIC, BYTES)])?;
         if !directory.exists(&record)? {
             if initialized || directory.exists(name)? {
                 return Err(ManagedRequestsError::Corrupt);
@@ -187,6 +209,7 @@ impl ManagedRequests {
             self.child_path(&state),
             self.context,
             self.limits,
+            self.rest.clone(),
         )?)
     }
     /// The active generation's child store directory.
@@ -296,6 +319,7 @@ impl ManagedRequests {
             self.child_path(state),
             self.context,
             self.limits,
+            self.rest.clone(),
         )?)
     }
     fn prune(
@@ -329,7 +353,8 @@ impl ManagedRequests {
         format!("{}.managed-owner", self.name)
     }
     fn load(&self) -> Result<(Directory, State), ManagedRequestsError> {
-        let (directory, initialized) = Directory::coordinator(&self.parent, &self.name, false)?;
+        let (directory, initialized) =
+            Directory::coordinator(&self.parent, &self.name, false, self.rest.clone())?;
         if !initialized {
             return Err(ManagedRequestsError::Corrupt);
         }

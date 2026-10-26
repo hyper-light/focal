@@ -57,7 +57,14 @@ fn requests(seed: u128) -> (RequestEnvelope, RequestEnvelope) {
 }
 fn create(path: &Path, seed: u128) -> OperationJournal {
     let (open, request) = requests(seed);
-    OperationJournal::create(path, context(), open, request).unwrap()
+    OperationJournal::create(
+        path,
+        context(),
+        open,
+        request,
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap()
 }
 fn execute(core: &mut Core, request: &RequestEnvelope) -> MutationReply {
     let (runtime, expected_revision, command) = match &request.operation {
@@ -111,7 +118,8 @@ fn expanded_authored_ids_epoch_and_business_receipts_survive_lost_replies() {
         // Remote commitment is real; deliberately lose the response before it
         // reaches the private journal, then reconstruct the same client command.
         drop(journal);
-        journal = OperationJournal::open(&path, &context()).unwrap();
+        journal =
+            OperationJournal::open(&path, &context(), crate::at_rest::AtRest::clear()).unwrap();
         assert_eq!(
             postcard::to_stdvec(journal.next_request().unwrap().unwrap()).unwrap(),
             original
@@ -129,7 +137,8 @@ fn expanded_authored_ids_epoch_and_business_receipts_survive_lost_replies() {
     assert_eq!(core.snapshot().claims.len(), 1);
     assert!(matches!(receipt.outcome, CommandResult::Generated(_)));
     drop(journal);
-    let journal = OperationJournal::open(&path, &context()).unwrap();
+    let journal =
+        OperationJournal::open(&path, &context(), crate::at_rest::AtRest::clear()).unwrap();
     assert_eq!(journal.receipt(), Some(&receipt));
     assert!(journal.next_request().unwrap().is_none());
 }
@@ -208,7 +217,12 @@ fn concurrent_operations_share_fixed_epoch_without_retiring_each_others_identity
     let reply = execute(&mut core, second.next_request().unwrap().unwrap());
     second.record_reply(&reply).unwrap();
     drop(first);
-    let mut first = OperationJournal::open(directory.path().join("first"), &context()).unwrap();
+    let mut first = OperationJournal::open(
+        directory.path().join("first"),
+        &context(),
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap();
     assert_eq!(first.next_request().unwrap(), Some(&unknown));
     first.record_reply(&execute(&mut core, &unknown)).unwrap();
     assert_eq!(core.snapshot().claims.len(), 2);
@@ -259,7 +273,12 @@ fn receipt_context_hash_epoch_and_noncommit_results_cannot_advance_the_journal()
         .unwrap();
     let bytes = postcard::to_stdvec(journal.next_request().unwrap().unwrap()).unwrap();
     drop(journal);
-    let journal = OperationJournal::open(directory.path().join("operation"), &context()).unwrap();
+    let journal = OperationJournal::open(
+        directory.path().join("operation"),
+        &context(),
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap();
     assert_eq!(
         postcard::to_stdvec(journal.next_request().unwrap().unwrap()).unwrap(),
         bytes
@@ -289,7 +308,8 @@ fn every_ambiguous_write_retains_exact_old_or_new_generation_and_requires_reopen
             Err(PendingError::Failed)
         ));
         drop(journal);
-        let mut recovered = OperationJournal::open(&path, &context()).unwrap();
+        let mut recovered =
+            OperationJournal::open(&path, &context(), crate::at_rest::AtRest::clear()).unwrap();
         assert_eq!(
             recovered.stage(),
             if fault == files::Fault::FileSynced {
@@ -319,7 +339,7 @@ fn initial_creation_recovers_only_a_complete_renamed_record() {
         files::Fault::DirectorySynced,
     ] {
         let path = temporary.path().join(format!("{fault:?}"));
-        let directory = files::Directory::create(&path).unwrap();
+        let directory = files::Directory::create(&path, crate::at_rest::AtRest::clear()).unwrap();
         directory.inject(fault);
         assert!(matches!(
             directory.install(&bytes, true),
@@ -330,12 +350,13 @@ fn initial_creation_recovers_only_a_complete_renamed_record() {
             // An unrenamed temporary was never exposed for transmission and is
             // insufficient to reconstruct an authoritative request identity.
             assert!(matches!(
-                OperationJournal::open(&path, &context()),
+                OperationJournal::open(&path, &context(), crate::at_rest::AtRest::clear()),
                 Err(PendingError::Corrupt)
             ));
             assert!(!path.join("INITIALIZED").exists());
         } else {
-            let recovered = OperationJournal::open(&path, &context()).unwrap();
+            let recovered =
+                OperationJournal::open(&path, &context(), crate::at_rest::AtRest::clear()).unwrap();
             assert_eq!(
                 recovered.next_request().unwrap(),
                 source.next_request().unwrap()
@@ -367,7 +388,9 @@ fn valid_checksum_cannot_hide_invalid_generation_or_trailing_state() {
         // still validate exact format, progression, and envelope identity.
         journal.directory.install(&bytes, false).unwrap();
         drop(journal);
-        assert!(OperationJournal::open(&path, &context()).is_err());
+        assert!(
+            OperationJournal::open(&path, &context(), crate::at_rest::AtRest::clear()).is_err()
+        );
     }
 }
 
@@ -393,7 +416,7 @@ fn missing_corrupt_initialized_or_entire_operation_state_is_never_recreated() {
             _ => fs::write(path.join("INITIALIZED"), b"wrong").unwrap(),
         }
         assert!(matches!(
-            OperationJournal::open(&path, &context()),
+            OperationJournal::open(&path, &context(), crate::at_rest::AtRest::clear()),
             Err(PendingError::Corrupt)
         ));
         assert!(!path.join("state.bin").exists() || name == "checksum" || name == "marker");
@@ -418,13 +441,13 @@ fn locks_private_modes_scope_and_wire_capacity_are_checked_before_transmission()
     let path = directory.path().join("operation");
     let journal = create(&path, 10);
     assert!(matches!(
-        OperationJournal::open(&path, &context()),
+        OperationJournal::open(&path, &context(), crate::at_rest::AtRest::clear()),
         Err(PendingError::Locked)
     ));
     let other_path = path.clone();
     assert!(
         std::thread::spawn(move || matches!(
-            OperationJournal::open(&other_path, &context()),
+            OperationJournal::open(&other_path, &context(), crate::at_rest::AtRest::clear()),
             Err(PendingError::Locked)
         ))
         .join()
@@ -432,7 +455,13 @@ fn locks_private_modes_scope_and_wire_capacity_are_checked_before_transmission()
     );
     let (open, command) = requests(10);
     assert!(matches!(
-        OperationJournal::create(&path, context(), open.clone(), command.clone()),
+        OperationJournal::create(
+            &path,
+            context(),
+            open.clone(),
+            command.clone(),
+            crate::at_rest::AtRest::clear()
+        ),
         Err(PendingError::Exists)
     ));
     drop(journal);
@@ -444,7 +473,7 @@ fn locks_private_modes_scope_and_wire_capacity_are_checked_before_transmission()
             _ => wrong.ledger.session = SessionId::from_u128(44),
         }
         assert!(matches!(
-            OperationJournal::open(&path, &wrong),
+            OperationJournal::open(&path, &wrong, crate::at_rest::AtRest::clear()),
             Err(PendingError::ContextMismatch)
         ));
     }
@@ -452,7 +481,13 @@ fn locks_private_modes_scope_and_wire_capacity_are_checked_before_transmission()
     epoch_two.request_epoch = RequestEpoch(2);
     let invalid = directory.path().join("invalid");
     assert!(matches!(
-        OperationJournal::create(&invalid, context(), epoch_two, command.clone()),
+        OperationJournal::create(
+            &invalid,
+            context(),
+            epoch_two,
+            command.clone(),
+            crate::at_rest::AtRest::clear()
+        ),
         Err(PendingError::EpochPolicy)
     ));
     assert!(!invalid.exists());
@@ -464,7 +499,13 @@ fn locks_private_modes_scope_and_wire_capacity_are_checked_before_transmission()
         },
     };
     assert!(matches!(
-        OperationJournal::create(&invalid, context(), open.clone(), floor),
+        OperationJournal::create(
+            &invalid,
+            context(),
+            open.clone(),
+            floor,
+            crate::at_rest::AtRest::clear()
+        ),
         Err(PendingError::EpochPolicy)
     ));
     assert!(!invalid.exists());
@@ -481,10 +522,17 @@ fn locks_private_modes_scope_and_wire_capacity_are_checked_before_transmission()
         },
     };
     let large_path = directory.path().join("large");
-    let journal =
-        OperationJournal::create(&large_path, context(), open.clone(), large.clone()).unwrap();
+    let journal = OperationJournal::create(
+        &large_path,
+        context(),
+        open.clone(),
+        large.clone(),
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap();
     drop(journal);
-    let journal = OperationJournal::open(&large_path, &context()).unwrap();
+    let journal =
+        OperationJournal::open(&large_path, &context(), crate::at_rest::AtRest::clear()).unwrap();
     assert_eq!(journal.state.request, large);
     let Operation::Submit {
         command: Command::RecordProgress { message, .. },
@@ -495,7 +543,13 @@ fn locks_private_modes_scope_and_wire_capacity_are_checked_before_transmission()
     };
     message.push_str(&"x".repeat(200 * 1024));
     assert!(matches!(
-        OperationJournal::create(&invalid, context(), open, large),
+        OperationJournal::create(
+            &invalid,
+            context(),
+            open,
+            large,
+            crate::at_rest::AtRest::clear()
+        ),
         Err(PendingError::Capacity)
     ));
     assert!(!invalid.exists());
@@ -515,7 +569,7 @@ fn symlinks_hardlinks_and_nonprivate_files_are_rejected() {
     let linked = directory.path().join("linked");
     symlink(&path, &linked).unwrap();
     assert!(matches!(
-        OperationJournal::open(&linked, &context()),
+        OperationJournal::open(&linked, &context(), crate::at_rest::AtRest::clear()),
         Err(PendingError::Permissions)
     ));
     fs::hard_link(
@@ -524,13 +578,13 @@ fn symlinks_hardlinks_and_nonprivate_files_are_rejected() {
     )
     .unwrap();
     assert!(matches!(
-        OperationJournal::open(&path, &context()),
+        OperationJournal::open(&path, &context(), crate::at_rest::AtRest::clear()),
         Err(PendingError::Permissions)
     ));
     fs::remove_file(directory.path().join("shared-state")).unwrap();
     fs::set_permissions(path.join("state.bin"), fs::Permissions::from_mode(0o644)).unwrap();
     assert!(matches!(
-        OperationJournal::open(&path, &context()),
+        OperationJournal::open(&path, &context(), crate::at_rest::AtRest::clear()),
         Err(PendingError::Permissions)
     ));
 }
@@ -598,11 +652,133 @@ async fn cancelling_network_wait_preserves_the_locked_operation_and_exact_reques
         hyper_rt::combine::Either::Second(committed) => committed.unwrap(),
     }
     assert!(matches!(
-        OperationJournal::open(&path, &context()),
+        OperationJournal::open(&path, &context(), crate::at_rest::AtRest::clear()),
         Err(PendingError::Locked)
     ));
     drop(journal);
-    let journal = OperationJournal::open(&path, &context()).unwrap();
+    let journal =
+        OperationJournal::open(&path, &context(), crate::at_rest::AtRest::clear()).unwrap();
     assert_eq!(journal.next_request().unwrap(), Some(&request));
     assert_eq!(journal.stage(), OperationStage::OpenEpoch);
+}
+
+/// Below the at-rest level a journal is written as every earlier binary wrote it; once its data
+/// directory's fence opens the level it is converted at its open, its command pending (committed,
+/// its reply lost), and the command goes on under its identity: the ledger answers it as the
+/// duplicate it is, once, and nothing of the journal lies in the clear (29 §12.11).
+#[test]
+fn a_pending_journal_converts_at_its_open_and_its_command_is_answered_once() {
+    use crate::at_rest::support::{assert_sealed_under, below, directory, sealing};
+    let (data, keys) = directory();
+    let path = data.path().join("one");
+    let mut core = Core::new(context().ledger, Limits::default());
+    let (open, request) = requests(40);
+    let mut journal =
+        OperationJournal::create(&path, context(), open, request, below(&keys)).unwrap();
+    let epoch = execute(&mut core, journal.next_request().unwrap().unwrap());
+    journal.record_reply(&epoch).unwrap();
+    let command = journal.next_request().unwrap().unwrap().clone();
+    let committed = execute(&mut core, &command);
+    drop(journal);
+    let clear = fs::read(path.join("state.bin")).unwrap();
+    assert!(clear.starts_with(b"FCLOP001"), "below the level, as before");
+    assert!(!path.join(crate::at_rest::SEALED).exists());
+
+    let mut journal = OperationJournal::open(&path, &context(), sealing(&keys)).unwrap();
+    assert!(path.join(crate::at_rest::SEALED).exists());
+    assert_sealed_under(
+        &path,
+        &[b"private authored operation payload", &clear[..12]],
+    );
+    assert_eq!(journal.next_request().unwrap(), Some(&command));
+    let sequence = core.sequence();
+    let duplicate = execute(&mut core, &command);
+    assert!(matches!(
+        duplicate,
+        MutationReply::Domain(DomainOutcome::Duplicate(_))
+    ));
+    assert_eq!(core.sequence(), sequence, "answered once");
+    assert_eq!(
+        journal.record_reply(&duplicate).unwrap(),
+        OperationStage::Completed
+    );
+    assert_eq!(
+        journal.record_reply(&committed).unwrap(),
+        OperationStage::Completed
+    );
+    let receipt = journal.receipt().unwrap().clone();
+    drop(journal);
+    let journal = OperationJournal::open(&path, &context(), sealing(&keys)).unwrap();
+    assert_eq!(journal.receipt(), Some(&receipt));
+    assert_eq!(core.snapshot().claims.len(), 1);
+    assert_sealed_under(&path, &[b"private authored operation payload"]);
+}
+
+/// A sealed journal's record changed, swapped with another journal's, carried in from another data
+/// directory, or planted in the clear after its mark is refused; put back, it opens.
+#[test]
+fn a_sealed_journal_changed_swapped_carried_or_planted_in_the_clear_is_refused() {
+    use crate::at_rest::support::{directory, flip, sealing, swap};
+    use crate::at_rest::{AtRest, AtRestError};
+    use focal_seal::named::NamedError;
+    let (data, keys) = directory();
+    let one = data.path().join("one");
+    let two = data.path().join("two");
+    let (open, request) = requests(50);
+    drop(OperationJournal::create(&one, context(), open, request, sealing(&keys)).unwrap());
+    let (open, request) = requests(60);
+    drop(OperationJournal::create(&two, context(), open, request, sealing(&keys)).unwrap());
+    let record = one.join("state.bin");
+    let sealed = fs::read(&record).unwrap();
+    let opens = || OperationJournal::open(&one, &context(), sealing(&keys));
+
+    flip(&record);
+    assert!(matches!(
+        opens(),
+        Err(PendingError::AtRest(AtRestError::Sealed(NamedError::Seal(
+            _
+        ))))
+    ));
+    fs::write(&record, &sealed).unwrap();
+
+    swap(&record, &two.join("state.bin"));
+    assert!(matches!(
+        opens(),
+        Err(PendingError::AtRest(AtRestError::Sealed(
+            NamedError::Moved(_)
+        )))
+    ));
+    swap(&record, &two.join("state.bin"));
+
+    let (far, far_keys) = directory();
+    let (open, request) = requests(50);
+    drop(
+        OperationJournal::create(
+            far.path().join("one"),
+            context(),
+            open,
+            request,
+            sealing(&far_keys),
+        )
+        .unwrap(),
+    );
+    fs::write(&record, fs::read(far.path().join("one/state.bin")).unwrap()).unwrap();
+    assert!(matches!(
+        opens(),
+        Err(PendingError::AtRest(AtRestError::Sealed(NamedError::Seal(
+            _
+        ))))
+    ));
+
+    let clear = data.path().join("clear");
+    let (open, request) = requests(50);
+    drop(OperationJournal::create(&clear, context(), open, request, AtRest::clear()).unwrap());
+    fs::write(&record, fs::read(clear.join("state.bin")).unwrap()).unwrap();
+    assert!(matches!(
+        opens(),
+        Err(PendingError::AtRest(AtRestError::ClearAfterSealed(name))) if name == "state.bin"
+    ));
+
+    fs::write(&record, &sealed).unwrap();
+    assert_eq!(opens().unwrap().stage(), OperationStage::OpenEpoch);
 }

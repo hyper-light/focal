@@ -1,4 +1,5 @@
 use super::StoreError;
+use crate::at_rest::{AtRest, Records};
 use crate::file_lock::FileLock;
 use std::{
     fs::{self, File},
@@ -38,6 +39,8 @@ pub(crate) struct Directory {
     path: PathBuf,
     _lock: FileLock,
     layout: Layout,
+    /// The store's records at rest (29 §12.11): sealed from the at-rest level, in the clear below it.
+    records: Records,
 }
 impl Directory {
     /// The coordinator lock is an initialized marker outside its managed child.
@@ -46,21 +49,24 @@ impl Directory {
         parent: &Path,
         name: &str,
         create: bool,
+        rest: AtRest,
     ) -> Result<(Self, bool), StoreError> {
-        Self::named_owner(parent, name, create, Layout::Coordinator)
+        Self::named_owner(parent, name, create, Layout::Coordinator, rest)
     }
     pub(crate) fn watch(
         parent: &Path,
         name: &str,
         create: bool,
+        rest: AtRest,
     ) -> Result<(Self, bool), StoreError> {
-        Self::named_owner(parent, name, create, Layout::Watch)
+        Self::named_owner(parent, name, create, Layout::Watch, rest)
     }
     fn named_owner(
         parent: &Path,
         name: &str,
         create: bool,
         layout: Layout,
+        rest: AtRest,
     ) -> Result<(Self, bool), StoreError> {
         let owner = focal_platform::fs::private_dir_owner(parent)
             .map_err(missing_is_corrupt)?
@@ -101,11 +107,14 @@ impl Directory {
         let initialized = read_marker_prefix(lock.file(), layout.marker())?;
         lock.file().sync_all()?;
         sync_dir(parent)?;
+        // Several owners share the directory: each its own mark.
+        let records = Records::owned(parent, rest, format!("{name}.{suffix}-sealed"))?;
         Ok((
             Self {
                 path: parent.into(),
                 _lock: lock,
                 layout,
+                records,
             },
             initialized,
         ))
@@ -121,7 +130,7 @@ impl Directory {
     }
     /// Only a durable outer initialization intent may resume this path; no
     /// child request can have escaped before that outer intent becomes Ready.
-    pub(crate) fn resume_managed_creation(path: &Path) -> Result<Self, StoreError> {
+    pub(crate) fn resume_managed_creation(path: &Path, rest: AtRest) -> Result<Self, StoreError> {
         match focal_platform::fs::create_dir_private(path) {
             Ok(()) => sync_dir(parent(path))?,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -132,16 +141,17 @@ impl Directory {
         for entry in fs::read_dir(path)? {
             count = count.checked_add(1).ok_or(StoreError::Capacity)?;
             let name = entry?.file_name();
-            if count > 4
+            if count > 5
                 || !matches!(
                     name.to_str(),
                     Some("LOCK" | "INITIALIZED" | "stream.bin" | "stream.pending")
+                        | Some(crate::at_rest::SEALED)
                 )
             {
                 return Err(StoreError::Corrupt);
             }
         }
-        let directory = Self::lock(path, missing_lock, Layout::Managed)?;
+        let directory = Self::lock(path, missing_lock, Layout::Managed, rest)?;
         if directory.exists(MARKER)? {
             let marker_path = path.join(MARKER);
             directory.check_path(&marker_path)?;
@@ -158,16 +168,16 @@ impl Directory {
         }
         Ok(directory)
     }
-    pub(crate) fn create(path: &Path) -> Result<Self, StoreError> {
-        Self::create_layout(path, Layout::Legacy)
+    pub(crate) fn create(path: &Path, rest: AtRest) -> Result<Self, StoreError> {
+        Self::create_layout(path, Layout::Legacy, rest)
     }
-    pub(crate) fn create_managed(path: &Path) -> Result<Self, StoreError> {
-        Self::create_layout(path, Layout::Managed)
+    pub(crate) fn create_managed(path: &Path, rest: AtRest) -> Result<Self, StoreError> {
+        Self::create_layout(path, Layout::Managed, rest)
     }
-    pub(crate) fn create_native(path: &Path) -> Result<Self, StoreError> {
-        Self::create_layout(path, Layout::Native)
+    pub(crate) fn create_native(path: &Path, rest: AtRest) -> Result<Self, StoreError> {
+        Self::create_layout(path, Layout::Native, rest)
     }
-    fn create_layout(path: &Path, layout: Layout) -> Result<Self, StoreError> {
+    fn create_layout(path: &Path, layout: Layout, rest: AtRest) -> Result<Self, StoreError> {
         focal_platform::fs::create_dir_private(path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::AlreadyExists {
                 StoreError::Exists
@@ -176,19 +186,19 @@ impl Directory {
             }
         })?;
         sync_dir(parent(path))?;
-        Self::lock(path, true, layout)
+        Self::lock(path, true, layout, rest)
     }
-    pub(crate) fn open(path: &Path) -> Result<Self, StoreError> {
-        Self::open_layout(path, Layout::Legacy)
+    pub(crate) fn open(path: &Path, rest: AtRest) -> Result<Self, StoreError> {
+        Self::open_layout(path, Layout::Legacy, rest)
     }
-    pub(crate) fn open_managed(path: &Path) -> Result<Self, StoreError> {
-        Self::open_layout(path, Layout::Managed)
+    pub(crate) fn open_managed(path: &Path, rest: AtRest) -> Result<Self, StoreError> {
+        Self::open_layout(path, Layout::Managed, rest)
     }
-    pub(crate) fn open_native(path: &Path) -> Result<Self, StoreError> {
-        Self::open_layout(path, Layout::Native)
+    pub(crate) fn open_native(path: &Path, rest: AtRest) -> Result<Self, StoreError> {
+        Self::open_layout(path, Layout::Native, rest)
     }
-    fn open_layout(path: &Path, layout: Layout) -> Result<Self, StoreError> {
-        let directory = Self::lock(path, false, layout)?;
+    fn open_layout(path: &Path, layout: Layout, rest: AtRest) -> Result<Self, StoreError> {
+        let directory = Self::lock(path, false, layout, rest)?;
         let mut file = directory.checked_open(&path.join(MARKER))?;
         if file.metadata()?.len() != 8 {
             return Err(StoreError::Corrupt);
@@ -204,7 +214,7 @@ impl Directory {
         sync_dir(path)?;
         Ok(directory)
     }
-    fn lock(path: &Path, create: bool, layout: Layout) -> Result<Self, StoreError> {
+    fn lock(path: &Path, create: bool, layout: Layout, rest: AtRest) -> Result<Self, StoreError> {
         let owner = focal_platform::fs::private_dir_owner(path)
             .map_err(missing_is_corrupt)?
             .ok_or(StoreError::Permissions)?;
@@ -243,11 +253,66 @@ impl Directory {
             lock.file().sync_all()?;
             sync_dir(path)?;
         }
+        let records = Records::new(path, rest)?;
+        if create && records.sealing() {
+            // Made sealed, with nothing in it to convert: a record in the clear is refused from
+            // its first.
+            records.mark()?;
+        }
         Ok(Self {
             path: path.into(),
             _lock: lock,
             layout,
+            records,
         })
+    }
+    /// Whether the store is marked: every record sealed, and one in the clear refused.
+    pub(crate) fn marked(&self) -> Result<bool, StoreError> {
+        Ok(self.records.marked()?)
+    }
+    /// Converts the records `names` (each a path in the store, its magic and the most its payload
+    /// holds) in the clear to sealed, then marks the store (29 §12.11): what the store's open does
+    /// under its lock once its data directory's fence opens the at-rest level. A record sealed
+    /// already, by a conversion a cut ended, is read to check it and left; one in the clear is read
+    /// as its reader reads it (its magic, length and hash checked, a publication a cut left
+    /// recovered) and written sealed through the replace that writes it. A cut anywhere leaves each
+    /// record whole in one form or the other, and the next open finishes. Below the level, or
+    /// marked already, nothing is done.
+    pub(crate) fn convert<'a>(
+        &self,
+        names: impl IntoIterator<Item = (String, &'a [u8; 8], usize)>,
+    ) -> Result<(), StoreError> {
+        if !self.records.sealing() || self.records.marked()? {
+            return Ok(());
+        }
+        for (relative, magic, maximum) in names {
+            if !self.exists(&relative)? {
+                continue;
+            }
+            let payload = self.read(&relative, magic, maximum)?;
+            if !self.sealed_on_disk(&self.path.join(&relative))? {
+                self.write(&relative, magic, &payload, true)?;
+                crate::at_rest::step()?;
+            }
+        }
+        self.records.mark()?;
+        Ok(())
+    }
+    /// Whether the record at `path` is sealed on disk: what its first bytes say.
+    fn sealed_on_disk(&self, path: &Path) -> Result<bool, StoreError> {
+        let mut file = self.checked_open(path)?;
+        let mut head = [0; 8];
+        let mut read = 0;
+        while read < head.len() {
+            let Some(rest) = head.get_mut(read..) else {
+                break;
+            };
+            match file.read(rest)? {
+                0 => break,
+                more => read = read.saturating_add(more),
+            }
+        }
+        Ok(Records::sealed(head.get(..read).unwrap_or_default()))
     }
     pub(crate) fn initialize(&self) -> Result<(), StoreError> {
         let mut file =
@@ -332,8 +397,10 @@ impl Directory {
             Err(error) => return Err(error),
         };
         let maximum = maximum.checked_add(OVERHEAD).ok_or(StoreError::Capacity)?;
+        // Either form: the record's own bytes, or their seal (29 §12.11).
+        let on_disk = self.records.bound(maximum)?;
         let size = usize::try_from(file.metadata()?.len()).map_err(|_| StoreError::Capacity)?;
-        if size > maximum {
+        if size > on_disk {
             return Err(StoreError::Capacity);
         }
         let mut bytes = Vec::new();
@@ -342,12 +409,16 @@ impl Directory {
             .map_err(|_| StoreError::Capacity)?;
         (&mut file)
             .take(
-                u64::try_from(maximum)
+                u64::try_from(on_disk)
                     .map_err(|_| StoreError::Capacity)?
                     .checked_add(1)
                     .ok_or(StoreError::Capacity)?,
             )
             .read_to_end(&mut bytes)?;
+        if bytes.len() > on_disk {
+            return Err(StoreError::Capacity);
+        }
+        let bytes = self.records.opened(relative, bytes, maximum)?;
         if bytes.len() > maximum {
             return Err(StoreError::Capacity);
         }
@@ -419,15 +490,22 @@ impl Directory {
         let length = u32::try_from(payload.len())
             .map_err(|_| StoreError::Capacity)?
             .to_be_bytes();
-        let mut file = focal_platform::fs::create_private_new(&temporary, false, true)?;
         let mut hash = blake3::Hasher::new();
         hash.update(magic);
         hash.update(&length);
         hash.update(payload);
-        file.write_all(magic)?;
-        file.write_all(&length)?;
-        file.write_all(payload)?;
-        file.write_all(hash.finalize().as_bytes())?;
+        // The record whole, as every earlier binary wrote it, then in the form the store keeps.
+        let mut record = Vec::new();
+        record
+            .try_reserve_exact(payload.len().saturating_add(OVERHEAD))
+            .map_err(|_| StoreError::Capacity)?;
+        record.extend_from_slice(magic);
+        record.extend_from_slice(&length);
+        record.extend_from_slice(payload);
+        record.extend_from_slice(hash.finalize().as_bytes());
+        let record = self.records.to_disk(relative, record)?;
+        let mut file = focal_platform::fs::create_private_new(&temporary, false, true)?;
+        file.write_all(&record)?;
         file.sync_all()?;
         // Close before renaming/linking: Windows refuses to rename a file with
         // an open handle, and the link-pair recovery reopens by path.

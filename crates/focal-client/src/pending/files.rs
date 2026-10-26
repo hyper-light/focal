@@ -1,4 +1,5 @@
 use super::{MAX_STATE_BYTES, PendingError};
+use crate::at_rest::{AtRest, Records};
 use crate::file_lock::FileLock;
 use std::{
     fs::{self, File},
@@ -19,6 +20,8 @@ const FRAME_OVERHEAD: usize = 44;
 pub(super) struct Directory {
     path: PathBuf,
     _lock: FileLock,
+    /// The journal's record at rest (29 §12.11): sealed from the at-rest level, in the clear below.
+    records: Records,
     #[cfg(test)]
     fault: std::cell::Cell<Option<Fault>>,
 }
@@ -26,7 +29,7 @@ impl Directory {
     pub(super) fn path(&self) -> &Path {
         &self.path
     }
-    pub(super) fn create(path: &Path) -> Result<Self, PendingError> {
+    pub(super) fn create(path: &Path, rest: AtRest) -> Result<Self, PendingError> {
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -39,19 +42,19 @@ impl Directory {
             }
         })?;
         sync_dir(parent)?;
-        Self::lock(path, true)
+        Self::lock(path, true, rest)
     }
-    pub(super) fn open(path: &Path) -> Result<Self, PendingError> {
-        Self::lock(path, false)
+    pub(super) fn open(path: &Path, rest: AtRest) -> Result<Self, PendingError> {
+        Self::lock(path, false, rest)
     }
     /// Only the store's unready, fully prepared operation path may use this.
     /// An absent lock is recoverable solely in a checked unpublished directory.
-    pub(super) fn resume_prepared(path: &Path) -> Result<Self, PendingError> {
+    pub(super) fn resume_prepared(path: &Path, rest: AtRest) -> Result<Self, PendingError> {
         let create_lock = !present(&path.join("LOCK"))?;
         if create_lock {
             check_unpublished_directory(path)?;
         }
-        Self::lock(path, create_lock)
+        Self::lock(path, create_lock, rest)
     }
     pub(super) fn unpublished(&self) -> Result<bool, PendingError> {
         if present(&self.path.join(RECORD))? {
@@ -60,7 +63,7 @@ impl Directory {
         check_unpublished_directory(&self.path)?;
         Ok(true)
     }
-    fn lock(path: &Path, create: bool) -> Result<Self, PendingError> {
+    fn lock(path: &Path, create: bool, rest: AtRest) -> Result<Self, PendingError> {
         let owner = focal_platform::fs::private_dir_owner(path)
             .map_err(missing_is_corrupt)?
             .ok_or(PendingError::Permissions)?;
@@ -86,12 +89,47 @@ impl Directory {
             lock.file().sync_all()?;
             sync_dir(path)?;
         }
+        let records = Records::new(path, rest)?;
+        if create && records.sealing() {
+            // Made sealed, with nothing in it to convert: a record in the clear is refused from
+            // its first.
+            records.mark()?;
+        }
         Ok(Self {
             path: path.to_path_buf(),
             _lock: lock,
+            records,
             #[cfg(test)]
             fault: std::cell::Cell::new(None),
         })
+    }
+    /// Converts the journal's record in the clear to sealed, then marks its directory (29 §12.11):
+    /// what its store's open does under its lock once its data directory's fence opens the at-rest
+    /// level. A record sealed already, by a conversion a cut ended, is read to check it and left; one
+    /// in the clear is read as its reader reads it and installed sealed by the replace that installs
+    /// it. A journal not yet published holds no record (an earlier binary's unpublished temporary
+    /// is never read, and goes at its install) and is marked as it is. Below the level, or marked
+    /// already, nothing is done.
+    pub(super) fn convert(&self) -> Result<(), PendingError> {
+        if !self.records.sealing() || self.records.marked()? {
+            return Ok(());
+        }
+        let path = self.path.join(RECORD);
+        if present(&path)? {
+            let payload = self.read()?;
+            if !Records::sealed(&self.head(&path)?) {
+                self.install(&payload, false)?;
+                crate::at_rest::step()?;
+            }
+        }
+        self.records.mark()?;
+        Ok(())
+    }
+    /// The first bytes of the file at `path`: what tells its form.
+    fn head(&self, path: &Path) -> Result<Vec<u8>, PendingError> {
+        let mut head = Vec::new();
+        self.checked_open(path)?.take(8).read_to_end(&mut head)?;
+        Ok(head)
     }
     pub(super) fn read(&self) -> Result<Vec<u8>, PendingError> {
         let path = self.path.join(RECORD);
@@ -99,8 +137,10 @@ impl Directory {
         let maximum = MAX_STATE_BYTES
             .checked_add(FRAME_OVERHEAD)
             .ok_or(PendingError::Capacity)?;
+        // Either form: the record's own bytes, or their seal (29 §12.11).
+        let on_disk = self.records.bound(maximum)?;
         let size = usize::try_from(file.metadata()?.len()).map_err(|_| PendingError::Capacity)?;
-        if size > maximum {
+        if size > on_disk {
             return Err(PendingError::Capacity);
         }
         let mut bytes = Vec::new();
@@ -108,12 +148,16 @@ impl Directory {
             .try_reserve_exact(size)
             .map_err(|_| PendingError::Capacity)?;
         file.take(
-            u64::try_from(maximum)
+            u64::try_from(on_disk)
                 .map_err(|_| PendingError::Capacity)?
                 .checked_add(1)
                 .ok_or(PendingError::Capacity)?,
         )
         .read_to_end(&mut bytes)?;
+        if bytes.len() > on_disk {
+            return Err(PendingError::Capacity);
+        }
+        let bytes = self.records.opened(RECORD, bytes, maximum)?;
         if bytes.len() > maximum {
             return Err(PendingError::Capacity);
         }
@@ -164,7 +208,6 @@ impl Directory {
             self.check_path(&temporary)?;
             fs::remove_file(&temporary)?;
         }
-        let mut file = focal_platform::fs::create_private_new(&temporary, false, true)?;
         let length = u32::try_from(payload.len())
             .map_err(|_| PendingError::Capacity)?
             .to_be_bytes();
@@ -172,10 +215,18 @@ impl Directory {
         digest.update(MAGIC);
         digest.update(&length);
         digest.update(payload);
-        file.write_all(MAGIC)?;
-        file.write_all(&length)?;
-        file.write_all(payload)?;
-        file.write_all(digest.finalize().as_bytes())?;
+        // The record whole, as every earlier binary wrote it, then in the form the journal keeps.
+        let mut record = Vec::new();
+        record
+            .try_reserve_exact(payload.len().saturating_add(FRAME_OVERHEAD))
+            .map_err(|_| PendingError::Capacity)?;
+        record.extend_from_slice(MAGIC);
+        record.extend_from_slice(&length);
+        record.extend_from_slice(payload);
+        record.extend_from_slice(digest.finalize().as_bytes());
+        let record = self.records.to_disk(RECORD, record)?;
+        let mut file = focal_platform::fs::create_private_new(&temporary, false, true)?;
+        file.write_all(&record)?;
         file.sync_all()?;
         // Close before rename: Windows refuses to rename a file with an open handle.
         drop(file);
@@ -255,13 +306,14 @@ fn check_unpublished_directory(path: &Path) -> Result<(), PendingError> {
     let owner = focal_platform::fs::private_dir_owner(path)
         .map_err(missing_is_corrupt)?
         .ok_or(PendingError::Permissions)?;
-    // At most LOCK and the unpublished initial temporary are admissible.
-    // A marker, any existing state (even corrupt), or an unexpected name
-    // prevents initialization. This scan allocates no unbounded collection.
+    // At most LOCK, the unpublished initial temporary and the at-rest mark
+    // (29 §12.11) are admissible. A marker, any existing state (even
+    // corrupt), or an unexpected name prevents initialization. This scan
+    // allocates no unbounded collection.
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         let name = entry.file_name();
-        if name != "LOCK" && name != TEMPORARY {
+        if name != "LOCK" && name != TEMPORARY && name != crate::at_rest::SEALED {
             return Err(PendingError::Corrupt);
         }
         check_file(&entry.path(), &owner)?;

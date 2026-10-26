@@ -89,8 +89,10 @@ pub use cold::{
     ColdGeometry, ColdPending, ColdReader, ColdRoom, ColdState, ColdStore, ColdStreams,
     install_cold_chunk,
 };
+// Public for the client's upload journal, which stages an upload's bytes in a part as staging
+// does (29 §12.11).
 #[path = "record_file.rs"]
-mod record_file;
+pub mod record_file;
 
 #[path = "native_artifact.rs"]
 mod native_artifact;

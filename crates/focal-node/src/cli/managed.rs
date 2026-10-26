@@ -51,6 +51,7 @@ fn open(context: &Context) -> Result<ManagedRequests> {
         context.operation,
         ManagedStoreLimits::default(),
         rotation()?,
+        context.at_rest.clone(),
     )
     .map_err(|error| ownership_error(context, error))
 }
@@ -61,6 +62,7 @@ fn existing(context: &Context, name: &str) -> Result<Option<ManagedRequests>> {
         context.operation,
         ManagedStoreLimits::default(),
         rotation()?,
+        context.at_rest.clone(),
     ) {
         Ok(value) => Ok(Some(value)),
         Err(ManagedRequestsError::Missing) => Ok(None),
@@ -787,8 +789,14 @@ mod tests {
                 window: 2,
             },
         };
-        let store =
-            ManagedOperationStore::create(root, context, limits, registration.clone()).unwrap();
+        let store = ManagedOperationStore::create(
+            root,
+            context,
+            limits,
+            registration.clone(),
+            focal_client::at_rest::AtRest::clear(),
+        )
+        .unwrap();
         store
             .record_registration(RequestStreamControlReceipt {
                 cluster: context.cluster,

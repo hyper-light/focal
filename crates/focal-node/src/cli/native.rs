@@ -277,16 +277,22 @@ pub(super) async fn run(
 /// Open the client's native journal, creating it once with a marker outside
 /// the store directory so a lost store cannot silently re-admit identities.
 pub(super) fn store(context: &Context, create: bool) -> Result<Option<NativeOperationStore>> {
-    store_in(&context.root.join("client"), STORE, create)
+    store_in(
+        &context.root.join("client"),
+        STORE,
+        create,
+        context.at_rest.clone(),
+    )
 }
-/// Open or create the native journal `name` under `parent`. The marker is
-/// written only after the store is durable and lives beside it, so an
-/// interrupted creation is retried and a lost store is refused rather than
-/// recreated under the same identities.
+/// Open or create the native journal `name` under `parent`, its records kept
+/// as `rest` says (29 §12.11). The marker is written only after the store is
+/// durable and lives beside it, so an interrupted creation is retried and a
+/// lost store is refused rather than recreated under the same identities.
 pub(super) fn store_in(
     parent: &Path,
     name: &str,
     create: bool,
+    rest: focal_client::at_rest::AtRest,
 ) -> Result<Option<NativeOperationStore>> {
     let path = parent.join(name);
     let marker = parent.join(format!("{name}.initialized"));
@@ -294,6 +300,7 @@ pub(super) fn store_in(
         return Ok(Some(NativeOperationStore::open(
             path,
             NativeStoreLimits::default(),
+            rest,
         )?));
     }
     if !create {
@@ -309,13 +316,14 @@ pub(super) fn store_in(
         return Ok(Some(NativeOperationStore::open(
             path,
             NativeStoreLimits::default(),
+            rest,
         )?));
     }
     if std::fs::symlink_metadata(&path).is_ok() {
         std::fs::remove_dir_all(&path)?;
         focal_platform::sync_dir(parent)?;
     }
-    let store = NativeOperationStore::create(path, NativeStoreLimits::default())?;
+    let store = NativeOperationStore::create(path, NativeStoreLimits::default(), rest)?;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]

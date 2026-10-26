@@ -1,6 +1,7 @@
 //! The bounded catalogue owns all claimed IDs, including incomplete creation.
 //! It holds its lock only for admission; returned journals lock their own bytes.
 use super::{MAX_TRANSFER_BYTES, TransferError, TransferLimits, UploadJournal, UploadSpec, files};
+use crate::at_rest::AtRest;
 use crate::pending::OperationContext;
 use focal_model::RouteEpoch;
 use serde::{Deserialize, Serialize};
@@ -113,6 +114,8 @@ impl Catalogue {
 pub struct UploadStore {
     path: PathBuf,
     limits: UploadStoreLimits,
+    /// How its catalogue and its uploads are kept at rest (29 §12.11).
+    rest: AtRest,
 }
 impl UploadStore {
     /// Owner-private first-use startup with an external initialized marker.
@@ -122,18 +125,20 @@ impl UploadStore {
         name: &str,
         context: OperationContext,
         limits: UploadStoreLimits,
+        rest: AtRest,
     ) -> Result<Self, TransferError> {
         limits.validate()?;
-        let (_lock, first) = files::bootstrap(parent.as_ref(), name, context)?;
+        let (_lock, first) = files::bootstrap(parent.as_ref(), name, context, rest.clone())?;
         if first {
-            Self::create(parent.as_ref().join(name), limits)
+            Self::create(parent.as_ref().join(name), limits, rest)
         } else {
-            Self::open(parent.as_ref().join(name), limits)
+            Self::open(parent.as_ref().join(name), limits, rest)
         }
     }
     pub fn create(
         path: impl AsRef<Path>,
         limits: UploadStoreLimits,
+        rest: AtRest,
     ) -> Result<Self, TransferError> {
         limits.validate()?;
         let catalogue = Catalogue {
@@ -141,17 +146,23 @@ impl UploadStore {
             limits,
             entries: BTreeMap::new(),
         };
-        let directory = files::Directory::create_catalogue(path.as_ref())?;
+        let directory = files::Directory::create_catalogue(path.as_ref(), rest.clone())?;
         catalogue.save(&directory, true)?;
         Ok(Self {
             path: path.as_ref().into(),
             limits,
+            rest,
         })
     }
-    pub fn open(path: impl AsRef<Path>, limits: UploadStoreLimits) -> Result<Self, TransferError> {
+    pub fn open(
+        path: impl AsRef<Path>,
+        limits: UploadStoreLimits,
+        rest: AtRest,
+    ) -> Result<Self, TransferError> {
         let store = Self {
             path: path.as_ref().into(),
             limits,
+            rest,
         };
         store.load()?;
         Ok(store)
@@ -208,7 +219,7 @@ impl UploadStore {
             .ok_or(TransferError::Corrupt)?;
         let path = self.operation_path(spec.upload)?;
         let journal = match fs::symlink_metadata(&path) {
-            Ok(_) => UploadJournal::open(&path, &context)?,
+            Ok(_) => UploadJournal::open(&path, &context, self.rest.clone())?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && !entry.ready => {
                 UploadJournal::begin(
                     &path,
@@ -216,6 +227,7 @@ impl UploadStore {
                     spec,
                     entry.route_epoch,
                     self.limits.transfer,
+                    self.rest.clone(),
                 )?
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -252,7 +264,8 @@ impl UploadStore {
         if !entry.ready {
             return Err(TransferError::Incomplete);
         }
-        let journal = UploadJournal::open(self.operation_path(upload)?, context)?;
+        let journal =
+            UploadJournal::open(self.operation_path(upload)?, context, self.rest.clone())?;
         if journal.spec() != entry.spec || journal.limits() != self.limits.transfer {
             return Err(TransferError::Corrupt);
         }
@@ -268,7 +281,7 @@ impl UploadStore {
     }
     fn load(&self) -> Result<(files::Directory, Catalogue), TransferError> {
         self.limits.validate()?;
-        let directory = files::Directory::open_catalogue(&self.path)?;
+        let directory = files::Directory::open_catalogue(&self.path, self.rest.clone())?;
         let bytes = directory.read()?;
         let (catalogue, remaining): (Catalogue, &[u8]) =
             postcard::take_from_bytes(&bytes).map_err(|_| TransferError::Corrupt)?;
@@ -293,7 +306,7 @@ mod tests {
             max_reserved_bytes: CATALOGUE_RESERVATION + TRANSFER_OVERHEAD + 3,
             transfer: TransferLimits::default(),
         };
-        let store = UploadStore::create(&path, limits).unwrap();
+        let store = UploadStore::create(&path, limits, crate::at_rest::AtRest::clear()).unwrap();
         let mut invalid = spec(b"");
         invalid.digest.0 = [7; 32];
         assert!(matches!(
@@ -316,7 +329,7 @@ mod tests {
         assert!(!store.operation_path(another.upload).unwrap().exists());
         drop(journal);
         drop(store);
-        let store = UploadStore::open(&path, limits).unwrap();
+        let store = UploadStore::open(&path, limits, crate::at_rest::AtRest::clear()).unwrap();
         let journal = store.begin(context(), spec(b"abc"), RouteEpoch(7)).unwrap();
         assert_eq!(journal.progress().staged, 3);
         drop(journal);
@@ -341,7 +354,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("uploads");
         let limits = UploadStoreLimits::default();
-        let store = UploadStore::create(&path, limits).unwrap();
+        let store = UploadStore::create(&path, limits, crate::at_rest::AtRest::clear()).unwrap();
         let (dir, mut catalogue) = store.load().unwrap();
         let spec = spec(b"abc");
         catalogue.entries.insert(
@@ -372,7 +385,7 @@ mod tests {
         ));
         fs::remove_file(path.join("uploads.bin")).unwrap();
         assert!(matches!(
-            UploadStore::open(&path, limits),
+            UploadStore::open(&path, limits, crate::at_rest::AtRest::clear()),
             Err(TransferError::Corrupt)
         ));
     }

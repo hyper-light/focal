@@ -608,6 +608,8 @@ fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, NativeStoreEr
 pub struct NativeOperationStore {
     root: PathBuf,
     limits: NativeStoreLimits,
+    /// How its records are kept at rest (29 §12.11).
+    rest: crate::at_rest::AtRest,
     #[cfg(test)]
     fault: std::sync::Mutex<Option<Fault>>,
 }
@@ -615,6 +617,7 @@ impl NativeOperationStore {
     pub fn create(
         root: impl AsRef<Path>,
         limits: NativeStoreLimits,
+        rest: crate::at_rest::AtRest,
     ) -> Result<Self, NativeStoreError> {
         limits.validate()?;
         let catalogue = Catalogue {
@@ -628,21 +631,58 @@ impl NativeOperationStore {
             issued: 0,
         };
         let bytes = encode(&catalogue, CATALOGUE_BYTES)?;
-        let directory = files::Directory::create_native(root.as_ref())?;
+        let directory = files::Directory::create_native(root.as_ref(), rest.clone())?;
         directory.initialize()?;
         directory.write(CATALOGUE, CATALOGUE_MAGIC, &bytes, false)?;
-        Ok(Self::handle(root.as_ref(), limits))
+        Ok(Self::handle(root.as_ref(), limits, rest))
     }
+    /// Opens the store at `root`, sweeping what an interrupted transition left, then converting its
+    /// records to sealed where `rest` seals and the store is not marked yet (29 §12.11), under the
+    /// store's lock.
     pub fn open(
         root: impl AsRef<Path>,
         limits: NativeStoreLimits,
+        rest: crate::at_rest::AtRest,
     ) -> Result<Self, NativeStoreError> {
         limits.validate()?;
-        let store = Self::handle(root.as_ref(), limits);
-        let directory = files::Directory::open_native(&store.root)?;
+        let store = Self::handle(root.as_ref(), limits, rest);
+        let directory = files::Directory::open_native(&store.root, store.rest.clone())?;
         let catalogue = store.catalogue(&directory)?;
-        store.sweep(&directory, catalogue)?;
+        let catalogue = store.sweep(&directory, catalogue)?;
+        store.convert(&directory, &catalogue)?;
         Ok(store)
+    }
+    /// Converts the store's records to sealed and marks it, where its at-rest form seals and it is
+    /// not marked: each operation's prepared request and journal, then the catalogue. The swept
+    /// catalogue is the store's authority on what it holds, within the operations its limits admit:
+    /// a directory it does not index went with the sweep.
+    fn convert(
+        &self,
+        directory: &files::Directory,
+        catalogue: &Catalogue,
+    ) -> Result<(), NativeStoreError> {
+        if !self.rest.sealing() || directory.marked()? {
+            return Ok(());
+        }
+        let mut names = Vec::new();
+        names
+            .try_reserve_exact(catalogue.entries.len().saturating_mul(2).saturating_add(1))
+            .map_err(|_| NativeStoreError::Capacity)?;
+        for id in catalogue.entries.keys() {
+            let operation = component(*id);
+            names.push((
+                format!("{operation}/{PREPARED}"),
+                PREPARED_MAGIC,
+                PREPARED_BYTES,
+            ));
+            names.push((
+                format!("{operation}/{JOURNAL}"),
+                JOURNAL_MAGIC,
+                JOURNAL_BYTES,
+            ));
+        }
+        names.push((CATALOGUE.to_owned(), CATALOGUE_MAGIC, CATALOGUE_BYTES));
+        Ok(directory.convert(names)?)
     }
     /// What an interrupted transition left (the audit's F04, F05): a
     /// directory of a retired or unknown identity (retired before its removal
@@ -654,7 +694,7 @@ impl NativeOperationStore {
         &self,
         directory: &files::Directory,
         mut catalogue: Catalogue,
-    ) -> Result<(), NativeStoreError> {
+    ) -> Result<Catalogue, NativeStoreError> {
         let mut changed = false;
         let unready: Vec<[u8; 16]> = catalogue
             .entries
@@ -677,14 +717,14 @@ impl NativeOperationStore {
                 directory.remove_child(&name)?;
             }
         }
-        Ok(())
+        Ok(catalogue)
     }
     /// How a retired operation ended, for an identity that retired.
     pub fn retired(
         &self,
         id: NativeOperationId,
     ) -> Result<Option<NativeRetired>, NativeStoreError> {
-        let directory = files::Directory::open_native(&self.root)?;
+        let directory = files::Directory::open_native(&self.root, self.rest.clone())?;
         Ok(self
             .catalogue(&directory)?
             .retired
@@ -693,13 +733,14 @@ impl NativeOperationStore {
     }
     /// Identities kept taken after their operations retired.
     pub fn retired_count(&self) -> Result<usize, NativeStoreError> {
-        let directory = files::Directory::open_native(&self.root)?;
+        let directory = files::Directory::open_native(&self.root, self.rest.clone())?;
         Ok(self.catalogue(&directory)?.retired.len())
     }
-    fn handle(root: &Path, limits: NativeStoreLimits) -> Self {
+    fn handle(root: &Path, limits: NativeStoreLimits, rest: crate::at_rest::AtRest) -> Self {
         Self {
             root: root.into(),
             limits,
+            rest,
             #[cfg(test)]
             fault: std::sync::Mutex::new(None),
         }
@@ -708,7 +749,7 @@ impl NativeOperationStore {
         &self.root
     }
     pub fn usage(&self) -> Result<StoreUsage, NativeStoreError> {
-        let directory = files::Directory::open_native(&self.root)?;
+        let directory = files::Directory::open_native(&self.root, self.rest.clone())?;
         self.catalogue(&directory)?.usage()
     }
     /// Claim an identity for `intent` and persist the exact request `expand`
@@ -725,7 +766,7 @@ impl NativeOperationStore {
     ) -> Result<NativeOperation, NativeStoreError> {
         crate::operation_store::validate_context(context)?;
         let digest = intent.digest()?;
-        let directory = files::Directory::open_native(&self.root)?;
+        let directory = files::Directory::open_native(&self.root, self.rest.clone())?;
         let mut catalogue = self.catalogue(&directory)?;
         let id = match operation {
             Some(operation) => operation.0.0,
@@ -912,7 +953,7 @@ impl NativeOperationStore {
     ) -> Result<Option<NativeOperation>, NativeStoreError> {
         crate::operation_store::validate_context(context)?;
         let digest = intent.digest()?;
-        let directory = files::Directory::open_native(&self.root)?;
+        let directory = files::Directory::open_native(&self.root, self.rest.clone())?;
         let catalogue = self.catalogue(&directory)?;
         let id = operation.0.0;
         if catalogue.retired.contains_key(&id) {
@@ -950,7 +991,7 @@ impl NativeOperationStore {
         id: NativeOperationId,
         context: &OperationContext,
     ) -> Result<NativeOperation, NativeStoreError> {
-        let directory = files::Directory::open_native(&self.root)?;
+        let directory = files::Directory::open_native(&self.root, self.rest.clone())?;
         let (_, prepared, journal) = self.journaled(&directory, id, context)?;
         Ok(assemble(id.0.0, prepared, journal))
     }
@@ -1063,7 +1104,7 @@ impl NativeOperationStore {
         let NativeMutationReply::Committed(receipt) = reply else {
             return Err(NativeStoreError::NotCommitted);
         };
-        let directory = files::Directory::open_native(&self.root)?;
+        let directory = files::Directory::open_native(&self.root, self.rest.clone())?;
         let (mut catalogue, prepared, journal) = self.journaled(&directory, id, context)?;
         validate_receipt(
             context,
@@ -1112,7 +1153,7 @@ impl NativeOperationStore {
         id: NativeOperationId,
         context: &OperationContext,
     ) -> Result<(), NativeStoreError> {
-        let directory = files::Directory::open_native(&self.root)?;
+        let directory = files::Directory::open_native(&self.root, self.rest.clone())?;
         let (mut catalogue, _, journal) = match self.journaled(&directory, id, context) {
             Ok(loaded) => loaded,
             Err(NativeStoreError::Retired) => return Ok(()),
@@ -1157,7 +1198,7 @@ impl NativeOperationStore {
         if refusal.detail.len() > 4096 {
             return Err(NativeStoreError::Capacity);
         }
-        let directory = files::Directory::open_native(&self.root)?;
+        let directory = files::Directory::open_native(&self.root, self.rest.clone())?;
         let (mut catalogue, _, journal) = self.journaled(&directory, id, context)?;
         if journal.receipt.is_some() {
             return Err(NativeStoreError::ReceiptMismatch);
@@ -1186,7 +1227,7 @@ impl NativeOperationStore {
     /// earlier generation has been reported (a lost reply is recovered
     /// first, never fenced away by the journal's own advance).
     pub fn floor_due(&self) -> Result<Option<RequestEpoch>, NativeStoreError> {
-        let directory = files::Directory::open_native(&self.root)?;
+        let directory = files::Directory::open_native(&self.root, self.rest.clone())?;
         let catalogue = self.catalogue(&directory)?;
         if catalogue.floor >= catalogue.generation {
             return Ok(None);
@@ -1209,7 +1250,7 @@ impl NativeOperationStore {
         floor: RequestEpoch,
         next: RequestEpoch,
     ) -> Result<(), NativeStoreError> {
-        let directory = files::Directory::open_native(&self.root)?;
+        let directory = files::Directory::open_native(&self.root, self.rest.clone())?;
         let mut catalogue = self.catalogue(&directory)?;
         let mut changed = false;
         if floor.0 > catalogue.floor {
@@ -1235,7 +1276,7 @@ impl NativeOperationStore {
     }
     /// The journal's current generation and floor (F12).
     pub fn generations(&self) -> Result<(RequestEpoch, RequestEpoch), NativeStoreError> {
-        let directory = files::Directory::open_native(&self.root)?;
+        let directory = files::Directory::open_native(&self.root, self.rest.clone())?;
         let catalogue = self.catalogue(&directory)?;
         Ok((
             RequestEpoch(catalogue.generation),
@@ -1248,7 +1289,7 @@ impl NativeOperationStore {
         id: NativeOperationId,
         context: &OperationContext,
     ) -> Result<RequestKey, NativeStoreError> {
-        let directory = files::Directory::open_native(&self.root)?;
+        let directory = files::Directory::open_native(&self.root, self.rest.clone())?;
         let catalogue = self.catalogue(&directory)?;
         if let Some(retired) = catalogue.retired.get(&id.0.0) {
             return Ok(id.key_in(context, RequestEpoch(retired.epoch)));
@@ -1265,7 +1306,7 @@ impl NativeOperationStore {
     /// Ready operations whose result has not been reported to the caller, in
     /// identity order: pending ones and committed ones whose reply was lost.
     pub fn outstanding(&self) -> Result<Vec<NativeOperationId>, NativeStoreError> {
-        let directory = files::Directory::open_native(&self.root)?;
+        let directory = files::Directory::open_native(&self.root, self.rest.clone())?;
         let catalogue = self.catalogue(&directory)?;
         let mut pending = Vec::new();
         for (id, entry) in &catalogue.entries {

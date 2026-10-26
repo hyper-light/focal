@@ -105,8 +105,20 @@ fn references_round_trip_and_reject_foreign_prefixes_and_zero() {
 fn prepare_claims_an_identity_once_then_retry_returns_the_exact_frame_and_binds_receipts() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("native");
-    let store = NativeOperationStore::create(&path, NativeStoreLimits::default()).unwrap();
-    assert!(NativeOperationStore::create(&path, NativeStoreLimits::default()).is_err());
+    let store = NativeOperationStore::create(
+        &path,
+        NativeStoreLimits::default(),
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap();
+    assert!(
+        NativeOperationStore::create(
+            &path,
+            NativeStoreLimits::default(),
+            crate::at_rest::AtRest::clear()
+        )
+        .is_err()
+    );
     let context = context();
     let mut generator = ids(100);
     let mut expansions = 0;
@@ -140,7 +152,12 @@ fn prepare_claims_an_identity_once_then_retry_returns_the_exact_frame_and_binds_
         )
         .unwrap();
     assert_eq!(again, operation);
-    let reopened = NativeOperationStore::open(&path, NativeStoreLimits::default()).unwrap();
+    let reopened = NativeOperationStore::open(
+        &path,
+        NativeStoreLimits::default(),
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap();
     assert_eq!(reopened.retry(operation.id, &context).unwrap(), operation);
     // A different intent under the claimed identity is refused, as is a
     // different context.
@@ -334,7 +351,8 @@ fn a_reported_operation_retires_when_a_claim_needs_its_slot_and_its_identity_sta
         max_operations: 2,
         max_reserved_bytes: 16 * 1024 * 1024,
     };
-    let store = NativeOperationStore::create(&path, limits).unwrap();
+    let store =
+        NativeOperationStore::create(&path, limits, crate::at_rest::AtRest::clear()).unwrap();
     let context = context();
     let directory =
         |id: NativeOperationId| path.join(format!("{:032x}", u128::from_be_bytes(id.request().0)));
@@ -410,7 +428,8 @@ fn a_reported_operation_retires_when_a_claim_needs_its_slot_and_its_identity_sta
     assert!(!directory(finished[3]).exists());
     assert!(store.retired(finished[3]).unwrap().is_some());
     // Reopening keeps it all and sweeps nothing live.
-    let reopened = NativeOperationStore::open(&path, limits).unwrap();
+    let reopened =
+        NativeOperationStore::open(&path, limits, crate::at_rest::AtRest::clear()).unwrap();
     assert_eq!(reopened.retired_count().unwrap(), 2);
     assert_eq!(reopened.outstanding().unwrap(), vec![fresh.id]);
     assert_eq!(reopened.usage().unwrap().operations, 2);
@@ -428,7 +447,8 @@ fn a_failed_or_interrupted_claim_holds_no_slot() {
         max_operations: 1,
         max_reserved_bytes: 16 * 1024 * 1024,
     };
-    let store = NativeOperationStore::create(&path, limits).unwrap();
+    let store =
+        NativeOperationStore::create(&path, limits, crate::at_rest::AtRest::clear()).unwrap();
     let context = context();
     let mut generator = ids(600);
     // Expansion fails: the claim is released, nothing is listed, the next
@@ -453,7 +473,8 @@ fn a_failed_or_interrupted_claim_holds_no_slot() {
                 .is_err()
         );
         assert_eq!(store.usage().unwrap().operations, 1, "{fault:?}");
-        let reopened = NativeOperationStore::open(&path, limits).unwrap();
+        let reopened =
+            NativeOperationStore::open(&path, limits, crate::at_rest::AtRest::clear()).unwrap();
         assert_eq!(reopened.usage().unwrap().operations, 0, "{fault:?}");
         assert_eq!(reopened.retired_count().unwrap(), 0);
     }
@@ -485,7 +506,8 @@ fn a_failed_or_interrupted_claim_holds_no_slot() {
     assert!(path.join(&component).exists());
     assert_eq!(store.usage().unwrap().operations, 0);
     assert!(store.retired(operation.id).unwrap().is_some());
-    let reopened = NativeOperationStore::open(&path, limits).unwrap();
+    let reopened =
+        NativeOperationStore::open(&path, limits, crate::at_rest::AtRest::clear()).unwrap();
     assert!(!path.join(&component).exists());
     assert!(matches!(
         reopened.retry(operation.id, &context),
@@ -511,7 +533,8 @@ fn concurrent_transitions_never_lose_a_committed_receipt() {
         max_operations: 64,
         max_reserved_bytes: 1024 * 1024 * 1024,
     };
-    let store = NativeOperationStore::create(&path, limits).unwrap();
+    let store =
+        NativeOperationStore::create(&path, limits, crate::at_rest::AtRest::clear()).unwrap();
     let context = context();
     let mut generator = ids(700);
     let refusal = focal_wire::NativeRefusal {
@@ -527,8 +550,8 @@ fn concurrent_transitions_never_lose_a_committed_receipt() {
         let committed = receipt(&operation, operation.fingerprint);
         let id = operation.id;
         let (a, b) = (
-            NativeOperationStore::open(&path, limits).unwrap(),
-            NativeOperationStore::open(&path, limits).unwrap(),
+            NativeOperationStore::open(&path, limits, crate::at_rest::AtRest::clear()).unwrap(),
+            NativeOperationStore::open(&path, limits, crate::at_rest::AtRest::clear()).unwrap(),
         );
         let refusal = refusal.clone();
         std::thread::scope(|scope| {
@@ -565,9 +588,12 @@ fn concurrent_transitions_never_lose_a_committed_receipt() {
 #[test]
 fn expansion_must_carry_the_claimed_identity_and_the_native_profile() {
     let root = tempfile::tempdir().unwrap();
-    let store =
-        NativeOperationStore::create(root.path().join("native"), NativeStoreLimits::default())
-            .unwrap();
+    let store = NativeOperationStore::create(
+        root.path().join("native"),
+        NativeStoreLimits::default(),
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap();
     let context = context();
     let mut generator = ids(200);
     for mutate in [
@@ -619,7 +645,12 @@ fn interrupted_initialization_resumes_without_minting_a_second_identity() {
     let context = context();
     for fault in [Fault::Claimed, Fault::Prepared, Fault::Ready] {
         let _ = std::fs::remove_dir_all(&path);
-        let store = NativeOperationStore::create(&path, NativeStoreLimits::default()).unwrap();
+        let store = NativeOperationStore::create(
+            &path,
+            NativeStoreLimits::default(),
+            crate::at_rest::AtRest::clear(),
+        )
+        .unwrap();
         store.inject(fault);
         let mut generator = ids(300);
         let failed = store.prepare(context, intent(b"{}"), None, &mut generator, |id| {
@@ -654,7 +685,8 @@ fn capacity_and_limits_are_enforced_and_stored_with_the_catalogue() {
         max_operations: 1,
         max_reserved_bytes: 16 * 1024 * 1024,
     };
-    let store = NativeOperationStore::create(&path, limits).unwrap();
+    let store =
+        NativeOperationStore::create(&path, limits, crate::at_rest::AtRest::clear()).unwrap();
     let context = context();
     let mut generator = ids(400);
     store
@@ -669,7 +701,11 @@ fn capacity_and_limits_are_enforced_and_stored_with_the_catalogue() {
         Err(NativeStoreError::Capacity)
     ));
     assert!(matches!(
-        NativeOperationStore::open(&path, NativeStoreLimits::default()),
+        NativeOperationStore::open(
+            &path,
+            NativeStoreLimits::default(),
+            crate::at_rest::AtRest::clear()
+        ),
         Err(NativeStoreError::Store(StoreError::LimitsMismatch))
     ));
     assert!(
@@ -678,7 +714,8 @@ fn capacity_and_limits_are_enforced_and_stored_with_the_catalogue() {
             NativeStoreLimits {
                 max_operations: 0,
                 ..limits
-            }
+            },
+            crate::at_rest::AtRest::clear()
         )
         .is_err()
     );
@@ -724,7 +761,8 @@ fn a_journal_rotates_its_generation_and_advances_its_floor_when_the_old_one_is_d
         max_operations: 4,
         max_reserved_bytes: 16 * 1024 * 1024,
     };
-    let store = NativeOperationStore::create(&path, limits).unwrap();
+    let store =
+        NativeOperationStore::create(&path, limits, crate::at_rest::AtRest::clear()).unwrap();
     let context = context();
     let mut generator = ids(900);
     let a = issue(&store, &context, &mut generator, 10);
@@ -837,7 +875,8 @@ fn a_journal_rotates_its_generation_and_advances_its_floor_when_the_old_one_is_d
     // floor of a later one: the owner closed it, and the journal's floor
     // stands past it already.
     assert_eq!(store.floor_due().unwrap(), None);
-    let reopened = NativeOperationStore::open(&path, limits).unwrap();
+    let reopened =
+        NativeOperationStore::open(&path, limits, crate::at_rest::AtRest::clear()).unwrap();
     assert_eq!(
         reopened.generations().unwrap(),
         (RequestEpoch(6), RequestEpoch(5))
@@ -894,4 +933,122 @@ fn a_catalogue_from_before_generations_is_carried_into_the_first_generation() {
     let retired = carried.retired.get(&[8; 16]).unwrap();
     assert_eq!((retired.epoch, retired.order), (1, 2));
     assert_eq!(retired.outcome, NativeRetired::Refused);
+}
+
+/// A native journal below the at-rest level holding an operation answered (its receipt recorded)
+/// and one pending, converted at its open and cut after each of its steps in turn: the next open
+/// finishes; then every record is sealed, nothing of them in the clear; the answered operation's
+/// receipt is kept; the pending one is retried with its exact frame under its identity, and its
+/// receipt bound once (29 §12.11).
+#[test]
+fn a_native_journal_converts_through_a_cut_at_any_step() {
+    use crate::at_rest::support::{assert_sealed_under, below, directory, sealing};
+    let context = context();
+    let limits = NativeStoreLimits::default();
+    for cut in 0.. {
+        let (data, keys) = directory();
+        let path = data.path().join("native");
+        let store = NativeOperationStore::create(&path, limits, below(&keys)).unwrap();
+        let mut generator = ids(100);
+        let answered = issue(&store, &context, &mut generator, 23);
+        let answer = receipt(&answered, answered.fingerprint);
+        store
+            .record_reply(
+                answered.id,
+                &context,
+                &NativeMutationReply::Committed(answer),
+            )
+            .unwrap();
+        let pending = issue(&store, &context, &mut generator, 24);
+        drop(store);
+        assert!(
+            std::fs::read(path.join(CATALOGUE))
+                .unwrap()
+                .starts_with(CATALOGUE_MAGIC)
+        );
+        crate::at_rest::cut::after(cut);
+        let first = NativeOperationStore::open(&path, limits, sealing(&keys));
+        let finished = first.is_ok();
+        crate::at_rest::cut::none();
+        let store = match first {
+            Ok(store) => store,
+            Err(_) => NativeOperationStore::open(&path, limits, sealing(&keys)).unwrap(),
+        };
+        assert!(path.join(crate::at_rest::SEALED).exists());
+        assert_sealed_under(
+            &path,
+            &[b"FCNINPUT", CATALOGUE_MAGIC, PREPARED_MAGIC, JOURNAL_MAGIC],
+        );
+        let kept = store.retry(answered.id, &context).unwrap();
+        assert_eq!(kept.stage(), NativeStage::Completed);
+        assert_eq!(kept.receipt, Some(answer));
+        let retried = store.retry(pending.id, &context).unwrap();
+        assert_eq!(retried, pending);
+        let bound = receipt(&pending, pending.fingerprint);
+        store
+            .record_reply(pending.id, &context, &NativeMutationReply::Committed(bound))
+            .unwrap();
+        let answered_once = store.retry(pending.id, &context).unwrap();
+        assert_eq!(answered_once.receipt, Some(bound));
+        assert_sealed_under(&path, &[b"FCNINPUT"]);
+        if finished {
+            assert!(cut > 0, "a conversion of no step");
+            break;
+        }
+    }
+}
+
+/// A sealed native journal's records changed, swapped between operations, or planted in the clear
+/// after its mark are refused; put back, it opens.
+#[test]
+fn a_sealed_native_journals_records_changed_swapped_or_planted_in_the_clear_are_refused() {
+    use crate::at_rest::AtRestError;
+    use crate::at_rest::support::{directory, flip, sealing, swap};
+    use crate::operation_store::StoreError;
+    use focal_seal::named::NamedError;
+    let context = context();
+    let limits = NativeStoreLimits::default();
+    let (data, keys) = directory();
+    let path = data.path().join("native");
+    let store = NativeOperationStore::create(&path, limits, sealing(&keys)).unwrap();
+    let mut generator = ids(200);
+    let first = issue(&store, &context, &mut generator, 23);
+    let second = issue(&store, &context, &mut generator, 24);
+    drop(store);
+    let prepared_of = |operation: &NativeOperation| {
+        path.join(format!("{}/{PREPARED}", component(operation.id.0.0)))
+    };
+    let opens = || {
+        let store = NativeOperationStore::open(&path, limits, sealing(&keys))?;
+        store.retry(first.id, &context)
+    };
+    assert_eq!(opens().unwrap(), first);
+
+    swap(&prepared_of(&first), &prepared_of(&second));
+    assert!(matches!(
+        opens(),
+        Err(NativeStoreError::Store(StoreError::AtRest(
+            AtRestError::Sealed(NamedError::Moved(_))
+        )))
+    ));
+    swap(&prepared_of(&first), &prepared_of(&second));
+
+    let catalogue = path.join(CATALOGUE);
+    let saved = std::fs::read(&catalogue).unwrap();
+    flip(&catalogue);
+    assert!(matches!(
+        opens(),
+        Err(NativeStoreError::Store(StoreError::AtRest(
+            AtRestError::Sealed(NamedError::Seal(_))
+        )))
+    ));
+    let clear = data.path().join("clear");
+    drop(NativeOperationStore::create(&clear, limits, crate::at_rest::AtRest::clear()).unwrap());
+    std::fs::write(&catalogue, std::fs::read(clear.join(CATALOGUE)).unwrap()).unwrap();
+    assert!(matches!(
+        opens(),
+        Err(NativeStoreError::Store(StoreError::AtRest(AtRestError::ClearAfterSealed(name)))) if name == CATALOGUE
+    ));
+    std::fs::write(&catalogue, &saved).unwrap();
+    assert_eq!(opens().unwrap(), first);
 }

@@ -129,6 +129,7 @@ fn store(context: &Context) -> Result<UploadStore> {
         STORE,
         context.operation,
         UploadStoreLimits::default(),
+        context.at_rest.clone(),
     )
     .map_err(other)
 }
@@ -506,6 +507,7 @@ mod tests {
             },
             RouteEpoch(1),
             focal_client::artifact_transfer::TransferLimits::default(),
+            focal_client::at_rest::AtRest::clear(),
         )
         .unwrap();
         journal.bind_intent(&old).unwrap();

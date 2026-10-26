@@ -39,6 +39,7 @@ impl ManagedRequests {
                 self.limits,
                 &initial.input,
                 &initial.receipt,
+                self.rest.clone(),
             )?;
             state.phase = Phase::Ready;
             self.save(&directory, &state, true)?;

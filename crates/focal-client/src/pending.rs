@@ -2,6 +2,7 @@
 //! owner on the CLI's OS thread; perform network awaits between its fsync calls.
 //! Dropping a wait or this owner never retracts or forgets an admitted request.
 mod files;
+use crate::at_rest::AtRest;
 use crate::{MutationReply, Operation, RequestEnvelope};
 use focal_model::*;
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,8 @@ pub enum PendingError {
     NotCommitted,
     #[error("operation journal had an ambiguous write; reopen it before further transmission")]
     Failed,
+    #[error("operation journal at rest: {0}")]
+    AtRest(#[from] crate::at_rest::AtRestError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,12 +161,25 @@ pub struct OperationJournal {
     directory: files::Directory,
     failed: bool,
 }
+/// Converts the journal at `path` to `rest`'s form (29 §12.11), under its lock: what its store's
+/// open does once its data directory's fence opens the at-rest level. A journal whose lock was never
+/// made (a creation a cut ended first) holds nothing and is left: its store's resume makes it in the
+/// store's form.
+pub(crate) fn convert(path: &Path, rest: AtRest) -> Result<(), PendingError> {
+    match std::fs::symlink_metadata(path.join("LOCK")) {
+        Ok(_) => files::Directory::open(path, rest)?.convert(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
 impl OperationJournal {
+    /// A new journal at `path`, its record kept as `rest` says (29 §12.11).
     pub fn create(
         path: impl AsRef<Path>,
         context: OperationContext,
         open_epoch: RequestEnvelope,
         request: RequestEnvelope,
+        rest: AtRest,
     ) -> Result<Self, PendingError> {
         let state = State {
             version: 1,
@@ -176,7 +192,7 @@ impl OperationJournal {
         };
         state.validate(&context)?;
         let bytes = encode(&state)?;
-        let directory = files::Directory::create(path.as_ref())?;
+        let directory = files::Directory::create(path.as_ref(), rest)?;
         directory.install(&bytes, true)?;
         Ok(Self {
             state,
@@ -184,8 +200,15 @@ impl OperationJournal {
             failed: false,
         })
     }
-    pub fn open(path: impl AsRef<Path>, expected: &OperationContext) -> Result<Self, PendingError> {
-        let directory = files::Directory::open(path.as_ref())?;
+    /// The journal at `path`, its record kept as `rest` says (29 §12.11).
+    pub fn open(
+        path: impl AsRef<Path>,
+        expected: &OperationContext,
+        rest: AtRest,
+    ) -> Result<Self, PendingError> {
+        let directory = files::Directory::open(path.as_ref(), rest)?;
+        // Its record to sealed, where its form seals and it is not marked yet (29 §12.11).
+        directory.convert()?;
         let state = read_state(&directory, expected)?;
         directory.recover_marker()?;
         Ok(Self {
@@ -201,6 +224,7 @@ impl OperationJournal {
         context: OperationContext,
         open_epoch: RequestEnvelope,
         request: RequestEnvelope,
+        rest: AtRest,
     ) -> Result<Self, PendingError> {
         let mut state = State {
             version: 1,
@@ -214,7 +238,8 @@ impl OperationJournal {
         // Validate and bound every supplied byte before any filesystem repair.
         state.validate(&context)?;
         let bytes = encode(&state)?;
-        let directory = files::Directory::resume_prepared(path)?;
+        let directory = files::Directory::resume_prepared(path, rest)?;
+        directory.convert()?;
         if directory.unpublished()? {
             directory.install(&bytes, true)?;
         } else {

@@ -31,6 +31,7 @@ use hyper_seal::keys::{KeyId, KeySource as _, RECORD, Wrapped, WrappingKey};
 use hyper_seal::{FileSource, SealError, Secret32};
 
 pub mod file;
+pub mod named;
 
 /// The file in the data directory that holds the node's wrapped keys.
 pub const SEAL_FILE: &str = "SEAL.node";

@@ -21,17 +21,49 @@
 //!   and where reads begin, one place for each [`RECORD_BYTES`] of the most plaintext the file
 //!   takes, sized when the file is made. A record is sealed in a buffer of its own, at most a
 //!   record and its overhead long, while it is written, and written with one write.
+//! - **Files as their owner keeps them.** A writer makes and opens its files through a
+//!   [`RecordFiles`]: the content store's as its data directory's other files are ([`Plain`]), a
+//!   client's owner-private and checked at each open, as its stores keep every file (focal-client's
+//!   upload journal, 29 §12.11).
 use hyper_seal::TAG;
 use hyper_seal::stream::VersionKey;
 
 use super::*;
+
+/// How a record file's files are made and opened: where they lie decides it, not the format.
+pub trait RecordFiles {
+    /// A new file at `path`, to be read and written: a file of a new ID, which must not stand.
+    fn create(&self, path: &Path) -> std::io::Result<File>;
+    /// The file at `path`, opened to be read, and written as well where `write`.
+    fn open(&self, path: &Path, write: bool) -> std::io::Result<File>;
+}
+
+/// A record file's files made and opened as the content store makes and opens the other files of
+/// its data directory.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Plain;
+
+impl RecordFiles for Plain {
+    fn create(&self, path: &Path) -> std::io::Result<File> {
+        OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(path)
+    }
+
+    fn open(&self, path: &Path, write: bool) -> std::io::Result<File> {
+        OpenOptions::new().read(true).write(write).open(path)
+    }
+}
 
 /// Format: the magic a cold stream's record file begins with. A sealed file begins with its
 /// header's version, so the two are told apart by their first byte.
 pub(super) const COLD_MAGIC: &[u8; 8] = b"FCLCOLD1";
 /// Format: the magic a part's record file begins with: an upload being staged, or a chunk a
 /// transfer is receiving.
-pub(super) const PART_MAGIC: &[u8; 8] = b"FCLPART1";
+pub const PART_MAGIC: &[u8; 8] = b"FCLPART1";
 /// Format: bytes of a cold record file's header: the magic and the file's ID.
 pub(super) const HEADER: usize = 8 + 16;
 /// Format: bytes of a part's header: the magic, the file's ID, and a tag sealed under the part's key
@@ -52,7 +84,7 @@ fn header_of(magic: &[u8; 8]) -> usize {
     }
 }
 /// The most plaintext one record holds.
-pub(super) const RECORD_BYTES: usize = 64 * 1024;
+pub const RECORD_BYTES: usize = 64 * 1024;
 /// Format: bytes of a record's length block: the length (u32, little-endian) and its tag.
 const LENGTH_BLOCK: usize = 4 + TAG;
 /// Bytes a record takes beyond its plaintext: its length block and its bytes' tag.
@@ -63,7 +95,7 @@ const VERSION: u64 = 0;
 
 /// How much of a record file [`RecordWriter::resume`] opens as it reads it through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Verify {
+pub enum Verify {
     /// Every block, lengths and bytes: what an upload's part takes once an open (29 §12.7).
     All,
     /// Every length block, each record's bytes passed over by their stated length: what a part a
@@ -73,8 +105,9 @@ pub(super) enum Verify {
     Lengths,
 }
 
-/// The writer of one record file.
-pub(super) struct RecordWriter {
+/// The writer of one record file, its files made and opened as `F` says.
+pub struct RecordWriter<F: RecordFiles = Plain> {
+    files: F,
     file: File,
     key: VersionKey,
     /// Its kind's magic, which a file written again for it begins with too.
@@ -102,7 +135,7 @@ struct Start {
 
 /// The file bytes `bytes` of plaintext take as records appended at once: the plaintext, and a
 /// record's overhead for every [`RECORD_BYTES`] of it begun. What an append's room promises.
-pub(super) fn records_bytes(bytes: usize) -> Result<u64, ContentError> {
+pub fn records_bytes(bytes: usize) -> Result<u64, ContentError> {
     let records = bytes.div_ceil(RECORD_BYTES);
     records
         .checked_mul(RECORD_OVERHEAD)
@@ -112,10 +145,7 @@ pub(super) fn records_bytes(bytes: usize) -> Result<u64, ContentError> {
 }
 
 impl RecordWriter {
-    /// A new record file of the kind `magic` names at `path`, which must not stand, its header
-    /// written: its ID `id` and its key `key`, made for that ID. `most` is the most plaintext the
-    /// file takes (a chunk, an upload), which sizes where reads begin; a file's places count its
-    /// plaintext in 32 bits, so more is refused.
+    /// [`RecordWriter::create_in`] the content store's files ([`Plain`]).
     pub(super) fn create(
         path: &Path,
         magic: &'static [u8; 8],
@@ -123,13 +153,37 @@ impl RecordWriter {
         key: VersionKey,
         most: usize,
     ) -> Result<Self, ContentError> {
+        Self::create_in(Plain, path, magic, id, key, most)
+    }
+
+    /// [`RecordWriter::resume_in`] the content store's files ([`Plain`]).
+    pub(super) fn resume(
+        path: &Path,
+        magic: &'static [u8; 8],
+        key_of: &dyn Fn(&[u8; 16]) -> Result<VersionKey, ContentError>,
+        most: usize,
+        torn: u64,
+        verify: Verify,
+    ) -> Result<Self, ContentError> {
+        Self::resume_in(Plain, path, magic, key_of, most, torn, verify)
+    }
+}
+
+impl<F: RecordFiles> RecordWriter<F> {
+    /// A new record file of the kind `magic` names at `path`, which must not stand, made through
+    /// `files`, its header written: its ID `id` and its key `key`, made for that ID. `most` is the
+    /// most plaintext the file takes (a chunk, an upload), which sizes where reads begin; a file's
+    /// places count its plaintext in 32 bits, so more is refused.
+    pub fn create_in(
+        files: F,
+        path: &Path,
+        magic: &'static [u8; 8],
+        id: [u8; 16],
+        key: VersionKey,
+        most: usize,
+    ) -> Result<Self, ContentError> {
         let starts = starts_for(most)?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .read(true)
-            .open(path)?;
+        let mut file = files.create(path)?;
         let mut header = [0u8; PART_HEADER];
         let (head, rest) = header
             .split_at_mut_checked(magic.len())
@@ -148,6 +202,7 @@ impl RecordWriter {
         let length = header_of(magic);
         file.write_all(header.get(..length).ok_or(ContentError::Capacity)?)?;
         Ok(Self {
+            files,
             file,
             key,
             magic,
@@ -170,8 +225,10 @@ impl RecordWriter {
     /// file of a new ID under a new key, beside it (`.resume`), which is synced and renamed over
     /// it, before the writer appends anything. What the cut append wrote may lie on the volume, and
     /// its blocks' places are never sealed over under its key. A record that does not open further
-    /// from the end, a header of another kind, or a file holding more than `most` is corrupt.
-    pub(super) fn resume(
+    /// from the end, a header of another kind, or a file holding more than `most` is corrupt. Its
+    /// files are made and opened through `files`.
+    pub fn resume_in(
+        files: F,
         path: &Path,
         magic: &'static [u8; 8],
         key_of: &dyn Fn(&[u8; 16]) -> Result<VersionKey, ContentError>,
@@ -179,7 +236,7 @@ impl RecordWriter {
         torn: u64,
         verify: Verify,
     ) -> Result<Self, ContentError> {
-        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        let mut file = files.open(path, true)?;
         let length = file.metadata()?.len();
         let length_of_header = header_of(magic);
         let mut header = [0u8; PART_HEADER];
@@ -201,6 +258,7 @@ impl RecordWriter {
                 .map_err(|_| ContentError::Corrupt)?;
         }
         let mut writer = Self {
+            files,
             key,
             file,
             magic,
@@ -248,7 +306,8 @@ impl RecordWriter {
                     if length.saturating_sub(writer.size) > torn {
                         return Err(ContentError::Corrupt);
                     }
-                    return writer.rewritten(path, key_of);
+                    let whole = writer.plain;
+                    return writer.rewritten(path, key_of, whole);
                 }
                 Err(error) => return Err(error),
             }
@@ -256,12 +315,36 @@ impl RecordWriter {
         Err(ContentError::Corrupt)
     }
 
-    /// The writer's whole records written again into a file of a new ID under a new key beside it,
-    /// synced, and renamed over it: the writer goes on in the new file ([`Self::resume`]).
+    /// The writer with its records up to `plain` bytes of plaintext kept and the rest let go: what
+    /// a writer goes on from whose owner never recorded its last appends (a crash between an
+    /// append's sync and its owner's record of it). The records kept are written again into a file
+    /// of a new ID under a new key, as a torn file is ([`Self::resume_in`]), so the places of those
+    /// let go are never sealed over under the old key. `plain` must fall where a record ends, and
+    /// not past what was written; the writer as it is where it is all of it.
+    pub fn cut(
+        self,
+        path: &Path,
+        plain: u64,
+        key_of: &dyn Fn(&[u8; 16]) -> Result<VersionKey, ContentError>,
+    ) -> Result<Self, ContentError> {
+        let keep = u32::try_from(plain).map_err(|_| ContentError::Corrupt)?;
+        if keep == self.plain {
+            return Ok(self);
+        }
+        if keep > self.plain {
+            return Err(ContentError::Corrupt);
+        }
+        self.rewritten(path, key_of, keep)
+    }
+
+    /// The writer's whole records up to `keep` bytes of plaintext written again into a file of a
+    /// new ID under a new key beside it, synced, and renamed over it: the writer goes on in the
+    /// new file ([`Self::resume_in`], [`Self::cut`]). A record crossing `keep` is corrupt.
     fn rewritten(
         self,
         path: &Path,
         key_of: &dyn Fn(&[u8; 16]) -> Result<VersionKey, ContentError>,
+        keep: u32,
     ) -> Result<Self, ContentError> {
         let temporary = path.with_extension("resume");
         match fs::remove_file(&temporary) {
@@ -281,33 +364,43 @@ impl RecordWriter {
             .capacity()
             .saturating_sub(1)
             .saturating_mul(RECORD_BYTES);
-        let mut copy = Self::create(&temporary, self.magic, id, key_of(&id)?, most)?;
-        let mut old = File::open(path)?;
+        let Self {
+            files,
+            file: written,
+            key: old_key,
+            magic,
+            blocks: old_blocks,
+            ..
+        } = self;
+        // Every handle on the old file closed before the rename: Windows renames no open file.
+        drop(written);
+        let mut copy = Self::create_in(files, &temporary, magic, id, key_of(&id)?, most)?;
+        let mut old = copy.files.open(path, false)?;
         old.seek(SeekFrom::Start(
-            u64::try_from(header_of(self.magic)).map_err(|_| ContentError::Capacity)?,
+            u64::try_from(header_of(magic)).map_err(|_| ContentError::Capacity)?,
         ))?;
         let mut records = Records {
             file: &mut old,
-            key: &self.key,
+            key: &old_key,
             block: 0,
         };
         let mut buffer = Vec::new();
-        // A record a step, the whole records the writer read: no more than its blocks.
-        for _ in 0..=self.blocks {
-            if records.block >= self.blocks {
+        // A record a step, the whole records the writer read up to `keep`: no more than its blocks.
+        for _ in 0..=old_blocks {
+            if records.block >= old_blocks || copy.plain >= keep {
                 break;
             }
             let record = records.next(&mut buffer)?.ok_or(ContentError::Corrupt)?;
             copy.append(record)?;
         }
-        if copy.plain != self.plain {
+        if copy.plain != keep {
             return Err(ContentError::Corrupt);
         }
         copy.sync()?;
-        // Every handle on either file closed before the rename: Windows renames no open file.
         drop(old);
-        drop(self);
+        drop(old_key);
         let Self {
+            files,
             file,
             key,
             magic,
@@ -320,9 +413,10 @@ impl RecordWriter {
         drop(file);
         focal_platform::fs::atomic_replace(&temporary, path)?;
         sync_directory(path.parent().ok_or(ContentError::Invalid)?)?;
-        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        let mut file = files.open(path, true)?;
         file.seek(SeekFrom::Start(size))?;
         Ok(Self {
+            files,
             file,
             key,
             magic,
@@ -335,17 +429,17 @@ impl RecordWriter {
     }
 
     /// The file's metadata: when it was last written.
-    pub(super) fn metadata(&self) -> Result<fs::Metadata, ContentError> {
+    pub fn metadata(&self) -> Result<fs::Metadata, ContentError> {
         self.file.metadata().map_err(ContentError::from)
     }
 
     /// The plaintext bytes written.
-    pub(super) fn plain(&self) -> u64 {
+    pub fn plain(&self) -> u64 {
         u64::from(self.plain)
     }
 
     /// What was appended made durable.
-    pub(super) fn sync(&self) -> Result<(), ContentError> {
+    pub fn sync(&self) -> Result<(), ContentError> {
         self.file.sync_all().map_err(ContentError::from)
     }
 
@@ -385,7 +479,7 @@ impl RecordWriter {
     /// its bytes and their tag) in a buffer of its own and written at once, one write a record as a
     /// stream in the clear writes once an append: what an append costs is its writes (29 §12.6).
     /// Nothing is synced.
-    pub(super) fn append(&mut self, bytes: &[u8]) -> Result<(), ContentError> {
+    pub fn append(&mut self, bytes: &[u8]) -> Result<(), ContentError> {
         let mut buffer = Vec::new();
         buffer
             .try_reserve_exact(
@@ -436,7 +530,7 @@ impl RecordWriter {
     /// The file's whole plaintext, read back from it at `path` through a handle of its own and
     /// opened in place ([`read_all`]): what a capture carries of the open chunk.
     pub(super) fn read_whole(&self, path: &Path) -> Result<Vec<u8>, ContentError> {
-        let mut file = File::open(path)?;
+        let mut file = self.files.open(path, false)?;
         file.seek(SeekFrom::Start(
             u64::try_from(HEADER).map_err(|_| ContentError::Capacity)?,
         ))?;
@@ -455,12 +549,7 @@ impl RecordWriter {
     /// handle of its own: from the place nearest before `offset` reads begin from, each record
     /// opened in a buffer of its own until `out` is filled. A range past what was written is
     /// refused.
-    pub(super) fn read(
-        &self,
-        path: &Path,
-        offset: u32,
-        out: &mut [u8],
-    ) -> Result<(), ContentError> {
+    pub fn read(&self, path: &Path, offset: u32, out: &mut [u8]) -> Result<(), ContentError> {
         let end = u32::try_from(out.len())
             .ok()
             .and_then(|length| offset.checked_add(length))
@@ -478,7 +567,7 @@ impl RecordWriter {
             .find(|start| start.plain <= offset)
             .copied()
             .ok_or(ContentError::Corrupt)?;
-        let mut file = File::open(path)?;
+        let mut file = self.files.open(path, false)?;
         file.seek(SeekFrom::Start(start.file))?;
         let mut reader = Records {
             file: &mut file,

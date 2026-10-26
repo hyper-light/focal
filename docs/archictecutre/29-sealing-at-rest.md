@@ -280,7 +280,7 @@ private journals (`focal_enrollment::PrivateJournal`), sealed with the private d
 | Bus log | a bus node's `bus.log` | its part's records | focal-bus `member` over hyper-log | sealed (its data directory's keys) |
 | Bus identities | the bus's identity directory | its local CA's and members' keys | focal-bus `pki` | sealed (§12.9) |
 | Bus part | a part's `part.image`, the node's `run` | streams' floors, producers' sessions; the node's run | focal-bus `group`, `member` | sealed (§12.9) |
-| Client stores | a client's data directory (`client/…`), `MCP.operations/` | requests, receipts, pending writes, artifact uploads | focal-client `operation_store`, `native_store`, `pending`, `artifact_transfer`, `managed_store` | clear |
+| Client stores | a client's data directory and each context's history (`client/…`, `CLI.requests`, `CLI.uploads`, `MCP.operations`, `MCP.requests`, `MCP.uploads`, `WATCHES`, an operation journal where a command was told) | requests, receipts, pending writes, artifact uploads | focal-client `operation_store`, `native_store`, `pending`, `artifact_transfer`, `managed_store`, `managed_requests`, `watch` | sealed from the at-rest level (§12.11) |
 | Node files | `IDENTITY`, `POLICY`, `NETWORK`, `SESSION.memory`, `trust-adopted.bin`, `cluster/partitions/*.partition`, `cluster/BOOTSTRAP`, `cluster/apply/<plan>/{PLAN,JOURNAL}`, `cluster/pending-retires` | the node's identity, policy, network state, founded allowance, adopted trust, partition records, the root's genesis, deployment journals, retirements to finish | focal-node `node_files` | sealed from the at-rest level (§12.10) |
 
 **In the clear by design**, each for what it is:
@@ -294,8 +294,13 @@ private journals (`focal_enrollment::PrivateJournal`), sealed with the private d
 - Locks (`LOCK`, `*.lock`) and markers: empty files held for their locks, `*.initialized` files a
   writer leaves to say its store was made (a fixed sentence each), and the empty `SEALING` and
   `SEALED` of a store converting and converted, a content store's `REST_SEALING` and
-  `REST_SEALED` for its files beside its objects (§12.7), and the empty `FILES.SEALED` of a data
-  directory whose node files are sealed (§12.10).
+  `REST_SEALED` for its files beside its objects (§12.7), the empty `FILES.SEALED` of a data
+  directory whose node files are sealed (§12.10), and a client store's empty marks (`SEALED`, and
+  `<name>.managed-sealed`, `<name>.watch-sealed`, `<name>.initialized-sealed` where several owners
+  share a directory) with `FILES.lock`, the lock a client's own directory converts its node files
+  under (§12.11).
+- The fence a client's context recorded in its history (`STORAGE.level`, as a node's), which its
+  next command reads to choose its stores' form before it opens one (§12.11).
 - What an operator asks for in the clear, outside any data directory: an artifact downloaded to a
   file it names, a trace written where it says, a deployment plan's output, and an invitation
   bundle handed to a joiner, a bearer credential kept owner-only and spent once.
@@ -1009,8 +1014,9 @@ the at-rest level:
   tests and two of the load tool's driver (`embedded::decode_identity`), which would have refused
   every node founded at the level. The path reader is gone; every reader opens the directory's node
   files (`node_files::read_identity`), in either form.
-- **A client's own data directory.** A data directory that hosts no node records no fence, and the
-  issuers its enrollments adopted stay in the clear until its client stores are sealed (step 7).
+- **A client's own data directory.** A data directory that hosts no node records the fence its
+  contexts learn from their clusters, and converts the issuers its enrollments adopted at a
+  context's open once that fence opens the level (§12.11).
 - **Found on the way.** Three node files were read whole with no bound: the founded allowance and
   the pending retirements (`std::fs::read`), and each partition record. Each is read within its
   bound now: 21 bytes; a partition ID for each partition a node may host; and a partition record's
@@ -1047,3 +1053,117 @@ with, and `node_files`'s tests plant it); the fence raised and recorded; started
 directory marked before it served, its identity, committed policy and deployment read back
 unchanged; a clear identity planted after the mark refused by name, and read again once its sealed
 form is back.
+
+### 12.11 A client's stores, sealed (2026-10-25)
+
+A client keeps what it asked and was answered in stores of its own (focal-client): the operation
+store (`MCP.operations`) and each operation's pending journal (`client/operations/<id>`, or where a
+command was told to keep it), the native journal (`client/native`), managed ownership and its stores
+(`CLI.requests`, `MCP.requests`, each watch's), the watches (`WATCHES`), and the upload stores
+(`CLI.uploads`, `MCP.uploads`) with each upload's staged bytes. They lie in a node's data directory
+when a command runs beside its node, and in a context's history (`CLIENT.contexts/history-<name>`)
+otherwise. Each was written in the clear. Each is now kept as the fence its data directory records
+says:
+
+- **Sealed whole, its name bound.** A record stays the whole file its store has always written (its
+  magic, its length, its bytes and their BLAKE3 hash), sealed whole through `focal_seal::named`, the
+  seal node files take (§12.10) with a kind of its own: the frame `FCLCREC1`, the record's path
+  relative to its data directory, then the record, under the directory's journal key, behind a clear
+  `FCLCSEAL` that says what it is and nothing of what it holds. A record moved to another's name or
+  another store, or carried in from another data directory, is refused as a changed byte is. A store
+  its operator put outside the data directory (an operation journal at a path a command named) is
+  bound to its canonical path whole, and refused moved; a path that is not UTF-8 is named lossily
+  and told apart by the hash of its bytes. A bootstrap marker that names its store's context (an
+  upload store's `<name>.initialized`, `MCP.operations.initialized`) is kept the same way
+  (`at_rest::OwnerFile`).
+- **An upload's bytes, a part.** An upload's staged bytes are a part, §12.7's record file
+  (`FCLPART1`): each stage appended as one record, sealed as it is written under a key of the part's
+  own (HKDF-SHA-384 from the journal key, the part's file ID and the hash of its bound name), so an
+  upload resumed across a restart reads its bytes from sealed records. No key and nonce seal two
+  plaintexts: a part whose last stage a crash cut short is written again whole under a new key
+  (`RecordWriter::resume_in`), and one holding a stage its state never recorded (the crash between
+  the stage's bytes and its record) is cut back to its recorded bytes the same way
+  (`RecordWriter::cut`). A part's files are made and opened owner-private and checked, as every file
+  of a client's store is: record files take their files from a policy (`RecordFiles`), the content
+  store's as before (`Plain`).
+- **The form from the fence.** Below the at-rest level every store is written byte for byte as
+  every earlier binary wrote it. A store in a node's data directory follows the fence the node
+  records (`STORAGE.level`). A context's history follows the higher of its data directory's fence
+  and the one the context learned from the cluster it addresses, which it records beside its stores;
+  a client's own data directory, which hosts no node (it holds no node identity), records the fence
+  its contexts learn as a node records its own (`storage_level::client_level`, `client_at_rest`). A
+  marked store seals what it writes whatever form it is asked for, and refuses to open without its
+  keys.
+- **The fence learned from the cluster.** A node answers `Operation::Fence` (tag 35, a participant's
+  exchange answered by the node from no session) with the fence it last recorded. A context that
+  addresses its node through the node's socket reads it from the node's own directory. A remote
+  context asks it once as it enrolls, and beside the first request a command sends while the fence it
+  knows is below the level (`Remote::fence`: the two in flight together, so the asking costs no
+  round trip of its own). A node below the level that added the query refuses its kind on that
+  request's own stream (hyper-transport's `Refusal::Kind`; the connection is kept), and the context
+  keeps the level it knew. Learned, the fence takes effect at the next open, as a node's takes effect
+  at its next start.
+- **Converted at the next open, under the store's lock.** Each store converts at its open once its
+  form seals and it is not marked: each record in the clear read and checked as its reader checks
+  it, written sealed through the replace that writes it, then the store marked (`SEALED`, or
+  `<name>.managed-sealed`, `<name>.watch-sealed`, `<name>.initialized-sealed` where several owners
+  share a directory), what it holds named by its own authority (its catalogue, or its state), within
+  the bound its limits set. An upload's payload in the clear is copied into a new part a chunk at a
+  time, the prefix its state vouches for hashed as it is copied and checked before anything in the
+  clear goes; then its state is sealed, the payload in the clear removed, and the upload marked. A
+  cut at any step leaves each record whole in one form or the other (a part beside a payload in the
+  clear is a cut conversion's, made again), and the next open finishes. A store made from the level
+  is marked as it is made, so a record in the clear is refused from its first. Each store converts
+  under its own lock at its own open: a watch a running process holds converts when a process opens
+  it again. A client's own data directory converts its node files (the issuers its enrollments
+  adopted, §12.10) at a context's open once its fence opens the level, under `FILES.lock`, since no
+  node holds its lock.
+- **Refused in the clear after the mark.** Before a store's mark a reader takes either form; from it
+  a record in the clear is refused by name (`AtRestError::ClearAfterSealed`).
+- **Every outcome known once.** A request pending across the conversion is retried under its
+  identity from its sealed journal and answered once: a command committed with its reply lost is
+  answered as the duplicate it is, a prepared managed request is sent as prepared and never expanded
+  again, and an upload's pending append goes out as it was.
+- **Found on the way.** A node's conversion of its files (§12.10) took every name in
+  `CLIENT.contexts` that began `enrollment-` for an enrollment's directory, the marker a client's join
+  leaves beside it (`enrollment-<name>.client-initialized`) among them, and failed on that file
+  (`ENOTDIR`): a node data directory holding a client enrollment would have failed its start at the
+  level, as a client's own directory failed its first open in the real-binary test. Only directories
+  are visited now, and `node_files`' tests plant the marker. A marked store asked for the clear form
+  would have written records its own reader then refused; a marked store seals whatever form it is
+  asked for.
+- **What stays open.** A store's directory names hold operations' and uploads' identities in the
+  clear, as before: names are not records. Two processes of one client adopting an issuer at once
+  write its node file through one temporary (`atomic_file`'s `.install`), an earlier defect; open.
+
+- **Measured** (this Mac, release, under other sessions' load at a load average of 8 to 17;
+  `measure_record_seal`, `measure_upload_staging`, `measure_store_conversion`): a record sealed whole,
+  the journal key unwrapped for it as a write unwraps it, takes 54 µs at 256 B, 52 µs at 4 KiB,
+  140 µs at 64 KiB and 1.23 ms at 1 MiB, a journal's bound, and opens in 50, 44, 91 and 716 µs (the
+  medians of 101); its write beside that is its replace's flushes, about 8 ms here (§12.10). An
+  upload staged 64 KiB a stage, each stage its bytes written and synced and then its state installed,
+  takes 13.73 ms a stage sealed and 13.71 ms in the clear, 1.880 s and 1.869 s for 8 MiB (+0.6%, the
+  medians of 5 interleaved rounds): a part's seal is lost in a stage's two flushes. A conversion,
+  once: an upload of 8 MiB in 76 ms; a store of 32 answered operations in 1.06 s (the median of
+  11), its 65 records each written sealed through a replace and its 33 marks made, each with its
+  flushes.
+
+Tests (focal-client): for each store (a pending journal, the operation store, the native journal, a
+managed store, managed ownership, the watches, an upload and an upload store), a store below the
+level holding answered and pending work converted at its open and cut after each of its steps in
+turn (`at_rest::cut`), the next open finishing, every record sealed and nothing of them in the clear,
+answers kept and pending work answered once; and the tampering battery on each store's sealed
+records, a changed byte, a record swapped with another's or carried from another data directory, and
+one planted in the clear after the mark, each refused and the store opening once it is put back. An
+upload cut between a stage's bytes and its state goes on under a new key (focal-evidence: a part cut
+to an earlier append, written again under a new ID). The MCP store's marker converted with its store,
+still binding its context (focal-node). The fence query on the wire (focal-wire): an actor's exchange
+in every profile, refused to a node, answered by its level alone. `cli_client_stores_at_rest.rs`, the
+real binary: a node founded below the level; through its directory, answered requests, a claim whose
+outcome stayed unknown (the node down) and an artifact whose upload stayed pending, its bytes owned by
+the client; a client enrolled from a directory of its own, which records the cluster's fence as it
+enrolls, with an answered claim; every record in the clear below the fence; the fence raised and the
+node restarted; then the pending claim retried from its converted journal and committed once, the
+artifact committed once and read back exactly, the enrolled client learning the risen fence beside a
+request and converting its history and its directory's files at its next open, and no record, report
+or claim's words of either client in the clear.

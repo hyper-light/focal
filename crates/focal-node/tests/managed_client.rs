@@ -254,14 +254,14 @@ fn actual_client_store_reconciles_lost_replies_retires_both_families_and_keeps_l
         let store_root = temp.path().join("managed");
         let register = registration(context, 0, 2000);
         let store =
-            ManagedOperationStore::create(&store_root, context, limits(), register.clone()).unwrap();
+            ManagedOperationStore::create(&store_root, context, limits(), register.clone(), focal_client::at_rest::AtRest::clear()).unwrap();
         let original_registration = control(&harness, &store.registration().unwrap()).await;
         // Registration committed, but its response never entered the private journal.
         drop(store);
         harness.drop_without_checkpoint();
         let harness = Harness::start(EmbeddedNode::open(&settings).unwrap());
         assert_eq!(harness.identity, original_identity);
-        let store = ManagedOperationStore::open(&store_root, context, limits()).unwrap();
+        let store = ManagedOperationStore::open(&store_root, context, limits(), focal_client::at_rest::AtRest::clear()).unwrap();
         assert!(!store.status().unwrap().registered);
         let retried_registration = control(&harness, &store.registration().unwrap()).await;
         assert_eq!(retried_registration, original_registration);
@@ -315,7 +315,7 @@ fn actual_client_store_reconciles_lost_replies_retires_both_families_and_keeps_l
             1
         );
         let harness = Harness::start(node);
-        let store = ManagedOperationStore::open(&store_root, context, limits()).unwrap();
+        let store = ManagedOperationStore::open(&store_root, context, limits(), focal_client::at_rest::AtRest::clear()).unwrap();
         let retried = store
             .prepare(domain, domain_intent, |_| {
                 panic!("unknown operation expanded twice")
@@ -432,7 +432,7 @@ fn actual_client_store_reconciles_lost_replies_retires_both_families_and_keeps_l
             "request-history ACK must never acknowledge consumer delta progress"
         );
         let harness = Harness::start(node);
-        let store = ManagedOperationStore::open(&store_root, context, limits()).unwrap();
+        let store = ManagedOperationStore::open(&store_root, context, limits(), focal_client::at_rest::AtRest::clear()).unwrap();
         assert_eq!(store.status().unwrap().retired_through, 0);
         assert_eq!(
             store.pending_control().unwrap(),
@@ -501,7 +501,7 @@ fn actual_client_store_reconciles_lost_replies_retires_both_families_and_keeps_l
             temp.path().join("next"),
             context,
             limits(),
-            registration(context, 1, 2010),
+            registration(context, 1, 2010), focal_client::at_rest::AtRest::clear(),
         )
         .unwrap();
         next.record_registration(control(&harness, &next.registration().unwrap()).await)
@@ -578,9 +578,14 @@ fn managed_domain_negatives_stay_pending_and_monitor_success_has_a_managed_recei
             ..ManagedStoreLimits::default()
         };
         let root = directory.path().join("requests");
-        let store =
-            ManagedOperationStore::create(&root, context, store_limits, registration.clone())
-                .unwrap();
+        let store = ManagedOperationStore::create(
+            &root,
+            context,
+            store_limits,
+            registration.clone(),
+            focal_client::at_rest::AtRest::clear(),
+        )
+        .unwrap();
         store
             .record_registration(control(&harness, &registration).await)
             .unwrap();
@@ -721,7 +726,13 @@ fn managed_domain_negatives_stay_pending_and_monitor_success_has_a_managed_recei
         assert_eq!(store.status().unwrap().retired_through, 0);
         drop(store);
         harness.drop_without_checkpoint();
-        let reopened = ManagedOperationStore::open(&root, context, store_limits).unwrap();
+        let reopened = ManagedOperationStore::open(
+            &root,
+            context,
+            store_limits,
+            focal_client::at_rest::AtRest::clear(),
+        )
+        .unwrap();
         assert_eq!(reopened.request(refused).unwrap().request, refusal);
         assert_eq!(reopened.request(informed).unwrap().request, information);
         assert_eq!(reopened.status().unwrap().retired_through, 0);

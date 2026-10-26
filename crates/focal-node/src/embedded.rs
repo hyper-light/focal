@@ -121,6 +121,10 @@ pub enum NodeError {
     /// A sealed node file in a data directory read without its keys.
     #[error("a sealed node file read without the data directory's keys")]
     SealedWithoutKeys,
+    /// A data directory whose fence seals its client stores (29 §12.11), with no keys to seal or
+    /// read them.
+    #[error("the data directory's fence seals its client stores, and it has no keys")]
+    ClientStoresWithoutKeys,
 }
 impl From<focal_consensus::storage_open::OpenError> for NodeError {
     fn from(error: focal_consensus::storage_open::OpenError) -> Self {

@@ -277,6 +277,8 @@ pub struct ManagedOperationStore {
     root: PathBuf,
     context: OperationContext,
     limits: ManagedStoreLimits,
+    /// How its records are kept at rest (29 §12.11).
+    rest: crate::at_rest::AtRest,
 }
 impl ManagedOperationStore {
     /// Only the coordinator's durable Initialize phase can invoke this: it has
@@ -287,8 +289,9 @@ impl ManagedOperationStore {
         limits: ManagedStoreLimits,
         registration: &RequestStreamControlInput,
         receipt: &RequestStreamControlReceipt,
+        rest: crate::at_rest::AtRest,
     ) -> Result<Self, ManagedStoreError> {
-        let directory = Directory::resume_managed_creation(root)?;
+        let directory = Directory::resume_managed_creation(root, rest.clone())?;
         let mut state = if directory.exists(STATE)? {
             decode::<State>(&directory.read(STATE, STATE_MAGIC, STATE_BYTES)?)?
         } else {
@@ -338,6 +341,7 @@ impl ManagedOperationStore {
             root: root.into(),
             context,
             limits,
+            rest,
         })
     }
     pub fn create(
@@ -345,6 +349,7 @@ impl ManagedOperationStore {
         context: OperationContext,
         limits: ManagedStoreLimits,
         registration: RequestStreamControlInput,
+        rest: crate::at_rest::AtRest,
     ) -> Result<Self, ManagedStoreError> {
         let state = State {
             schema: 1,
@@ -364,27 +369,61 @@ impl ManagedOperationStore {
         };
         state.validate(context, limits)?;
         let bytes = encode(&state, STATE_BYTES)?;
-        let directory = Directory::create_managed(root.as_ref())?;
+        let directory = Directory::create_managed(root.as_ref(), rest.clone())?;
         directory.initialize()?;
         directory.write(STATE, STATE_MAGIC, &bytes, false)?;
         Ok(Self {
             root: root.as_ref().into(),
             context,
             limits,
+            rest,
         })
     }
+    /// Opens the store at `root`, finishing what a crash left of its cleanup, then converting its
+    /// records to sealed where `rest` seals and the store is not marked yet (29 §12.11), under the
+    /// store's lock.
     pub fn open(
         root: impl AsRef<Path>,
         context: OperationContext,
         limits: ManagedStoreLimits,
+        rest: crate::at_rest::AtRest,
     ) -> Result<Self, ManagedStoreError> {
         let store = Self {
             root: root.as_ref().into(),
             context,
             limits,
+            rest,
         };
-        let (_, _) = store.load()?;
+        let (directory, state) = store.load()?;
+        store.convert(&directory, &state)?;
         Ok(store)
+    }
+    /// Converts the store's records to sealed and marks it, where its at-rest form seals and it is
+    /// not marked: each live entry's prepared request and receipt, then the stream's state. The
+    /// state is the store's authority on what it holds (an entry's records are checked present at
+    /// its load, and the retired prefix's removed), within the window its limits admit.
+    fn convert(&self, directory: &Directory, state: &State) -> Result<(), ManagedStoreError> {
+        if !self.rest.sealing() || directory.marked()? {
+            return Ok(());
+        }
+        let mut names = Vec::new();
+        names
+            .try_reserve_exact(state.entries.len().saturating_mul(2).saturating_add(1))
+            .map_err(|_| ManagedStoreError::Capacity)?;
+        for entry in &state.entries {
+            names.push((
+                prepared_name(entry.key.ordinal),
+                PREPARED_MAGIC,
+                PREPARED_BYTES,
+            ));
+            names.push((
+                receipt_name(entry.key.ordinal),
+                RECEIPT_MAGIC,
+                RECEIPT_BYTES,
+            ));
+        }
+        names.push((STATE.to_owned(), STATE_MAGIC, STATE_BYTES));
+        Ok(directory.convert(names)?)
     }
     pub fn root(&self) -> &Path {
         &self.root
@@ -635,7 +674,7 @@ impl ManagedOperationStore {
         Ok(result)
     }
     fn load(&self) -> Result<(Directory, State), ManagedStoreError> {
-        let directory = Directory::open_managed(&self.root)?;
+        let directory = Directory::open_managed(&self.root, self.rest.clone())?;
         let bytes = directory.read(STATE, STATE_MAGIC, STATE_BYTES)?;
         let mut state: State = decode(&bytes)?;
         state.validate(self.context, self.limits)?;

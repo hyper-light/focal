@@ -29,16 +29,20 @@ use crate::embedded::{NodeError, atomic_file};
 /// clear is refused. An empty file, in the clear by design (29 §12).
 pub const SEALED: &str = "FILES.SEALED";
 
+/// Format: the lock a client's own data directory converts its node files under
+/// ([`NodeFiles::convert_client`]): an empty file held for its lock, in the clear by design.
+const CLIENT_LOCK: &str = "FILES.lock";
+
 /// Format: what a sealed node file begins with, in the clear: its kind, and nothing of what it holds.
 pub const SEALED_MAGIC: &[u8; 8] = b"FCLNSEAL";
 
-/// Format: what a sealed node file's plaintext begins with, then its name's length (two bytes,
-/// little-endian), its name relative to the data directory (`/` between its parts), and the file's
-/// bytes as its writer made them.
-const FRAME: &[u8; 8] = b"FCLNFIL1";
-
-/// Derived: the bytes of a frame before its name: the frame's magic and the name's length.
-const FRAME_HEAD: usize = FRAME.len() + 2;
+/// Format: a node file sealed whole (`focal_seal::named`): [`SEALED_MAGIC`] in the clear, then the
+/// seal of its frame, `FCLNFIL1`, its name relative to the data directory (`/` between its parts),
+/// and the file's bytes as its writer made them.
+const KIND: focal_seal::named::Kind = focal_seal::named::Kind {
+    outer: SEALED_MAGIC,
+    frame: b"FCLNFIL1",
+};
 
 /// A node's small files, as its data directory keeps them: sealed under its keys once the fence it
 /// last knew opens the at-rest level, in the clear below it. The form is read at each write, from
@@ -78,6 +82,21 @@ impl NodeFiles {
         Ok(self.root.join(SEALED).try_exists()?)
     }
 
+    /// Converts the node files of a client's own data directory, which hosts no node (the issuers
+    /// its enrollments adopted), once the fence it recorded opens the at-rest level (29 §12.11): as
+    /// [`NodeFiles::convert`] does at a node's start, under the directory's own lock for it
+    /// (`FILES.lock`, held while it converts), since no node holds the directory's. A directory
+    /// marked already, or below the level, is left without taking the lock.
+    pub fn convert_client(&self) -> Result<Converted, NodeError> {
+        if self.marked()? || !self.sealing()? {
+            return Ok(Converted::default());
+        }
+        let lock =
+            focal_platform::fs::open_private(&self.root.join(CLIENT_LOCK), true, true, true)?;
+        let _lock = focal_platform::FileLock::exclusive_waiting(lock)?;
+        self.convert()
+    }
+
     /// Writes `bytes` as the node file `name` (relative to the data directory), whole, through the
     /// atomic replace: sealed from the at-rest level, in the clear below it.
     pub fn write(&self, name: &str, bytes: &[u8]) -> Result<(), NodeError> {
@@ -98,7 +117,7 @@ impl NodeFiles {
         if !path.try_exists()? {
             return Ok(None);
         }
-        let bytes = crate::embedded::read_bounded(&path, on_disk_bound(name, most)?)?;
+        let bytes = crate::embedded::read_bounded(&path, on_disk_bound(most)?)?;
         if bytes.starts_with(SEALED_MAGIC) {
             return open(&self.journal_key()?, name, bytes, most).map(Some);
         }
@@ -146,68 +165,34 @@ pub fn read_identity(
     crate::embedded::decode_identity_bytes(&bytes)
 }
 
-/// The most bytes a frame of `name` holding `most` bytes takes.
-fn frame_len(name: &str, most: usize) -> Result<usize, NodeError> {
-    FRAME_HEAD
-        .checked_add(name.len())
-        .and_then(|head| head.checked_add(most))
-        .ok_or(NodeError::Capacity("a node file's bound"))
+/// The most bytes a node file holding `most` bytes takes on disk, in either form: its bytes in the
+/// clear, or the clear magic and the seal of its frame.
+pub(crate) fn on_disk_bound(most: usize) -> Result<usize, NodeError> {
+    KIND.bound(most).map_err(named)
 }
 
-/// The most bytes the node file `name` holding `most` bytes takes on disk, in either form: its
-/// bytes in the clear, or the clear magic and the seal of its frame.
-pub(crate) fn on_disk_bound(name: &str, most: usize) -> Result<usize, NodeError> {
-    focal_seal::file::sealed_bound(frame_len(name, most)?)
-        .and_then(|sealed| sealed.checked_add(SEALED_MAGIC.len()))
-        .map(|sealed| sealed.max(most))
-        .ok_or(NodeError::Capacity("a node file's bound"))
-}
-
-/// `bytes`, the node file `name`, sealed whole under the directory's journal key: the clear magic,
-/// then the seal of its frame.
+/// `bytes`, the node file `name`, sealed whole under the directory's journal key.
 fn seal(key: &WrappingKey, name: &str, bytes: &[u8]) -> Result<Vec<u8>, NodeError> {
-    let name_len =
-        u16::try_from(name.len()).map_err(|_| NodeError::Capacity("a node file's name"))?;
-    let mut frame = zeroize::Zeroizing::new(Vec::new());
-    frame
-        .try_reserve_exact(frame_len(name, bytes.len())?)
-        .map_err(|_| NodeError::Capacity("a node file's frame"))?;
-    frame.extend_from_slice(FRAME);
-    frame.extend_from_slice(&name_len.to_le_bytes());
-    frame.extend_from_slice(name.as_bytes());
-    frame.extend_from_slice(bytes);
-    let sealed = focal_seal::file::seal(key, &frame)?;
-    let mut out = Vec::new();
-    out.try_reserve_exact(SEALED_MAGIC.len().saturating_add(sealed.len()))
-        .map_err(|_| NodeError::Capacity("a sealed node file"))?;
-    out.extend_from_slice(SEALED_MAGIC);
-    out.extend_from_slice(&sealed);
-    Ok(out)
+    KIND.seal(key, name, bytes).map_err(named)
 }
 
 /// The bytes the sealed node file `bytes`, read as `name`, holds: opened under the directory's journal
 /// key, its frame's name checked, no more than `most` of them.
 fn open(key: &WrappingKey, name: &str, bytes: Vec<u8>, most: usize) -> Result<Vec<u8>, NodeError> {
-    let malformed = || NodeError::Corrupt("a sealed node file's frame");
-    let mut sealed = bytes;
-    if !sealed.starts_with(SEALED_MAGIC) {
-        return Err(malformed());
+    let mut opened = KIND.open(key, name, bytes, most).map_err(named)?;
+    Ok(std::mem::take(&mut *opened))
+}
+
+/// A named seal's refusal as a node file's.
+fn named(error: focal_seal::named::NamedError) -> NodeError {
+    use focal_seal::named::NamedError;
+    match error {
+        NamedError::Seal(error) => NodeError::SealedFile(error),
+        NamedError::Moved(name) => NodeError::MovedNodeFile(name),
+        NamedError::Malformed => NodeError::Corrupt("a sealed node file's frame"),
+        NamedError::Bound(_) => NodeError::Corrupt("a sealed node file past its reader's bound"),
+        NamedError::Capacity => NodeError::Capacity("a sealed node file's frame"),
     }
-    sealed.drain(..SEALED_MAGIC.len());
-    let frame = focal_seal::file::open(key, sealed, frame_len(name, most)?)?;
-    let (magic, rest) = frame.split_at_checked(FRAME.len()).ok_or_else(malformed)?;
-    let (stated, rest) = rest.split_at_checked(2).ok_or_else(malformed)?;
-    let stated = usize::from(u16::from_le_bytes(
-        stated.try_into().map_err(|_| malformed())?,
-    ));
-    let (named, body) = rest.split_at_checked(stated).ok_or_else(malformed)?;
-    if magic != FRAME || named != name.as_bytes() {
-        return Err(NodeError::MovedNodeFile(name.to_owned()));
-    }
-    if body.len() > most {
-        return Err(malformed());
-    }
-    Ok(body.to_vec())
 }
 
 /// Derived: the partition records a data directory holds at most: one for each partition its node
@@ -352,7 +337,12 @@ impl NodeFiles {
         let mut enrollments = 0usize;
         for name in names(&self.root.join("CLIENT.contexts"))? {
             let name = name?;
-            if !name.starts_with("enrollment-") {
+            // An enrollment is a directory; beside it lies its marker, a file whose name begins as
+            // its does (`enrollment-<name>.client-initialized`), which holds no adoption.
+            if !name.starts_with("enrollment-")
+                || !std::fs::symlink_metadata(self.path(&format!("CLIENT.contexts/{name}"))?)?
+                    .is_dir()
+            {
                 continue;
             }
             enrollments = enrollments.saturating_add(1);
@@ -391,7 +381,7 @@ impl NodeFiles {
         if !path.try_exists()? {
             return Ok(());
         }
-        let bytes = crate::embedded::read_bounded(&path, on_disk_bound(name, kind.most)?)?;
+        let bytes = crate::embedded::read_bounded(&path, on_disk_bound(kind.most)?)?;
         if bytes.starts_with(SEALED_MAGIC) {
             (kind.check)(&open(key, name, bytes, kind.most)?)?;
             converted.found_sealed = converted.found_sealed.saturating_add(1);
@@ -432,6 +422,16 @@ fn discard_temporary(path: &Path) -> Result<(), NodeError> {
     match std::fs::remove_file(path.with_extension("install")) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Whether the data directory `root` hosts a node: a node's identity is its first file, and a
+/// client's own directory has none. One that cannot be looked for is an error, never its absence.
+pub fn hosts_node(root: &Path) -> Result<bool, NodeError> {
+    match std::fs::symlink_metadata(root.join("IDENTITY")) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
     }
 }
@@ -505,9 +505,17 @@ mod tests {
         let genesis = crate::cluster::tests::plant_genesis(files);
         let bytes = std::fs::read(files.root().join(&genesis)).unwrap();
         planted.push((genesis, bytes));
-        // The issuers a client enrollment of the directory adopted, as its join keeps them.
+        // The issuers a client enrollment of the directory adopted, as its join keeps them, its
+        // marker beside it as its join leaves it: a file whose name begins as the enrollment's.
         let enrollment = files.root().join("CLIENT.contexts/enrollment-alice");
         std::fs::create_dir_all(&enrollment).unwrap();
+        std::fs::write(
+            files
+                .root()
+                .join("CLIENT.contexts/enrollment-alice.client-initialized"),
+            b"",
+        )
+        .unwrap();
         let authority = files.root().join("planted-authority");
         let authority = focal_enrollment::BootstrapAuthority::open_or_create(
             &authority,

@@ -291,6 +291,7 @@ fn modern_and_legacy_stdio_share_durable_ids_builders_and_real_evidence_workflow
     let store = focal_client::operation_store::OperationStore::open(
         root.path().join("MCP.operations"),
         Default::default(),
+        client_rest(root.path()),
     )
     .unwrap();
     let journal = store.operation_path(&id(1)).unwrap();
@@ -854,3 +855,11 @@ fn managed_evidence_lifecycle_preserves_fences_and_testament_is_not_satisfaction
 
 #[path = "support/mcp_selection.rs"]
 mod selection;
+
+/// How the client stores in the node's data directory `root` keep their records (29 §12.11), as a
+/// command line beside the node finds them.
+fn client_rest(root: &std::path::Path) -> focal_client::at_rest::AtRest {
+    let mut settings = focal_node::config::Settings::default();
+    settings.node.data_dir = Some(root.to_path_buf());
+    focal_node::storage_level::client_at_rest_in(&settings, root, root).unwrap()
+}

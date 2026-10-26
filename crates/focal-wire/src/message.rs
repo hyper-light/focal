@@ -258,6 +258,13 @@ pub enum Operation {
     /// A recipient's inbox read that waits for its page (the waiting profile,
     /// [`crate::WAITING_PROTOCOL_VERSION`]).
     NativeWait(crate::NativeWaitRequest),
+    /// The upgrade fence's level as the answering node last recorded it (its
+    /// `STORAGE.level`), which a client whose own data directory hosts no node
+    /// records as a node does, so its stores take the form the fence opens
+    /// (29 §12.11). Answered by the node itself, from no session; a node below
+    /// the level that added it refuses its kind, and the client keeps the level
+    /// it knew.
+    Fence,
 }
 /// What a request is to the connection that carries it; see
 /// [`Operation::class`].
@@ -307,8 +314,8 @@ impl TrafficClass {
             7 | 8 | 10 => Some(Self::Bulk),
             // Submit, Read, Subscribe, OpenEpoch, Stream, List, Reconcile, Managed,
             // RequestStreamControl, RequestStreamRead, Traverse, Validators, Summary, Monitor,
-            // Select, Native, NativeRead, NativeList, NativeWait.
-            1 | 2 | 3 | 5 | 6 | 14..=18 | 20..=27 | 34 => Some(Self::Exchange),
+            // Select, Native, NativeRead, NativeList, NativeWait, Fence.
+            1 | 2 | 3 | 5 | 6 | 14..=18 | 20..=27 | 34 | 35 => Some(Self::Exchange),
             _ => None,
         }
     }
@@ -373,6 +380,7 @@ impl Operation {
             Self::SessionControl { .. } => 32,
             Self::RaftOrdered { .. } => 33,
             Self::NativeWait(_) => 34,
+            Self::Fence => 35,
         }
     }
     /// What goes first where one connection carries several requests at
@@ -413,7 +421,8 @@ impl Operation {
             | Self::Native { .. }
             | Self::NativeRead(_)
             | Self::NativeList(_)
-            | Self::NativeWait(_) => TrafficClass::Exchange,
+            | Self::NativeWait(_)
+            | Self::Fence => TrafficClass::Exchange,
         }
     }
     pub fn is_mutation(&self) -> bool {
@@ -856,6 +865,11 @@ pub enum Response {
     /// The receiver's probe reply: its acknowledgement or relayed outcome,
     /// coordinate, health and piggyback.
     Probe(#[serde(with = "focal_memory::serde_bytes")] Vec<u8>),
+    /// The upgrade fence's level the answering node last recorded
+    /// ([`Operation::Fence`]): zero where it recorded none.
+    Fence {
+        level: u32,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponseEnvelope {

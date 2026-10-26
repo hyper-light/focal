@@ -25,7 +25,14 @@ fn ids(start: u128) -> impl IdGenerator {
     }
 }
 fn open(parent: &Path) -> ManagedRequests {
-    ManagedRequests::open(parent, "CLI.requests", context(), limits()).unwrap()
+    ManagedRequests::open(
+        parent,
+        "CLI.requests",
+        context(),
+        limits(),
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap()
 }
 fn token(request: &RequestEnvelope) -> ReadToken {
     ReadToken {
@@ -242,7 +249,14 @@ fn first_use_is_two_roundtrips_and_lost_registration_retries_exactly() {
 fn registration_conflict_requires_generation_fence_and_never_adopts_public_owner() {
     let dir = private_dir();
     let a = open(dir.path());
-    let b = ManagedRequests::open(dir.path(), "MCP.requests", context(), limits()).unwrap();
+    let b = ManagedRequests::open(
+        dir.path(),
+        "MCP.requests",
+        context(),
+        limits(),
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap();
     let mut ia = ids(100);
     let mut ib = ids(200);
     let qa = a.maintenance(&mut ia).unwrap().unwrap();
@@ -381,7 +395,16 @@ fn committed_child_initialization_resumes_but_ready_child_loss_never_reinitializ
     assert!(reopened.maintenance(&mut entropy).unwrap().is_none());
     assert!(reopened.store().unwrap().status().unwrap().registered);
     std::fs::remove_dir_all(&child).unwrap();
-    assert!(ManagedRequests::open(dir.path(), "CLI.requests", context(), limits()).is_err());
+    assert!(
+        ManagedRequests::open(
+            dir.path(),
+            "CLI.requests",
+            context(),
+            limits(),
+            crate::at_rest::AtRest::clear()
+        )
+        .is_err()
+    );
     assert!(!child.exists());
 }
 
@@ -389,7 +412,13 @@ fn committed_child_initialization_resumes_but_ready_child_loss_never_reinitializ
 fn missing_state_marker_context_and_tampered_receipt_fail_closed() {
     let dir = private_dir();
     assert!(matches!(
-        ManagedRequests::open_existing(dir.path(), "CLI.requests", context(), limits()),
+        ManagedRequests::open_existing(
+            dir.path(),
+            "CLI.requests",
+            context(),
+            limits(),
+            crate::at_rest::AtRest::clear()
+        ),
         Err(ManagedRequestsError::Missing)
     ));
     let owner = open(dir.path());
@@ -413,9 +442,27 @@ fn missing_state_marker_context_and_tampered_receipt_fail_closed() {
         cluster: [7; 16],
         ..context()
     };
-    assert!(ManagedRequests::open(dir.path(), "CLI.requests", wrong, limits()).is_err());
+    assert!(
+        ManagedRequests::open(
+            dir.path(),
+            "CLI.requests",
+            wrong,
+            limits(),
+            crate::at_rest::AtRest::clear()
+        )
+        .is_err()
+    );
     std::fs::remove_file(dir.path().join("CLI.requests.managed-owner")).unwrap();
-    assert!(ManagedRequests::open(dir.path(), "CLI.requests", context(), limits()).is_err());
+    assert!(
+        ManagedRequests::open(
+            dir.path(),
+            "CLI.requests",
+            context(),
+            limits(),
+            crate::at_rest::AtRest::clear()
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -522,7 +569,16 @@ fn only_pre_network_initialization_can_repair_a_partial_external_marker() {
     assert_eq!(std::fs::read(&marker).unwrap(), MAGIC);
     owner.maintenance(&mut ids(100)).unwrap();
     std::fs::write(&marker, b"FCLM").unwrap();
-    assert!(ManagedRequests::open(dir.path(), "CLI.requests", context(), limits()).is_err());
+    assert!(
+        ManagedRequests::open(
+            dir.path(),
+            "CLI.requests",
+            context(),
+            limits(),
+            crate::at_rest::AtRest::clear()
+        )
+        .is_err()
+    );
     assert_eq!(std::fs::read(&marker).unwrap(), b"FCLM");
 }
 
@@ -535,9 +591,14 @@ fn concurrent_coordinator_child() {
     let mut entropy = ids(output.parse::<u128>().unwrap() * 1000);
     let mut result = None;
     for _ in 0..500 {
-        let attempt =
-            ManagedRequests::open(Path::new(&parent), "CLI.requests", context(), limits())
-                .and_then(|owner| owner.maintenance(&mut entropy));
+        let attempt = ManagedRequests::open(
+            Path::new(&parent),
+            "CLI.requests",
+            context(),
+            limits(),
+            crate::at_rest::AtRest::clear(),
+        )
+        .and_then(|owner| owner.maintenance(&mut entropy));
         match attempt {
             Ok(Some(request)) => {
                 result = Some(request);
@@ -676,12 +737,27 @@ fn registered_reply(request: &RequestEnvelope, index: u64, generation: u64) -> R
 fn a_drained_generation_at_its_rotation_bound_closes_and_the_next_registers_in_a_fresh_store() {
     let dir = private_dir();
     let rotate = |dir: &Path| {
-        ManagedRequests::open_with(dir, "CLI.requests", context(), limits(), 2).unwrap()
+        ManagedRequests::open_with(
+            dir,
+            "CLI.requests",
+            context(),
+            limits(),
+            2,
+            crate::at_rest::AtRest::clear(),
+        )
+        .unwrap()
     };
     let owner = rotate(dir.path());
     // The bound is part of the saved record: another bound cannot open it.
     assert!(matches!(
-        ManagedRequests::open_with(dir.path(), "CLI.requests", context(), limits(), 3),
+        ManagedRequests::open_with(
+            dir.path(),
+            "CLI.requests",
+            context(),
+            limits(),
+            3,
+            crate::at_rest::AtRest::clear()
+        ),
         Err(ManagedRequestsError::Store(StoreError::LimitsMismatch))
     ));
     let mut entropy = ids(100);
@@ -856,4 +932,144 @@ fn a_rotation_interrupted_between_its_fence_and_the_store_removal_finishes_on_th
     reopened.save(&directory, &state, true).unwrap();
     drop(directory);
     assert_eq!(open(dir.path()).load().unwrap().1.cleanup, None);
+}
+
+/// A private directory inside a data directory with keys: where an owner and its stores lie.
+fn private_in(data: &Path) -> std::path::PathBuf {
+    let parent = data.join("context");
+    focal_platform::fs::create_dir_private(&parent).unwrap();
+    parent
+}
+
+/// Managed ownership below the at-rest level, registered, holding an answered operation and one
+/// prepared and pending, converted at its open and its store's (the owner's record, then the
+/// store's records) and cut after each step in turn: the next opens finish; then nothing of either
+/// lies in the clear, the answer is kept, and the pending request is the one prepared before (29
+/// §12.11).
+#[test]
+fn managed_ownership_converts_through_a_cut_at_any_step() {
+    use crate::at_rest::support::{assert_sealed_under, below, directory, sealing};
+    let intent = OperationIntent {
+        name: "claim.post",
+        version: 1,
+        canonical: b"{}",
+    };
+    for cut in 0.. {
+        let (data, keys) = directory();
+        let parent = private_in(data.path());
+        let opened =
+            |rest| ManagedRequests::open(&parent, "CLI.requests", context(), limits(), rest);
+        let owner = opened(below(&keys)).unwrap();
+        register(&owner, &mut ids(100));
+        let store = owner.store().unwrap();
+        let answered = complete(&store, 30);
+        let answer = store.receipt(answered).unwrap();
+        let pending = store.reserve(RequestId::from_u128(31)).unwrap();
+        let prepared = store
+            .prepare(pending, intent, |key| {
+                Ok(RequestEnvelope {
+                    protocol: focal_wire::MANAGED_PROTOCOL_VERSION,
+                    ledger: key.stream.ledger,
+                    route_epoch: RouteEpoch(1),
+                    request_epoch: RequestEpoch(1),
+                    request_id: key.id,
+                    operation: Operation::Managed {
+                        key,
+                        operation: ManagedOperation::Submit {
+                            expected_revision: None,
+                            command: Command::PostClaim {
+                                claim: ClaimId::from_u128(2),
+                            },
+                        },
+                    },
+                })
+            })
+            .unwrap();
+        drop((store, owner));
+        crate::at_rest::cut::after(cut);
+        let first = opened(sealing(&keys)).and_then(|owner| owner.store().map(|_| owner));
+        let finished = first.is_ok();
+        crate::at_rest::cut::none();
+        let owner = match first {
+            Ok(owner) => owner,
+            Err(_) => opened(sealing(&keys)).unwrap(),
+        };
+        let store = owner.store().unwrap();
+        assert!(parent.join("CLI.requests.managed-sealed").exists());
+        assert!(
+            parent
+                .join("CLI.requests")
+                .join(crate::at_rest::SEALED)
+                .exists()
+        );
+        assert_sealed_under(&parent, &[MAGIC, b"FCLMCA01", b"FCLMPR01", b"FCLMRE01"]);
+        assert_eq!(store.receipt(answered).unwrap(), answer);
+        let again = store
+            .prepare(pending, intent, |_| panic!("retry expanded"))
+            .unwrap();
+        assert_eq!(again.request, prepared.request);
+        if finished {
+            assert!(cut > 0, "a conversion of no step");
+            break;
+        }
+    }
+}
+
+/// A sealed owner record changed, or planted in the clear after the owner's mark, is refused; put
+/// back, the owner opens.
+#[test]
+fn a_sealed_owner_record_changed_or_planted_in_the_clear_is_refused() {
+    use crate::at_rest::AtRestError;
+    use crate::at_rest::support::{directory, flip, sealing};
+    use focal_seal::named::NamedError;
+    let (data, keys) = directory();
+    let parent = private_in(data.path());
+    let opened =
+        || ManagedRequests::open(&parent, "CLI.requests", context(), limits(), sealing(&keys));
+    let owner = opened().unwrap();
+    register(&owner, &mut ids(100));
+    drop(owner);
+    let record = parent.join("CLI.requests.managed-owner");
+    let saved = std::fs::read(&record).unwrap();
+    flip(&record);
+    assert!(matches!(
+        opened(),
+        Err(ManagedRequestsError::Store(StoreError::AtRest(
+            AtRestError::Sealed(NamedError::Seal(_))
+        )))
+    ));
+    let clear = private_dir();
+    let plain = ManagedRequests::open(
+        clear.path(),
+        "CLI.requests",
+        context(),
+        limits(),
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap();
+    register(&plain, &mut ids(100));
+    drop(plain);
+    std::fs::write(
+        &record,
+        std::fs::read(clear.path().join("CLI.requests.managed-owner")).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        opened(),
+        Err(ManagedRequestsError::Store(StoreError::AtRest(
+            AtRestError::ClearAfterSealed(_)
+        )))
+    ));
+    std::fs::write(&record, &saved).unwrap();
+    assert_eq!(
+        opened()
+            .unwrap()
+            .store()
+            .unwrap()
+            .status()
+            .unwrap()
+            .stream
+            .slot,
+        0
+    );
 }

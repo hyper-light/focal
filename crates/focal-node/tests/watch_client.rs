@@ -102,7 +102,12 @@ fn lost_delivery_and_lost_ack_recover_exactly_without_advancing_unconsumed_data(
         let local = tempfile::tempdir().unwrap();
         std::fs::set_permissions(local.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let fixture = Fixture::start(root.path());
-        let store = WatchStore::open(local.path(), fixture.context).unwrap();
+        let store = WatchStore::open(
+            local.path(),
+            fixture.context,
+            focal_client::at_rest::AtRest::clear(),
+        )
+        .unwrap();
         let mut watch = store
             .create(
                 "changes",
@@ -125,7 +130,12 @@ fn lost_delivery_and_lost_ack_recover_exactly_without_advancing_unconsumed_data(
         let context = fixture.context;
         fixture.stop();
         let fixture = Fixture::start(root.path());
-        let store = WatchStore::open(local.path(), context).unwrap();
+        let store = WatchStore::open(
+            local.path(),
+            context,
+            focal_client::at_rest::AtRest::clear(),
+        )
+        .unwrap();
         let mut watch = store.resume("changes").unwrap();
         assert_eq!(watch.delivery(), Some(&first));
         assert!(matches!(
@@ -159,7 +169,12 @@ fn lost_network_reply_keeps_exact_request_and_missing_journal_cannot_recreate() 
         let local = tempfile::tempdir().unwrap();
         std::fs::set_permissions(local.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let fixture = Fixture::start(root.path());
-        let store = WatchStore::open(local.path(), fixture.context).unwrap();
+        let store = WatchStore::open(
+            local.path(),
+            fixture.context,
+            focal_client::at_rest::AtRest::clear(),
+        )
+        .unwrap();
         let mut watch = store
             .create(
                 "unknown",
@@ -227,7 +242,7 @@ fn seed_pages_survive_client_restart_and_expired_source_never_skips_to_tail() {
         let report = focal_node::demo::run(&mut node).unwrap();
         drop(node);
         let fixture = Fixture::start(root.path());
-        let store = WatchStore::open(local.path(), fixture.context).unwrap();
+        let store = WatchStore::open(local.path(), fixture.context, focal_client::at_rest::AtRest::clear()).unwrap();
         let options = WatchOptions {
             claims: vec![report.claim],
             max_items: 1,
@@ -345,7 +360,12 @@ fn large_seed_rows_use_server_byte_budget_and_all_continuations_finish() {
         }
         drop(node);
         let fixture = Fixture::start(root.path());
-        let store = WatchStore::open(local.path(), fixture.context).unwrap();
+        let store = WatchStore::open(
+            local.path(),
+            fixture.context,
+            focal_client::at_rest::AtRest::clear(),
+        )
+        .unwrap();
         let mut watch = store.create("large", WatchOptions::default()).unwrap();
         let mut count = 0;
         let mut pages = 0;
@@ -531,7 +551,7 @@ fn native_watches_seed_through_native_reads_and_stream_schema_two_deltas_in_proc
         let fixture = Fixture::start(root.path());
         let first = commit_native(&fixture, 1, 100).await;
         assert_eq!(first.sequence, SessionSeq(1));
-        let store = WatchStore::open(local.path(), fixture.context).unwrap();
+        let store = WatchStore::open(local.path(), fixture.context, focal_client::at_rest::AtRest::clear()).unwrap();
 
         // A seeded claim watch: the claim is read with its evaluations at a
         // prefix no older than the snapshot, then the seed completes and the
@@ -696,7 +716,7 @@ fn native_watches_seed_through_native_reads_and_stream_schema_two_deltas_in_proc
         let context = fixture.context;
         fixture.stop();
         let fixture = Fixture::start(root.path());
-        let store = WatchStore::open(local.path(), context).unwrap();
+        let store = WatchStore::open(local.path(), context, focal_client::at_rest::AtRest::clear()).unwrap();
         let mut definitions = store.resume("definitions").unwrap();
         assert_eq!(definitions.delivery(), Some(&listed));
         definitions.acknowledge(listed.id).unwrap();
@@ -730,7 +750,12 @@ fn idle_tail_polls_are_plain_reads_that_commit_nothing_and_take_no_ordinal() {
         .unwrap();
         let fixture = Fixture::start(root.path());
         commit_native(&fixture, 1, 100).await;
-        let store = WatchStore::open(local.path(), fixture.context).unwrap();
+        let store = WatchStore::open(
+            local.path(),
+            fixture.context,
+            focal_client::at_rest::AtRest::clear(),
+        )
+        .unwrap();
         let mut watch = store
             .create(
                 "idle",

@@ -1,5 +1,5 @@
 use super::*;
-use crate::{operation_store::files::Directory, pending::OperationContext};
+use crate::{at_rest::AtRest, operation_store::files::Directory, pending::OperationContext};
 use std::path::{Path, PathBuf};
 const CATALOGUE: &str = "WATCHES.watch-owner";
 #[derive(Serialize, Deserialize)]
@@ -17,9 +17,17 @@ struct Entry {
 pub struct WatchStore {
     parent: PathBuf,
     context: OperationContext,
+    /// How its catalogue and its watches' records are kept at rest (29 §12.11).
+    rest: AtRest,
 }
 impl WatchStore {
-    pub fn open(parent: impl AsRef<Path>, context: OperationContext) -> Result<Self, WatchError> {
+    /// Opens the watches under `parent`, converting the catalogue to sealed where `rest` seals and
+    /// it is not marked yet (29 §12.11); each watch converts at its own open, under its own lock.
+    pub fn open(
+        parent: impl AsRef<Path>,
+        context: OperationContext,
+        rest: AtRest,
+    ) -> Result<Self, WatchError> {
         if context.cluster == [0; 16]
             || context.principal.is_zero()
             || context.ledger.tenant.is_zero()
@@ -30,8 +38,11 @@ impl WatchStore {
         let this = Self {
             parent: parent.as_ref().into(),
             context,
+            rest,
         };
-        let (directory, initialized) = Directory::watch(&this.parent, "WATCHES", true)?;
+        let (directory, initialized) =
+            Directory::watch(&this.parent, "WATCHES", true, this.rest.clone())?;
+        directory.convert([(CATALOGUE.to_owned(), MAGIC, RECORD_BYTES)])?;
         if !directory.exists(CATALOGUE)? {
             if initialized {
                 return Err(WatchError::Corrupt);
@@ -60,7 +71,7 @@ impl WatchStore {
         self.context
     }
     pub fn names(&self) -> Result<Vec<String>, WatchError> {
-        let (directory, _) = Directory::watch(&self.parent, "WATCHES", false)?;
+        let (directory, _) = Directory::watch(&self.parent, "WATCHES", false, self.rest.clone())?;
         Ok(self
             .read(&directory)?
             .entries
@@ -73,7 +84,7 @@ impl WatchStore {
             return Err(WatchError::Invalid);
         }
         options.validate()?;
-        let (directory, _) = Directory::watch(&self.parent, "WATCHES", false)?;
+        let (directory, _) = Directory::watch(&self.parent, "WATCHES", false, self.rest.clone())?;
         let mut state = self.read(&directory)?;
         let index = match state.entries.iter().position(|e| e.name == name) {
             Some(index) => {
@@ -105,7 +116,14 @@ impl WatchStore {
             }
         };
         let entry = state.entries.get(index).ok_or(WatchError::Corrupt)?;
-        let journal = WatchJournal::open(&self.parent, name, self.context, options, !entry.ready)?;
+        let journal = WatchJournal::open(
+            &self.parent,
+            name,
+            self.context,
+            options,
+            !entry.ready,
+            self.rest.clone(),
+        )?;
         if !entry.ready {
             state
                 .entries
@@ -117,7 +135,7 @@ impl WatchStore {
         Ok(journal)
     }
     pub fn resume(&self, name: &str) -> Result<WatchJournal, WatchError> {
-        let (directory, _) = Directory::watch(&self.parent, "WATCHES", false)?;
+        let (directory, _) = Directory::watch(&self.parent, "WATCHES", false, self.rest.clone())?;
         let state = self.read(&directory)?;
         let entry = state
             .entries

@@ -347,6 +347,26 @@ impl<T: ClientTransport> Client<T> {
             _ => Err(ClientError::InvalidResponse),
         }
     }
+    /// The upgrade fence's level the node answering `request` last recorded (29 §12.11), asked
+    /// once with no retry: a node below the level that added the query refuses its kind, which is
+    /// no failure of the caller's, who keeps the level it knew.
+    pub async fn fence(&self, request: RequestEnvelope) -> Result<u32, ClientError> {
+        if !matches!(request.operation, Operation::Fence) {
+            return Err(ClientError::Configuration);
+        }
+        let response = self
+            .transport
+            .request(None, &request)
+            .await
+            .map_err(|_| ClientError::Transport)?;
+        focal_wire::validate_response(&request, &response, None, &self.limits)
+            .map_err(|_| ClientError::InvalidResponse)?;
+        match response.result {
+            Response::Fence { level } => Ok(level),
+            Response::Error(error) => Err(ClientError::Access(error)),
+            _ => Err(ClientError::InvalidResponse),
+        }
+    }
     pub fn new(
         transport: T,
         policy: RetryPolicy,

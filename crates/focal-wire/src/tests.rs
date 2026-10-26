@@ -7006,3 +7006,45 @@ fn only_the_waiting_inbox_read_is_parked() {
     assert_eq!(waiting, vec![tag]);
     assert!(!crate::net::FocalClasses::waits(crate::net::Kind::Hello));
 }
+
+/// The fence query (29 §12.11): a participant's exchange that any authenticated participant may
+/// send in the profile every connection accepts, never a node's; answered only by its own kind of
+/// response, which carries the level and nothing else.
+#[test]
+fn the_fence_query_is_a_participants_exchange_answered_by_its_level_alone() {
+    let mut query = request(70);
+    query.operation = Operation::Fence;
+    assert_eq!(query.operation.class(), TrafficClass::Exchange);
+    assert_eq!(query.operation.registered_tag(), 35);
+    assert_eq!(TrafficClass::of_tag(35), Some(TrafficClass::Exchange));
+    assert!(!query.operation.is_mutation());
+    assert!(crate::native_profile_operation(&query.operation));
+    let actor = AuthenticatedPeer::local(grant()).unwrap();
+    assert!(verify_request(actor.clone(), query.clone(), &limits()).is_ok());
+    let mut native = query.clone();
+    native.protocol = crate::NATIVE_PROTOCOL_VERSION;
+    assert!(verify_request(actor, native, &limits()).is_ok());
+    let mut value = grant();
+    value.role = PeerRole::Node { node_id: 7 };
+    assert!(matches!(
+        verify_request(
+            AuthenticatedPeer::local(value).unwrap(),
+            query.clone(),
+            &limits()
+        ),
+        Err(AccessError::Unauthorized)
+    ));
+    let answer = query.reply(Response::Fence { level: 10 });
+    validate_response(&query, &answer, None, &limits()).unwrap();
+    let mut summary = request(71);
+    summary.operation = Operation::Summary;
+    assert!(
+        validate_response(
+            &summary,
+            &summary.reply(Response::Fence { level: 10 }),
+            None,
+            &limits()
+        )
+        .is_err()
+    );
+}

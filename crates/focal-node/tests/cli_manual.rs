@@ -199,7 +199,7 @@ fn remote_recovery_reads_are_authenticated_preserve_journals_and_survive_restart
         ledger: identity.ledger,
         principal: identity.issuer,
     };
-    let journal = OperationJournal::open(&path, &context).unwrap();
+    let journal = OperationJournal::open(&path, &context, client_rest(root.path())).unwrap();
     let business = journal.business_request().unwrap().clone();
     let open = RequestEnvelope {
         request_id: RequestId::from_u128(999),
@@ -211,7 +211,16 @@ fn remote_recovery_reads_are_authenticated_preserve_journals_and_survive_restart
     // This journal has the exact business request whose replies were lost. Its
     // first local step is epoch admission, so inspection must ignore next_request.
     let lost_path = root.path().join("lost-replies");
-    drop(OperationJournal::create(&lost_path, context, open, business.clone()).unwrap());
+    drop(
+        OperationJournal::create(
+            &lost_path,
+            context,
+            open,
+            business.clone(),
+            client_rest(root.path()),
+        )
+        .unwrap(),
+    );
     drop(journal);
     let committed_sequence = sequence(root.path());
     for operation in [&path, &lost_path] {
@@ -948,4 +957,12 @@ fn validation_get_pages_actual_committed_run_and_verdict_after_restart() {
         recovered.as_array().unwrap(),
         &vec![records[0].clone(), attempts[0].clone()]
     );
+}
+
+/// How the client stores in the node's data directory `root` keep their records (29 §12.11), as a
+/// command line beside the node finds them.
+fn client_rest(root: &std::path::Path) -> focal_client::at_rest::AtRest {
+    let mut settings = focal_node::config::Settings::default();
+    settings.node.data_dir = Some(root.to_path_buf());
+    focal_node::storage_level::client_at_rest_in(&settings, root, root).unwrap()
 }

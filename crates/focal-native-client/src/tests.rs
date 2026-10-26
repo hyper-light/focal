@@ -2607,9 +2607,12 @@ fn an_identity_already_journaled_is_prepared_again_without_a_read() {
     };
     use focal_client::pending::OperationContext;
     let root = tempfile::tempdir().unwrap();
-    let store =
-        NativeOperationStore::create(root.path().join("native"), NativeStoreLimits::default())
-            .unwrap();
+    let store = NativeOperationStore::create(
+        root.path().join("native"),
+        NativeStoreLimits::default(),
+        focal_client::at_rest::AtRest::clear(),
+    )
+    .unwrap();
     let build = context(ISSUER);
     let limits = CompileLimits::default();
     let preparation = Preparation {

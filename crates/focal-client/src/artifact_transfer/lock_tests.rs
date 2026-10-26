@@ -6,27 +6,28 @@ fn upload_and_catalogue_lock_end_with_owner_while_duplicate_is_still_open() {
     for layout in [Layout::Upload, Layout::Catalogue] {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("transfer");
-        let owner = Directory::create_layout(&path, layout).unwrap();
+        let owner =
+            Directory::create_layout(&path, layout, crate::at_rest::AtRest::clear()).unwrap();
         owner.install(b"original transfer state", true).unwrap();
         let inherited = owner._lock.file().try_clone().unwrap();
         for _ in 0..2 {
             assert!(matches!(
-                Directory::lock(&path, false, layout),
+                Directory::lock(&path, false, layout, crate::at_rest::AtRest::clear()),
                 Err(TransferError::Locked)
             ));
         }
         drop(owner);
         inherited.metadata().unwrap();
-        let next = Directory::lock(&path, false, layout).unwrap();
+        let next = Directory::lock(&path, false, layout, crate::at_rest::AtRest::clear()).unwrap();
         assert_eq!(next.read().unwrap(), b"original transfer state");
         drop(inherited);
         assert!(matches!(
-            Directory::lock(&path, false, layout),
+            Directory::lock(&path, false, layout, crate::at_rest::AtRest::clear()),
             Err(TransferError::Locked)
         ));
         drop(next);
         assert_eq!(
-            Directory::lock(&path, false, layout)
+            Directory::lock(&path, false, layout, crate::at_rest::AtRest::clear())
                 .unwrap()
                 .read()
                 .unwrap(),
@@ -48,19 +49,36 @@ fn bootstrap_marker_lock_releases_without_losing_identity_or_live_exclusion() {
             session: SessionId::from_u128(4),
         },
     };
-    let (owner, first) = bootstrap(root.path(), "uploads", context).unwrap();
+    let (owner, first) = bootstrap(
+        root.path(),
+        "uploads",
+        context,
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap();
     assert!(first);
     let original = fs::read(root.path().join("uploads.initialized")).unwrap();
     let inherited = owner.file().try_clone().unwrap();
     for _ in 0..2 {
         assert!(matches!(
-            bootstrap(root.path(), "uploads", context),
+            bootstrap(
+                root.path(),
+                "uploads",
+                context,
+                crate::at_rest::AtRest::clear()
+            ),
             Err(TransferError::Locked)
         ));
     }
     drop(owner);
     inherited.metadata().unwrap();
-    let (next, first) = bootstrap(root.path(), "uploads", context).unwrap();
+    let (next, first) = bootstrap(
+        root.path(),
+        "uploads",
+        context,
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap();
     assert!(!first);
     assert_eq!(
         fs::read(root.path().join("uploads.initialized")).unwrap(),
@@ -68,7 +86,12 @@ fn bootstrap_marker_lock_releases_without_losing_identity_or_live_exclusion() {
     );
     drop(inherited);
     assert!(matches!(
-        bootstrap(root.path(), "uploads", context),
+        bootstrap(
+            root.path(),
+            "uploads",
+            context,
+            crate::at_rest::AtRest::clear()
+        ),
         Err(TransferError::Locked)
     ));
     drop(next);
@@ -77,9 +100,20 @@ fn bootstrap_marker_lock_releases_without_losing_identity_or_live_exclusion() {
         ..context
     };
     assert!(matches!(
-        bootstrap(root.path(), "uploads", other),
+        bootstrap(
+            root.path(),
+            "uploads",
+            other,
+            crate::at_rest::AtRest::clear()
+        ),
         Err(TransferError::Conflict)
     ));
-    let (_, first) = bootstrap(root.path(), "uploads", context).unwrap();
+    let (_, first) = bootstrap(
+        root.path(),
+        "uploads",
+        context,
+        crate::at_rest::AtRest::clear(),
+    )
+    .unwrap();
     assert!(!first);
 }

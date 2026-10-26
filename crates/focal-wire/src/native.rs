@@ -1667,6 +1667,7 @@ pub const fn native_profile_operation(operation: &Operation) -> bool {
             | Operation::RequestStreamRead { .. }
             | Operation::Reconcile(_)
             | Operation::Summary
+            | Operation::Fence
             | Operation::Stream(_)
             | Operation::Upload(_)
             | Operation::Download { .. }

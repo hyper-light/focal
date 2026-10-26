@@ -127,9 +127,10 @@ fn backend(
         root,
         admin_root,
         invocation: _,
+        at_rest,
     } = Context::open(settings, selection)?;
     let store = Bootstrap::open(&root)
-        .and_then(|bootstrap| bootstrap.finish(&operation))
+        .and_then(|bootstrap| bootstrap.finish(&operation, at_rest.clone()))
         .map_err(|error| CliError::Other(Box::new(error)))?;
     let managed = ManagedRequests::open_with(
         &root,
@@ -137,6 +138,7 @@ fn backend(
         operation,
         ManagedStoreLimits::default(),
         super::managed::rotation()?,
+        at_rest.clone(),
     )
     .map_err(|error| CliError::Other(Box::new(error)))?;
     let mut backend =
@@ -146,16 +148,18 @@ fn backend(
         "MCP.uploads",
         operation,
         focal_client::artifact_transfer::UploadStoreLimits::default(),
+        at_rest.clone(),
     )
     .map_err(|error| CliError::Other(Box::new(error)))?;
     backend = backend.with_uploads(uploads);
-    let watches = focal_client::watch::WatchStore::open(&root, operation)
+    let watches = focal_client::watch::WatchStore::open(&root, operation, at_rest.clone())
         .map_err(|error| CliError::Other(Box::new(error)))?;
     backend = backend.with_watches(watches)?;
     // The engine probe runs inside the adapter on its worker runtime; this
     // adapter's own native journal is opened only when the ledger is native.
     backend = backend.with_native_journal(Box::new(NativeJournal {
         parent: root.join("client"),
+        rest: at_rest,
     }));
     if let Some(admin_root) = admin_root {
         let mut admin_settings = Settings::default();
@@ -173,6 +177,8 @@ fn backend(
 /// root; each adapter owns its identities and delivery marks.
 struct NativeJournal {
     parent: PathBuf,
+    /// How its records are kept at rest (29 §12.11).
+    rest: focal_client::at_rest::AtRest,
 }
 impl focal_mcp::NativeJournal for NativeJournal {
     fn initialized(&self) -> bool {
@@ -184,7 +190,7 @@ impl focal_mcp::NativeJournal for NativeJournal {
         focal_client::native_store::NativeOperationStore,
         focal_mcp::JournalError,
     > {
-        match super::native::store_in(&self.parent, super::native::MCP_STORE, true) {
+        match super::native::store_in(&self.parent, super::native::MCP_STORE, true, self.rest) {
             Ok(Some(store)) => Ok(store),
             Ok(None) => Err("native journal was not created".into()),
             Err(error) => Err(Box::new(error)),
@@ -208,6 +214,8 @@ enum BootstrapError {
     Context,
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error("MCP operation-store marker at rest: {0}")]
+    AtRest(#[from] focal_client::at_rest::AtRestError),
 }
 
 // This short bootstrap lock is separate from the running node's physical-owner
@@ -265,9 +273,11 @@ impl Bootstrap {
             fault: std::cell::Cell::new(None),
         })
     }
+    /// The operation store, created on first use, its records kept as `rest` says (29 §12.11).
     fn finish(
         &self,
         context: &OperationContext,
+        rest: focal_client::at_rest::AtRest,
     ) -> std::result::Result<OperationStore, BootstrapError> {
         if context.cluster == [0; 16]
             || context.principal.is_zero()
@@ -276,27 +286,41 @@ impl Bootstrap {
         {
             return Err(BootstrapError::Context);
         }
+        // The marker names its context, so it is kept as the store's records are (29 §12.11).
+        let marker = focal_client::at_rest::OwnerFile::new(&self.root, MARKER, rest.clone())?;
         if self.first {
-            self.write_marker(context)?;
+            if marker.sealing() {
+                marker.mark()?;
+            }
+            self.write_marker(context, &marker)?;
             #[cfg(test)]
             self.fail_at(Fault::Marker)?;
-            let store = OperationStore::create(self.root.join(STORE), StoreLimits::default())?;
+            let store =
+                OperationStore::create(self.root.join(STORE), StoreLimits::default(), rest)?;
             #[cfg(test)]
             self.fail_at(Fault::Store)?;
             Ok(store)
         } else {
-            self.read_marker(context)?;
-            OperationStore::open(self.root.join(STORE), StoreLimits::default()).map_err(Into::into)
+            self.read_marker(context, &marker)?;
+            OperationStore::open(self.root.join(STORE), StoreLimits::default(), rest)
+                .map_err(Into::into)
         }
     }
-    fn write_marker(&self, context: &OperationContext) -> std::result::Result<(), BootstrapError> {
+    fn write_marker(
+        &self,
+        context: &OperationContext,
+        marker: &focal_client::at_rest::OwnerFile,
+    ) -> std::result::Result<(), BootstrapError> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        for field in fields(context) {
+            bytes.extend_from_slice(field);
+        }
+        bytes.extend_from_slice(digest(context).as_bytes());
+        let bytes = marker.to_disk(bytes)?;
         let mut file =
             focal_platform::fs::open_private(&self.root.join(MARKER), false, true, true)?;
-        file.write_all(MAGIC)?;
-        for field in fields(context) {
-            file.write_all(field)?;
-        }
-        file.write_all(digest(context).as_bytes())?;
+        file.write_all(&bytes)?;
         file.sync_all()?;
         #[cfg(unix)]
         {
@@ -304,41 +328,46 @@ impl Bootstrap {
         }
         Ok(())
     }
-    fn read_marker(&self, context: &OperationContext) -> std::result::Result<(), BootstrapError> {
+    fn read_marker(
+        &self,
+        context: &OperationContext,
+        marker: &focal_client::at_rest::OwnerFile,
+    ) -> std::result::Result<(), BootstrapError> {
         let path = self.root.join(MARKER);
         let owner = focal_platform::fs::owner_at(&self.root)?;
         check_file(&path, &owner)?;
         let mut file = File::open(&path)?;
         check_open_file(&path, &file, &owner)?;
-        if file.metadata()?.len() != MARKER_BYTES {
+        let most = usize::try_from(MARKER_BYTES).map_err(|_| BootstrapError::Incomplete)?;
+        let bound = u64::try_from(marker.bound(most)?).map_err(|_| BootstrapError::Incomplete)?;
+        if file.metadata()?.len() > bound {
             return Err(BootstrapError::Incomplete);
         }
-        let mut magic = [0; 8];
-        file.read_exact(&mut magic)?;
-        if magic != *MAGIC {
+        let mut on_disk = Vec::new();
+        (&mut file).take(bound).read_to_end(&mut on_disk)?;
+        // The marker was written and synced by its installer before it could be
+        // read back; a read handle needs no re-sync (FlushFileBuffers rejects a
+        // read-only handle on Windows). The directory entry is fenced below.
+        drop(file);
+        let bytes = marker.opened(on_disk.clone(), most)?;
+        if bytes.len() != most || bytes.get(..8) != Some(MAGIC.as_slice()) {
             return Err(BootstrapError::Incomplete);
         }
         let mut hash = blake3::Hasher::new();
-        hash.update(&magic);
+        hash.update(MAGIC);
         let mut mismatch = false;
-        for expected in fields(context) {
-            let mut actual = [0; 16];
-            file.read_exact(&mut actual)?;
-            hash.update(&actual);
-            mismatch |= actual != *expected;
+        let saved = bytes.get(8..72).ok_or(BootstrapError::Incomplete)?;
+        for (actual, expected) in saved.as_chunks::<16>().0.iter().zip(fields(context)) {
+            hash.update(actual);
+            mismatch |= actual != expected;
         }
-        let mut checksum = [0; 32];
-        file.read_exact(&mut checksum)?;
-        if hash.finalize().as_bytes() != &checksum {
+        if Some(hash.finalize().as_bytes().as_slice()) != bytes.get(72..) {
             return Err(BootstrapError::Incomplete);
         }
         if mismatch {
             return Err(BootstrapError::Context);
         }
-        // The marker was written and synced by its installer before it could be
-        // read back; a read handle needs no re-sync (FlushFileBuffers rejects a
-        // read-only handle on Windows). The directory entry is fenced below.
-        drop(file);
+        marker.convert(&on_disk, &bytes)?;
         #[cfg(unix)]
         {
             File::open(&self.root)?.sync_all()?;
@@ -447,7 +476,64 @@ mod tests {
         }
     }
     fn open(root: &Path) -> std::result::Result<OperationStore, BootstrapError> {
-        Bootstrap::open(root)?.finish(&context())
+        Bootstrap::open(root)?.finish(&context(), focal_client::at_rest::AtRest::clear())
+    }
+    /// The marker names its store's context, so it is kept as the store's records are (29 §12.11):
+    /// written as before below the at-rest level, converted with its store once the fence opens
+    /// the level, its context still binding the store; one planted in the clear after the mark is
+    /// refused, and put back it opens.
+    #[test]
+    fn the_marker_converts_with_its_store_and_still_binds_its_context() {
+        use focal_client::at_rest::{AtRest, AtRestError, SEALED_MAGIC};
+        let data = private_root();
+        let keys = focal_seal::test_keys(data.path()).unwrap();
+        let root = data.path().join("context");
+        focal_platform::fs::create_dir_private(&root).unwrap();
+        let below = AtRest::new(Some(keys.clone()), false);
+        let sealing = AtRest::new(Some(keys), true);
+        drop(
+            Bootstrap::open(&root)
+                .unwrap()
+                .finish(&context(), below)
+                .unwrap(),
+        );
+        let clear = fs::read(root.join(MARKER)).unwrap();
+        assert!(clear.starts_with(MAGIC), "below the level, as before");
+        let store = Bootstrap::open(&root)
+            .unwrap()
+            .finish(&context(), sealing.clone())
+            .unwrap();
+        drop(store);
+        let sealed = fs::read(root.join(MARKER)).unwrap();
+        assert!(sealed.starts_with(SEALED_MAGIC));
+        assert!(!sealed.windows(16).any(|window| window == context().cluster));
+        assert!(
+            fs::read(root.join(STORE).join("catalogue.bin"))
+                .unwrap()
+                .starts_with(SEALED_MAGIC)
+        );
+        let mut other = context();
+        other.principal = ParticipantId::from_u128(8);
+        assert!(matches!(
+            Bootstrap::open(&root)
+                .unwrap()
+                .finish(&other, sealing.clone()),
+            Err(BootstrapError::Context)
+        ));
+        fs::write(root.join(MARKER), &clear).unwrap();
+        assert!(matches!(
+            Bootstrap::open(&root)
+                .unwrap()
+                .finish(&context(), sealing.clone()),
+            Err(BootstrapError::AtRest(AtRestError::ClearAfterSealed(_)))
+        ));
+        fs::write(root.join(MARKER), &sealed).unwrap();
+        assert!(
+            Bootstrap::open(&root)
+                .unwrap()
+                .finish(&context(), sealing)
+                .is_ok()
+        );
     }
     #[test]
     fn first_use_is_automatic_and_ordinary_reopen_preserves_context_and_catalogue() {
@@ -471,7 +557,10 @@ mod tests {
         let boot = Bootstrap::open(temp.path()).unwrap();
         let mut other = context();
         other.principal = ParticipantId::from_u128(8);
-        assert!(matches!(boot.finish(&other), Err(BootstrapError::Context)));
+        assert!(matches!(
+            boot.finish(&other, focal_client::at_rest::AtRest::clear()),
+            Err(BootstrapError::Context)
+        ));
         drop(boot);
         drop(open(temp.path()).unwrap());
         assert_eq!(
@@ -486,7 +575,11 @@ mod tests {
             let bootstrap = Bootstrap::open(temp.path()).unwrap();
             bootstrap.fault.set(point);
             if point.is_some() {
-                assert!(bootstrap.finish(&context()).is_err());
+                assert!(
+                    bootstrap
+                        .finish(&context(), focal_client::at_rest::AtRest::clear())
+                        .is_err()
+                );
             }
             drop(bootstrap);
             if point == Some(Fault::Store) {
@@ -520,7 +613,11 @@ mod tests {
             Bootstrap::open(temp.path()),
             Err(BootstrapError::Locked)
         ));
-        drop(bootstrap.finish(&context()).unwrap());
+        drop(
+            bootstrap
+                .finish(&context(), focal_client::at_rest::AtRest::clear())
+                .unwrap(),
+        );
         drop(bootstrap);
         let marker = temp.path().join(MARKER);
         let original = fs::read(&marker).unwrap();

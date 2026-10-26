@@ -837,6 +837,13 @@ pub(crate) fn dispatch(
                 crate::managed_requests::local(node, views, streams, verified, limits)
             }
             Operation::ManagedSupport { .. } => Err(AccessError::UnsupportedOperation),
+            // The fence this node last recorded, which a client's own directory records as a
+            // node does (29 §12.11).
+            Operation::Fence => crate::storage_level::known(node.root())
+                .map(|level| Response::Fence {
+                    level: level.unwrap_or(0),
+                })
+                .map_err(|_| AccessError::Unavailable),
             Operation::Native { frame } => {
                 crate::native_ingress::admit_local(node, peer, request, frame, &mut proposal)
             }

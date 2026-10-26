@@ -126,18 +126,45 @@ pub(super) struct Context {
     root: PathBuf,
     admin_root: Option<PathBuf>,
     invocation: Option<String>,
+    /// How the client stores under `root` keep their records at rest (29 §12.11): as the fence and
+    /// keys of the data directory `root` lies in say.
+    at_rest: focal_client::at_rest::AtRest,
 }
 impl Context {
     fn open(settings: &Settings, selection: Option<&str>) -> Result<Self> {
         match context::selected(settings, selection)? {
             Some((profile, history, name)) => {
-                let mut context = context::connect(settings, profile, history)?;
-                context.invocation = Self::recovery_invocation(
-                    &settings
-                        .data_dir()
-                        .map_err(|e| CliError::Other(Box::new(e)))?,
-                    &name,
-                );
+                // A context's history lies in this data directory, under its keys, and its stores
+                // follow the higher of its fence and the one the context learned from its cluster
+                // (29 §12.11): read from the node's own directory where the context addresses it
+                // through its socket, asked of the cluster with the first request otherwise.
+                let data_dir = settings
+                    .data_dir()
+                    .map_err(|e| CliError::Other(Box::new(e)))?;
+                let own = !focal_node::node_files::hosts_node(&data_dir)
+                    .map_err(|e| CliError::Other(Box::new(e)))?;
+                let learn = context::Learn {
+                    history: history.clone(),
+                    data_dir: own.then(|| data_dir.clone()),
+                };
+                context::learn_local_fence(&profile, &learn)?;
+                let level = focal_node::storage_level::client_level(&data_dir, &history)
+                    .map_err(|e| CliError::Other(Box::new(e)))?;
+                let keys = settings
+                    .found_data_keys(&data_dir)
+                    .map_err(|e| CliError::Other(Box::new(e)))?;
+                if own {
+                    // The directory's own files (the issuers its enrollments adopted), converted
+                    // as a node's are at its start, once the fence it recorded opens the level.
+                    focal_node::node_files::NodeFiles::new(&data_dir, keys.clone())
+                        .convert_client()
+                        .map_err(|e| CliError::Other(Box::new(e)))?;
+                }
+                let at_rest = focal_node::storage_level::client_at_rest(level, keys)
+                    .map_err(|e| CliError::Other(Box::new(e)))?;
+                let learn = (level < focal_node::upgrade::AT_REST_LEVEL).then_some(learn);
+                let mut context = context::connect(settings, profile, history, at_rest, learn)?;
+                context.invocation = Self::recovery_invocation(&data_dir, &name);
                 Ok(context)
             }
             None => Self::open_local(settings),
@@ -155,6 +182,9 @@ impl Context {
         // node that owns them.
         let keys = settings
             .found_data_keys(&root)
+            .map_err(|e| CliError::Other(Box::new(e)))?;
+        let at_rest = focal_node::storage_level::client_level(&root, &root)
+            .and_then(|level| focal_node::storage_level::client_at_rest(level, keys.clone()))
             .map_err(|e| CliError::Other(Box::new(e)))?;
         let actor = focal_node::network_join::local_unix_principal(
             &root,
@@ -195,6 +225,7 @@ impl Context {
             invocation: Self::recovery_invocation(&root, "local"),
             admin_root: Some(root.clone()),
             root,
+            at_rest,
         })
     }
     fn recovery_invocation(root: &std::path::Path, selection: &str) -> Option<String> {
@@ -356,7 +387,13 @@ async fn submit(context: &Context, command: Command, options: MutationOptions) -
             parent.join(request.request_id.to_string())
         }
     };
-    let mut journal = OperationJournal::create(&path, context.operation, epoch, request)?;
+    let mut journal = OperationJournal::create(
+        &path,
+        context.operation,
+        epoch,
+        request,
+        context.at_rest.clone(),
+    )?;
     writeln!(std::io::stderr().lock(), "operation: {}", path.display())?;
     drive(context, &mut journal, options.output.format).await
 }
@@ -485,7 +522,8 @@ pub(super) async fn request(
             if upload::resume_legacy(&context, &operation, output.format).await? {
                 return Ok(());
             }
-            let mut journal = OperationJournal::open(&operation, &context.operation)?;
+            let mut journal =
+                OperationJournal::open(&operation, &context.operation, context.at_rest.clone())?;
             writeln!(
                 std::io::stderr().lock(),
                 "operation: {}",
@@ -506,6 +544,7 @@ pub(super) async fn request(
             let journal = OperationJournal::open(
                 operation.ok_or_else(|| CliError::Input("operation path is required".into()))?,
                 &context.operation,
+                context.at_rest.clone(),
             )?;
             if remote {
                 reconcile::inspect(&context, &journal, output.format).await

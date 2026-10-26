@@ -62,6 +62,9 @@ pub enum StoreError {
     Expansion(#[from] InputError),
     #[error(transparent)]
     Pending(#[from] PendingError),
+    /// A record sealed, or refused in the clear, at rest (29 §12.11).
+    #[error(transparent)]
+    AtRest(#[from] crate::at_rest::AtRestError),
 }
 
 /// The capability is stored with the catalogue. Retrying with different limits
@@ -233,11 +236,17 @@ impl Prepared {
 pub struct OperationStore {
     root: PathBuf,
     limits: StoreLimits,
+    /// How its records are kept at rest (29 §12.11).
+    rest: crate::at_rest::AtRest,
     #[cfg(test)]
     fault: std::cell::Cell<Option<Fault>>,
 }
 impl OperationStore {
-    pub fn create(root: impl AsRef<Path>, limits: StoreLimits) -> Result<Self, StoreError> {
+    pub fn create(
+        root: impl AsRef<Path>,
+        limits: StoreLimits,
+        rest: crate::at_rest::AtRest,
+    ) -> Result<Self, StoreError> {
         limits.validate()?;
         let catalogue = Catalogue {
             schema: 1,
@@ -245,22 +254,72 @@ impl OperationStore {
             entries: BTreeMap::new(),
         };
         let bytes = encode(&catalogue, CATALOGUE_BYTES)?;
-        let directory = files::Directory::create(root.as_ref())?;
+        let directory = files::Directory::create(root.as_ref(), rest.clone())?;
         directory.initialize()?;
         directory.write(CATALOGUE, CATALOGUE_MAGIC, &bytes, false)?;
-        Ok(Self::handle(root.as_ref(), limits))
+        Ok(Self::handle(root.as_ref(), limits, rest))
     }
-    pub fn open(root: impl AsRef<Path>, limits: StoreLimits) -> Result<Self, StoreError> {
+    /// Opens the store at `root`, converting its records to sealed where `rest` seals and the store
+    /// is not marked yet (29 §12.11): every operation's journal, then its prepared record and the
+    /// catalogue, under the store's lock.
+    pub fn open(
+        root: impl AsRef<Path>,
+        limits: StoreLimits,
+        rest: crate::at_rest::AtRest,
+    ) -> Result<Self, StoreError> {
         limits.validate()?;
-        let store = Self::handle(root.as_ref(), limits);
-        let directory = files::Directory::open(&store.root)?;
-        store.catalogue(&directory)?;
+        let store = Self::handle(root.as_ref(), limits, rest);
+        let directory = files::Directory::open(&store.root, store.rest.clone())?;
+        let catalogue = store.catalogue(&directory)?;
+        store.convert(&directory, &catalogue)?;
         Ok(store)
     }
-    fn handle(root: &Path, limits: StoreLimits) -> Self {
+    /// Converts the store's records to sealed and marks it, where its at-rest form seals and it is
+    /// not marked: each catalogued operation's journal first (marked in its own directory; one
+    /// another process holds converts at its own next open), then its prepared record, then the
+    /// catalogue. The catalogue is the store's authority on what it holds,
+    /// within the operations its limits admit: a directory it does not index is never adopted
+    /// (`resolve` refuses one), and so is never read to be converted.
+    fn convert(
+        &self,
+        directory: &files::Directory,
+        catalogue: &Catalogue,
+    ) -> Result<(), StoreError> {
+        if !self.rest.sealing() || directory.marked()? {
+            return Ok(());
+        }
+        let mut names = Vec::new();
+        names
+            .try_reserve_exact(catalogue.entries.len().saturating_add(1))
+            .map_err(|_| StoreError::Capacity)?;
+        for id in catalogue.entries.keys() {
+            let operation = component(*id);
+            if directory.exists(&format!("{operation}/journal"))? {
+                match crate::pending::convert(
+                    &self.root.join(&operation).join("journal"),
+                    self.rest.clone(),
+                ) {
+                    // A journal another process holds converts at its own next open, under its own
+                    // lock and mark: the store's mark speaks for its catalogue and prepared
+                    // requests, and each journal's for its record.
+                    Ok(()) | Err(PendingError::Locked) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            names.push((
+                format!("{operation}/{PREPARED}"),
+                PREPARED_MAGIC,
+                PREPARED_BYTES,
+            ));
+        }
+        names.push((CATALOGUE.to_owned(), CATALOGUE_MAGIC, CATALOGUE_BYTES));
+        directory.convert(names)
+    }
+    fn handle(root: &Path, limits: StoreLimits, rest: crate::at_rest::AtRest) -> Self {
         Self {
             root: root.into(),
             limits,
+            rest,
             #[cfg(test)]
             fault: std::cell::Cell::new(None),
         }
@@ -269,14 +328,14 @@ impl OperationStore {
         &self.root
     }
     pub fn usage(&self) -> Result<StoreUsage, StoreError> {
-        let directory = files::Directory::open(&self.root)?;
+        let directory = files::Directory::open(&self.root, self.rest.clone())?;
         self.catalogue(&directory)?.usage()
     }
     /// Locate a claimed ID for the existing explicit journal inspect/retry API.
     /// This does not create files or grant authority to use a different context.
     pub fn operation_path(&self, operation_id: &str) -> Result<PathBuf, StoreError> {
         let id = parse_id(operation_id)?;
-        let directory = files::Directory::open(&self.root)?;
+        let directory = files::Directory::open(&self.root, self.rest.clone())?;
         if !self.catalogue(&directory)?.entries.contains_key(&id) {
             return Err(StoreError::MissingOperation);
         }
@@ -314,7 +373,7 @@ impl OperationStore {
     ) -> Result<OperationJournal, StoreError> {
         let id = parse_id(operation_id)?;
         validate_context(*context)?;
-        let directory = files::Directory::open(&self.root)?;
+        let directory = files::Directory::open(&self.root, self.rest.clone())?;
         let mut catalogue = self.catalogue(&directory)?;
         let entry = catalogue
             .entries
@@ -340,7 +399,7 @@ impl OperationStore {
         let id = parse_id(operation_id)?;
         validate_context(context)?;
         let digest = intent.digest()?;
-        let directory = files::Directory::open(&self.root)?;
+        let directory = files::Directory::open(&self.root, self.rest.clone())?;
         let mut catalogue = self.catalogue(&directory)?;
         let component = component(id);
         let prepared_path = format!("{component}/{PREPARED}");
@@ -446,7 +505,7 @@ impl OperationStore {
         let journal_path = self.root.join(&component).join("journal");
         let journal = if directory.exists(&format!("{component}/journal"))? {
             if ready {
-                let journal = OperationJournal::open(&journal_path, &context)?;
+                let journal = OperationJournal::open(&journal_path, &context, self.rest.clone())?;
                 if !journal.matches_requests(&prepared.open_epoch, &prepared.request) {
                     return Err(StoreError::Corrupt);
                 }
@@ -457,6 +516,7 @@ impl OperationStore {
                     context,
                     prepared.open_epoch,
                     prepared.request,
+                    self.rest.clone(),
                 )?
             }
         } else if ready {
@@ -467,6 +527,7 @@ impl OperationStore {
                 context,
                 prepared.open_epoch,
                 prepared.request,
+                self.rest.clone(),
             )?
         };
         if !ready {

@@ -93,6 +93,7 @@ fn open(context: &Context, origin: Origin, id: [u8; 16]) -> Result<UploadJournal
         name,
         context.operation,
         UploadStoreLimits::default(),
+        context.at_rest.clone(),
     )
     .map_err(error)?;
     store.open_upload(id, &context.operation).map_err(error)

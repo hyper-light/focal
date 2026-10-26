@@ -190,3 +190,51 @@ fn damage_behind_the_last_append_and_another_kinds_file_are_refused() {
     let writer = RecordWriter::resume(&path, PART_MAGIC, &key_of, most, torn, Verify::All).unwrap();
     assert_eq!(writer.plain(), 3 * RECORD_BYTES as u64);
 }
+
+/// A part cut to where an earlier append ended keeps the records before it and lets the rest go,
+/// written again under a new ID, so what the writer appends next takes no place a record let go
+/// was sealed at under the old key; a cut inside a record, or past what was written, is refused,
+/// and a cut to the whole is the part as it is.
+#[test]
+fn a_part_cut_to_an_earlier_append_goes_on_from_it_under_a_new_key() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("upload.part");
+    let most = 4 * RECORD_BYTES;
+    let appends = [plaintext(10, 5000), plaintext(11, 7000), plaintext(12, 900)];
+    let writer = part(&path, &appends, most);
+    let kept = (appends[0].len() + appends[1].len()) as u64;
+    let whole = writer.plain();
+    let writer = writer.cut(&path, whole, &key_of).unwrap();
+    assert_eq!(
+        header_id(&path),
+        [7u8; 16],
+        "the whole kept is the part as it is"
+    );
+    assert!(matches!(
+        writer.cut(&path, whole + 1, &key_of),
+        Err(ContentError::Corrupt)
+    ));
+    let writer = part(&path, &appends, most);
+    assert!(matches!(
+        writer.cut(&path, kept - 1, &key_of),
+        Err(ContentError::Corrupt)
+    ));
+    let writer = part(&path, &appends, most);
+    let mut writer = writer.cut(&path, kept, &key_of).unwrap();
+    assert_ne!(header_id(&path), [7u8; 16], "written again under a new ID");
+    assert_eq!(writer.plain(), kept);
+    assert!(!directory.path().join("upload.resume").exists());
+    let mut past = vec![0u8; 1];
+    assert!(writer.read(&path, kept as u32, &mut past).is_err());
+    let next = plaintext(13, 3000);
+    writer.append(&next).unwrap();
+    writer.sync().unwrap();
+    let all = [appends[0].clone(), appends[1].clone(), next].concat();
+    let mut read = vec![0u8; all.len()];
+    writer.read(&path, 0, &mut read).unwrap();
+    assert_eq!(read, all);
+    drop(writer);
+    let torn = records_bytes(RECORD_BYTES).unwrap();
+    let writer = RecordWriter::resume(&path, PART_MAGIC, &key_of, most, torn, Verify::All).unwrap();
+    assert_eq!(writer.plain(), all.len() as u64);
+}
