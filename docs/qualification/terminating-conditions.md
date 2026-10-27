@@ -102,10 +102,23 @@ wrapped in its `ENCRYPTION-INFO`, every other file sealed whole under it with ke
 node's part image and run are sealed under its data directory's keys, and the bus's identity
 directory under keys of its own, each key file a sealed frame of its name and key (doc 29 §12.9,
 "2026-10-25 — The bus's images, runs and identity keys are sealed"), each converted at its next open
-and refused in the clear after its mark.
+and refused in the clear after its mark. A node's small files (its identity, policy, network state,
+founded allowance, partition records, deployment plans and journals, pending retirements, and the
+issuers its client enrollments adopted) are sealed whole from the at-rest level, each its name
+bound inside its seal (doc 29 §12.10, "2026-10-25 — A node's small files are sealed from the at-rest
+level"), converted at its start before it serves. A client's stores (its requests and their
+receipts, its pending writes, its managed ownership, its watches and its uploads' staged bytes) are
+sealed from the same level (doc 29 §12.11, "2026-10-25 — A client's stores are sealed from the
+at-rest level"): in a node's data directory behind the node's fence, in a client's own behind the
+fence it learns from its cluster (`Operation::Fence`), each store converted at its next open with
+every pending request answered once. The whole of it is held by one journey on the real binary
+(doc 29 §12.12, "2026-10-26 — Every store focal writes is sealed at rest, held end to end"): a
+cluster founded below the level with every store populated, the fence raised, every store converted
+while it serves, and every data directory scanned for what the journey wrote and for every store's
+clear form, run again and again on one CPU and on two beside busy loops.
 
-**Open.** Still written in the clear (doc 29 §12's inventory, taken again 2026-10-24): client
-stores and the node's small files.
+**Open.** None: every store of doc 29 §12's inventory is sealed from its level, and every file
+left in the clear is listed there clear by design, with its reason.
 
 ## 6. Adversarial batteries
 

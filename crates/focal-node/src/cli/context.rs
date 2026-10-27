@@ -576,20 +576,25 @@ pub(super) struct Remote {
     fence: Mutex<Option<Learn>>,
 }
 /// Where a context records the fence it learns from its cluster (29 §12.11): its history, whose
-/// stores follow it, and its data directory where that hosts no node, whose own files (the issuers
-/// its enrollments adopted) follow it as a node's follow the fence the node records.
+/// stores follow it, and its data directory where that hosts no node (`own`), whose own files (the
+/// issuers its enrollments adopted) follow it as a node's follow the fence the node records.
 pub(super) struct Learn {
+    /// The data directory the history lies in.
+    pub(super) data_dir: PathBuf,
     pub(super) history: PathBuf,
-    pub(super) data_dir: Option<PathBuf>,
+    pub(super) own: bool,
 }
 impl Learn {
-    /// The fence at `level` recorded where it is learned for: the record never falls.
+    /// The fence at `level` recorded where it is learned for, under the data directory's node files'
+    /// lock, which every process of the client records it under: the record never falls.
     fn record(&self, level: u32) -> std::result::Result<(), focal_node::embedded::NodeError> {
-        focal_node::storage_level::record(&self.history, level)?;
-        if let Some(data_dir) = &self.data_dir {
-            focal_node::storage_level::record(data_dir, level)?;
-        }
-        Ok(())
+        let both = [self.history.as_path(), self.data_dir.as_path()];
+        let dirs = if self.own {
+            both.as_slice()
+        } else {
+            both.get(..1).unwrap_or_default()
+        };
+        focal_node::storage_level::record_shared(&self.data_dir, dirs, level)
     }
 }
 /// A context's adoption of the endorsed issuers its verifier found.
@@ -1059,9 +1064,9 @@ async fn enroll(settings: &Settings, selected: &str, invitation: &Path) -> Resul
     let request_id = pending.request_id();
     drop(pending);
     let learn = Learn {
+        data_dir: root.clone(),
         history: history.clone(),
-        data_dir: (!focal_node::node_files::hosts_node(&root).map_err(other)?)
-            .then(|| root.clone()),
+        own: !focal_node::node_files::hosts_node(&root).map_err(other)?,
     };
     learn_remote_fence(
         settings,

@@ -144,8 +144,9 @@ impl Context {
                 let own = !focal_node::node_files::hosts_node(&data_dir)
                     .map_err(|e| CliError::Other(Box::new(e)))?;
                 let learn = context::Learn {
+                    data_dir: data_dir.clone(),
                     history: history.clone(),
-                    data_dir: own.then(|| data_dir.clone()),
+                    own,
                 };
                 context::learn_local_fence(&profile, &learn)?;
                 let level = focal_node::storage_level::client_level(&data_dir, &history)
@@ -157,7 +158,7 @@ impl Context {
                     // The directory's own files (the issuers its enrollments adopted), converted
                     // as a node's are at its start, once the fence it recorded opens the level.
                     focal_node::node_files::NodeFiles::new(&data_dir, keys.clone())
-                        .convert_client()
+                        .convert()
                         .map_err(|e| CliError::Other(Box::new(e)))?;
                 }
                 let at_rest = focal_node::storage_level::client_at_rest(level, keys)

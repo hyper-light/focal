@@ -1,0 +1,37 @@
+name: At rest under load
+
+# doc 29 §12.12: the at-rest journey (crates/focal-node/tests/cli_at_rest.rs), a
+# node founded below the at-rest level with every store populated, its fence
+# raised and every store converted while claims, artifacts and retired families
+# keep reading back, run again and again on one CPU and on two beside a busy loop
+# on each (scripts/at-rest-loop.sh). Linux, for taskset.
+on:
+  schedule:
+    # 06:30 UTC daily, after the nightly qualification starts.
+    - cron: "30 6 * * *"
+  # A branch named at-rest-loop/<anything> runs it, which starts a run without
+  # the workflow on the default branch.
+  push:
+    branches: ["at-rest-loop/**"]
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Runs of the journey, alternating one CPU and two, beside a busy loop on each"
+        default: "20"
+
+permissions:
+  contents: read
+
+jobs:
+  at-rest-under-load:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.98.1 --profile minimal
+      - name: Install native protobuf compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: The at-rest journey, on one CPU and on two beside busy loops
+        env:
+          FOCAL_AT_REST_RUNS: ${{ github.event.inputs.runs || '20' }}
+        run: bash scripts/at-rest-loop.sh

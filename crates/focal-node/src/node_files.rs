@@ -29,9 +29,11 @@ use crate::embedded::{NodeError, atomic_file};
 /// clear is refused. An empty file, in the clear by design (29 §12).
 pub const SEALED: &str = "FILES.SEALED";
 
-/// Format: the lock a client's own data directory converts its node files under
-/// ([`NodeFiles::convert_client`]): an empty file held for its lock, in the clear by design.
-const CLIENT_LOCK: &str = "FILES.lock";
+/// Format: the lock of a data directory's node files ([`NodeFiles::lock`]): their conversion takes
+/// it, and so does every change a client's process makes to one beside another process (an
+/// adoption, a recorded fence), which no node's lock orders. An empty file held for its lock, in the
+/// clear by design.
+const FILES_LOCK: &str = "FILES.lock";
 
 /// Format: what a sealed node file begins with, in the clear: its kind, and nothing of what it holds.
 pub const SEALED_MAGIC: &[u8; 8] = b"FCLNSEAL";
@@ -82,19 +84,15 @@ impl NodeFiles {
         Ok(self.root.join(SEALED).try_exists()?)
     }
 
-    /// Converts the node files of a client's own data directory, which hosts no node (the issuers
-    /// its enrollments adopted), once the fence it recorded opens the at-rest level (29 §12.11): as
-    /// [`NodeFiles::convert`] does at a node's start, under the directory's own lock for it
-    /// (`FILES.lock`, held while it converts), since no node holds the directory's. A directory
-    /// marked already, or below the level, is left without taking the lock.
-    pub fn convert_client(&self) -> Result<Converted, NodeError> {
-        if self.marked()? || !self.sealing()? {
-            return Ok(Converted::default());
-        }
-        let lock =
-            focal_platform::fs::open_private(&self.root.join(CLIENT_LOCK), true, true, true)?;
-        let _lock = focal_platform::FileLock::exclusive_waiting(lock)?;
-        self.convert()
+    /// The lock of the directory's node files (`FILES.lock`), held until the guard drops, waited for
+    /// while another holds it: what their conversion takes, and what every read, change and write of
+    /// one that processes of a client make beside each other takes (an adoption, a recorded fence;
+    /// 29 §12.11), so that no two of them write one file through one temporary and none writes over
+    /// a change it did not read. Each holder holds it for a file's read and replace at most, or a
+    /// conversion's.
+    pub fn lock(&self) -> Result<focal_platform::FileLock, NodeError> {
+        let file = focal_platform::fs::open_private(&self.root.join(FILES_LOCK), true, true, true)?;
+        Ok(focal_platform::FileLock::exclusive_waiting(file)?)
     }
 
     /// Writes `bytes` as the node file `name` (relative to the data directory), whole, through the
@@ -263,16 +261,25 @@ fn fixed() -> [(&'static str, Kind); 6] {
 }
 
 impl NodeFiles {
-    /// Converts every node file of the directory in the clear to sealed, then marks it: what the
-    /// node's start does under the directory's lock, before it serves, once its fence opens the
-    /// at-rest level. Each file in the clear is checked by its reader's rule and written sealed
+    /// Converts every node file of the directory in the clear to sealed, then marks it, once the
+    /// fence the directory records opens the at-rest level: what a node's start does under the
+    /// directory's lock before it serves, and a client's open of its own data directory, which
+    /// hosts no node (the issuers its enrollments adopted, 29 §12.11), each under the node files'
+    /// lock ([`NodeFiles::lock`]), which a client's processes take to change one beside the node or
+    /// each other. Each file in the clear is checked by its reader's rule and written sealed
     /// through the atomic replace that writes it; one sealed already (by a conversion a cut ended,
     /// or written since the fence rose) is opened to check it and left; what a cut install left
     /// beside a file (its temporary) is removed. A cut anywhere leaves each file whole in one form
     /// or the other, and the next start finishes. Below the level, or marked already, nothing is
-    /// done. The files are visited as they are listed, none held but the one being converted.
+    /// done and the lock is not taken. The files are visited as they are listed, none held but the
+    /// one being converted.
     pub fn convert(&self) -> Result<Converted, NodeError> {
         if self.marked()? || !self.sealing()? {
+            return Ok(Converted::default());
+        }
+        let _lock = self.lock()?;
+        // Another process may have converted the directory while this one waited.
+        if self.marked()? {
             return Ok(Converted::default());
         }
         let key = self.journal_key()?;
@@ -447,6 +454,54 @@ mod tests {
         crate::storage_level::record(dir.path(), level).unwrap();
         let files = NodeFiles::new(dir.path(), Some(keys));
         (dir, files)
+    }
+
+    /// Commands of one client adopting issuers at once each keep theirs: every adoption is read,
+    /// changed and written under the node files' lock. Before it, each read the file before the
+    /// others wrote it and wrote over their adoptions, through one temporary. Threads stand for the
+    /// processes: a file lock taken through two opens of its file is two owners within a process as
+    /// across processes (flock and LockFileEx alike).
+    #[test]
+    fn issuers_adopted_at_once_are_all_kept() {
+        let (dir, files) = directory(crate::upgrade::AT_REST_LEVEL);
+        let keys = files.keys.clone().unwrap();
+        let anchors: Vec<focal_wire::Adopted> = (0..focal_wire::MAX_TRUST_ROOTS)
+            .map(|index| {
+                let path = dir.path().join(format!("authority-{index}"));
+                let authority = focal_enrollment::BootstrapAuthority::open_or_create(
+                    &path,
+                    &focal_seal::test_keys_beside(&path).unwrap(),
+                    [9; 16],
+                    vec!["localhost".into()],
+                    1_783_000_000,
+                )
+                .unwrap();
+                focal_wire::Adopted {
+                    anchor: authority.ca_certificate().to_vec(),
+                    issuer: None,
+                }
+            })
+            .collect();
+        for round in 0..8 {
+            let enrollment = dir
+                .path()
+                .join(format!("CLIENT.contexts/enrollment-round-{round}"));
+            std::fs::create_dir_all(&enrollment).unwrap();
+            let start = std::sync::Barrier::new(anchors.len());
+            std::thread::scope(|scope| {
+                for adopted in &anchors {
+                    let (keys, enrollment, start) = (&keys, &enrollment, &start);
+                    scope.spawn(move || {
+                        start.wait();
+                        assert!(
+                            crate::network_join::adopt_issuer(keys, enrollment, adopted).unwrap()
+                        );
+                    });
+                }
+            });
+            let kept = crate::network_join::adopted_issuers(&keys, &enrollment).unwrap();
+            assert_eq!(kept.len(), anchors.len(), "round {round}: {kept:?}");
+        }
     }
 
     /// An identity file's bytes, as a node's directory writes them.

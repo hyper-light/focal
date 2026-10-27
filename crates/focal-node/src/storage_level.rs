@@ -58,6 +58,19 @@ pub fn record(root: &Path, level: u32) -> Result<(), NodeError> {
     Ok(())
 }
 
+/// Records the fence at `level` in each of `dirs`, directories of the data directory `root` that
+/// processes of one client record it in beside each other (a context's history, and the directory
+/// itself where it hosts no node; 29 §12.11), under the node files' lock of `root`
+/// ([`crate::node_files::NodeFiles::lock`]): so no record falls, whatever order two processes learn
+/// the fence in, and no two write one record through one temporary.
+pub fn record_shared(root: &Path, dirs: &[&Path], level: u32) -> Result<(), NodeError> {
+    let _lock = crate::node_files::NodeFiles::new(root, None).lock()?;
+    for dir in dirs {
+        record(dir, level)?;
+    }
+    Ok(())
+}
+
 /// Whether the node's groups live on the shell at its start: the fence it last knew opens
 /// `STORAGE_LEVEL`.
 pub fn storage_opened(root: &Path) -> Result<bool, NodeError> {
@@ -233,6 +246,34 @@ pub fn retire_rule_at(level: u32) -> focal_ledger::RetireRule {
 )]
 mod tests {
     use super::*;
+
+    /// Processes of one client recording the fences they learned at once leave the highest: each
+    /// record is read and written under the node files' lock. Before it, one could read the record
+    /// before another raised it and write its lower level over it, through one temporary. Threads
+    /// stand for the processes, as the file lock holds between two opens of its file in one.
+    #[test]
+    fn fences_recorded_at_once_by_one_client_leave_the_highest() {
+        let root = tempfile::tempdir().unwrap();
+        let history = root.path().join("CLIENT.contexts/history-alice");
+        std::fs::create_dir_all(&history).unwrap();
+        let levels: Vec<u32> = (1..=8).collect();
+        for round in 0..8u32 {
+            let start = std::sync::Barrier::new(levels.len());
+            std::thread::scope(|scope| {
+                for level in &levels {
+                    let (root, history, start) = (root.path(), history.as_path(), &start);
+                    let level = level + round * 8;
+                    scope.spawn(move || {
+                        start.wait();
+                        record_shared(root, &[history, root], level).unwrap();
+                    });
+                }
+            });
+            let highest = 8 + round * 8;
+            assert_eq!(known(&history).unwrap(), Some(highest), "round {round}");
+            assert_eq!(known(root.path()).unwrap(), Some(highest), "round {round}");
+        }
+    }
 
     /// None until recorded; a record rises and never falls; a damaged record is an error, never
     /// none; the storage level opens at `STORAGE_LEVEL`.

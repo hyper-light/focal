@@ -17320,3 +17320,50 @@ zstd 0.14.3 now (zstd-safe 8.2.0, zstd-sys 2.1.2), whose two calls (`dict::from_
 `bulk::Compressor::with_dictionary`) are unchanged; the audit passes, and so do `tools/compare`'s
 tests and focal-bus's corpus tests. zstd's license changed with the release, from MIT to
 BSD-3-Clause, which the license policy allows; the inventory records the new versions and license.
+
+### 2026-10-26 — Every store focal writes is sealed at rest, held end to end
+
+Doc 29 §12's inventory is sealed: every store a node, a client and a bus write keeps its records
+sealed from the level its fence opens (the node log, group files, payload log and private
+directories before; the seeds, cold streams, content staging, parts and custody records, backups,
+bus files, node files and client stores from the at-rest level, 29 §12.5 to §12.11), and every file
+left in the clear is listed clear by design, each with its reason. Names are among them (29 §12):
+every hash a store files by is named under its directory's keyed name, and the names that stay are
+identifiers and labels, never a record or a hash of one, as Vault's threat model and Kubernetes'
+etcd keys keep them. The root key file and an operator's backup key file lie outside every data
+directory (29 §2, §12.8).
+
+- **End to end** (`crates/focal-node/tests/cli_at_rest.rs`, 29 §12.12). A node founded below the
+  at-rest level with every store filled (seeds by a seeded checkpoint, a family retired to its cold
+  stream, an upload half staged, a chunk half received and a custody record of each kind, a clear
+  backup, a client's stores in the node's directory and an enrolled client's in its own, the node's
+  small files, and a bus group's part); the fence raised and recorded; the node started again, every
+  store converted while its claims, artifact and retired family read back, the claim whose reply was
+  lost answered once, a backup taken at the level sealed and restored on a fresh node with its key
+  file only. Then every data directory is scanned: no file holds a marker the journey wrote or the
+  magic of any store's clear form (fifty of them; six held in the clear below the fence and none
+  after), no path names a hash the journey made, and the files clear by design hold no more than a
+  marker.
+- **Under load** (`scripts/at-rest-loop.sh`, `.github/workflows/at-rest.yml`, nightly and on
+  `at-rest-loop/*` branches): twenty runs of the journey on GitHub's `ubuntu-24.04`, alternately on
+  one CPU and on two (`taskset`) with a busy loop on each, all passed, in 25 to 28 s each; on
+  fedora, 23 s on two CPUs of its own, 33 s with a busy loop on each, 36 s on one.
+- **Found on the way.** Two commands of one client changing a node file at once raced (an adoption
+  of an issuer, a recorded fence), each read-change-write through the atomic replace's one
+  temporary: an adoption lost to the other's write, a fence record left lower, or a write failed
+  (`ENOENT`) when the other renamed the temporary under it. Each such change is now made under the
+  node files' lock (`FILES.lock`, `NodeFiles::lock`), which their conversion takes too; tested with
+  threads standing for processes (without the lock three of four adoptions and seven of eight fence
+  records failed in the first round; with it, eight rounds keep every adoption and the highest
+  fence).
+- **The benches** (each where its section records it; 29 §12.5 to §12.11):
+
+  | Store | Sealed against clear |
+  |---|---|
+  | Seeds (a 64 MiB batch) | 1.717 / 1.424 ms a MiB, +20.6% |
+  | Cold stream (appends' CPU) | +17% to +74% a MiB by batch size |
+  | Staging (8 MiB upload's CPU) | 10.33 / 9.88 ms a MiB, +4.5% |
+  | Backup (seeded session) | 83.8 / 72.5 ms, one file's flushes |
+  | Bus image (6.2 KB) | 8.43 / 8.46 ms, within noise |
+  | Node file (1 MiB, its bound) | 9.75 / 8.39 ms |
+  | Client upload stage (64 KiB) | 13.73 / 13.71 ms, +0.6% |

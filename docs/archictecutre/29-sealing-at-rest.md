@@ -297,8 +297,8 @@ private journals (`focal_enrollment::PrivateJournal`), sealed with the private d
   `REST_SEALED` for its files beside its objects (§12.7), the empty `FILES.SEALED` of a data
   directory whose node files are sealed (§12.10), and a client store's empty marks (`SEALED`, and
   `<name>.managed-sealed`, `<name>.watch-sealed`, `<name>.initialized-sealed` where several owners
-  share a directory) with `FILES.lock`, the lock a client's own directory converts its node files
-  under (§12.11).
+  share a directory) with `FILES.lock`, the lock of a directory's node files, which their
+  conversion takes and every change a client's process makes to one (§12.11).
 - The fence a client's context recorded in its history (`STORAGE.level`, as a node's), which its
   next command reads to choose its stores' form before it opens one (§12.11).
 - What an operator asks for in the clear, outside any data directory: an artifact downloaded to a
@@ -311,6 +311,27 @@ private journals (`focal_enrollment::PrivateJournal`), sealed with the private d
 - focal-log's WAL of a node below the storage level, which a binary below that level reads alone,
   converted to the sealed shell at the level (27 §15.8, §12.3).
 - The measurement tools' reports (`tools/load`, `tools/compare`): a run's results, not focal's data.
+- Names. No name holds a record or a hash of one: every store that files by a hash (content, seeds,
+  cold streams, staging's parts and custody records, a sealed backup) names each file by its
+  directory's keyed name of that hash (§12.4 to §12.8), since a hash in a name confirms what it
+  names to anyone holding a candidate. The names left in the clear say where a store keeps what, not
+  what it holds: the layout's own (`IDENTITY`, `journal.bin`, `catalogue.bin`, `bus.log`, `open.0`,
+  …); ordinals and generations (a bus member's `node-N`, a managed store's `<ordinal>.receipt`, a
+  managed stream's `<name>.g<generation>`, a payload segment's number); identifiers, a ledger's, a
+  group's or a content domain's directory named by its ID, and an operation's, a request's or an
+  upload's by the 128 bits its client drew from the operating system's random source (or a hash of
+  them); and the labels an operator gave, a context's name (`enrollment-<name>`, `history-<name>`),
+  and an invitation's, a watch's and an upload journal's, each named by an unkeyed hash of the label
+  with its cluster or its context. That a volume holds an operation, a ledger or a context is not
+  kept from its reader, as Vault's threat model leaves out "the leakage of the existence of secret
+  material" (a reader of its storage "may observe that secret material exists and is stored, even if
+  it is kept confidential"), and as Kubernetes' encryption at rest seals a Secret's value under its
+  etcd key, `/registry/secrets/<namespace>/<name>`, which stays in the clear (the etcd dump of its
+  guide, "Encrypting Confidential Data at Rest", shows it). The journey of §12.12 scans every name
+  for the hashes it made that a store files under a keyed name.
+- The root key file (§2) and an operator's backup key file (§12.8): each outside every data
+  directory, owner-only, kept where its operator keeps secrets; what opens the seal cannot lie under
+  it.
 
 A store's temporaries are written in its form (a sealed store's sealed), and what a crash leaves of
 them goes with the store's sweep past its grace or at its next open, as before.
@@ -1131,10 +1152,23 @@ says:
   level, as a client's own directory failed its first open in the real-binary test. Only directories
   are visited now, and `node_files`' tests plant the marker. A marked store asked for the clear form
   would have written records its own reader then refused; a marked store seals whatever form it is
-  asked for.
-- **What stays open.** A store's directory names hold operations' and uploads' identities in the
-  clear, as before: names are not records. Two processes of one client adopting an issuer at once
-  write its node file through one temporary (`atomic_file`'s `.install`), an earlier defect; open.
+  asked for. And two commands of one client changing a node file at once raced: an adoption reads
+  the issuers adopted, adds one and writes them back, and a context records the fence it learned
+  unless one as high is recorded, each through the atomic replace's one temporary
+  (`<name>.install`). Two adopting at once each wrote over the other's adoption, and two recording
+  at once could leave the lower fence, or one renamed the temporary away under the other, whose
+  write failed (`ENOENT`), or installed a file the other was still writing into. Every change a
+  client's process makes to a node file is now read, changed and written under the node files' lock
+  (`FILES.lock`, `NodeFiles::lock`), which their conversion takes too, a node's at its start among
+  them, so no two write through one temporary and none writes over a change it did not read
+  (`storage_level::record_shared`). Tests, threads standing for the processes (a file lock taken
+  through two opens of its file is two owners within a process as across processes): four issuers
+  adopted at once, all four kept, over eight rounds (without the lock, three of the four writes
+  failed in the first round); eight fences recorded at once, the highest left (without it, seven of
+  the eight failed).
+- **Names.** A store's directory names hold operations', uploads' and watches' identities in the
+  clear, as before: identifiers and labels, never a record or a hash of one (§12's names, clear by
+  design).
 
 - **Measured** (this Mac, release, under other sessions' load at a load average of 8 to 17;
   `measure_record_seal`, `measure_upload_staging`, `measure_store_conversion`): a record sealed whole,
@@ -1167,3 +1201,62 @@ node restarted; then the pending claim retried from its converted journal and co
 artifact committed once and read back exactly, the enrolled client learning the risen fence beside a
 request and converting its history and its directory's files at its next open, and no record, report
 or claim's words of either client in the clear.
+
+### 12.12 Every store at once, end to end (2026-10-26)
+
+`crates/focal-node/tests/cli_at_rest.rs` holds the whole of §12 on the real binary at once, across
+the fence (Unix-only, as the other real-binary at-rest tests: the data directories are kept private
+by their mode bits):
+
+- **Founded below the level, every store filled.** A node founded at the level below seeds its
+  checkpoints (an inline bound of 64 bytes, so a checkpoint's rows go to seeds), carries a two-party
+  cycle to its release so its family retires to the cold stream, takes claims, and backs its session
+  up in the clear. A client enrolled from a directory of its own records the cluster's fence as it
+  enrolls and claims. A claim through the node's directory is cut after its commit and before its
+  reply (`FOCAL_FAULT`), its outcome unknown. With the node down, its content store's own writer
+  lays out an upload half sent, a chunk half received from a peer and a custody record of each kind.
+  A bus group of three publishes. Below the fence every store holds what the journey wrote in the
+  clear, which the scan would find: the claims' words in the seeds and the cold stream, the clients'
+  words in their journals, the upload's, the chunk's and the records' bytes beside the objects, the
+  seeds named by their hashes, and six stores' clear forms by their magic (the node's identity and
+  network state, the client's native catalogue, journals and prepared requests, a custody receipt).
+- **The fence raised; every store converted while it serves.** The fence rises to the at-rest level
+  and the node records it. Started again, the node converts its files before it serves (§12.10) and
+  its seeds, cold stream and the files beside its objects as it serves (§12.5 to §12.7), while its
+  claims and its retired family read back at every look. The claim cut after its commit is retried
+  once from its converted journal and answered as the duplicate it is (§12.11). The enrolled client
+  learns the risen fence beside a request and converts its history and its directory's files at its
+  next open. A backup taken at the level is sealed under an operator's key file: a fresh node
+  refuses it without the key file (`backup_key_required`) and restores it with it at the source's
+  prefix (§12.8). The bus group opens its sealed files again (§12.9). The upload, the chunk and the
+  records go on from their sealed forms. The backup taken in the clear below the fence still
+  verifies, as a binary below the level may restore it.
+- **The scan.** Every file under every data directory the journey made: the node's, the client's,
+  the fresh node's, the bus group's with its root key files beside them, and the sealed backup. A
+  file §12 lists clear by design by its name (`SEAL.node`, `SEAL.root`, `STORAGE.level`, the locks,
+  the marks and markers, the key records) holds no more than a page: each is empty, a fixed
+  sentence, a wrapped key, or a level and its CRC. No other file holds a marker the journey wrote
+  (the claims' words, the enrolled client's, the pending request's, a proof's, the staged upload's
+  bytes, the received chunk's, a custody record's, a bus record's) or the magic any store's clear
+  form begins with (fifty of them, every eight-byte magic the store crates declare but the clear
+  headers of the sealed forms themselves), so a store left in the clear is found even where the
+  journey wrote no marker into it. No path names a hash the journey made that a store files under a
+  keyed name (each seed's, the artifact's, the staged upload's identity, the chunk's root, the
+  custody record's). The names that stay (traced from a run: the layout's own, identifiers and
+  labels) are §12's names, clear by design. The invitation bundle is the operator's, kept outside
+  every data directory.
+- **Under load.** `scripts/at-rest-loop.sh` runs the journey again and again with a busy loop on
+  each of two CPUs, its odd runs on one CPU and its even runs on both (`taskset`), on GitHub's Linux
+  runners (`.github/workflows/at-rest.yml`, nightly and on any `at-rest-loop/*` branch). Twenty
+  runs on an `ubuntu-24.04` runner (four vCPUs) all passed, each in 25 to 28 s, on one CPU and on
+  two alike: the journey waits on its own steps in turn (a process started, a node ready, a
+  request answered), each of which the busy loops slow alike. The scan first read every file once
+  for each marker, which held each run at 377 to 383 s on one CPU and on two (the search ran at half
+  of one CPU either way); it reads each file once and searches every marker together now.
+- **Found on the way.** §12.11's open defect, two commands of one client adopting an issuer at
+  once through one temporary, closed with the race beside it, two recording the fence at once
+  (§12.11's last finding).
+
+Measured: the journey takes 25 s on this Mac (debug, under other sessions' load) and 23 s on fedora
+on two CPUs of its own; on the same two CPUs with a busy loop on each, 33 s, and on one of them
+with a busy loop, 36 s.

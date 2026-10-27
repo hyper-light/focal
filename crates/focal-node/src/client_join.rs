@@ -191,7 +191,14 @@ pub fn adopt_issuer(
         }
         None => focal_enrollment::IssuerRecord::of(&adopted.anchor, None)?,
     };
-    let mut issuers = adopted_issuers(keys, directory)?;
+    let (files, name) = adopted_file(keys, directory)?;
+    // Read, changed and written under the node files' lock: two commands of one client adopting at
+    // once each wrote over the other's adoption, through one temporary.
+    let _lock = files.lock()?;
+    let mut issuers = match files.read(&name, MAX_ADOPTED_BYTES)? {
+        Some(bytes) => decode_adopted(&bytes)?,
+        None => Vec::new(),
+    };
     if issuers
         .iter()
         .any(|known| known.fingerprint == record.fingerprint)
@@ -209,7 +216,6 @@ pub fn adopt_issuer(
     let mut bytes = ADOPTED_MAGIC.to_vec();
     bytes.extend_from_slice(blake3::hash(&payload).as_bytes());
     bytes.extend_from_slice(&payload);
-    let (files, name) = adopted_file(keys, directory)?;
     files.write(&name, &bytes)?;
     Ok(true)
 }
