@@ -112,6 +112,11 @@ jobs:
           {
             df -h /var/lib/docker || df -h /
             lsblk -o NAME,ROTA,SIZE,MODEL || true
+            # The processor the runs share: hosted runners come with different ones, whose cost a
+            # write differs by half again (focal's work mode, 2026-10-27), so a run is read beside
+            # its processor.
+            grep -m1 'model name' /proc/cpuinfo || true
+            nproc || true
             # 500 synchronous 4 KiB writes: whether fsync reaches the device
             # here; then three writers at once, as a system's three nodes are.
             echo "one writer:"

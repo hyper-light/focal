@@ -153,6 +153,11 @@ jobs:
             echo "B ${{ github.sha }}"
             df -h /var/lib/docker || df -h /
             lsblk -o NAME,ROTA,SIZE,MODEL || true
+            # The processor the runs share: hosted runners come with different ones, whose cost a
+            # write differs by half again (focal's work mode, 2026-10-27), so a run is read beside
+            # its processor.
+            grep -m1 'model name' /proc/cpuinfo || true
+            nproc || true
             echo "one writer:"
             dd if=/dev/zero of=/tmp/dsync bs=4k count=500 oflag=dsync 2>&1 | tail -1
           } | tee tools/compare/compose/reports/disk.txt
