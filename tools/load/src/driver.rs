@@ -1063,12 +1063,80 @@ impl Shared<'_> {
             };
             let lin = self.diag_linearizable(actor, operation).await;
             let lin_at = self.run_start.elapsed().as_millis();
+            let claim = objects.iter().find_map(|object| match object {
+                NativeObject::Claim(claim) => Some(u128::from_be_bytes(claim.binding.object.0)),
+                _ => None,
+            });
+            let history = match claim {
+                Some(claim) => self.diag_history(actor, claim).await,
+                None => "no claim".into(),
+            };
             eprintln!(
-                "DIAGS i={i} seen={} read_at={read_at} refused_at={refused_at} lin_at={lin_at} orig=[{described}] again=[{again}] lin=[{lin}]",
+                "DIAGS i={i} seen={} read_at={read_at} refused_at={refused_at} lin_at={lin_at} orig=[{described}] again=[{again}] lin=[{lin}] history=[{history}]",
                 written.0
             );
         }
         Ok(result)
+    }
+    /// diag (not for merge): `claim`'s history and evaluations, linearizable, described.
+    async fn diag_history(&self, actor: &Actor<'_>, claim: u128) -> String {
+        let Ok(request) = self.protocol_request(actor) else {
+            return "request".into();
+        };
+        let envelope = RequestEnvelope {
+            protocol: focal_wire::NATIVE_PROTOCOL_VERSION,
+            ledger: self.job.names.ledger,
+            route_epoch: RouteEpoch(1),
+            request_epoch: RequestEpoch(1),
+            request_id: RequestId::from_u128(request),
+            operation: Operation::NativeRead(NativeReadRequest {
+                consistency: ReadConsistency::Linearizable,
+                query: NativeReadQuery::Claim {
+                    id: ClaimId::from_u128(claim),
+                    expand: NativeClaimExpand {
+                        history: true,
+                        evaluations: true,
+                        ..NativeClaimExpand::default()
+                    },
+                    after: None,
+                },
+                max_items: LIFECYCLE_SELECTION_ITEMS,
+            }),
+        };
+        match actor.conn.request(envelope).await {
+            Ok(envelope) => match envelope.result {
+                Response::NativeRead(page) => {
+                    let mut described =
+                        format!("t{}/n{}:", page.token.sequence.0, page.native_sequence.0);
+                    for object in &page.objects {
+                        match object {
+                            NativeObject::Event(event) => {
+                                let fact: String =
+                                    format!("{:?}", event.fact).chars().take(240).collect();
+                                described.push_str(&format!(
+                                    " {}.{} {fact}|",
+                                    event.sequence.0, event.ordinal
+                                ));
+                            }
+                            NativeObject::Evaluation(evaluation) => described.push_str(&format!(
+                                " E r{} {:?} b{}|",
+                                evaluation.binding.revision.0,
+                                evaluation.state,
+                                evaluation.has_begun
+                            )),
+                            NativeObject::Claim(claim) => described.push_str(&format!(
+                                " C r{} {:?}|",
+                                claim.binding.revision.0, claim.status
+                            )),
+                            _ => described.push_str(" other|"),
+                        }
+                    }
+                    described
+                }
+                other => format!("reply {other:?}"),
+            },
+            Err(error) => format!("client {error}"),
+        }
     }
     /// diag (not for merge): `operation`'s reads linearizable, described.
     async fn diag_linearizable(
