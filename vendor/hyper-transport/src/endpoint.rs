@@ -686,6 +686,10 @@ struct Core<C: Classes, B, D> {
     /// What the connections' own state is charged, learned from what the owner observes the
     /// endpoint's work holds (docs/transport.md §4x).
     state: StateAccount,
+    /// DIAG (not for merge): the connections gone, summed; the dump's clock and call count.
+    diag_gone: [u64; DIAG_N],
+    diag_at: Option<std::time::Instant>,
+    diag_calls: u64,
 }
 
 /// The attempts an endpoint refused (its places taken, or a bound it holds), each by its client's
@@ -946,6 +950,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                     ..Refused::default()
                 },
                 state: StateAccount::new(state_charge::<C>(&limits)),
+                diag_gone: [0; DIAG_N],
+                diag_at: None,
+                diag_calls: 0,
             },
             receive: Receive::new(limits.receive_chunks),
             scratch: Vec::new(),
@@ -1320,6 +1327,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     /// documentation): an exchange's slot, a peer's entry, or a seat of a lane's window, and a
     /// lane paused for want of one is read again.
     pub fn poll_event(&mut self) -> Option<Event<C>> {
+        self.diag_dump();
         let Waiting { event, lane } = self.core.events.pop_front()?;
         match event {
             Event::Request { exchange, .. }
@@ -2960,6 +2968,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
 
     /// The connection drained: what it held goes back.
     fn gone(&mut self, key: usize, mut conn: Box<Conn<C::Role>>) {
+        diag_add(&mut self.diag_gone, &conn.quic.stats());
         self.lost(key, &mut conn);
         if conn.listed {
             let serial = conn.serial;
@@ -4896,5 +4905,83 @@ fn priority<C: Classes>(rank: u8) -> i32 {
 fn bind_stream(by_stream: &mut Vec<(StreamId, u64)>, stream: StreamId, id: u64) {
     if let Err(at) = by_stream.binary_search_by_key(&stream, |(held, _)| *held) {
         by_stream.insert(at, (stream, id));
+    }
+}
+
+// DIAG (not for merge): each endpoint's datagrams and frames, every connection it held summed,
+// written to stderr every five seconds when FOCAL_DIAG_TRAFFIC is set.
+const DIAG_N: usize = 54;
+const DIAG_NAMES: [&str; DIAG_N] = [
+    "tx_dg", "tx_bytes", "tx_ios", "rx_dg", "rx_bytes", "rx_ios", "sent_pkts", "lost_pkts",
+    "warm_pkts", "mtu_probes", "spurious", "warm_bytes", "_12", "_13",
+    "tx_ack", "tx_stream", "tx_msb", "tx_msu", "tx_msd", "tx_md", "tx_ping", "tx_ncid", "tx_rcid",
+    "tx_imm", "tx_af", "tx_crypto", "tx_close", "tx_sdb", "tx_sbb", "tx_db", "tx_rs", "tx_ss",
+    "tx_dgram", "tx_token",
+    "rx_ack", "rx_stream", "rx_msb", "rx_msu", "rx_msd", "rx_md", "rx_ping", "rx_ncid", "rx_rcid",
+    "rx_imm", "rx_af", "rx_crypto", "rx_close", "rx_sdb", "rx_sbb", "rx_db", "rx_rs", "rx_ss",
+    "rx_dgram", "rx_token",
+];
+fn diag_frames(f: &hyper_quic::FrameStats) -> [u64; 20] {
+    [
+        f.acks, f.stream, f.max_streams_bidi, f.max_streams_uni, f.max_stream_data, f.max_data,
+        f.ping, f.new_connection_id, f.retire_connection_id, f.immediate_ack, f.ack_frequency,
+        f.crypto, f.connection_close, f.stream_data_blocked, f.streams_blocked_bidi,
+        f.data_blocked, f.reset_stream, f.stop_sending, f.datagram, f.new_token,
+    ]
+}
+fn diag_add(sum: &mut [u64; DIAG_N], s: &hyper_quic::ConnectionStats) {
+    let mut v = [0u64; DIAG_N];
+    let head = [
+        s.udp_tx.datagrams, s.udp_tx.bytes, s.udp_tx.ios, s.udp_rx.datagrams, s.udp_rx.bytes,
+        s.udp_rx.ios, s.path.sent_packets, s.path.lost_packets, s.path.sent_warm_up_packets,
+        s.path.sent_plpmtud_probes, s.path.spurious_losses, s.path.sent_warm_up_bytes, 0, 0,
+    ];
+    v[..14].copy_from_slice(&head);
+    v[14..34].copy_from_slice(&diag_frames(&s.frame_tx));
+    v[34..54].copy_from_slice(&diag_frames(&s.frame_rx));
+    for (a, b) in sum.iter_mut().zip(v) {
+        *a = a.saturating_add(b);
+    }
+}
+impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, B, D> {
+    fn diag_dump(&mut self) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("FOCAL_DIAG_TRAFFIC").is_some()) {
+            return;
+        }
+        self.core.diag_calls = self.core.diag_calls.wrapping_add(1);
+        if self.core.diag_calls % 64 != 0 {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .core
+            .diag_at
+            .is_some_and(|at| now.duration_since(at) < std::time::Duration::from_secs(5))
+        {
+            return;
+        }
+        self.core.diag_at = Some(now);
+        let mut sum = self.core.diag_gone;
+        let mut live = 0u64;
+        for conn in self.conns.iter().flatten() {
+            diag_add(&mut sum, &conn.quic.stats());
+            live += 1;
+        }
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let mut line = format!(
+            "DIAGT {epoch} ep={:p} live={live} exchanges={}",
+            self as *const Self,
+            self.core.exchanges.len()
+        );
+        for (name, v) in DIAG_NAMES.iter().zip(sum) {
+            if v > 0 {
+                line.push_str(&format!(" {name}={v}"));
+            }
+        }
+        eprintln!("{line}");
     }
 }
