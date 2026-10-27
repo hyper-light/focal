@@ -17367,3 +17367,21 @@ directory (29 §2, §12.8).
   | Bus image (6.2 KB) | 8.43 / 8.46 ms, within noise |
   | Node file (1 MiB, its bound) | 9.75 / 8.39 ms |
   | Client upload stage (64 KiB) | 13.73 / 13.71 ms, +0.6% |
+
+### 2026-10-26 — The listener's full-lane test keeps its lane full against what the endpoint gives back
+
+`tests/network_listener.rs`' `one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data`
+fills the ordinary lane and expects a participant's dial and body refused there. It failed on macOS
+CI twice (b6cf8e33, 7a381f1f) and in 12 of about 180 runs on a loaded Linux host, two ways, each
+the endpoint giving back after the fill what funded what the lane was to refuse; traced with each
+grant and each budget reservation logged. A connection closed before the fill keeps its window's
+grant while it drains (RFC 9000 §10.2) and gives it back only as the endpoint drops it: four
+dials were admitted into exactly one connection's grant (14,268 and 11,440 bytes) given back after
+the fill, which the test's settled check, counting the grant as held, could not see. And the
+receive ring, which the test brought to its least before filling with a pass count of its size
+squared, stays grown under load, a drain taking more than one message (eight runs). Now
+focal-wire's `AdmissionStats::held` counts the connections the endpoint holds in any state, and
+the test fills only once none is closed; then it fills first and brings the ring to its least
+with the lane full, where nothing can grow (a growth is reserved first) and each release is filled
+again behind, the drive charged to the ring's shrinks. 300 of 300 runs passed on the same loaded
+host, on two CPUs beside a busy loop on each.

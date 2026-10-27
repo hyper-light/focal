@@ -602,8 +602,14 @@ fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() {
         // Its handshake's own reservations go back once it has ended, after the
         // connection is up: filled before, the lane had room again for the dial
         // below (Linux CI, bus-replicated 7a79f0d7: the dial refused at a full
-        // lane was admitted). Filled once the listener holds the two
-        // connections and nothing pending.
+        // lane was admitted). And a connection closed before keeps its window's
+        // grant while it drains (RFC 9000 §10.2), given back only as the
+        // endpoint drops it: given back after a fill, it funded the dial below
+        // (macOS CI on b6cf8e33 and 7a381f1f, 4 of 180 runs on a loaded Linux
+        // host, each admitting the dial into exactly one connection's grant,
+        // 14,268 and 11,440 bytes, a closed connection gave back after the
+        // fill). Filled once the listener holds the two connections, nothing
+        // pending and nothing closed.
         let joined = listener.admission().await.changes;
         owners::counted_async(
             async || vec![listener.admission().await.changes],
@@ -614,6 +620,7 @@ fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() {
                     let admission = listener.admission().await;
                     if admission.pending == 0
                         && admission.connections == 2
+                        && admission.held == admission.connections
                         && network_budget.stats().used == listener_residency + admission.bytes
                     {
                         break;
@@ -644,29 +651,40 @@ fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() {
                 None => *pressure = Some(more),
             }
         };
-        // The listener's receive ring at its least before the lane is filled. What the ring grew
-        // by is the endpoint's own, charged to this lane as it grew, and given back as quiet
-        // drains shrink it (hyper-raft docs/transport.md §4aa): given back after a fill, it funded
-        // what the full lane was to refuse, a dial or a participant's body (Linux CI on
-        // compare/work-wait 35a2e5c0; 7 of 40 runs on a loaded Linux host, each with the ring
-        // shrunk between the fill and the refused request). Once the lane is full, the ring cannot
-        // grow again: a growth is reserved first. The node's requests, funded from the
-        // completion reserve, are the drains that shrink it: a ring of `n` buffers shrinks to the
-        // most any of `n` drains wanted, each request one drain at least, so each pass of `n`
-        // requests that leaves it grown has shrunk it by one buffer at least.
+        // The lane is filled, then the listener's receive ring brought to its least with the lane
+        // kept full. What the ring grew by is the endpoint's own, charged to this lane as it grew,
+        // and given back as quiet drains shrink it (hyper-raft docs/transport.md §4aa): given back
+        // after a fill, it funded what the full lane was to refuse, a dial or a participant's body
+        // (Linux CI on compare/work-wait 35a2e5c0; 7 of 40 runs on a loaded Linux host, each with
+        // the ring shrunk between the fill and the refused request). At a full lane the ring cannot
+        // grow (a growth is reserved first), so it only shrinks. The node's requests, funded from
+        // the completion reserve and served at the full lane, are the drains that shrink it: a ring
+        // of `n` buffers shrinks to the most any of a spell of `n` drains wanted, each request a
+        // drain at least; under load a drain takes more than one message and the spell begins
+        // again (5 of 78 runs on a loaded Linux host found the ring grown after a pass count of its
+        // size squared), so the drive is charged to the ring's shrinks, each of which the lane is
+        // filled again behind, and ends with the ring at its least.
+        let mut pressure = None;
+        fill(&mut pressure);
         let grown = listener.admission().await;
-        for _ in 0..grown.ring_buffers.saturating_mul(grown.ring_buffers.max(1)) {
-            if listener.admission().await.ring_charged == 0 {
-                break;
-            }
-            assert!(matches!(
-                remote.request(&discovery()).await.unwrap().result,
-                Response::Control { .. }
-            ));
-        }
+        owners::counted_async(
+            async || vec![listener.admission().await.ring_shrunk],
+            u64::try_from(grown.ring_buffers).unwrap(),
+            Duration::from_millis(5),
+            async {
+                while listener.admission().await.ring_charged > 0 {
+                    assert!(matches!(
+                        remote.request(&discovery()).await.unwrap().result,
+                        Response::Control { .. }
+                    ));
+                    fill(&mut pressure);
+                }
+            },
+        )
+        .await
+        .unwrap();
         let quiet = listener.admission().await;
         assert_eq!(quiet.ring_charged, 0, "the ring at its least: {quiet:?}");
-        let mut pressure = None;
         fill(&mut pressure);
         // The ordinary lane is full: no connection is admitted (a dial of its
         // own, as the route's is held and shared), and a participant's body is
@@ -694,9 +712,10 @@ fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() {
                 loop {
                     let admission = listener.admission().await;
                     // The refused dial gone whole: no handshake pending, the
-                    // listener back to its two connections.
+                    // listener back to its two connections, and none closed.
                     if admission.pending == 0
                         && admission.connections == 2
+                        && admission.held == admission.connections
                         && network_budget.stats().used
                             == listener_residency + admission.bytes + held
                     {

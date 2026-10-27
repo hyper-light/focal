@@ -96,6 +96,11 @@ pub struct AdmissionStats {
     pub pending: usize,
     pub identities: usize,
     pub connections: usize,
+    /// Connections the endpoint holds in any state: those admitted, those being handshaken, and
+    /// those closed and still draining (RFC 9000 §10.2), each of which keeps its receive window's
+    /// grant until the endpoint drops it as its draining ends. More than `connections` and
+    /// `pending` together while any closed one drains.
+    pub held: usize,
     /// Bytes the listener holds of its budget: request bodies being read, its connections'
     /// receive windows, and the pool its datagrams are received into.
     pub bytes: usize,
@@ -173,6 +178,7 @@ impl AdmissionStats {
             pending: admission.pending,
             identities: admission.identities,
             connections: admission.connections,
+            held: stats.endpoint.connections,
             bytes,
             pooled: stats
                 .endpoint
