@@ -60,6 +60,18 @@ impl CustodyReceipt {
         receipt.attestation = attest(&encoded);
         receipt
     }
+    /// Whether `other` records the same fact as this receipt: the same copy's verification of the
+    /// same object under the same scope (its route epoch and policy revision). Only when each was
+    /// recorded may differ, which nothing reads.
+    pub fn same_fact(&self, other: &Self) -> bool {
+        self.ledger == other.ledger
+            && self.domain == other.domain
+            && self.root == other.root
+            && self.length == other.length
+            && self.node == other.node
+            && self.route_epoch == other.route_epoch
+            && self.policy_revision == other.policy_revision
+    }
     /// The record name a receipt is stored under.
     pub fn name(ledger: LedgerId, root: ContentHash, node: u64) -> ContentHash {
         let mut hasher = blake3::Hasher::new_derive_key("focal.custody.receipt.name.v1");
@@ -152,12 +164,21 @@ fn attest(encoded: &[u8; RECEIPT_BYTES]) -> ContentHash {
 }
 
 impl ContentStore {
-    /// Keep one copy's receipt; the same receipt again is idempotent and a
-    /// different one for the same copy replaces it (the newer scope).
+    /// Keep one copy's receipt; the same fact again is idempotent and a
+    /// different one for the same copy replaces it (the newer scope). A
+    /// receipt of the fact held, recorded again (an object's copies are asked
+    /// for every artifact that names it), writes nothing: it differs only in
+    /// when it was recorded. One the store cannot read is the replace's to
+    /// judge, as it was.
     pub fn record_custody_receipt(
         &mut self,
         receipt: &CustodyReceipt,
     ) -> Result<(), crate::ContentError> {
+        if let Ok(Some(held)) = self.custody_receipt(receipt.ledger, receipt.root, receipt.node)
+            && held.same_fact(receipt)
+        {
+            return Ok(());
+        }
         let name = CustodyReceipt::name(receipt.ledger, receipt.root, receipt.node);
         self.replace_named_custody_record(CustodyRecordKind::Receipt, name, &receipt.encode())
     }
@@ -253,6 +274,27 @@ mod tests {
             );
             store.record_custody_receipt(&first).unwrap();
             store.record_custody_receipt(&first).unwrap();
+            assert_eq!(
+                store.custody_receipt(first.ledger, first.root, 2).unwrap(),
+                Some(first)
+            );
+            // The same fact recorded later writes nothing: the held receipt stays, byte for byte.
+            let name = CustodyReceipt::name(first.ledger, first.root, 2);
+            let path = store.record_path(crate::CustodyRecordKind::Receipt, name);
+            let before = std::fs::read(&path).unwrap();
+            let later = CustodyReceipt::new(
+                first.ledger,
+                first.domain,
+                first.root,
+                first.length,
+                2,
+                first.route_epoch,
+                first.policy_revision,
+                first.recorded_at + 1_000,
+            );
+            assert!(later.same_fact(&first) && later != first);
+            store.record_custody_receipt(&later).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), before);
             assert_eq!(
                 store.custody_receipt(first.ledger, first.root, 2).unwrap(),
                 Some(first)
