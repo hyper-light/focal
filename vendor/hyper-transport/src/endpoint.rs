@@ -215,8 +215,13 @@ impl Limits {
             .send_window(self.window_ceiling)
             .max_idle_timeout(Some(idle))
             .keep_alive_interval(self.keep_alive)
-            .congestion(congestion.clone())
-            .decimate_acks();
+            .congestion(congestion.clone());
+        // DIAG (not for merge): every peer asked to acknowledge within RFC 9000 §18.2's default
+        // max_ack_delay, 25 ms, so a reply sent sooner carries its request's acknowledgement.
+        // The reordering threshold is RFC 9002 §6.1.1's kPacketThreshold, the config's default.
+        let mut frequency = hyper_quic::AckFrequencyConfig::decimation(3);
+        frequency.max_ack_delay(Some(std::time::Duration::from_millis(25)));
+        transport.ack_frequency_config(Some(frequency));
         // MTU discovery searches up to what the peer takes and the path carries, as the path's
         // socket tells it (`Endpoint::set_path_ceiling`), not to quinn's 1,452-byte default: a
         // jumbo-frame path carried 8,954-byte datagrams, and a bus node at a million messages a
