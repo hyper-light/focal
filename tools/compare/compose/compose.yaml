@@ -55,6 +55,8 @@ x-focal: &focal
   # diag: every node is sampled by perf while a run is under way (run.sh).
   cap_add: [NET_ADMIN, SYS_ADMIN, SYS_PTRACE, PERFMON]
   security_opt: ["seccomp:unconfined"]
+  # diag: each endpoint's datagrams and frames on stderr every five seconds.
+  environment: { FOCAL_DIAG_TRAFFIC: "1" }
 
 services:
   nats1: { <<: *nats, environment: { NAME: nats1, SYNC: "${NATS_SYNC:-2m}" }, ports: ["14221:4222"] }
