@@ -210,11 +210,9 @@ pub fn endpoint_limits(
 /// default (compare CI runs 40455697570 and 40458612631). A node's connector carries a group's
 /// replication, a stream whose congestion control waits on its acknowledgements: decimated.
 fn acknowledgement(serving: bool, role: Sender) -> hyper_transport::Acknowledgement {
-    if serving || role != Sender::Node {
-        hyper_transport::Acknowledgement::Replies
-    } else {
-        hyper_transport::Acknowledgement::Decimated
-    }
+    // diag (not for merge): every endpoint decimated, as before Acknowledgement::Replies.
+    let _ = (serving, role);
+    hyper_transport::Acknowledgement::Decimated
 }
 
 /// What an endpoint under `limits` and `admission` holds of its budget at most, bytes, in two
