@@ -119,7 +119,28 @@ pub struct Limits {
     /// taken: a rule that tracks a count, which an owner deriving its places from its memory
     /// would make tens of thousands, the crypto of every one done before the first Retry.
     pub retry_bytes: Option<u64>,
+    /// How the endpoint's connections ask their peers to acknowledge what they send.
+    pub acknowledgement: Acknowledgement,
 }
+
+/// How a connection asks its peer to acknowledge its packets, through the acknowledgement
+/// frequency extension every peer takes (draft-ietf-quic-ack-frequency; docs/transport.md §4ak).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Acknowledgement {
+    /// An ACK for every 10 ack-eliciting packets or a quarter of the smoothed round trip after the
+    /// first one waiting, from the 100th packet on, as Google QUIC's receivers do (§4k): for a
+    /// stream of data whose sender's congestion control waits on its acknowledgements.
+    Decimated,
+    /// An ACK for every 10 ack-eliciting packets or within RFC 9000's default max_ack_delay
+    /// ([`REPLY_ACK_DELAY`]), whichever comes first: for requests a reply answers, the reply
+    /// carrying the request's acknowledgement where it goes sooner, so none goes alone.
+    Replies,
+}
+
+/// RFC 9000 §18.2's default max_ack_delay: "If this value is absent, a default of 25 milliseconds
+/// is assumed." What an endpoint whose packets replies answer ([`Acknowledgement::Replies`]) asks
+/// its peer to acknowledge within.
+pub const REPLY_ACK_DELAY: Duration = Duration::from_millis(25);
 
 /// How connections are given the exchanges their peers may open at once (QUIC's bidirectional
 /// stream credit, RFC 9000 §4.6; docs/transport.md §4g).
@@ -215,8 +236,11 @@ impl Limits {
             .send_window(self.window_ceiling)
             .max_idle_timeout(Some(idle))
             .keep_alive_interval(self.keep_alive)
-            .congestion(congestion.clone())
-            .decimate_acks();
+            .congestion(congestion.clone());
+        match self.acknowledgement {
+            Acknowledgement::Decimated => transport.decimate_acks(),
+            Acknowledgement::Replies => transport.decimate_acks_within(REPLY_ACK_DELAY),
+        };
         // MTU discovery searches up to what the peer takes and the path carries, as the path's
         // socket tells it (`Endpoint::set_path_ceiling`), not to quinn's 1,452-byte default: a
         // jumbo-frame path carried 8,954-byte datagrams, and a bus node at a million messages a
@@ -2836,7 +2860,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                     .join(&mut conn.share, initial, conn.key, conn.serial);
                 if self
                     .pool
-                    .welcome(&mut conn.share, self.limits.streams_per_connection)
+                    .welcome(
+                        &mut conn.share,
+                        self.limits.streams_per_connection,
+                        conn.key,
+                        conn.serial,
+                    )
                     .is_some()
                 {
                     conn.quic

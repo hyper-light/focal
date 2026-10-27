@@ -21,4 +21,7 @@ pub enum Mutant {
     /// The fast track counts a fast quorum of the configuration in force alone, not of every one a
     /// member of the term may count by (the second rule, seed 54104).
     FastAnyConfiguration,
+    /// A leader commits what its own durable log holds, before a quorum's logs hold it: a
+    /// persisted acknowledgement before a quorum's flush (Quiver's simulation, CP-T2.2 step 6).
+    OwnLogCommit,
 }

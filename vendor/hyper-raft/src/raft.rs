@@ -2026,7 +2026,12 @@ impl<S: Storage> Raft<S> {
     }
     /// Commits what the quorum holds, if it is of this term: whether the commit moved.
     fn commit(&mut self) -> Result<bool> {
-        let index = self.tracker.quorum_index();
+        let mut index = self.tracker.quorum_index();
+        if self.planted(crate::Mutant::OwnLogCommit)
+            && let Some(own) = self.tracker.get(self.id)
+        {
+            index = index.max(own.matched);
+        }
         let term = if self.planted(crate::Mutant::OlderTermCommit) {
             self.log.term(index).unwrap_or(self.term)
         } else {

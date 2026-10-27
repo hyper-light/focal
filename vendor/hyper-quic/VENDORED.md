@@ -1636,3 +1636,22 @@ never over a 100 ms round trip with a server that answers; never on the server; 
 after a packet lost by time left nothing in flight (without the quiescence stop it told one four
 probe timeouts after the lost packet's send, `(1, 0)`, found by
 `a_retired_cid_routes_for_three_probe_timeouts`, whose drive the running timer kept from idling).
+
+## 46. Decimated acknowledgements within a stated delay (2026-10-27, found by focal)
+
+`config/transport.rs`: `TransportConfig::decimate_acks_within(max_ack_delay)` asks the peer to
+acknowledge as `decimate_acks` does (§33: an ACK for every 10 ack-eliciting packets
+from the 100th packet on, its reordering threshold the loss detector's packet threshold), but within
+`max_ack_delay` rather than a quarter of the smoothed round trip, the `AckFrequencyConfig` request
+clamped as any fixed request is (the peer's `min_ack_delay` below, the greater of the round trip and
+25 ms above). A quarter of a round trip shorter than 4 ms is the peer's 1 ms granularity, so a
+request whose reply came later than that was acknowledged alone ahead of its reply: focal's work
+mode took about 3.5 acknowledgement-only packets a write from its leader at 50 claims a second.
+draft-ietf-quic-ack-frequency-14 §2 names the cost ("Sending UDP datagrams is very CPU intensive on
+some platforms. A data receiver can decrease its CPU usage by reducing the number of
+acknowledgement-only packets sent"), and leaves the sender its choice of delay (§8, "Implementers
+can select an appropriate strategy to meet the needs of their applications"). Test:
+`tests::decimated_acks_within_a_delay_wait_that_delay_and_every_tenth_packet_no_longer` (a ping alone
+waits the 25 ms asked on a 1 ms round trip, where decimation acknowledged it at 1 ms; the tenth
+packet is acknowledged at once).
+

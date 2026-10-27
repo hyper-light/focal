@@ -196,6 +196,10 @@ fn limits(identities: usize, lanes: u32) -> Result<Limits, BusError> {
         // Every seat's handshake may be under way at once, the places the seats: the rule of half
         // of them holds.
         retry_bytes: None,
+        // A part's publishes and deliveries are streams whose congestion control waits on their
+        // acknowledgements, as decimation was measured on (hyper-raft docs/transport.md §4k: a
+        // node's acknowledgements fell from 0.50 to 0.14 a message at 100,000 a second).
+        acknowledgement: hyper_transport::Acknowledgement::Decimated,
     })
 }
 

@@ -496,6 +496,14 @@ impl<L: LogStore, M: StateMachine, B: Budget> Replica<L, M, B> {
         Ok(replica)
     }
 
+    /// Plants `mutant` in the replica's core, or takes the one planted out: a defect a test build
+    /// shows its checks catch (`hyper_raft::Mutant`; the `mutants` feature, which no consumer
+    /// enables).
+    #[cfg(feature = "mutants")]
+    pub fn plant(&mut self, mutant: Option<hyper_raft::Mutant>) {
+        self.node.plant(mutant);
+    }
+
     /// This member.
     pub fn id(&self) -> u64 {
         self.node.raft.id()

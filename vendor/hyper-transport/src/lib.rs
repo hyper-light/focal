@@ -62,8 +62,8 @@ pub use credit::{
     socket_buffer_ask, stream_window_ceiling,
 };
 pub use endpoint::{
-    AskQueue, Config, Endpoint, Limits, PathFacts, Stats, StreamCredit, connection_charge,
-    state_charge,
+    Acknowledgement, AskQueue, Config, Endpoint, Limits, PathFacts, REPLY_ACK_DELAY, Stats,
+    StreamCredit, connection_charge, state_charge,
 };
 pub use error::Refusal;
 pub use frame::Embedded;

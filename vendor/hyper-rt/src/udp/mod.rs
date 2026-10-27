@@ -137,12 +137,13 @@ fn on_sim() -> bool {
 
 impl UdpSocket {
     /// Binds a non-blocking UDP socket to `addr` (use port 0 for an OS-assigned port, then
-    /// [`UdpSocket::local_addr`]). On the simulation runtime the requested address is ignored and a
-    /// fabric port is assigned.
+    /// [`UdpSocket::local_addr`]). On the simulation runtime a port of the shard's own range asked for
+    /// by number is taken if free (refused if bound), and any other request is given the next free
+    /// fabric port.
     pub fn bind(addr: impl Into<SocketAddr>) -> Result<UdpSocket, RtError> {
         let addr = addr.into();
         if on_sim() {
-            let (index, port) = crate::sim::sim_bind()?;
+            let (index, port) = crate::sim::sim_bind(addr.port())?;
             return Ok(UdpSocket::of(Inner::Sim { index, port }));
         }
         let socket = netsys::dgram_socket(Family::of(addr))?;

@@ -294,6 +294,20 @@ impl TransportConfig {
         self
     }
 
+    /// Asks the peer to acknowledge as [`decimate_acks`](Self::decimate_acks) does, an ACK for
+    /// every 10 ack-eliciting packets from the 100th packet on, but within `max_ack_delay` rather
+    /// than a quarter of the smoothed round trip: for packets a reply answers, so the
+    /// acknowledgement a reply sent sooner carries goes in it, where a quarter of a short round
+    /// trip sent it alone ahead of the reply (VENDORED.md §46). Never below the peer's
+    /// `min_ack_delay`, nor past the greater of the round trip and 25 ms
+    /// ([`AckFrequencyConfig::max_ack_delay`]).
+    pub fn decimate_acks_within(&mut self, max_ack_delay: Duration) -> &mut Self {
+        let mut config = AckFrequencyConfig::decimation(self.packet_threshold);
+        config.max_ack_delay(Some(max_ack_delay));
+        self.ack_frequency_config = Some(config);
+        self
+    }
+
     /// Number of consecutive PTOs after which network is considered to be experiencing persistent congestion.
     pub fn persistent_congestion_threshold(&mut self, value: u32) -> &mut Self {
         self.persistent_congestion_threshold = value;

@@ -4499,6 +4499,61 @@ fn decimated_acks_come_from_the_hundredth_packet_every_tenth_or_a_quarter_round_
     assert_eq!(server_acks_by(&mut pair, server_ch, latency), 1);
 }
 
+/// Decimation within a stated delay (`TransportConfig::decimate_acks_within`, VENDORED.md §46): from
+/// the 100th packet on, a packet alone waits the delay asked for its ACK, here 25 ms on a 1 ms
+/// round trip where a quarter of it would have been the peer's 1 ms granularity, and the tenth
+/// ack-eliciting packet is still acknowledged at once.
+#[test]
+fn decimated_acks_within_a_delay_wait_that_delay_and_every_tenth_packet_no_longer() {
+    let _guard = subscribe();
+    let mut client_config = client_config_with_deterministic_pns();
+    client_config
+        .transport
+        .decimate_acks_within(Duration::from_millis(25))
+        .mtu_discovery_config(None);
+    let mut pair = Pair::deterministic_pns(endpoint_config_without_warm_up());
+    let latency = Duration::from_micros(500);
+    pair.latency = latency;
+    let (client_ch, server_ch) = pair.connect_with(client_config);
+    pair.drive();
+    for _ in 0..100 {
+        pair.client_conn_mut(client_ch).ping();
+        pair.drive_client();
+    }
+    pair.drive();
+    assert_eq!(
+        pair.server_conn_mut(server_ch)
+            .stats()
+            .frame_rx
+            .ack_frequency,
+        1
+    );
+
+    // A ping alone waits the 25 ms asked for its ACK, past a quarter of the round trip and past
+    // the granularity
+    pair.client_conn_mut(client_ch).ping();
+    pair.drive_client();
+    assert_eq!(server_acks_by(&mut pair, server_ch, latency), 0);
+    assert_eq!(
+        server_acks_by(&mut pair, server_ch, Duration::from_millis(23)),
+        0
+    );
+    assert_eq!(
+        server_acks_by(&mut pair, server_ch, Duration::from_millis(2)),
+        1
+    );
+
+    // Nine pings wait; the tenth is acknowledged at once, with the nine
+    for _ in 0..9 {
+        pair.client_conn_mut(client_ch).ping();
+        pair.drive_client();
+    }
+    assert_eq!(server_acks_by(&mut pair, server_ch, latency), 0);
+    pair.client_conn_mut(client_ch).ping();
+    pair.drive_client();
+    assert_eq!(server_acks_by(&mut pair, server_ch, latency), 1);
+}
+
 fn stream_chunks(mut recv: RecvStream) -> Vec<u8> {
     let mut buf = Vec::new();
 

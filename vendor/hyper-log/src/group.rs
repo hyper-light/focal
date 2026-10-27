@@ -690,6 +690,7 @@ impl<F: BlockFile + 'static> GroupLog<F> {
             high,
             page,
             into,
+            waits: true,
         };
         match self.ask(query)? {
             Answer::Entries(f) => Ok(f),

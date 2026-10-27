@@ -33,6 +33,6 @@
 mod driver;
 mod plane;
 
-pub use driver::{Driver, RingStats, Rooms, TURNS, least_bytes};
+pub use driver::{Driver, RingStats, Rooms, TURNS, least_bytes, shard_instant};
 pub use hyper_rt::udp::{Arrival, Io, IoStats, MAX_BATCH, RECEIVE_BYTES};
 pub use plane::PlaneSocket;

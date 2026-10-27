@@ -193,7 +193,28 @@ pub fn endpoint_limits(
         max_responses: hyper_rt_transport::TURNS.saturating_mul(IO_BATCH),
         receive_chunks,
         retry_bytes: admission.retry_bytes,
+        // An endpoint's driver chooses how its connections ask to be acknowledged, from what it
+        // serves and sends as (`acknowledgement`); its budget is the same either way.
+        acknowledgement: hyper_transport::Acknowledgement::Decimated,
     })
+}
+
+/// How an endpoint's connections ask their peers to acknowledge what they send (hyper-raft
+/// docs/transport.md §4ak). A listener answers requests, a participant's and a joiner's connector
+/// ask them, and either side's packets are answered by the other's reply or next request: each asks
+/// its peer to acknowledge within RFC 9000's default max_ack_delay, the answer carrying the
+/// acknowledgement where it goes first. Acknowledged within a quarter of the round trip, which on a
+/// path shorter than 4 ms is the peer's 1 ms granularity, a write's request was acknowledged alone
+/// ahead of its reply: a 1-CPU leader under 500 agents sent about 3.5 acknowledgement-only packets
+/// a write of 8.4 datagrams at 50 work claims a second, and 26% fewer datagrams asked for the
+/// default (compare CI runs 40455697570 and 40458612631). A node's connector carries a group's
+/// replication, a stream whose congestion control waits on its acknowledgements: decimated.
+fn acknowledgement(serving: bool, role: Sender) -> hyper_transport::Acknowledgement {
+    if serving || role != Sender::Node {
+        hyper_transport::Acknowledgement::Replies
+    } else {
+        hyper_transport::Acknowledgement::Decimated
+    }
 }
 
 /// What an endpoint under `limits` and `admission` holds of its budget at most, bytes, in two
@@ -499,7 +520,8 @@ pub(crate) fn endpoint_driver(
     admission: &AdmissionLimits,
     budget: MemoryBudget,
 ) -> Result<Driver, WireError> {
-    let endpoint_limits = endpoint_limits(limits, admission)?;
+    let mut endpoint_limits = endpoint_limits(limits, admission)?;
+    endpoint_limits.acknowledgement = acknowledgement(tls.server.is_some(), role);
     let config = Config {
         tls,
         role,

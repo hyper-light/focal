@@ -476,6 +476,9 @@ pub(crate) struct Device<F> {
     mac: Option<hyper_seal::log::FrameMac>,
     /// What making a record durable has cost this file each way ([`Device::confirm`]).
     costs: Costs,
+    /// A confirmation is made durable the first way alone, whatever the costs measured: under
+    /// `Waits::Told`, whose caller decides every operation the device makes.
+    steady: bool,
 }
 
 /// A running mean of nanoseconds, of every sample since the log opened: no constant weighs them.
@@ -534,7 +537,15 @@ impl<F: BlockFile> Device<F> {
             more,
             mac: None,
             costs: Costs::default(),
+            steady: false,
         }
+    }
+
+    /// The device of a log under `Waits::Told`, whose confirmations are made durable one way,
+    /// never by what it measured, so its operations follow from its frames alone.
+    pub(crate) fn steady(mut self, steady: bool) -> Self {
+        self.steady = steady;
+        self
     }
 
     /// The device of a sealed log, which checks every frame it reads against `mac`.
@@ -741,7 +752,7 @@ impl<F: BlockFile> Device<F> {
     /// own. Each mean is of every sample since the log opened, so no constant weighs them; a way
     /// not taken keeps the mean it had, and is taken again once the other's mean passes it.
     fn confirm(&mut self, buf: &mut AlignedBuf, at: u64) -> (Result<(), LogError>, Timing) {
-        if self.costs.flushing_is_cheaper() {
+        if !self.steady && self.costs.flushing_is_cheaper() {
             let (result, timing) = self.write_flushed(buf, at);
             if result.is_ok() {
                 self.costs.flushed.add(timing.took_ns);

@@ -100,11 +100,17 @@ impl TokenLog for BloomTokenLog {
                 &mut state.filter_2
             }
             _ => {
-                // turn over both filters
+                // turn over both filters, period 1 the one before this token's: a token issued
+                // before it and still valid expires in period 1, where starting period 1 at this
+                // token's expiry refused every such token as too far in the past (a server's first
+                // token checked set the bound, and a token it issued a second earlier, presented
+                // after, was refused; Quiver's simulation, kiln's CP-T2.2 step 6, where whether
+                // tokens straddled a second of the wall clock decided which runs refused one)
                 state.filter_1 = Filter::default();
                 state.filter_2 = Filter::default();
-                state.period_1_start = expires_at;
-                &mut state.filter_1
+                // Within `issued`, which is representable (`expires_at` is `issued` plus `lifetime`)
+                state.period_1_start = expires_at.checked_sub(lifetime).unwrap_or(issued);
+                &mut state.filter_2
             }
         };
 
@@ -303,7 +309,7 @@ mod test {
             let token = rng.random::<u128>();
             let result = log.check_and_insert(token, issued, lifetime);
             {
-                let filter = &log.0.filter_1;
+                let filter = &log.0.filter_2;
                 if let Filter::Set(ref hset) = *filter {
                     assert!(hset.capacity() * size_of::<u64>() <= 800);
                     assert_eq!(hset.len(), i + 1);
@@ -316,8 +322,43 @@ mod test {
         }
 
         assert!(
-            matches!(log.0.filter_1, Filter::Bloom { .. }),
+            matches!(log.0.filter_2, Filter::Bloom { .. }),
             "didn't bloom"
+        );
+    }
+
+    /// A token issued before the first one the log checked, and still valid, is taken once and
+    /// refused the second time, as any token is: the first token checked bounded the log's periods
+    /// at its expiry, and refused such a token as too far in the past, so whether a server took a
+    /// client's token depended on the order the wall clock issued them in (Quiver's simulation,
+    /// kiln's CP-T2.2 step 6). One past its lifetime before the first is refused.
+    #[test]
+    fn a_token_issued_before_the_first_checked_is_taken_once() {
+        let mut log = BloomTokenLog::new_expected_items(800, 200);
+        let lifetime = Duration::from_secs(1_000);
+        let now = UNIX_EPOCH + lifetime * 10;
+        let second = Duration::from_secs(1);
+        assert!(log.check_and_insert(1, now, lifetime).is_ok());
+        assert!(log.check_and_insert(2, now - second, lifetime).is_ok());
+        assert!(
+            log.check_and_insert(3, now - lifetime / 2, lifetime)
+                .is_ok()
+        );
+        assert!(log.check_and_insert(4, now + second, lifetime).is_ok());
+        for (nonce, issued) in [
+            (1, now),
+            (2, now - second),
+            (3, now - lifetime / 2),
+            (4, now + second),
+        ] {
+            assert!(
+                log.check_and_insert(nonce, issued, lifetime).is_err(),
+                "{nonce} again"
+            );
+        }
+        assert!(
+            log.check_and_insert(5, now - lifetime - second, lifetime)
+                .is_err()
         );
     }
 

@@ -34,6 +34,20 @@ use crate::task::SpawnRequest;
 /// Format: the "no deadline requested" sentinel.
 const NO_DEADLINE: u64 = u64::MAX;
 
+/// The instant every simulated shard's clock reads zero at: one for the process, taken the first time
+/// it is asked for. An adapter that speaks `std::time::Instant` anchors to it on a simulated shard
+/// (hyper-rt-transport's `Driver`), so every endpoint of a simulation reads one clock however much real
+/// time passed between their making; an endpoint anchored when it was made would read the virtual clock
+/// offset by the real time before it, a different offset for each.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "a simulation's Instant anchor, its one read of the host's clock (docs/sim.md §3.2)"
+)]
+pub fn anchor() -> std::time::Instant {
+    static ANCHOR: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *ANCHOR.get_or_init(std::time::Instant::now)
+}
+
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::mem::Encoded;
@@ -52,7 +66,8 @@ const BITS_PER_BYTE: u128 = 8;
 /// 1960; Elliott, BSTJ 1963], the standard model of both independent loss (one state) and bursty loss
 /// (a "bad" state entered and left with the given per-datagram probabilities). Every probability is in
 /// parts per million ([`PPM`]); the state is kept per directed flow and drawn from the fabric's seeded
-/// generator, so a scenario replays exactly from its seed.
+/// generator, so a scenario replays exactly from its seed. The chain steps once per datagram, and, for
+/// a process stepped in time ([`SimLoss::in_time`]), once more for each slot a flow stays quiet.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SimLoss {
     /// Per-datagram probability of moving from the good state to the bad one.
@@ -63,6 +78,8 @@ pub struct SimLoss {
     good_loss_ppm: u32,
     /// Loss probability of a datagram sent in the bad state.
     bad_loss_ppm: u32,
+    /// The time one step of the chain stands for, beside each datagram's own; zero for none.
+    slot_ns: u64,
 }
 
 impl SimLoss {
@@ -72,6 +89,7 @@ impl SimLoss {
         bad_to_good_ppm: PPM,
         good_loss_ppm: 0,
         bad_loss_ppm: 0,
+        slot_ns: 0,
     };
 
     /// Independent (Bernoulli) loss of `loss_ppm` per datagram.
@@ -81,6 +99,7 @@ impl SimLoss {
             bad_to_good_ppm: PPM,
             good_loss_ppm: loss_ppm,
             bad_loss_ppm: loss_ppm,
+            slot_ns: 0,
         }
     }
 
@@ -93,12 +112,37 @@ impl SimLoss {
             bad_to_good_ppm: leave_ppm,
             good_loss_ppm: 0,
             bad_loss_ppm: burst_loss_ppm,
+            slot_ns: 0,
         }
+    }
+
+    /// This process with its chain stepped in time as well: a flow quiet for longer than `slot_ns`
+    /// steps once for each slot after the first (its datagram stands for that one), up to
+    /// [`QUIET_STEPS_MOST`]. A burst then ends in time, as a real path's does, whether the flow sends
+    /// or not; stepped per datagram alone, a flow that sends rarely stays in a burst for as long as it
+    /// sends little: a QUIC handshake's probes, backing off, met one burst for 30 s (Quiver CP-T2.2
+    /// step 6, seeds 6302 and 7452). A flow that sends once a slot or more often steps as before.
+    #[must_use]
+    pub const fn in_time(self, slot_ns: u64) -> SimLoss {
+        SimLoss { slot_ns, ..self }
     }
 
     /// Whether this process ever loses anything (so a loss-free path draws nothing from the generator).
     const fn is_lossless(&self) -> bool {
         self.good_loss_ppm == 0 && self.bad_loss_ppm == 0
+    }
+}
+
+/// Format: the most steps a quiet flow's loss chain takes at once ([`SimLoss::in_time`]): a chain that
+/// leaves a burst with one percent a step has left it after 1,024 with probability above 0.99996.
+pub const QUIET_STEPS_MOST: u64 = 1024;
+
+/// One step of a Gilbert–Elliott chain from `bad`: whether it is in the bad state after.
+fn step(rng: &mut Xorshift, bad: bool, loss: SimLoss) -> bool {
+    if bad {
+        !chance(rng, loss.bad_to_good_ppm)
+    } else {
+        chance(rng, loss.good_to_bad_ppm)
     }
 }
 
@@ -170,6 +214,9 @@ pub struct SimPath {
     reorders: bool,
     /// The loss process.
     loss: SimLoss,
+    /// How often a datagram is delivered twice, in parts per million: the copy after a delay of its
+    /// own, kept in the flow's order where the path keeps it.
+    duplicate_ppm: u32,
     /// The largest datagram the path carries; a larger one is dropped. `None` — no limit.
     mtu: Option<usize>,
     /// The bottleneck the path's datagrams are serialized through, if any.
@@ -189,6 +236,7 @@ impl SimPath {
         jitter_ns: 0,
         reorders: false,
         loss: SimLoss::NONE,
+        duplicate_ppm: 0,
         mtu: None,
         link: None,
     };
@@ -200,6 +248,7 @@ impl SimPath {
             jitter_ns,
             reorders: false,
             loss: SimLoss::NONE,
+            duplicate_ppm: 0,
             mtu: None,
             link: None,
         }
@@ -212,6 +261,7 @@ impl SimPath {
             jitter_ns,
             reorders: true,
             loss: SimLoss::NONE,
+            duplicate_ppm: 0,
             mtu: None,
             link: None,
         }
@@ -220,6 +270,15 @@ impl SimPath {
     /// This path, losing datagrams by `loss`.
     pub const fn with_loss(self, loss: SimLoss) -> SimPath {
         SimPath { loss, ..self }
+    }
+
+    /// This path, delivering `duplicate_ppm` datagrams in a million twice (a link's resend, a route
+    /// taken twice), the copy after a delay of its own. At 0 it draws nothing from the generator.
+    pub const fn with_duplicates(self, duplicate_ppm: u32) -> SimPath {
+        SimPath {
+            duplicate_ppm,
+            ..self
+        }
     }
 
     /// This path, dropping every datagram longer than `mtu` bytes.
@@ -303,6 +362,8 @@ pub struct SimFabricStats {
     pub dropped_unbound: u64,
     /// The largest backlog any link's queue held, in bytes.
     pub peak_queue_bytes: u64,
+    /// Datagrams a path's duplication sent a second time.
+    pub duplicated: u64,
 }
 
 /// A datagram the fabric holds until its arrival time.
@@ -343,6 +404,8 @@ pub struct SimFabric {
     pair_paths: BTreeMap<(u16, u16), SimPath>,
     links: BTreeMap<SimLinkId, LinkState>,
     loss_state: BTreeMap<(u16, u16), bool>,
+    /// When each flow's loss chain last stepped, for a process stepped in time ([`SimLoss::in_time`]).
+    loss_at: BTreeMap<(u16, u16), u64>,
     nats: BTreeMap<u16, NatState>,
     external: BTreeMap<u16, u16>,
     /// Every external port a NAT has allocated, live or expired, so a datagram to an expired mapping is
@@ -367,6 +430,7 @@ impl SimFabric {
             pair_paths: BTreeMap::new(),
             links: BTreeMap::new(),
             loss_state: BTreeMap::new(),
+            loss_at: BTreeMap::new(),
             nats: BTreeMap::new(),
             external: BTreeMap::new(),
             nat_ports: std::collections::BTreeSet::new(),
@@ -429,17 +493,27 @@ impl SimFabric {
             .unwrap_or(self.default_path)
     }
 
-    /// Whether the flow's loss process drops the next datagram, advancing its Gilbert–Elliott state.
-    fn lose(&mut self, flow: (u16, u16), loss: SimLoss) -> bool {
+    /// Whether the flow's loss process drops the datagram it sends at `now`, advancing its
+    /// Gilbert–Elliott state: once for the datagram, and first once for each slot the flow was quiet
+    /// past the first, for a process stepped in time ([`SimLoss::in_time`]).
+    fn lose(&mut self, now: u64, flow: (u16, u16), loss: SimLoss) -> bool {
         if loss.is_lossless() {
             return false;
         }
-        let bad = self.loss_state.get(&flow).copied().unwrap_or(false);
-        let next = if bad {
-            !chance(&mut self.rng, loss.bad_to_good_ppm)
-        } else {
-            chance(&mut self.rng, loss.good_to_bad_ppm)
-        };
+        let mut bad = self.loss_state.get(&flow).copied().unwrap_or(false);
+        if loss.slot_ns > 0 {
+            let quiet = self.loss_at.insert(flow, now).map_or(0, |last| {
+                now.saturating_sub(last)
+                    .checked_div(loss.slot_ns)
+                    .unwrap_or(0)
+                    .saturating_sub(1)
+                    .min(QUIET_STEPS_MOST)
+            });
+            for _ in 0..quiet {
+                bad = step(&mut self.rng, bad, loss);
+            }
+        }
+        let next = step(&mut self.rng, bad, loss);
         self.loss_state.insert(flow, next);
         chance(
             &mut self.rng,
@@ -478,7 +552,7 @@ impl SimFabric {
                 .saturating_add(link.serialization_ns(bytes.len()));
             link.busy_until_ns = departure;
         }
-        if self.lose((from, path_dest), path.loss) {
+        if self.lose(now, (from, path_dest), path.loss) {
             self.stats.dropped_loss = self.stats.dropped_loss.saturating_add(1);
             return None;
         }
@@ -489,6 +563,24 @@ impl SimFabric {
             arrival = arrival.max(*previous);
         }
         self.last_arrival.insert((from, path_dest), arrival);
+        if path.duplicate_ppm > 0 && chance(&mut self.rng, path.duplicate_ppm) {
+            let mut again = departure.saturating_add(path.draw(&mut self.rng));
+            if !path.reorders {
+                again = again.max(arrival);
+                self.last_arrival.insert((from, path_dest), again);
+            }
+            self.stats.duplicated = self.stats.duplicated.saturating_add(1);
+            let sequence = self.next_sequence;
+            self.next_sequence = self.next_sequence.saturating_add(1);
+            self.in_flight.insert(
+                (again, sequence),
+                InFlight {
+                    dest,
+                    bytes: bytes.clone(),
+                    from: wire_from,
+                },
+            );
+        }
         if arrival <= now {
             return self.arrive(dest, bytes, wire_from, now);
         }
@@ -692,6 +784,24 @@ impl SimSockets {
         self.port_base.saturating_add(index)
     }
 
+    /// Takes socket `index` from the free list, the others left in their order; `None` if it is not
+    /// there.
+    fn take_free(&self, index: u16) -> Option<u16> {
+        let mut above = Vec::new();
+        let mut found = false;
+        while let Some(free) = self.free.pop() {
+            if free == index {
+                found = true;
+                break;
+            }
+            above.push(free);
+        }
+        for free in above.into_iter().rev() {
+            let _ = self.free.push(free);
+        }
+        found.then_some(index)
+    }
+
     /// The bytes every socket's receive buffer holds at once: the send queue's bound.
     fn outbound_bound(&self) -> usize {
         self.sockets.len().saturating_mul(SIM_RECV_BUFFER_BYTES)
@@ -740,13 +850,26 @@ fn with_sockets<R>(f: impl FnOnce(&ShardContext, &SimSockets) -> R) -> Option<R>
         .flatten()
 }
 
-/// Binds a simulated socket on the current shard: its index and port.
-pub(crate) fn sim_bind() -> Result<(u16, u16), RtError> {
+/// Binds a simulated socket on the current shard: its index and port. A port of the shard's own
+/// range asked for by number is taken if free and refused if bound, as an OS binds one, so a node
+/// started again on its shard listens where its peers dial it; any other (port 0, or another shard's)
+/// is the next free port.
+pub(crate) fn sim_bind(requested: u16) -> Result<(u16, u16), RtError> {
     with_sockets(|_, sockets| {
-        let index = sockets.free.pop().ok_or(RtError::Capacity {
+        let full = || RtError::Capacity {
             what: "simulated sockets",
             bound: sockets.sockets.len(),
-        })?;
+        };
+        let index = match sockets.index_of(requested).filter(|_| requested != 0) {
+            Some(index) if sockets.socket(index).is_some_and(|s| s.bound.get()) => {
+                return Err(RtError::DriverRefused {
+                    call: "bind a simulated port already bound",
+                    code: None,
+                });
+            }
+            Some(index) => sockets.take_free(index).ok_or_else(full)?,
+            None => sockets.free.pop().ok_or_else(full)?,
+        };
         if let Some(socket) = sockets.socket(index) {
             socket.bound.set(true);
             socket.held.set(0);

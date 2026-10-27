@@ -614,8 +614,15 @@ impl Pair {
             }
             Some(_) => return Sent::Nothing,
         };
-        let spacing = if self.stream.next.is_none() {
-            interval
+        // A schedule keeps the spacing it was given; a stream that has none yet takes the interval
+        // it has now, and never nothing. Its first floor can be nothing: a flush answered at the
+        // instant it was asked (a simulated disk's cut, a clock that did not move), its timer not
+        // yet measured. Kept at nothing, every heartbeat came due at the instant it was asked, no
+        // flush fell after the one before, and the stream proved none, sent none and asked no wake,
+        // so its timer was never measured either: a restarted node its peers suspected for good
+        // (Quiver's simulation, kiln's CP-T2.2 step 6).
+        let spacing = if self.stream.next.is_none() || self.stream.interval_ns == 0 {
+            interval.max(1)
         } else {
             self.stream.interval_ns
         };
@@ -691,7 +698,8 @@ impl Pair {
         self.counts.skipped = self.counts.skipped.saturating_add(skipped);
         self.stream.sent = Some(seq);
         self.stream.proof = sender.durable_count;
-        self.stream.interval_ns = interval;
+        // Never nothing, which says no heartbeat was ever sent (`Pair::report`'s `sending`).
+        self.stream.interval_ns = interval.max(1);
         self.stream.base_ns = base;
         if self.received.run.is_none() {
             self.stream.unanswered = self.stream.unanswered.saturating_add(1);
@@ -1410,6 +1418,36 @@ mod tests {
             "{} ns measured, {bound:?} stated",
             at - due
         );
+    }
+
+    /// A stream whose floor is nothing (a flush answered at the instant it was asked, its timer
+    /// not yet measured) sends once a flush proves a heartbeat, the spacing it keeps never nothing.
+    /// It kept nothing: every heartbeat came due at the instant it was asked, no flush fell after
+    /// the one before, and it sent none (Quiver's simulation, kiln's CP-T2.2 step 6: a restarted
+    /// node its peers suspected for good).
+    #[test]
+    fn a_stream_whose_floor_is_nothing_sends_once_a_flush_proves_it() {
+        let sender = |floor: Duration, durable_count: u64, durable_ns: u64| Sender {
+            local_run: 1,
+            floor: Some(floor),
+            granularity: None,
+            durable_count,
+            durable_ns: Some(durable_ns),
+        };
+        let mut out = [0; MAX_BYTES];
+        let now = 10_000 * MS;
+        for floor in [Duration::ZERO, Duration::from_millis(1)] {
+            let mut node = pair();
+            // Due at once, no flush past the one before: one is asked, at a floor of nothing.
+            let first = node.send(&sender(Duration::ZERO, 1, now - 1), now, &mut out);
+            assert!(matches!(first, Sent::NeedsFlush), "a flush is asked");
+            // The flush asked, answered at the same instant, the floor still nothing or measured
+            // since: it proves the heartbeat.
+            let proved = node.send(&sender(floor, 2, now), now, &mut out);
+            assert!(matches!(proved, Sent::Message(..)), "floor {floor:?}: sent");
+            assert!(node.stream.interval_ns > 0, "floor {floor:?}");
+            assert!(node.report().sending.is_some(), "floor {floor:?}");
+        }
     }
 
     /// A stream to a peer never heard backs off (`Pair::backed_off`): its interval doubles from the

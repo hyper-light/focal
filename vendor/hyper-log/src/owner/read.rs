@@ -24,6 +24,9 @@ pub(crate) enum Query {
         high: u64,
         page: Page,
         into: Fetched,
+        /// Its caller waits on its answer as it asks (`Log::fetch`, a group's `fetch`): under
+        /// `Waits::Told` it could serve nothing until answered, so it is read as it is asked.
+        waits: bool,
     },
     Flushed,
     Fenced,
@@ -37,6 +40,8 @@ pub(super) struct Fetch {
     ticket: Ticket,
     /// Reads made of entries that missed, which a second miss ends.
     retries: u32,
+    /// Its caller waits on its answer (`Query::Entries`).
+    pub(super) waits: bool,
 }
 
 /// Reads an entry that missed its place is given before it is called damaged: mantle-log looks
@@ -55,8 +60,9 @@ impl<F: BlockFile + 'static> Owner<F> {
                 high,
                 page,
                 into,
+                waits,
             } => {
-                self.fetch(group, (low, high, page), into, ticket);
+                self.fetch(group, (low, high, page), into, (ticket, waits));
                 return;
             }
             Query::Flushed => Ok(Answer::Flushed(self.schedule.frames, self.schedule.updates)),
@@ -144,7 +150,7 @@ impl<F: BlockFile + 'static> Owner<F> {
         group: u128,
         range: (u64, u64, Page),
         mut into: Fetched,
-        mut ticket: Ticket,
+        (mut ticket, waits): (Ticket, bool),
     ) {
         into.clear();
         let mut reads = std::mem::replace(&mut self.spare_reads, Reads::none());
@@ -175,8 +181,15 @@ impl<F: BlockFile + 'static> Owner<F> {
             reads,
             ticket,
             retries: 0,
+            waits,
         });
-        if self.fetches.len() == 1 {
+        self.read_if_served();
+    }
+
+    /// Hands the device the first fetch's reads, unless they are there already or, under
+    /// `Waits::Told`, no serve asks for them yet (`Owner::serves`).
+    pub(super) fn read_if_served(&mut self) {
+        if !self.reading && self.serves() {
             self.read_next();
         }
     }
@@ -221,12 +234,14 @@ impl<F: BlockFile + 'static> Owner<F> {
             return;
         };
         let reads = std::mem::replace(&mut fetch.reads, Reads::none());
+        self.reading = true;
         self.io.push_back((Job::Read(reads), None));
     }
 
     /// A fetch's reads are back: entries that missed their place are looked up again, once, as
     /// one moved by a sweep since its place was taken; the fetch is answered when none is left.
     pub(super) fn read(&mut self, mut reads: Reads) {
+        self.reading = false;
         let Some(mut fetch) = self.fetches.pop_front() else {
             return;
         };
@@ -252,7 +267,13 @@ impl<F: BlockFile + 'static> Owner<F> {
             }
             Err(e) => fetch.ticket.answer(Err(e)),
         }
-        self.read_next();
+        // The serves are answered once no fetch is left.
+        if self.fetches.is_empty() {
+            for mut ticket in self.serving.drain(..) {
+                ticket.answer(Ok(Answer::Durable(Vec::new())));
+            }
+        }
+        self.read_if_served();
     }
 
     /// A sealed log's entries read back as stored, opened: each under the session of its segment

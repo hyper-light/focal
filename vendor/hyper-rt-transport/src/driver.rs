@@ -46,6 +46,7 @@ use std::time::{Duration, Instant};
 use hyper_rt::RtError;
 use hyper_rt::futures::{Sleep, sleep};
 use hyper_rt::readiness::{Member, Ready, ReadyGroup};
+use hyper_rt::shard::ShardContext;
 use hyper_rt::udp::{
     Batched, Io, IoStats, MAX_BATCH, QueueCharge, Queued, RECEIVE_BYTES, Ring, UdpSocket,
 };
@@ -60,6 +61,29 @@ pub const TURNS: usize = 128;
 /// The shard's clock now, nanoseconds.
 fn shard_now() -> Result<u64, RtError> {
     hyper_rt::registry::with_current(|context| context.now_ns()).ok_or(RtError::NotOnShardThread)
+}
+
+/// Now, as the `Instant` an endpoint made on this thread's shard is to be given (`Endpoint::new`'s
+/// `now`): on a simulated shard the virtual clock's reading from the process's anchor, the clock every
+/// driver there reads (`hyper_rt::sim::anchor`); on any other thread the host's clock, as before.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the runtime adapter's clock: the host's off a simulated shard, as the driver's anchor is"
+)]
+pub fn shard_instant() -> Instant {
+    let simulated = hyper_rt::registry::with_current(|context| {
+        context.driver_is_sim().then(|| context.now_ns())
+    })
+    .flatten();
+    match simulated {
+        Some(ns) => {
+            let anchor = hyper_rt::sim::anchor();
+            anchor
+                .checked_add(Duration::from_nanos(ns))
+                .unwrap_or(anchor)
+        }
+        None => Instant::now(),
+    }
 }
 
 /// Bound: the datagrams one turn takes from the endpoint and sends before the turn's other work:
@@ -295,7 +319,15 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Driver<C, B,
             .set_recv_buffer_bytes(usize::try_from(ask).unwrap_or(usize::MAX))?;
         let unmeasured = endpoint.unmeasured_room();
         endpoint.set_receive_capacity(unmeasured, 0);
-        let anchor = (shard_now()?, Instant::now());
+        // On a simulated shard every driver anchors to the process's one instant for the virtual
+        // clock's zero, so all of a simulation's endpoints read one clock (`hyper_rt::sim::anchor`).
+        let simulated =
+            hyper_rt::registry::with_current(ShardContext::driver_is_sim).unwrap_or(false);
+        let anchor = if simulated {
+            (0, hyper_rt::sim::anchor())
+        } else {
+            (shard_now()?, Instant::now())
+        };
         let resolution = Duration::from_nanos(hyper_rt::machine::clock::resolution_ns());
         Ok(Self {
             endpoint,
