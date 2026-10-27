@@ -87,7 +87,7 @@ tempfile = "3.20"
 thiserror = "2.0"
 # The edge codec of the event bus: Zstandard (RFC 8878), dictionary-trained per stream, which
 # claimants and respondents run and the bus never does (docs/archictecutre/32-event-bus.md).
-zstd = { version = "0.13", default-features = false, features = ["zdict_builder"] }
+zstd = { version = "0.14", default-features = false, features = ["zdict_builder"] }
 # tools/compare alone: the competitors' canonical clients it drives (async-nats, redis) run on
 # tokio. No focal crate uses it; focal runs on hyper-rt (vendor/hyper-rt).
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "time", "fs"] }

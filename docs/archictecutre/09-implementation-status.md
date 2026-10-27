@@ -17305,3 +17305,18 @@ a file policy that keeps a client's files owner-private and checked).
   answered once, and its sealed records' tampering battery; `cli_client_stores_at_rest.rs`, the real
   binary, a local client and an enrolled one converted across the fence's rise with every outcome
   known once, the upload completed and nothing in the clear.
+
+### 2026-10-26 — zstd 0.14.3 for four advisories published today
+
+The dependency audit (`cargo deny check advisories bans licenses sources`) failed on four RustSec
+advisories published on 2026-10-26 against zstd 0.13.3, zstd-safe 7.3.0 and zstd-sys 2.1.1:
+RUSTSEC-2026-0391 (an abandoned stream's data leaking into the next one on a reused context),
+RUSTSEC-2026-0398 (`Seekable::decompress` setting a `Vec`'s length past its capacity),
+RUSTSEC-2026-0403 (uninitialized memory exposed when a legacy frame's streaming decompression fails)
+and RUSTSEC-2026-0410 (the wasm32 allocator shim corrupting memory on an allocation's failure). No
+crate brings zstd into focal's binary: `tools/compare` trains and applies a dictionary with it to
+size the comparison's payloads, and focal-bus uses it in its benches and tests alone. Both take
+zstd 0.14.3 now (zstd-safe 8.2.0, zstd-sys 2.1.2), whose two calls (`dict::from_samples`,
+`bulk::Compressor::with_dictionary`) are unchanged; the audit passes, and so do `tools/compare`'s
+tests and focal-bus's corpus tests. zstd's license changed with the release, from MIT to
+BSD-3-Clause, which the license policy allows; the inventory records the new versions and license.
