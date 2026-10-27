@@ -148,6 +148,10 @@ pub(crate) struct NativeEngine<S: NativeSchemaVerifier> {
     /// Bounded by the core's reads in flight; charged once, when first used.
     pub(super) parked_reads: Vec<focal_consensus::ReadBarrier>,
     pub(super) parked_charge: Option<Allocation>,
+    /// The copy's linearizable reads and the barriers asked for them, at most its share of its
+    /// leader's reads out (`read_rounds`); the room they are held in is charged as it grows.
+    pub(super) read_rounds: super::read_rounds::ReadRounds,
+    pub(super) read_rounds_charge: Option<Allocation>,
     /// Barriers parked, and barriers dropped at the parked bound, since
     /// this engine opened, for diagnostics.
     pub(super) reads_parked: u64,
@@ -328,6 +332,8 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             readiness_requested: None,
             parked_reads: Vec::new(),
             parked_charge: None,
+            read_rounds: super::read_rounds::ReadRounds::default(),
+            read_rounds_charge: None,
             reads_parked: 0,
             reads_dropped: 0,
             observed_term: 0,

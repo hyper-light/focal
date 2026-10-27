@@ -39,6 +39,8 @@ pub mod genesis;
 pub mod payloads;
 #[path = "native_session_range.rs"]
 pub mod range;
+#[path = "native_read_rounds.rs"]
+pub(crate) mod read_rounds;
 #[path = "native_session_retention.rs"]
 pub mod retention;
 #[path = "native_session_retirement.rs"]
@@ -1152,6 +1154,7 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
     pub fn tick(&mut self) -> Result<(), NativeSessionError> {
         self.engine.check()?;
         self.consensus.tick()?;
+        self.engine.tick_reads(&mut self.consensus);
         Ok(())
     }
     pub fn step_authenticated(

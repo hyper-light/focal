@@ -693,6 +693,9 @@ impl Session {
     pub fn tick(&mut self) -> Result<(), LedgerError> {
         self.check()?;
         self.consensus.tick()?;
+        if let Some(engine) = self.native.as_deref_mut() {
+            engine.tick_reads(&mut self.consensus);
+        }
         Ok(())
     }
     #[cfg(test)]
@@ -1600,7 +1603,12 @@ impl Session {
                     .events
                     .read_states
                     .len()
-                    .saturating_add(self.parked_reads.len()),
+                    .saturating_add(self.parked_reads.len())
+                    .saturating_add(
+                        self.native
+                            .as_deref()
+                            .map_or(0, |engine| engine.reads_held()),
+                    ),
             )?);
         }
         let applied_index = delivery.events.applied_index;
@@ -1639,7 +1647,12 @@ impl Session {
                             .events
                             .read_states
                             .len()
-                            .saturating_add(self.parked_reads.len()),
+                            .saturating_add(self.parked_reads.len())
+                            .saturating_add(
+                                self.native
+                                    .as_deref()
+                                    .map_or(0, |engine| engine.reads_held()),
+                            ),
                     )?);
                 }
                 continue;
@@ -1741,6 +1754,15 @@ impl Session {
         self.release_parked_reads(leader, &status, delivery)?;
         let bound = self.consensus.pending_reads();
         while let Some(barrier) = delivery.events.read_states.get(delivery.read) {
+            // A native read answers its round in the engine, which serves every read of the
+            // round once this copy may answer it (below), and asks for the reads behind it.
+            if engine::NativeEngine::<BuiltinNativeSchemas>::is_correlated_read(&barrier.context) {
+                let barrier = barrier.clone();
+                let engine = self.native.as_deref_mut().ok_or(LedgerError::Corrupt)?;
+                engine.answer_round(&barrier, &mut self.consensus)?;
+                delivery.read = delivery.read.checked_add(1).ok_or(LedgerError::Capacity)?;
+                continue;
+            }
             if self.read_waits(barrier, leader, &status) {
                 // Answered by a leader ahead of this copy (27 §5, F55):
                 // replication lag, never corruption. The read waits for
@@ -1760,6 +1782,14 @@ impl Session {
         // The readiness of the term, answered in this delivery, releases
         // the reads it held, parked above or before it.
         self.release_parked_reads(leader, &status, delivery)?;
+        // The native reads whose rounds this copy has applied, waiting as a parked barrier does
+        // at a leader whose readiness of its term is not yet answered (`Session::read_waits`).
+        if !(leader && self.ready_term != Some(status.term))
+            && let Some(engine) = self.native.as_deref_mut()
+            && let Some(output) = delivery.native.as_mut()
+        {
+            engine.serve_rounds(status.term, output)?;
+        }
         if leader
             && self.consensus.has_committed_current_term()
             && self.ready_term != Some(status.term)
@@ -1861,8 +1891,7 @@ impl Session {
         } else if engine::NativeEngine::<BuiltinNativeSchemas>::is_correlated_read(&barrier.context)
         {
             let engine = self.native.as_deref_mut().ok_or(LedgerError::Corrupt)?;
-            let output = delivery.native.as_mut().ok_or(LedgerError::Corrupt)?;
-            engine.apply_correlated_read(barrier, output)?;
+            engine.answer_round(barrier, &mut self.consensus)?;
         } else {
             delivery
                 .result
@@ -1924,11 +1953,20 @@ impl Session {
     /// caught up (27 §5, follower reads), or answered to a leader before
     /// its readiness of the term and held for it (`Session::read_waits`).
     pub fn reads_parked(&self) -> u64 {
-        self.reads_parked
+        self.reads_parked.saturating_add(
+            self.native
+                .as_deref()
+                .map_or(0, |engine| engine.reads_parked()),
+        )
     }
-    /// Read barriers dropped at the parked bound since this session opened.
+    /// Read barriers dropped at the parked bound, and native reads given up unanswered, since
+    /// this session opened.
     pub fn reads_dropped(&self) -> u64 {
-        self.reads_dropped
+        self.reads_dropped.saturating_add(
+            self.native
+                .as_deref()
+                .map_or(0, |engine| engine.reads_dropped()),
+        )
     }
 
     /// The next reconstruction of the native owner is refused as memory:

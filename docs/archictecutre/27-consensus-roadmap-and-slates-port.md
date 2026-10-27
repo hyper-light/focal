@@ -575,7 +575,8 @@ asked of a replica that does not lead is served by that replica: its core forwar
 the read's barrier to the leader (`MsgReadIndex`, thesis §6.4), the answer names the
 leader's commit index, the engine parks the barrier until this copy has applied
 that index (bounded by the reads the core holds in flight, `DurableNode::pending_reads`),
-and the page is read from the copy's own committed core (`read_at_least`). The
+and the page is read from the copy's own committed core (`read_at_least`); a copy keeps at most
+its share of the leader's reads out as barriers (§10, since 2026-10-27). The
 hosted `Session` parks the same way (2026-09-29, the audit's F55: the leader's
 answer may reach a follower before the append that carries its index — QUIC
 streams and separate exchanges owe no ordering between them — and that is
@@ -1227,10 +1228,26 @@ drains leave in two heartbeats and are all confirmed by one follower's answer
 queued for a session's owner leave in two heartbeats where a drain for each sent two
 hundred (`reads_queued_together_leave_in_one_round_and_all_are_answered`).
 
-Open: the reads a leader may hold are bounded by the window it lets a peer have in flight
-(`DurableNode::pending_reads`), a size that was right when each read was a round in
-flight. A read a follower forwards to a leader at that bound is refused there and found
-by its asker's deadline, not told to its asker at once.
+The reads a leader may hold are bounded by the window it lets a peer have in flight
+(`DurableNode::pending_reads`), and a read a follower forwards to a leader at that bound is
+refused there, unanswered, and found by its asker's deadline. With compare's agents homed over
+the nodes and reading linearizable, the 1-CPU leader refused 984 and 1,165 of its peers' frames a
+round at 100 work claims a second where none were refused without read barriers, and 63 and
+140 lifecycles a round were abandoned on a read (run 40584468171). Closed (2026-10-27): a copy
+keeps at most its share of the leader's bound out, the bound divided among the members that may
+ask, voters and learners (`read_rounds`, `read_window`), so no copy at its share takes the leader
+past it. Short of its share a copy asks a barrier for each read as it is asked, as before, and
+no read waits for another's. At it, the reads asked meanwhile wait, and every one that waited
+is asked for by one barrier once one comes back: a barrier asked after a read was held confirms
+it, as a round sent after a read was asked does, and as etcd's members ask one read index for
+every read that waited while the last was out (server/etcdserver/read/read.go,
+`LinearizableReadLoop`). A leader whose answers slow down is so asked fewer barriers, each for
+more reads. A barrier lost within a term is asked again once it has waited the core's election
+timeout in ticks and given up with its reads after a second; a new term ends every barrier. The
+barriers a copy holds, out or answered ahead of what it has applied, are bounded by the core's
+bound as its parked barriers were, and the reads they confirm are held in room charged to the
+copy's memory as it grows (`a_followers_reads_asked_together_share_the_next_barrier`,
+`a_followers_lost_barrier_is_asked_again_after_the_election_timeout`).
 
 ## 11. What a member is sent ahead of its answers (2026-10-01)
 

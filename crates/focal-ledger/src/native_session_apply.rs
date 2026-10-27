@@ -700,6 +700,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     /// Term and role observation. A change alone leaves unresolved candidates
     /// and grants intact; only committed evidence may discard them.
     pub(crate) fn observe(&mut self, status: &focal_consensus::NodeScalars) {
+        self.begin_read_term(status.term);
         let leader = status.role == StateRole::Leader;
         if status.term != self.observed_term || leader != self.observed_leader {
             self.ready_term = None;
@@ -1262,32 +1263,6 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         self.applied_raft = applied_index;
         Ok(())
     }
-    /// A completed caller-correlated read barrier becomes a boundary naming the
-    /// applied Raft index and native sequence at which the read may be served.
-    pub(crate) fn apply_correlated_read(
-        &mut self,
-        barrier: &focal_consensus::ReadBarrier,
-        output: &mut NativeOutput,
-    ) -> Result<(), NativeSessionError> {
-        if barrier.index > self.applied_raft {
-            return Err(NativeSessionError::Corrupt);
-        }
-        let correlation = barrier
-            .context
-            .strip_prefix(CORRELATION.as_slice())
-            .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
-            .ok_or(NativeSessionError::Corrupt)?;
-        let boundary = NativeReadBoundary {
-            correlation: ReadCorrelation(correlation),
-            raft_index: barrier.index,
-            native_sequence: self.sequence()?,
-        };
-        if output.reads.len() == output.reads.capacity() {
-            return Err(NativeSessionError::Capacity("read output"));
-        }
-        output.reads.push(boundary);
-        Ok(())
-    }
     /// After a delivery: a fully applied newer-term entry proves older-term
     /// candidates dead, an idle follower returns to a passive Core, and a ready
     /// leader without a genesis proposes it.
@@ -1372,7 +1347,8 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                     .events
                     .read_states
                     .len()
-                    .saturating_add(self.parked_reads.len()),
+                    .saturating_add(self.parked_reads.len())
+                    .saturating_add(self.read_rounds.held()),
             )?);
         }
         if !delivery.snapshot {
@@ -1418,9 +1394,17 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         // Barriers parked by an earlier delivery whose index this one reached.
         let bound = consensus.pending_reads();
         for barrier in self.take_applied_parked_reads() {
-            self.apply_read_barrier(&barrier, leader, &status, consensus, delivery)?;
+            self.apply_read_barrier(&barrier, leader, &status, consensus)?;
         }
         while let Some(barrier) = delivery.events.read_states.get(delivery.read) {
+            // A caller's read answers its round, which is served once this copy has applied
+            // the index it names (`serve_rounds`), never parked on its own.
+            if Self::is_correlated_read(&barrier.context) {
+                let barrier = barrier.clone();
+                self.answer_round(&barrier, consensus)?;
+                delivery.read = add(delivery.read, 1)?;
+                continue;
+            }
             if barrier.index > self.applied_raft {
                 // Answered by a leader ahead of this copy: the read waits
                 // for the entries it names (27 §5, follower reads).
@@ -1439,9 +1423,11 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                 continue;
             }
             let barrier = barrier.clone();
-            self.apply_read_barrier(&barrier, leader, &status, consensus, delivery)?;
+            self.apply_read_barrier(&barrier, leader, &status, consensus)?;
             delivery.read = add(delivery.read, 1)?;
         }
+        let output = delivery.output.as_mut().ok_or(NativeSessionError::Failed)?;
+        self.serve_rounds(status.term, output)?;
         self.settle(&status, consensus)?;
         if leader
             && consensus.has_committed_current_term()
@@ -1466,15 +1452,13 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         leader: bool,
         status: &focal_consensus::NodeScalars,
         consensus: &mut DurableNode,
-        delivery: &mut Delivery,
     ) -> Result<(), NativeSessionError> {
         if barrier.context.starts_with(READINESS.as_slice()) {
             if leader && barrier.context == readiness(status.term) {
                 self.promote(status.term, consensus)?;
             }
         } else if Self::is_correlated_read(&barrier.context) {
-            let output = delivery.output.as_mut().ok_or(NativeSessionError::Failed)?;
-            self.apply_correlated_read(barrier, output)?;
+            self.answer_round(barrier, consensus)?;
         } else {
             return Err(NativeSessionError::Corrupt);
         }
@@ -1485,42 +1469,192 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         consensus: &mut DurableNode,
         context: &[u8],
     ) -> Result<(), NativeSessionError> {
-        if context.is_empty() || context.len() > 1024 {
-            return Err(NativeSessionError::Capacity("read context"));
-        }
-        let _permit = self.budget.reserve(
-            BudgetKind::Pending,
-            BudgetLane::Completion,
-            array::<u8>(context.len())?,
-        )?;
-        let mut copied = reserved(context.len())?;
-        copied.extend_from_slice(context);
-        consensus.read_index(copied)?;
-        Ok(())
+        request_barrier(&self.budget, consensus, context)
     }
-    /// Request a quorum read barrier tagged with the caller's correlation. The
-    /// completion arrives in a later poll as a `NativeReadBoundary`; the readiness
-    /// namespace is internal and cannot be requested here.
+    /// Request a quorum read barrier for the caller's correlation. The completion arrives in a
+    /// later poll as a `NativeReadBoundary`; the readiness namespace is internal and cannot be
+    /// requested here. One barrier is out at a time, confirming every read held when it was
+    /// asked: a read asked while one is out waits for the next (`read_rounds`).
     pub(crate) fn read_index(
         &mut self,
         consensus: &mut DurableNode,
         correlation: ReadCorrelation,
     ) -> Result<(), NativeSessionError> {
-        self.require_reader(&consensus.scalars())?;
-        // A copy whose parked reads are at their bound is too far behind to
-        // take another: refused here, typed, not dropped when answered.
-        if self.parked_reads.len() >= consensus.pending_reads() {
+        let status = consensus.scalars();
+        self.require_reader(&status)?;
+        self.begin_read_term(status.term);
+        // A copy whose barriers wait at their bound, out or answered ahead of what it has
+        // applied, is too far behind to take another read: refused here, typed, not dropped
+        // when answered.
+        if self
+            .read_rounds
+            .rounds()
+            .saturating_add(self.parked_reads.len())
+            >= consensus.pending_reads()
+        {
             return Err(NativeSessionError::Capacity("parked reads"));
         }
-        let mut context = [0u8; 24];
-        if let Some(prefix) = context.get_mut(..8) {
-            prefix.copy_from_slice(CORRELATION);
-        }
-        if let Some(suffix) = context.get_mut(8..) {
-            suffix.copy_from_slice(&correlation.0);
-        }
-        self.request_read(consensus, &context)
+        self.grow_read_room()?;
+        let window = read_window(consensus);
+        let budget = &self.budget;
+        self.read_rounds.hold(correlation, window, |barrier| {
+            request_barrier(budget, consensus, &correlated(barrier))
+        })
     }
+    /// Room for one more read held: grown by doubling as reads come, the room's bytes charged
+    /// before it is taken, and the charge for the room it replaces let go.
+    fn grow_read_room(&mut self) -> Result<(), NativeSessionError> {
+        let held = self.read_rounds.held();
+        if held < self.read_rounds.room() {
+            return Ok(());
+        }
+        let room = held.saturating_mul(2).max(1);
+        let permit = self.budget.reserve(
+            BudgetKind::Pending,
+            BudgetLane::Completion,
+            super::read_rounds::ReadRounds::bytes_for(room),
+        )?;
+        if !self.read_rounds.reserve(room) {
+            return Err(NativeSessionError::Capacity("reads held"));
+        }
+        self.read_rounds_charge = Some(permit.commit());
+        Ok(())
+    }
+    /// The reads held for `term`: those of an earlier term are given up with it, as their
+    /// askers' waits are.
+    fn begin_read_term(&mut self, term: u64) {
+        let given = self.read_rounds.begin_term(term);
+        self.count_given_up(given);
+    }
+    /// Reads given up unanswered, counted.
+    fn count_given_up(&mut self, given: usize) {
+        self.reads_dropped = self
+            .reads_dropped
+            .saturating_add(u64::try_from(given).unwrap_or(u64::MAX));
+    }
+    /// One tick of the copy's clock for its reads: a barrier out asked again, or given up, once
+    /// it has waited the core's election timeout in ticks unanswered (`read_rounds`).
+    pub(crate) fn tick_reads(&mut self, consensus: &mut DurableNode) {
+        self.begin_read_term(consensus.scalars().term);
+        let window = read_window(consensus);
+        let patience = consensus.election_tick();
+        let budget = &self.budget;
+        let given = self.read_rounds.tick(patience, window, |barrier| {
+            request_barrier(budget, consensus, &correlated(barrier))
+        });
+        self.count_given_up(given);
+    }
+    /// A caller's barrier answered: its round is served once this copy has applied the index
+    /// it names, and the reads behind it are asked for.
+    pub(crate) fn answer_round(
+        &mut self,
+        barrier: &focal_consensus::ReadBarrier,
+        consensus: &mut DurableNode,
+    ) -> Result<(), NativeSessionError> {
+        let correlation = barrier
+            .context
+            .strip_prefix(CORRELATION.as_slice())
+            .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
+            .ok_or(NativeSessionError::Corrupt)?;
+        // Answered by a leader ahead of this copy (27 §5, F55): the round waits for the entries
+        // its answer names, counted as a parked barrier was.
+        if barrier.index > self.applied_raft {
+            self.reads_parked = self.reads_parked.saturating_add(1);
+        }
+        let window = read_window(consensus);
+        let budget = &self.budget;
+        let given = self.read_rounds.answered(
+            ReadCorrelation(correlation),
+            barrier.index,
+            window,
+            |next| request_barrier(budget, consensus, &correlated(next)),
+        );
+        self.count_given_up(given);
+        Ok(())
+    }
+    /// The reads held: waiting on a barrier, or answered and waiting to be applied here.
+    pub(crate) fn reads_held(&self) -> usize {
+        self.read_rounds.held()
+    }
+    /// Read barriers answered above this copy's applied index and held until it caught up.
+    pub(crate) fn reads_parked(&self) -> u64 {
+        self.reads_parked
+    }
+    /// Reads given up unanswered: their barrier refused or lost, or their term ended.
+    pub(crate) fn reads_dropped(&self) -> u64 {
+        self.reads_dropped
+    }
+    /// Every read of `term` whose round this copy has now applied, as a boundary naming the
+    /// applied Raft index and native sequence it may be served at, into the room the output
+    /// holds; a read of an earlier term is given up with it.
+    pub(crate) fn serve_rounds(
+        &mut self,
+        term: u64,
+        output: &mut NativeOutput,
+    ) -> Result<(), NativeSessionError> {
+        self.begin_read_term(term);
+        let native_sequence = self.sequence()?;
+        let room = output.reads.capacity().saturating_sub(output.reads.len());
+        let reads = &mut output.reads;
+        self.read_rounds
+            .take_served(self.applied_raft, room, |correlation, raft_index| {
+                reads.push(NativeReadBoundary {
+                    correlation,
+                    raft_index,
+                    native_sequence,
+                });
+            });
+        Ok(())
+    }
+}
+
+/// Asks consensus for a read barrier under `context`, its bytes held while it is asked.
+fn request_barrier(
+    budget: &MemoryBudget,
+    consensus: &mut DurableNode,
+    context: &[u8],
+) -> Result<(), NativeSessionError> {
+    if context.is_empty() || context.len() > 1024 {
+        return Err(NativeSessionError::Capacity("read context"));
+    }
+    let _permit = budget.reserve(
+        BudgetKind::Pending,
+        BudgetLane::Completion,
+        array::<u8>(context.len())?,
+    )?;
+    let mut copied = reserved(context.len())?;
+    copied.extend_from_slice(context);
+    consensus.read_index(copied)?;
+    Ok(())
+}
+
+/// The barriers a copy keeps out at once: its share of the reads its leader may hold
+/// (`DurableNode::pending_reads`), divided among the members that may ask, voters and learners,
+/// so that every copy at its share is still within the leader's bound (`read_rounds`).
+fn read_window(consensus: &DurableNode) -> usize {
+    let members = consensus.membership();
+    let askers = members
+        .voters
+        .len()
+        .saturating_add(members.learners.len())
+        .max(1);
+    consensus
+        .pending_reads()
+        .checked_div(askers)
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// A caller's read barrier's context: the correlation namespace and the correlation.
+fn correlated(correlation: ReadCorrelation) -> [u8; 24] {
+    let mut context = [0u8; 24];
+    if let Some(prefix) = context.get_mut(..8) {
+        prefix.copy_from_slice(CORRELATION);
+    }
+    if let Some(suffix) = context.get_mut(8..) {
+        suffix.copy_from_slice(&correlation.0);
+    }
+    context
 }
 
 /// The same split or merge on a passive core.

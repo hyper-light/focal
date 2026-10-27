@@ -98,6 +98,10 @@ struct Cluster {
     /// Deliver messages of this kind before the others of a round: the
     /// leader's answer to a barrier ahead of the entries it names.
     deliver_first: Option<MessageType>,
+    /// Drop every message of this kind: a barrier lost on its way.
+    drop_kind: Option<MessageType>,
+    /// The read barriers a follower forwarded to its leader (`MsgReadIndex`), delivered or not.
+    read_indexes: usize,
 }
 impl Cluster {
     fn new() -> Self {
@@ -156,6 +160,8 @@ impl Cluster {
             failed: Vec::new(),
             corrupt_to: None,
             deliver_first: None,
+            drop_kind: None,
+            read_indexes: 0,
         }
     }
     fn node(&mut self, id: u64) -> &mut Node {
@@ -256,7 +262,13 @@ impl Cluster {
                 messages.sort_by_key(|message| message.msg_type != kind);
             }
             for mut message in messages {
-                if isolated.contains(&message.from) || isolated.contains(&message.to) {
+                if message.msg_type == MessageType::MsgReadIndex {
+                    self.read_indexes += 1;
+                }
+                if isolated.contains(&message.from)
+                    || isolated.contains(&message.to)
+                    || self.drop_kind == Some(message.msg_type)
+                {
                     continue;
                 }
                 let (from, to) = (message.from, message.to);
@@ -936,6 +948,87 @@ fn a_followers_barrier_answered_ahead_of_its_log_waits_for_the_entries() {
         "the answer came with the entries"
     );
     assert!(cluster.status(2, 2).is_some());
+}
+
+/// A cluster whose cores hold three reads that wait for their quorum, a barrier for each of its
+/// members: each copy keeps one barrier out (`read_rounds`).
+fn one_barrier_a_copy() -> Cluster {
+    Cluster::configured(|_| limits(), &|config| config.max_inflight_messages = 2)
+}
+
+/// A copy's reads asked while its share of its leader's reads is out wait for the next barrier,
+/// which confirms them all (`read_rounds`): a follower keeping one out, asked five reads at once,
+/// forwards its leader two barriers, not five, and serves every read at the leader's commit
+/// index.
+#[test]
+fn a_followers_reads_asked_together_share_the_next_barrier() {
+    let mut cluster = one_barrier_a_copy();
+    cluster.elect(1, &[]);
+    let create = cluster.creation(1);
+    cluster.commit(1, PARTIES.issuer, create, &[]);
+    cluster.read_indexes = 0;
+    for n in 1..=5u8 {
+        cluster
+            .node(2)
+            .read_index(ReadCorrelation([n; 16]))
+            .unwrap();
+    }
+    cluster.pump(&[]);
+    let seen = std::mem::take(&mut cluster.boundaries);
+    let mut correlations: Vec<u8> = seen
+        .iter()
+        .map(|boundary| boundary.correlation.0[0])
+        .collect();
+    correlations.sort();
+    assert_eq!(correlations, vec![1, 2, 3, 4, 5]);
+    assert_eq!(
+        cluster.read_indexes, 2,
+        "the first read's barrier, then one for the four asked while it was out"
+    );
+    for boundary in seen {
+        assert_eq!(boundary.native_sequence, SessionSeq(1));
+        assert!(cluster.node(2).read_at_least(boundary).is_ok());
+    }
+}
+
+/// A follower's barrier lost on its way is asked again once it has waited the core's election
+/// timeout in ticks, in the same term, and its read is then served; the read asked behind it is
+/// served by the barrier after.
+#[test]
+fn a_followers_lost_barrier_is_asked_again_after_the_election_timeout() {
+    let mut cluster = one_barrier_a_copy();
+    cluster.elect(1, &[]);
+    let create = cluster.creation(1);
+    cluster.commit(1, PARTIES.issuer, create, &[]);
+    let term = cluster.node(2).status().term;
+    cluster.drop_kind = Some(MessageType::MsgReadIndex);
+    cluster
+        .node(2)
+        .read_index(ReadCorrelation([7; 16]))
+        .unwrap();
+    cluster.pump(&[]);
+    cluster
+        .node(2)
+        .read_index(ReadCorrelation([8; 16]))
+        .unwrap();
+    cluster.pump(&[]);
+    assert!(cluster.boundaries.is_empty(), "the barrier was lost");
+    cluster.drop_kind = None;
+    // The leader's heartbeats keep the follower following while its barrier waits.
+    for _ in 0..config(2).election_tick {
+        for id in cluster.live() {
+            cluster.node(id).tick().unwrap();
+        }
+        cluster.pump(&[]);
+    }
+    assert_eq!(cluster.node(2).status().term, term, "no election");
+    let mut correlations: Vec<u8> = cluster
+        .boundaries
+        .iter()
+        .map(|boundary| boundary.correlation.0[0])
+        .collect();
+    correlations.sort();
+    assert_eq!(correlations, vec![7, 8]);
 }
 
 #[test]
