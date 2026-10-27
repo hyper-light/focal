@@ -424,6 +424,10 @@ EOF
     cpu_stat before > "$out/$report.cpu.txt"
     net_stat before > "$out/$report.net.txt"
     disk_stat before > "$out/$report.disk.txt"
+    # diag: every node's processor with call graphs, twenty seconds into the measured window.
+    for n in focal1 focal2 focal3; do
+      dc exec -d "$n" sh -c "sleep $(( warmup + 20 )); perf record -F 499 --call-graph fp -p 1 -o /data/perf.data -- sleep 20 > /data/perf.log 2>&1" || true
+    done
     faults_start
     if ! timeout "$bound" docker compose -f compose.yaml --profile focal \
       exec -T -e "FOCAL_LOAD_WRITES_CSV=/reports/$report.csv" focal-load \
@@ -436,6 +440,24 @@ EOF
     cpu_stat after >> "$out/$report.cpu.txt"
     net_stat after >> "$out/$report.net.txt"
     disk_stat after >> "$out/$report.disk.txt"
+    # diag: each node's profile by thread, by function inclusive and by thread and function, and
+    # every sample's whole stack folded root first under its thread's name (the reports artifact).
+    for n in focal1 focal2 focal3; do
+      echo "::group::$n profile (focal at $rate/s)"
+      dc exec -T "$n" sh -c "cat /data/perf.log; perf report -i /data/perf.data --stdio --no-children --sort comm -g none 2>/dev/null | grep -v '^#' | grep -v '^\$' | head -25" || true
+      dc exec -T "$n" sh -c "perf report -i /data/perf.data --stdio --children --sort symbol -g none --percent-limit 1.5 2>/dev/null | grep -v '^#' | grep -v '^\$' | head -150" || true
+      dc exec -T "$n" sh -c "perf report -i /data/perf.data --stdio --no-children --sort comm,symbol -g none --percent-limit 0.4 2>/dev/null | grep -v '^#' | grep -v '^\$' | head -120" || true
+      dc exec -T "$n" sh -c "perf script -i /data/perf.data -F comm,ip,sym 2>/dev/null" \
+        | awk '
+          function emit(  s, i) { if (n == 0) return; s = comm; for (i = n; i >= 1; i--) s = s ";" f[i]; c[s]++; n = 0 }
+          /^\t/ { n++; sym = $2; for (j = 3; j <= NF; j++) sym = sym " " $j; f[n] = sym; next }
+          /^[ \t]*$/ { emit(); next }
+          { emit(); comm = $1; next }
+          END { emit(); for (k in c) print k, c[k] }
+        ' > "$out/$report.$n.folded" || true
+      wc -l "$out/$report.$n.folded" || true
+      echo "::endgroup::"
+    done
     dc exec -T focal-load cat "/reports/$report" > "$out/$report"
     # Each write's intended start and latency, for where its tail falls in time.
     dc exec -T focal-load cat "/reports/$report.csv" > "$out/$report.csv" || true
