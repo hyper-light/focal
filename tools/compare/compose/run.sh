@@ -385,7 +385,8 @@ print(w if isinstance(w, str) else bytes(w).hex())')
       # waits on its inbox, at its home and writes at the session's leader (focal-load's
       # `homes`), where every agent dialed the founder its invitation names, and the leader
       # served every read beside every write.
-      homes=$(dc exec -T focal1 focal --data-dir /data list nodes | python3 -c '
+      homes=""
+      [ "${HOMES:-1}" = 1 ] && homes=$(dc exec -T focal1 focal --data-dir /data list nodes | python3 -c '
 import json, sys
 nodes = sorted(json.load(sys.stdin)["result"]["nodes"], key=lambda node: node["node"])
 if not nodes:
