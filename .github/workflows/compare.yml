@@ -99,6 +99,8 @@ jobs:
         with:
           name: focal-bench-image
       - run: zstd -dc focal-bench.tar.zst | docker load
+      - name: Let perf sample a container's process (diag)
+        run: sudo sysctl -w kernel.perf_event_paranoid=1 kernel.kptr_restrict=0
       - uses: docker/login-action@v3
         if: needs.image.outputs.registry != ''
         continue-on-error: true
@@ -140,7 +142,7 @@ jobs:
           BENCH_KAFKA: ${{ needs.image.outputs.registry && format('{0}/kafka', needs.image.outputs.registry) || 'apache/kafka' }}
         run: |
           for system in ${{ github.event.inputs.systems || (startsWith(github.ref_name, 'compare/work') && 'focal' || 'focal kafka nats redis') }}; do
-            for rate in ${{ github.event.inputs.rates || (startsWith(github.ref_name, 'compare/deliver') && '50 100 200 400' || (startsWith(github.ref_name, 'compare/work') && '20 50 100' || '100 200 1000 4000')) }}; do
+            for rate in ${{ github.event.inputs.rates || (startsWith(github.ref_name, 'compare/deliver') && '50 100 200 400' || (startsWith(github.ref_name, 'compare/work') && '100' || '100 200 1000 4000')) }}; do
               for window in ${{ github.event.inputs.windows || '-' }}; do
                 if [ "$window" = - ]; then
                   unset INFLIGHT
