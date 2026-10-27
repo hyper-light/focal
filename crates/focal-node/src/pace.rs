@@ -259,10 +259,14 @@ pub(crate) enum DoorRefusal {
 /// same rule (`evidence_service::EvidenceCoordinator`).
 #[derive(Default)]
 pub(crate) struct Door {
-    held: Mutex<std::collections::VecDeque<hyper_rt::sync::OneshotSender<()>>>,
+    /// Each request held, with when it was first held, in nanoseconds since the process began.
+    held: Mutex<std::collections::VecDeque<(u64, hyper_rt::sync::OneshotSender<()>)>>,
     /// How many words `held` holds, read without its lock: the owner wakes one as it takes
     /// each request, and a door that holds none is passed by its lock.
     count: AtomicUsize,
+    /// When the oldest request held was first held, zero while none is: what it has waited at
+    /// the door ([`Door::oldest_held_ns`]), read without the lock.
+    oldest_ns: AtomicU64,
 }
 impl Door {
     /// Holds `word` last, or first for one woken to a door shut again: it was the oldest.
@@ -271,14 +275,26 @@ impl Door {
         word: hyper_rt::sync::OneshotSender<()>,
         first: bool,
     ) -> Result<(), DoorRefusal> {
+        self.hold_since(word, first, now_ns())
+    }
+    /// [`Door::hold`], for a request first held at `since`: one held again keeps the time it
+    /// came, as it keeps its place.
+    pub(crate) fn hold_since(
+        &self,
+        word: hyper_rt::sync::OneshotSender<()>,
+        first: bool,
+        since: u64,
+    ) -> Result<(), DoorRefusal> {
         let mut held = self.held.lock().map_err(|_| DoorRefusal::Broken)?;
         held.try_reserve(1).map_err(|_| DoorRefusal::Memory)?;
+        // Zero is none: a request held as the process began is marked a nanosecond later.
+        let since = since.max(1);
         if first {
-            held.push_front(word);
+            held.push_front((since, word));
         } else {
-            held.push_back(word);
+            held.push_back((since, word));
         }
-        self.count.store(held.len(), Ordering::Release);
+        self.settle(&held);
         Ok(())
     }
     /// Wakes the oldest request still held, if any is: the words of those that stopped waiting
@@ -291,12 +307,28 @@ impl Door {
         let Ok(mut held) = self.held.lock() else {
             return;
         };
-        while let Some(word) = held.pop_front() {
+        while let Some((_, word)) = held.pop_front() {
             if word.send(()).is_ok() {
                 break;
             }
         }
+        self.settle(&held);
+    }
+    /// The count and the oldest's time, as `held` now holds them.
+    fn settle(&self, held: &std::collections::VecDeque<(u64, hyper_rt::sync::OneshotSender<()>)>) {
+        self.oldest_ns.store(
+            held.front().map_or(0, |(since, _)| *since),
+            Ordering::Release,
+        );
         self.count.store(held.len(), Ordering::Release);
+    }
+    /// When the oldest request held was first held, none while none is. One whose deadline
+    /// passed is let go at the next wake, which the owner gives as it takes each request.
+    fn oldest_held_ns(&self) -> Option<u64> {
+        match self.oldest_ns.load(Ordering::Acquire) {
+            0 => None,
+            since => Some(since),
+        }
     }
 }
 /// One kind of input's refusals, a count for each bound.
@@ -674,6 +706,7 @@ impl TickPeriod {
             return Ok(ticket);
         }
         self.0.requests_held.fetch_add(1, Ordering::Relaxed);
+        let since = now_ns();
         let mut first = false;
         // Each turn is a wake: the loop ends when the door admits the request or its deadline
         // passes.
@@ -684,7 +717,7 @@ impl TickPeriod {
                 return Err(DoorRefusal::Delay);
             }
             let (word, woken) = hyper_rt::sync::oneshot().map_err(|_| DoorRefusal::Reply)?;
-            door.hold(word, first)?;
+            door.hold_since(word, first, since)?;
             // The owner may have taken a request between the door found shut and the word
             // held, and woken none: open now, it wakes the oldest held, this one or one before.
             if !self.delay_exceeded(write) {
@@ -868,7 +901,32 @@ impl TickPeriod {
         let (Some(bound), Some(window)) = (self.delay_bound(), self.write_window()) else {
             return true;
         };
-        in_flight < window && Duration::from_nanos(now.saturating_sub(oldest)) <= bound
+        let depth = self.depth_at(bound, now);
+        in_flight < window.saturating_mul(depth)
+            && Duration::from_nanos(now.saturating_sub(oldest))
+                <= bound.saturating_mul(u32::try_from(depth).unwrap_or(u32::MAX))
+    }
+    /// How many bounds deep the pipeline runs now: one, and while writes are held at the door,
+    /// as many as the oldest of them has waited there. A bound of `m` cycles buys `1 - 1/m` of
+    /// the session's greatest throughput ([`DELAY_BOUND_CYCLES`]); the quarter four cycles
+    /// give up holds the latency down while the door holds nothing, and is what a held queue
+    /// waits on once it does. Writes held have paid the delay already, and a pipeline as deep
+    /// takes them in batches as large as they come, as PostgreSQL's group commit flushes as one
+    /// the commit records of every session that came to flush during the flush before it ("At
+    /// higher client counts a 'gangway effect' tends to occur", its WAL configuration): a write
+    /// it takes waits in it no longer than it waited at the door, the queue it drains is the one
+    /// it batches, and once the door holds none the pipeline is one bound deep again. Each write
+    /// is charged as it is held, a held write waits no longer than its request's time, and the
+    /// owner takes at most a slice of dispatches before it drains.
+    fn depth_at(&self, bound: Duration, now: u64) -> usize {
+        let Some(since) = self.0.write_door.oldest_held_ns() else {
+            return 1;
+        };
+        let waited = now.saturating_sub(since);
+        let bound = u64::try_from(bound.as_nanos()).unwrap_or(u64::MAX).max(1);
+        usize::try_from(waited.checked_div(bound).unwrap_or(0))
+            .unwrap_or(usize::MAX)
+            .max(1)
     }
     /// The session's least write cycle uncongested; none until one is
     /// measured.
@@ -1258,6 +1316,67 @@ mod admission_tests {
         assert!(!pace.pipeline_open_at(1, now), "its oldest past the bound");
         pace.set_oldest_write(None);
         assert!(pace.pipeline_open_at(100, now));
+    }
+
+    /// While writes are held at the door the pipeline runs as many bounds deep as the oldest of
+    /// them has waited there, its window and its bound alike, and one bound deep once none is:
+    /// writes held have paid the delay, and a pipeline that deep takes them as one batch.
+    #[test]
+    fn the_pipeline_runs_as_deep_as_the_oldest_held_write_has_waited() {
+        running_for(ms(1_000));
+        // Bound 50 ms, window 100.
+        let pace = measured(CYCLE, 100);
+        let now = now_ns();
+        pace.set_oldest_write(Some(now - ns(ms(10))));
+        assert!(pace.pipeline_open_at(99, now));
+        assert!(
+            !pace.pipeline_open_at(100, now),
+            "one bound deep while none is held"
+        );
+        // The oldest held has waited 210 ms: four bounds, four windows.
+        let (word, _woken) = hyper_rt::sync::oneshot().unwrap();
+        pace.0
+            .write_door
+            .hold_since(word, false, now - ns(ms(210)))
+            .unwrap();
+        let (later, _later_woken) = hyper_rt::sync::oneshot().unwrap();
+        pace.0
+            .write_door
+            .hold_since(later, false, now - ns(ms(20)))
+            .unwrap();
+        assert!(pace.pipeline_open_at(399, now));
+        assert!(!pace.pipeline_open_at(400, now), "four windows");
+        pace.set_oldest_write(Some(now - ns(ms(199))));
+        assert!(pace.pipeline_open_at(1, now));
+        pace.set_oldest_write(Some(now - ns(ms(201))));
+        assert!(!pace.pipeline_open_at(1, now), "past four bounds");
+        // The oldest woken, the next held has waited 20 ms: one bound deep again.
+        pace.0.write_door.wake_one();
+        pace.set_oldest_write(Some(now - ns(ms(10))));
+        assert!(!pace.pipeline_open_at(100, now));
+        pace.0.write_door.wake_one();
+        assert!(!pace.pipeline_open_at(100, now), "none held");
+    }
+
+    /// A write woken to a door shut again is held first, at the time it first came: its wait at
+    /// the door is counted whole.
+    #[test]
+    fn a_write_held_again_keeps_the_time_it_was_first_held() {
+        focal_rt::block_on(async move {
+            let pace = measured(CYCLE, 10);
+            let _queued: Vec<QueueTicket> = (0..10).map(|_| pace.queue_request(true)).collect();
+            let held = held_write(&pace, far(), 1).await;
+            let since = pace.0.write_door.oldest_held_ns().unwrap();
+            // Woken with the queue still at its window: held again, first.
+            pace.0.write_door.wake_one();
+            assert!(
+                until(64, || pace.0.write_door.count.load(Ordering::Acquire) == 1).await,
+                "held again"
+            );
+            assert_eq!(pace.0.write_door.oldest_held_ns(), Some(since));
+            assert!(!held.is_finished());
+        })
+        .unwrap();
     }
 
     /// A write's door shuts once its queue holds its window; the rest's queue is judged apart, so
