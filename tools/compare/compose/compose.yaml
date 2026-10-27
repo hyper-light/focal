@@ -121,6 +121,9 @@ services:
     image: ${FOCAL_LOAD_IMAGE:-focal:bench}
     profiles: [focal]
     command: ["sleep", "86400"]
+    # diag: the generator is sampled by perf too (run.sh).
+    cap_add: [SYS_ADMIN, SYS_PTRACE, PERFMON]
+    security_opt: ["seccomp:unconfined"]
     volumes: ["./focal-target.yaml:/etc/focal/target.yaml:ro", "invites:/invite", "focal-client:/client", "reports:/reports"]
 
   # focal's event bus (doc 34): three nodes replicating one part, each acknowledging a
