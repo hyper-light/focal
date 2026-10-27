@@ -486,7 +486,7 @@ EOF
       dc exec -T "$n" focal --data-dir /data inspect node --metrics \
         > "$out/$report.$n.metrics.txt" 2>/dev/null || true
       # diag: each endpoint's traffic dumps.
-      dc logs --no-color "$n" 2>&1 | grep DIAGT > "$out/$report.$n.diagt" || true
+      dc logs --no-color "$n" 2>&1 | grep -E "DIAGT|DIAGP" > "$out/$report.$n.diagt" || true
     done
     ;;
   focal-bus | focal-bus-fates) endpoints=focal-bus1:7443,focal-bus2:7443,focal-bus3:7443 ;;
