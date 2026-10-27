@@ -17385,3 +17385,109 @@ the test fills only once none is closed; then it fills first and brings the ring
 with the lane full, where nothing can grow (a growth is reserved first) and each release is filled
 again behind, the drive charged to the ring's shrinks. 300 of 300 runs passed on the same loaded
 host, on two CPUs beside a busy loop on each.
+
+### 2026-10-27 — The 1-CPU leader's work-mode cliff at 100 claims a second
+
+compare CI's work mode puts three nodes and the generator in containers of one CPU each, with 500
+enrolled agents. Each claim makes eleven writes among an issuer, a worker and an evaluator, each
+write preceded by a read of what it binds to, and each agent waits on its events in a long poll. At
+100 claims a second (1,100 writes), the write p99 was 28.5 s (run 40032185474). The leader used 94%
+of its CPU and was throttled in most of its CFS periods, so a request took about 0.8 s at its p50.
+The generator's schedule delay grew behind it, and that delay made the p99. At 50 claims a second
+the same leader already used 94% of its CPU on that runner.
+
+The method was a diagnostic branch of the compare workflow. perf sampled every node for 20 s into
+the measured window, at 499 Hz with frame pointers, and its stacks were folded per thread
+(compare/work-profile-1, run 40439487138). A frame-count diagnostic summed every connection's QUIC
+statistics on each endpoint every 5 s (compare/work-traffic-1, run 40449727309). At 100 claims a
+second, the leader's network thread took 43% of its samples, the session's owner 37% and the content
+host 14%. The leader's listener received 10.6 datagrams a write and sent 9.9. The causes found, each
+removed at its source:
+
+- **Stream credit asked for and granted in packets of their own.** The listener's stream pool, 142
+  streams for 502 connections, took back all of a connection's credit as its last exchange ended
+  while another waited. Each agent's next request then said it was blocked (STREAMS_BLOCKED) and
+  waited for a grant (MAX_STREAMS): 2.60 and 2.72 frames a write at 100 claims a second, 0.30
+  STREAMS_BLOCKED at 50, mostly packets of their own and their acknowledgements. Breakwater's design
+  speculates demand and leaves each client at least one credit, carried in the response (Cho et al.,
+  OSDI 2020, §3.2.2); the explicit variant doubled its packets (§5).
+  - Fixed in hyper-transport (`pool::KEPT`, hyper-raft docs/transport.md §4aj): a pooled connection
+    keeps one stream past its pool, outside the pool's account.
+  - A first version counted the kept streams inside the pool. With 502 connections past 142, nothing
+    was ever spare, and STREAMS_BLOCKED rose to 1.33 a write at 50 claims a second.
+  - Outside the account: STREAMS_BLOCKED fell to 0.22 a write at 100 claims a second. The leader took
+    6% less CPU a write in the interleaved A/B ab/work-credit-2.
+- **Requests acknowledged alone ahead of their replies.** Every connection asked its peer to
+  acknowledge within a quarter of the round trip, which on these paths is the peer's 1 ms
+  granularity. A write takes longer than that to commit, so the leader sent about 3.5
+  acknowledgement-only packets a write at 50 claims a second, of 8.4 datagrams.
+  - The listener and the participants' connectors now ask for RFC 9000's default max_ack_delay,
+    25 ms (hyper-transport `Acknowledgement::Replies`, hyper-quic `decimate_acks_within`, hyper-raft
+    docs/transport.md §4ak), so a reply carries its request's acknowledgement. A node's replication
+    and the bus stay decimated.
+  - The leader sent 26% fewer datagrams a write and received 9 to 13% fewer (run 40458612631).
+  - The cost: a lost request's last packet is probed about 25 ms past the round trip on a path
+    shorter than 4 ms, where it was about 2 ms. Linux's TCP probes a lone lost segment no sooner than
+    about 200 ms: its probe timeout adds the minimum RTO, `HZ / 5` by default, when one packet is
+    outstanding (net/ipv4/tcp_output.c `tcp_schedule_loss_probe`), which RFC 8985 §7.2 leaves to the
+    implementation.
+- **A retirement walk that derived families none of which could be due.** The archive agent's cold
+  walk derived every terminal family it visited, its members, rows and events, ten times a second,
+  to learn that none was due under the one-day default grace. It took 3.7% of the leader.
+  - Now a walk derives nothing while no record is a grace old (`Settled::due_through`, c68a1546).
+  - That alone did not fire: an empty core's logical time reads 0. Taken as the epoch by the session's
+    first walk, before its first claim, it dated every later record a grace old for good. The sampler
+    now takes no sample of a core with no logical time (1255cab8).
+- **A custody receipt rewritten for the fact it already held.** Replicating an object records a
+  receipt for each of its copies every time an artifact names it. One recorded again differed only
+  in its `recorded_at`, which nothing reads, and was read, sealed, written, flushed and renamed
+  again: 6.2% of the leader at 50 claims a second, where every work claim submits the same payload.
+  The same fact is no longer written (35f21b0e).
+- **An inline payload sealed again in full.** An artifact carrying bytes already held installed
+  their manifest again and charged the volume's estimate for files it never wrote: 2.5%. Now only
+  what the volume lacks is promised and written, as a transfer's duplicates already were
+  (1cca040f).
+- **A claim's acceptance fingerprint hashed again by every check.** Each check of a registration or
+  envelope against a claim hashed its whole acceptance manifest, 15 to 30 times a write: 2.3%. The
+  fingerprint is now taken once as the claim is made, restored or copied, the claim holding 32 bytes
+  more (7fd88e36). Hashing the fields in batches instead measured no faster and was not kept.
+
+Results, all fixes together (focal `work-cliff` 43a7c238, hyper-raft 3fc2a6c). Hosted runners come in
+at least two processors, and the compare and A/B runs now record theirs:
+
+| Run | Processor | 50/s write p99 | 100/s write p99 | 100/s writes a second | 100/s leader µs a write | 100/s leader busy |
+|---|---|---|---|---|---|---|
+| base, run 40032185474 | slow class (1,806 µs a write at 50/s) | 37 ms | 28.5 s | 688 | 1,370 | 94% |
+| compare/work-cliff-1, run 40482473853 | AMD EPYC 7763 | 36 ms | 14.7 s | 808 | 1,178 | 95% |
+| diagnostic, perf on, run 40484078579 | AMD EPYC 9V74 | 468 ms | 3.3 s | 929 | 952 | 89% |
+| diagnostic of 1cca040f with the pool's second version, perf on, run 40461657046 | fast class (1,276 µs a write at 50/s) | 71 ms | 308 ms | 1,053 | 862 | 91% |
+
+The interleaved A/B ab/work-cliff-all-1 (run 40482467349) ran on an AMD EPYC 7763, two rounds a
+side, A bus-replicated 2dc0db80 and B these fixes (medians; throttled is the share of the wall clock
+the leader's cgroup spent throttled, cpu.stat's `throttled_usec`):
+
+| Rate | Write p99 A → B | Writes a second A → B | Leader µs a write A → B | Leader busy A → B | Leader throttled A → B |
+|---|---|---|---|---|---|
+| 50/s | 78 → 36 ms | 518 → 519 | 1,836 → 1,820 | 95% → 94% | 30% → 11% |
+| 100/s | 38.9 → 17.7 s | 615 → 785 | 1,566 → 1,187 | 96% → 93% | 42% → 22% |
+
+At 100 claims a second neither side keeps up, so each takes its writes in batches as large as they
+come, and its CPU a write is what a write costs it: B's is 24% less. At 50 claims a second both keep
+up, at about 95% of the CPU and the same CPU a write. Read from these numbers, not traced: on this
+processor the leader is never idle at that rate and takes whatever has arrived as it gets to it, so
+the less a batch costs, the sooner it takes the next and the smaller each is, and its CPU a write
+follows the rate, not the work. B's smaller batches show as latency: its write p99 halved, and it
+was throttled a third as long.
+
+At 100 claims a second, 1,100 writes, the EPYC 7763's leader needs about 1.3 CPUs at 1,178 µs a write,
+so the cliff holds on it: the goal is not met on that class of runner.
+
+What remains:
+
+- **Runners.** GitHub's hosted runners differ. Across six runs of the same code, the leader's CPU a
+  write at 50 claims a second ranged from 1,276 to 1,851 µs, and per datagram the network work
+  differed by half again. The compare and A/B runs now record their processor.
+- **The next lever is the reads.** Every lifecycle step reads before it writes, about 1.1 reads a
+  write, and all of them go to the leader. A follower can serve a read-your-writes read once it has
+  applied the token (`check_consistency`'s `AtLeast`), and the followers used about half of their
+  CPU. A participant's connector would have to reach them.
