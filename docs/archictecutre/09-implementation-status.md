@@ -17491,3 +17491,61 @@ What remains:
   write, and all of them go to the leader. A follower can serve a read-your-writes read once it has
   applied the token (`check_consistency`'s `AtLeast`), and the followers used about half of their
   CPU. A participant's connector would have to reach them.
+
+### 2026-10-27 — Agents homed over the nodes, and a pipeline as deep as its door's held queue
+
+The work-mode cliff's next two causes (the entry before this one names the first six). Each was
+measured in an interleaved A/B on one runner, each side driven by its own build's generator.
+
+- **Every agent read and waited at the leader.** compare's 500 agents dialed the founder their
+  invitations name, and a client sent what it reads where its writes went, so the 1-CPU leader
+  served every lifecycle read and inbox wait beside every write (about 4 requests and 11 of its
+  listener's datagrams a write at 100 claims a second), while each follower used about half of
+  its CPU.
+  - focal-client's `ReadRoute::Home` sends what does not mutate to the node the client is homed
+    on (its transport's first route) and its writes to the leader; a read its home cannot answer is
+    asked once of the leader (docs 24 and 27). focal-load's `homes` homes agent n on node
+    n mod homes, and compare's work mode homes its agents over the nodes `focal list nodes` gives.
+  - A read at least at a token its copy has not applied waits for the copy to apply it
+    (`WaitingFor::NativeReadApplied`) where it was answered behind at once, as etcd's members wait
+    for their applied index; under load the copies had applied every token by the time its read
+    came.
+  - About one request a write moved to the followers (the inbox waits are about 0.6 a write).
+- **Under a standing queue the pipeline gave up a quarter of what it could commit.** A pipeline
+  bounded at four uncongested cycles commits three quarters of its greatest throughput, the
+  quarter keeping latency down; but once writes are held at the door they have paid that delay,
+  and the pipeline still took them a window at a time: about 7 writes a log frame at 100 claims a
+  second, each frame costing the 1-CPU leader about 0.8 ms of CPU (at 50 a second, about one
+  write a frame). Now while writes are held, the pipeline runs as many bounds deep as the oldest
+  of them has waited at the door, window and bound alike, and one bound deep once none is
+  (`TickPeriod::depth_at`): PostgreSQL's group commit likewise flushes as one every commit that
+  came to flush during the flush before it.
+
+| A/B (runner) | A → B | Writes a second at 100/s | Write p99 at 100/s | Leader µs a write |
+|---|---|---|---|---|
+| homes, run 40520957312 attempt 1 (EPYC 7763) | not homed → homed | 814 → 891 | 14.2 → 6.4 s | 1,171 → 1,060 |
+| homes, attempt 2 (EPYC 9V74) | not homed → homed | 857 → 1,023 | 12.2 s → 661 ms | 832 → 801 |
+| door, run 40528465450 attempt 2 (EPYC 7763) | one bound → held depth | 727 → 843 | 24.1 → 10.7 s | 1,283 → 1,142 |
+| door, attempt 1 (EPYC 9V45) | one bound → held depth | 1,054 → 1,052 | 179 → 143 ms | 860 → 864 |
+
+On the EPYC 9V74 the leader not homed was 71% busy and still fell behind: its requests waited at
+the door and for stream credit, a limit of latency and not of CPU, which homing lifted. On the EPYC
+9V45 nothing was held long enough for the depth to engage, and bus-replicated already kept up. With
+the door's held depth the leader took 9.6 writes a log frame on the EPYC 7763 where it took 6.7.
+
+Measured and not kept: every endpoint decimated, as before `Acknowledgement::Replies`, against
+replies acknowledged within 25 ms (run 40533001216, EPYC 7763): the leader's CPU a write at 100
+claims a second 1,181 → 1,155 µs, within the rounds' own spread (1,165 and 1,198 on one side), and
+the 50 a second p99 39 → 33 ms.
+
+What remains on the EPYC 7763, where the goal is not yet met:
+
+- **The generator.** focal-load used about 76% of its CPU at 891 writes a second homed: a
+  `focal_rt::Concurrent` set polls every future it runs at each wake, and the generator runs its
+  500 agents' inbox tails in one set and up to 64 lifecycles in each caller's, so each reply
+  polled the rest (`OneshotReceiver::try_recv` alone took 12.8% of its samples, run 40540102366).
+- **The followers' replay.** Homed, the followers used 65 to 75% of their CPU, half of it
+  preparing replicated records; a claim a record changes has its acceptance policy prepared again
+  from its bytes, about 10% of a follower.
+- **The leader's replication.** A claim's creation record of 2,919 bytes compresses to 850 with
+  zstd at level 1; the replication to two followers is about 5.3 of the leader's datagrams a write.
