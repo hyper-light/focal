@@ -443,6 +443,8 @@ EOF
     for n in focal1 focal2 focal3; do
       dc exec -d "$n" sh -c "sleep $(( warmup + 20 )); perf record -F 499 --call-graph fp -p 1 -o /data/perf.data -- sleep 20 > /data/perf.log 2>&1" || true
     done
+    # diag: the generator's process, found once it runs.
+    dc exec -d focal-load sh -c "sleep $(( warmup + 20 )); perf record -F 499 --call-graph fp -p \$(pidof focal-load) -o /reports/load-perf.data -- sleep 20 > /reports/load-perf.log 2>&1" || true
     faults_start
     if ! timeout "$bound" docker compose -f compose.yaml --profile focal \
       exec -T -e "FOCAL_LOAD_WRITES_CSV=/reports/$report.csv" focal-load \
@@ -473,6 +475,19 @@ EOF
       wc -l "$out/$report.$n.folded" || true
       echo "::endgroup::"
     done
+    echo "::group::focal-load profile (focal at $rate/s)"
+    dc exec -T focal-load sh -c "cat /reports/load-perf.log; perf report -i /reports/load-perf.data --stdio --no-children --sort comm -g none 2>/dev/null | grep -v '^#' | grep -v '^\$' | head -25" || true
+    dc exec -T focal-load sh -c "perf script -i /reports/load-perf.data -F comm,ip,sym 2>/dev/null" \
+      | awk '
+        function emit(  s, i) { if (n == 0) return; s = comm; for (i = n; i >= 1; i--) s = s ";" f[i]; c[s]++; n = 0 }
+        /^\t/ { n++; sym = $2; for (j = 3; j <= NF; j++) sym = sym " " $j; f[n] = sym; next }
+        /^[ \t]*$/ { emit(); next }
+        { emit(); comm = $1; next }
+        END { emit(); for (k in c) print k, c[k] }
+      ' > "$out/$report.load.folded" || true
+    wc -l "$out/$report.load.folded" || true
+    dc exec -T focal-load rm -f /reports/load-perf.data || true
+    echo "::endgroup::"
     dc exec -T focal-load cat "/reports/$report" > "$out/$report"
     # Each write's intended start and latency, for where its tail falls in time.
     dc exec -T focal-load cat "/reports/$report.csv" > "$out/$report.csv" || true
