@@ -204,6 +204,36 @@ mod tests {
         assert!(serde_saphyr::from_str::<shape::WorkloadShape>("claims: &n 5\nseed: *n\n").is_ok());
     }
 
+    /// Enrolled agents may be homed over a cluster's nodes, at most one home an agent; homes
+    /// apply to nothing else.
+    #[test]
+    fn homes_apply_to_enrolled_agents_at_most_one_an_agent() {
+        let shape = |text: &str| parse_shape(text).unwrap().validate();
+        let work = "claims: 4\nlifecycle: work\nprofile: authored_v1\ntransport: enrolled\n\
+                    enrollment: /c\nagents: 3\nagent_enrollments: /a\n";
+        let home = |n: u16| format!("  - endpoint: \"focal{n}:7443\"\n    server_name: \"n{n}\"\n");
+        assert!(shape(work).is_ok());
+        assert!(shape(&format!("{work}homes:\n{}", home(1))).is_ok());
+        assert!(shape(&format!("{work}homes:\n{}{}{}", home(1), home(2), home(3))).is_ok());
+        assert!(
+            shape(&format!(
+                "{work}homes:\n{}{}{}{}",
+                home(1),
+                home(2),
+                home(3),
+                home(4)
+            ))
+            .is_err(),
+            "more homes than agents"
+        );
+        assert!(shape(&format!("{work}homes: []\n")).is_err());
+        // Agents on the embedded node have no nodes to be homed on.
+        let embedded = "claims: 4\nlifecycle: work\nprofile: authored_v1\nagents: 3\n";
+        assert!(shape(embedded).is_ok());
+        assert!(shape(&format!("{embedded}homes:\n{}", home(1))).is_err());
+        assert!(shape(&format!("claims: 4\nhomes:\n{}", home(1))).is_err());
+    }
+
     /// A caller reads as many of its lifecycles' steps at once as it writes, unless the shape
     /// says fewer: one read a caller paced 500 agents' work by the round trip of sixteen reads.
     #[test]

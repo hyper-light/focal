@@ -832,6 +832,11 @@ impl WaitingFor {
                 | WaitingFor::RequestStreamControl { .. }
         )
     }
+    /// Whether the wait is for this copy's own apply alone, which no term ends: a read at
+    /// least at a committed sequence, which stays committed whoever leads.
+    fn waits_on_this_copy(&self) -> bool {
+        matches!(self, WaitingFor::NativeReadApplied { .. })
+    }
 }
 // Pending admission already reserves 4096 bytes of per-request owner metadata;
 // keeping stream fences inline avoids another separately allocated wrapper.
@@ -844,6 +849,17 @@ enum WaitingFor {
     },
     NativeRead {
         correlation: focal_ledger::ReadCorrelation,
+        principal: ParticipantId,
+        role: NativePeerRole,
+        profile: NativeProfile,
+        read: NativeReadRequest,
+    },
+    /// A read at least at a sequence this copy has not applied yet (`ReadConsistency::AtLeast`,
+    /// whose token a committed answer gave): served once this copy has applied it, which a
+    /// follower does an append or two after its leader answered ([`Owner::resolve`]); given up
+    /// at its deadline as behind.
+    NativeReadApplied {
+        through: SessionSeq,
         principal: ParticipantId,
         role: NativePeerRole,
         profile: NativeProfile,
@@ -3364,6 +3380,7 @@ impl Owner {
                     | WaitingFor::Reconcile { .. }
                     | WaitingFor::RequestStreamRead { .. }
                     | WaitingFor::NativeRead { .. }
+                    | WaitingFor::NativeReadApplied { .. }
             ) {
                 AccessError::Unavailable
             } else {
@@ -4563,6 +4580,35 @@ impl Owner {
                             deadline,
                         ));
                         Ok(Response::Error(AccessError::Unavailable))
+                    } else if let ReadConsistency::AtLeast(token) = &read.consistency
+                        && token.ledger == self.session.ledger()
+                        && token.sequence
+                            > self
+                                .session
+                                .native_core()
+                                .map_err(access)?
+                                .native_sequence()
+                        && self.session.serves_native_reads()
+                    {
+                        // A copy behind its token waits to apply it, as the leader that gave the
+                        // token applied it before answering: a client reads at the copy it is
+                        // homed on and writes at the leader, and a follower is an append or two
+                        // behind its leader's answers. etcd's members wait likewise for their
+                        // applied index to reach the one a read needs (server/etcdserver/read,
+                        // `ApplyWait`); a Kafka follower refuses such a fetch for the consumer to
+                        // ask again (KIP-392's OFFSET_NOT_AVAILABLE), a round trip a time. A copy
+                        // that knows no leader answers behind at once.
+                        waiting = Some((
+                            WaitingFor::NativeReadApplied {
+                                through: token.sequence,
+                                principal: peer.principal(),
+                                role,
+                                profile,
+                                read: read.clone(),
+                            },
+                            deadline,
+                        ));
+                        Ok(Response::Error(AccessError::Unavailable))
                     } else {
                         let core = self.session.native_core().map_err(access)?;
                         crate::native_reads::check_consistency(
@@ -5225,6 +5271,39 @@ impl Owner {
                             Err(error) => Response::Error(access(error)),
                         },
                     ),
+                WaitingFor::NativeReadApplied {
+                    through,
+                    principal,
+                    role,
+                    profile,
+                    read,
+                } => match self.session.native_core() {
+                    Ok(core) if core.native_sequence() >= *through => Some(
+                        crate::native_reads::page(
+                            &crate::native_reads::Reader {
+                                core,
+                                ledger: self.session.ledger(),
+                                profile: *profile,
+                                principal: *principal,
+                                role: *role,
+                                route: pending.header.route_epoch,
+                            },
+                            read,
+                            &mut pending._charge,
+                        )
+                        .map(Response::NativeRead)
+                        .unwrap_or_else(Response::Error),
+                    ),
+                    // Short of it, a copy that no longer knows a leader to catch up from answers
+                    // behind now; one that does waits on.
+                    Ok(core) if !self.session.serves_native_reads() => {
+                        Some(Response::Error(AccessError::Behind {
+                            published: core.native_sequence(),
+                        }))
+                    }
+                    Ok(_) => None,
+                    Err(error) => Some(Response::Error(access(error))),
+                },
                 WaitingFor::Read {
                     context,
                     principal,
@@ -5425,7 +5504,7 @@ impl Owner {
             if let Some(result) = result {
                 pending.finish(result);
             } else if self.pace.periods() >= pending.deadline
-                || status.term != pending.term
+                || (status.term != pending.term && !pending.waiting.waits_on_this_copy())
                 || (status.role != StateRole::Leader && pending.waiting.answered_by_leader())
             {
                 let result = self.given_up(&mut pending);
@@ -5591,6 +5670,15 @@ impl Owner {
             | WaitingFor::RequestStreamControl { .. } => {
                 Response::Error(AccessError::OutcomeUnknown)
             }
+            // This copy did not apply its token in the request's time: behind, as it would have
+            // answered without waiting, where the client may read at the leader.
+            WaitingFor::NativeReadApplied { .. } => Response::Error(
+                self.session
+                    .native_core()
+                    .map_or(AccessError::Unavailable, |core| AccessError::Behind {
+                        published: core.native_sequence(),
+                    }),
+            ),
             WaitingFor::NativeRead { .. }
             | WaitingFor::Inbox { .. }
             | WaitingFor::RequestStreamRead { .. }

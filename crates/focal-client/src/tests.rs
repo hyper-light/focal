@@ -623,6 +623,210 @@ async fn a_leader_that_moves_within_a_route_epoch_is_followed_and_an_older_epoch
     );
 }
 
+/// How a client's home answers its reads in [`Homed`].
+#[derive(Clone, Copy)]
+enum HomeReads {
+    Serve,
+    Behind,
+    Unavailable,
+    /// Served at route epoch 2; a read at an older one is sent to the leader at 2.
+    Stale,
+}
+/// Each exchange a [`Homed`] session took: (endpoint, mutation, route epoch).
+type Exchanges = std::sync::Arc<Mutex<Vec<(Option<String>, bool, u64)>>>;
+/// A session seen from a client homed on one of its followers (route `None`): the follower
+/// serves reads as `reads` says and sends every write to the leader at 127.0.0.1:7777, which
+/// serves both.
+struct Homed {
+    seen: Exchanges,
+    reads: HomeReads,
+}
+const LEADER: &str = "127.0.0.1:7777";
+fn leader_at(epoch: u64) -> RouteHint {
+    RouteHint {
+        epoch: RouteEpoch(epoch),
+        endpoint: LEADER.into(),
+        server_name: "localhost".into(),
+    }
+}
+fn native_read() -> RequestEnvelope {
+    let base = request();
+    RequestEnvelope {
+        protocol: NATIVE_PROTOCOL_VERSION,
+        operation: Operation::NativeRead(NativeReadRequest {
+            consistency: ReadConsistency::AtLeast(ReadToken {
+                ledger: base.ledger,
+                sequence: SessionSeq(12),
+                route_epoch: RouteEpoch(1),
+            }),
+            query: NativeReadQuery::Objects(Vec::new()),
+            max_items: 1,
+        }),
+        ..base
+    }
+}
+fn page(request: &RequestEnvelope) -> ResponseEnvelope {
+    request.reply(Response::NativeRead(NativeReadPage {
+        token: ReadToken {
+            ledger: request.ledger,
+            sequence: SessionSeq(12),
+            route_epoch: request.route_epoch,
+        },
+        native_sequence: SessionSeq(12),
+        logical_time: 0,
+        objects: Vec::new(),
+        next: None,
+        visited: 0,
+    }))
+}
+impl ClientTransport for Homed {
+    fn request<'a>(
+        &'a self,
+        route: Option<&'a RouteHint>,
+        request: &'a RequestEnvelope,
+    ) -> TransportFuture<'a> {
+        Box::pin(async move {
+            let mutation = request.operation.is_mutation();
+            self.seen.lock().unwrap().push((
+                route.map(|hint| hint.endpoint.clone()),
+                mutation,
+                request.route_epoch.0,
+            ));
+            let refused = |error| Ok(request.reply(Response::Error(error)));
+            match (route.map(|hint| hint.endpoint.as_str()), mutation) {
+                (None, true) => refused(AccessError::RouteChanged(leader_at(1))),
+                (None, false) => match self.reads {
+                    HomeReads::Serve => Ok(page(request)),
+                    HomeReads::Behind => refused(AccessError::Behind {
+                        published: SessionSeq(11),
+                    }),
+                    HomeReads::Unavailable => refused(AccessError::Unavailable),
+                    HomeReads::Stale if request.route_epoch < RouteEpoch(2) => {
+                        refused(AccessError::RouteChanged(leader_at(2)))
+                    }
+                    HomeReads::Stale => Ok(page(request)),
+                },
+                (Some(LEADER), true) => Ok(request.reply(Response::Submitted(
+                    MutationReply::Committed(receipt(request)),
+                ))),
+                (Some(LEADER), false) => Ok(page(request)),
+                (Some(other), _) => panic!("asked {other}"),
+            }
+        })
+    }
+}
+fn homed(reads: HomeReads, route: ReadRoute) -> (Client<Homed>, Exchanges) {
+    let seen = std::sync::Arc::new(Mutex::new(vec![]));
+    let client = Client::new(
+        Homed {
+            seen: seen.clone(),
+            reads,
+        },
+        policy(),
+        WireLimits::default(),
+        1,
+    )
+    .unwrap()
+    .with_read_route(route);
+    (client, seen)
+}
+fn at(endpoint: Option<&str>, mutation: bool, epoch: u64) -> (Option<String>, bool, u64) {
+    (endpoint.map(str::to_owned), mutation, epoch)
+}
+
+/// A client homed on a follower reads at its home and writes at the leader its first write
+/// found; one that reads where it writes (the default) follows its writes there.
+#[test]
+fn a_homed_client_reads_at_home_and_writes_at_the_leader() {
+    focal_rt::block_on(a_homed_client_reads_at_home_and_writes_at_the_leader_on_a_shard()).unwrap();
+}
+async fn a_homed_client_reads_at_home_and_writes_at_the_leader_on_a_shard() {
+    let (client, seen) = homed(HomeReads::Serve, ReadRoute::Home);
+    assert!(matches!(
+        client.submit(request()).await.unwrap(),
+        MutationReply::Committed(_)
+    ));
+    client.request(native_read()).await.unwrap();
+    assert!(matches!(
+        client.submit(request()).await.unwrap(),
+        MutationReply::Committed(_)
+    ));
+    client.request(native_read()).await.unwrap();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            at(None, true, 1),
+            at(Some(LEADER), true, 1),
+            at(None, false, 1),
+            at(Some(LEADER), true, 1),
+            at(None, false, 1),
+        ]
+    );
+    let (client, seen) = homed(HomeReads::Serve, ReadRoute::Leader);
+    client.submit(request()).await.unwrap();
+    client.request(native_read()).await.unwrap();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            at(None, true, 1),
+            at(Some(LEADER), true, 1),
+            at(Some(LEADER), false, 1),
+        ]
+    );
+}
+
+/// A homed read its home cannot answer (behind its token, unavailable) is asked of the leader
+/// its writes found, once and at once; with no leader found, its home's answer stands.
+#[test]
+fn a_homed_read_its_home_cannot_answer_is_asked_of_the_leader_once() {
+    focal_rt::block_on(
+        a_homed_read_its_home_cannot_answer_is_asked_of_the_leader_once_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn a_homed_read_its_home_cannot_answer_is_asked_of_the_leader_once_on_a_shard() {
+    for reads in [HomeReads::Behind, HomeReads::Unavailable] {
+        let (client, seen) = homed(reads, ReadRoute::Home);
+        client.submit(request()).await.unwrap();
+        client.request(native_read()).await.unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                at(None, true, 1),
+                at(Some(LEADER), true, 1),
+                at(None, false, 1),
+                at(Some(LEADER), false, 1),
+            ]
+        );
+    }
+    let (client, seen) = homed(HomeReads::Behind, ReadRoute::Home);
+    let error = client.request(native_read()).await.unwrap_err();
+    assert!(
+        matches!(error, ClientError::Access(AccessError::Behind { .. })),
+        "{error:?}"
+    );
+    assert_eq!(*seen.lock().unwrap(), vec![at(None, false, 1)]);
+}
+
+/// A homed read its home answers with a newer epoch is asked at home again at that epoch, and
+/// the next reads take it from the start, where the hint's leader is where the writes go.
+#[test]
+fn a_homed_read_at_a_stale_epoch_is_asked_at_home_again_at_the_newer_one() {
+    focal_rt::block_on(
+        a_homed_read_at_a_stale_epoch_is_asked_at_home_again_at_the_newer_one_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn a_homed_read_at_a_stale_epoch_is_asked_at_home_again_at_the_newer_one_on_a_shard() {
+    let (client, seen) = homed(HomeReads::Stale, ReadRoute::Home);
+    client.request(native_read()).await.unwrap();
+    client.request(native_read()).await.unwrap();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![at(None, false, 1), at(None, false, 2), at(None, false, 2)]
+    );
+}
+
 struct LostAppendReply {
     first: Mutex<Option<RequestEnvelope>>,
     always_fail: bool,

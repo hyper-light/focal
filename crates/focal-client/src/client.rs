@@ -159,6 +159,33 @@ pub(crate) fn entropy() -> u64 {
         Err(_) => u64::MAX,
     }
 }
+/// Whether the node a read was asked of could not answer it: no answer, an answer that it is
+/// unavailable or behind the read's token, or a refusal before anything was sent for want of a
+/// connection. A read so refused may be asked of another copy; any other answer stands.
+fn home_failed(
+    request: &RequestEnvelope,
+    response: &Result<Result<ResponseEnvelope, WireError>, ()>,
+    limits: &WireLimits,
+) -> bool {
+    match response {
+        Ok(Ok(response)) => {
+            validate_response(request, response, None, limits).is_ok()
+                && matches!(
+                    response.result,
+                    Response::Error(AccessError::Unavailable | AccessError::Behind { .. })
+                )
+        }
+        Ok(Err(
+            WireError::Access(AccessError::Unavailable)
+            | WireError::Io(_)
+            | WireError::Allocation
+            | WireError::Connection
+            | WireError::Timeout,
+        ))
+        | Err(()) => true,
+        Ok(Err(_)) => false,
+    }
+}
 
 /// A committed managed receipt or a transient domain response. A Domain value
 /// never releases an issued ordinal and is not a historical receipt.
@@ -205,6 +232,22 @@ impl std::fmt::Debug for ClientError {
     }
 }
 impl std::error::Error for ClientError {}
+
+/// Where a client sends what it reads (27 §5: a follower serves a current read, and a read at
+/// least at a token once it has applied it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReadRoute {
+    /// Where its writes go: the ledger's leader, once a write found it.
+    #[default]
+    Leader,
+    /// Its transport's first route, the node it is homed on, while its writes go to the leader:
+    /// a client spread over a cluster's nodes reads where it is homed, as a Kafka consumer
+    /// fetches from the replica in its rack (KIP-392). A read its home sends elsewhere at the
+    /// epoch it knows goes there for that ledger until it learns a newer epoch; one its home
+    /// cannot answer (no answer, unavailable, behind the token) is asked again of the ledger's
+    /// leader once a write has found it.
+    Home,
+}
 
 struct CachedRoute {
     hint: RouteHint,
@@ -262,6 +305,9 @@ pub struct Client<T: ClientTransport> {
     policy: RetryPolicy,
     limits: WireLimits,
     routes: Mutex<Routes>,
+    /// Where reads go ([`ReadRoute`]), and, homed, the routes its home sent a ledger's reads to.
+    reads: ReadRoute,
+    read_routes: Mutex<Routes>,
     /// Optional offline-history trace (R11 §1). Absent by default; when absent,
     /// `request` does no per-call trace work.
     trace: Option<Box<dyn crate::TraceSink>>,
@@ -394,12 +440,25 @@ impl<T: ClientTransport> Client<T> {
                 clock: 0,
                 capacity: route_capacity,
             }),
+            reads: ReadRoute::Leader,
+            read_routes: Mutex::new(Routes {
+                entries: BTreeMap::new(),
+                clock: 0,
+                capacity: route_capacity,
+            }),
             trace: None,
             calls: std::sync::atomic::AtomicU64::new(0),
             retries: RetryBudget::new(),
         })
     }
 
+    /// Send reads where `reads` says ([`ReadRoute`]); a client reads where its writes go unless
+    /// told otherwise.
+    #[must_use]
+    pub fn with_read_route(mut self, reads: ReadRoute) -> Self {
+        self.reads = reads;
+        self
+    }
     /// Attach a trace sink so every subsequent `request` records one
     /// [`TraceEntry`](crate::TraceEntry) (R11 §1 offline history checking).
     /// Tracing is off by default; a client without a sink pays nothing.
@@ -753,6 +812,14 @@ impl<T: ClientTransport> Client<T> {
         let allowed = self.retries.refused();
         allowed && refusals < CAPACITY_RESENDS
     }
+    /// The routes a request follows: a homed read's, or every other request's.
+    fn routes_for(&self, homed: bool) -> &Mutex<Routes> {
+        if homed {
+            &self.read_routes
+        } else {
+            &self.routes
+        }
+    }
     async fn request_inner(
         &self,
         request: &mut RequestEnvelope,
@@ -767,8 +834,22 @@ impl<T: ClientTransport> Client<T> {
         // into a throwaway buffer (the transport serializes once itself).
         focal_wire::payload_len(&request, self.limits.max_frame_bytes)
             .map_err(|_| ClientError::Access(AccessError::Capacity))?;
+        // A read homed elsewhere goes home at the newest epoch this client knows of its ledger,
+        // which its writes may have learned, unless its home sent the ledger's reads elsewhere at
+        // that epoch ([`ReadRoute::Home`]).
+        let homed = self.reads == ReadRoute::Home && !request.operation.is_mutation();
+        if homed
+            && let Some(known) = self
+                .routes
+                .lock()
+                .map_err(|_| ClientError::Transport)?
+                .get(request.ledger)
+            && known.epoch > request.route_epoch
+        {
+            request.route_epoch = known.epoch;
+        }
         let mut route = self
-            .routes
+            .routes_for(homed)
             .lock()
             .map_err(|_| ClientError::Transport)?
             .get(request.ledger);
@@ -779,6 +860,8 @@ impl<T: ClientTransport> Client<T> {
                 route = None;
             }
         }
+        // Whether a homed read its home could not answer was asked of the leader: once.
+        let mut left_home = false;
         let start = crate::time::Instant::now();
         let mut uncertain = false;
         // A capacity or availability refusal has no effect (nothing was
@@ -802,6 +885,25 @@ impl<T: ClientTransport> Client<T> {
                 crate::time::within(remaining, self.transport.request(route.as_ref(), request))
                     .await?
                     .ok_or(());
+            // A homed read its home could not answer (no answer, unavailable, or behind its
+            // token) is asked of the ledger's leader, as the writes found it, once and at once:
+            // another node, not a resend after a backoff.
+            if homed
+                && !left_home
+                && home_failed(request, &response, &self.limits)
+                && let Some(leader) = self
+                    .routes
+                    .lock()
+                    .map_err(|_| ClientError::Transport)?
+                    .get(request.ledger)
+                && route.as_ref() != Some(&leader)
+                && leader.epoch >= request.route_epoch
+            {
+                left_home = true;
+                request.route_epoch = leader.epoch;
+                route = Some(leader);
+                continue;
+            }
             match response {
                 Ok(Ok(response)) => {
                     if validate_response(request, &response, None, &self.limits).is_err() {
@@ -820,12 +922,24 @@ impl<T: ClientTransport> Client<T> {
                                     hint.clone(),
                                 )));
                             }
-                            self.routes
-                                .lock()
-                                .map_err(|_| ClientError::Transport)?
-                                .insert(request.ledger, hint.clone())?;
-                            request.route_epoch = hint.epoch;
-                            route = Some(hint.clone());
+                            if homed && route.is_none() && hint.epoch > request.route_epoch {
+                                // Its home knows a newer epoch: asked home again at it, it serves
+                                // the read if it holds the ledger then, and sends it on if not.
+                                // The hint names the leader at that epoch, where the writes go
+                                // and whose epoch the next reads take.
+                                self.routes
+                                    .lock()
+                                    .map_err(|_| ClientError::Transport)?
+                                    .insert(request.ledger, hint.clone())?;
+                                request.route_epoch = hint.epoch;
+                            } else {
+                                self.routes_for(homed)
+                                    .lock()
+                                    .map_err(|_| ClientError::Transport)?
+                                    .insert(request.ledger, hint.clone())?;
+                                request.route_epoch = hint.epoch;
+                                route = Some(hint.clone());
+                            }
                         }
                         Response::Error(AccessError::OutcomeUnknown)
                         | Response::Submitted(MutationReply::Pending(_))

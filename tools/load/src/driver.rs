@@ -18,12 +18,12 @@ use crate::measurements::{
 use crate::native;
 use crate::progress::{PROGRESS, Stage};
 use crate::report::{self, Latency, Report};
-use crate::shape::{Lifecycle, Profile, Transport, WorkloadShape};
+use crate::shape::{Home, Lifecycle, Profile, Transport, WorkloadShape};
 use crate::watch::{self, Side, Watch};
 use focal_client::native_store::{NativeIdentity, NativeIdentityKind};
 use focal_client::operations::NativeAuthoredOperation;
 use focal_client::{
-    Client, ClientError, EmbeddedTransport, LocalTransport, QuicTransport, RetryPolicy,
+    Client, ClientError, EmbeddedTransport, LocalTransport, QuicTransport, ReadRoute, RetryPolicy,
 };
 use focal_ledger::NativeContentProfile;
 use focal_model::{
@@ -35,7 +35,7 @@ use focal_wire::{
     AccessError, AuthenticatedPeer, NativeClaimExpand, NativeErrorCode, NativeMutationReply,
     NativeObject, NativeReadQuery, NativeReadRequest, NativeRefusalKind, Operation, PeerGrant,
     PeerRole, QuicConnector, ReadConsistency, ReadToken, RequestEnvelope, Response,
-    ResponseEnvelope, WireLimits,
+    ResponseEnvelope, RouteHint, WireLimits,
 };
 use hyper_rt::combine::{Either, race2};
 use std::{
@@ -119,6 +119,17 @@ impl Conn {
         names: &Names,
         limits: &WireLimits,
     ) -> Result<Self, LoadError> {
+        Self::open_homed(connector, principal, names, limits, None)
+    }
+    /// [`Conn::open`], an enrolled client homed on `home` where one is given: it dials its home
+    /// first, reads there and writes at the ledger's leader ([`ReadRoute::Home`]).
+    fn open_homed(
+        connector: &Connector,
+        principal: ParticipantId,
+        names: &Names,
+        limits: &WireLimits,
+        home: Option<&Home>,
+    ) -> Result<Self, LoadError> {
         match connector {
             Connector::Embedded(host) => {
                 let peer = AuthenticatedPeer::local(PeerGrant {
@@ -146,7 +157,14 @@ impl Conn {
             }
             Connector::Enrolled(pending) => {
                 let client = pending.remote_client(unix_now()?, limits)?;
-                let initial = client.initial;
+                let initial = match home {
+                    Some(home) => RouteHint {
+                        epoch: client.initial.epoch,
+                        endpoint: home.endpoint.clone(),
+                        server_name: home.server_name.clone(),
+                    },
+                    None => client.initial,
+                };
                 let address = if initial.endpoint.starts_with('[') {
                     "[::]:0"
                 } else {
@@ -160,12 +178,14 @@ impl Conn {
                 // One route, one connection: the transport's bound is the
                 // routes a client may hold, as the CLI's enrolled context.
                 let transport = QuicTransport::new(connector, initial, 16)?;
-                Ok(Self::Enrolled(Client::new(
-                    transport,
-                    RetryPolicy::default(),
-                    limits.clone(),
-                    1,
-                )?))
+                let reads = match home {
+                    Some(_) => ReadRoute::Home,
+                    None => ReadRoute::Leader,
+                };
+                Ok(Self::Enrolled(
+                    Client::new(transport, RetryPolicy::default(), limits.clone(), 1)?
+                        .with_read_route(reads),
+                ))
             }
         }
     }
@@ -2100,7 +2120,8 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
         // endpoint and a connection of its own.
         (Some(count), Some(directory)) => enrolled_agents(directory, count)?
             .into_iter()
-            .map(|enrollment| {
+            .enumerate()
+            .map(|(agent, enrollment)| {
                 let pending = focal_node::network_join::PendingClientJoin::resume_shared(
                     &enrollment,
                     &client_keys(&enrollment)?,
@@ -2114,7 +2135,13 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
                 }
                 let principal = client.build.actor;
                 let connector = Connector::Enrolled(Box::new(pending));
-                let conn = Conn::open(&connector, principal, &names, &limits)?;
+                // Agent `n` on home `n mod homes`: the cluster's agents spread over its nodes.
+                let home = shape.homes.as_deref().and_then(|homes| {
+                    agent
+                        .checked_rem(homes.len())
+                        .and_then(|place| homes.get(place))
+                });
+                let conn = Conn::open_homed(&connector, principal, &names, &limits, home)?;
                 PROGRESS.agent_opened();
                 Ok(Agent {
                     principal,

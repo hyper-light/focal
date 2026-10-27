@@ -191,6 +191,14 @@ pub struct WorkloadShape {
     /// credential names, on a connection of its own.
     #[serde(default)]
     pub agent_enrollments: Option<PathBuf>,
+    /// `agents` over `enrolled`: the nodes the agents are homed on, agent `n` on home
+    /// `n mod homes` (each a node's advertised address and data server name, as `focal cluster
+    /// list nodes` gives them), at most one an agent. A homed agent reads, and waits on its
+    /// inbox, at its home, and writes at the ledger's leader (focal-client's `ReadRoute::Home`),
+    /// as clients spread over a cluster's nodes do. Unset, each agent dials the node its
+    /// invitation names and reads where it writes.
+    #[serde(default)]
+    pub homes: Option<Vec<Home>>,
     /// Offered creations a second over all callers. Set, the writes are
     /// paced on a fixed schedule and each latency counts from its request's
     /// intended start (wrk2's constant-throughput method), so a stall is
@@ -223,6 +231,16 @@ pub struct WorkloadShape {
     /// single-node recovery at exactly this run's retained size.
     #[serde(default)]
     pub reopen: bool,
+}
+
+/// A node an agent is homed on ([`WorkloadShape::homes`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Home {
+    /// The node's advertised address, `host:port`.
+    pub endpoint: String,
+    /// The name its data certificate presents.
+    pub server_name: String,
 }
 
 fn default_seed() -> u64 {
@@ -359,10 +377,20 @@ impl WorkloadShape {
             } else if self.agent_enrollments.is_some() {
                 return Err("agent_enrollments apply to a run among agents".into());
             }
+            if let Some(homes) = &self.homes {
+                if self.agent_enrollments.is_none() {
+                    return Err("homes apply to enrolled agents".into());
+                }
+                if homes.is_empty() || homes.len() > usize::from(self.agents.unwrap_or(0)) {
+                    return Err("homes must be 1..=agents".into());
+                }
+            }
         } else if self.consumer_enrollment.is_some() {
             return Err("consumer_enrollment applies to the deliver lifecycle".into());
         } else if self.agents.is_some() {
             return Err("agents apply to the deliver lifecycle".into());
+        } else if self.homes.is_some() {
+            return Err("homes apply to enrolled agents".into());
         }
         if self.rate == Some(0) {
             return Err("rate must be greater than zero".to_string());

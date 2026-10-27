@@ -1881,6 +1881,19 @@ fn native_claim(id: u128, claim: u128) -> RequestEnvelope {
     }
 }
 
+/// A read of claim `claim` at least at `sequence`, as a client reads what it wrote.
+fn native_claim_at_least(id: u128, claim: u128, sequence: SessionSeq) -> RequestEnvelope {
+    let mut request = native_claim(id, claim);
+    if let Operation::NativeRead(read) = &mut request.operation {
+        read.consistency = ReadConsistency::AtLeast(ReadToken {
+            ledger: ledger(),
+            sequence,
+            route_epoch: RouteEpoch(1),
+        });
+    }
+    request
+}
+
 /// The voters promise the native decoder to each other and the leader
 /// activates projection-only native history; the leader then hosts native
 /// admission.
@@ -1998,6 +2011,83 @@ fn a_native_write_its_leader_gives_up_on_is_of_unknown_outcome() {
             "a write that took effect was answered {given_up:?}"
         );
         fleet.reconnect();
+        fleet.stop().await;
+    })
+    .unwrap()
+}
+
+/// A follower holds a read at least at a sequence it has not applied until it has applied it,
+/// where it answered behind at once: a client homed on a follower reads there what it wrote at
+/// the leader (focal-client's `ReadRoute::Home`). The replicas reach each other across paths of
+/// 50 ms each way and their clients directly, so a follower learns of a write's commit a path
+/// after its writer is answered; each read the writer sends a follower at once, at its write's
+/// sequence, is answered with the claim the write made.
+#[test]
+fn a_follower_holds_a_read_at_a_sequence_it_has_not_applied_until_it_has() {
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let fleet = Fleet::open_shaped(
+            directory.path(),
+            true,
+            3,
+            true,
+            Some(Shaped {
+                delay: Duration::from_millis(50),
+                jitter: Duration::ZERO,
+                loss: None,
+                limited: &[],
+                offering: &[],
+            }),
+        )
+        .await;
+        activate_projection_only(&fleet).await;
+        let mut wait = fleet.wait(Duration::from_secs(20));
+        let mut read = 0u32;
+        let mut id = 0u128;
+        while read < 3 {
+            id += 1;
+            let claim = id;
+            let leader = fleet.leader(None).await;
+            let answer = fleet.replicas[leader]
+                .actor
+                .request(&native_create(id, claim))
+                .await
+                .unwrap();
+            let receipt = match answer.result {
+                Response::Native(NativeMutationReply::Committed(receipt)) => receipt,
+                // The group settling: the next write goes to whoever leads then.
+                Response::Error(AccessError::OutcomeUnknown | AccessError::Unavailable) => {
+                    if let Err(spent) = wait.check(&fleet) {
+                        panic!("no write committed: {spent}");
+                    }
+                    focal_rt::time::sleep(TICK).await.unwrap();
+                    continue;
+                }
+                other => panic!("write {id}: {other:?}"),
+            };
+            for follower in (0..3).filter(|replica| *replica != leader) {
+                id += 1;
+                let answer = fleet.replicas[follower]
+                    .actor
+                    .request(&native_claim_at_least(id, claim, receipt.sequence))
+                    .await
+                    .unwrap();
+                let Response::NativeRead(page) = &answer.result else {
+                    panic!(
+                        "follower {follower} answered a read at {:?} {:?}",
+                        receipt.sequence, answer.result
+                    );
+                };
+                // The one claim asked for, found: not its absence, nor a retired marker.
+                assert!(
+                    page.objects
+                        .iter()
+                        .any(|object| matches!(object, NativeObject::Claim(_))),
+                    "follower {follower}: {page:?}"
+                );
+            }
+            read += 1;
+        }
         fleet.stop().await;
     })
     .unwrap()

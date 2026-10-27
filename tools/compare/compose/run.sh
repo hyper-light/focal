@@ -381,9 +381,24 @@ print(w if isinstance(w, str) else bytes(w).hex())')
     # Append: every claim targets the node's worker. Deliver: every claim targets the
     # consumer, a client of its own that completes it.
     if [ "$mode" = work ]; then
+      # The agents are homed over the cluster's nodes, as its clients would be: each reads, and
+      # waits on its inbox, at its home and writes at the session's leader (focal-load's
+      # `homes`), where every agent dialed the founder its invitation names, and the leader
+      # served every read beside every write.
+      homes=$(dc exec -T focal1 focal --data-dir /data list nodes | python3 -c '
+import json, sys
+nodes = sorted(json.load(sys.stdin)["result"]["nodes"], key=lambda node: node["node"])
+if not nodes:
+    sys.exit("the cluster lists no nodes")
+print("homes:")
+for node in nodes:
+    print("  - endpoint: " + json.dumps(node["advertise"]))
+    print("    server_name: " + json.dumps(node["server_name"]))
+')
       lifecycle="lifecycle: work
 agents: $AGENTS
-agent_enrollments: /client/agents"
+agent_enrollments: /client/agents
+$homes"
     elif [ "$mode" = deliver ] && [ -n "${AGENTS:-}" ]; then
       lifecycle="lifecycle: deliver
 agents: $AGENTS
