@@ -2598,6 +2598,7 @@ impl Owner {
             .acks
             .quorum_tail(self.session.members().voters, scalars.node_id);
         self.pace.publish_quorum_tail(tail);
+        diag_owner(self, tail);
         self.session.set_quorum_patience(
             self.pace
                 .quorum_ticks(self.config.tick, self.config.tick_ceiling),
@@ -4598,6 +4599,7 @@ impl Owner {
                         // `ApplyWait`); a Kafka follower refuses such a fetch for the consumer to
                         // ask again (KIP-392's OFFSET_NOT_AVAILABLE), a round trip a time. A copy
                         // that knows no leader answers behind at once.
+                        DIAG_APPLIED_PARKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         waiting = Some((
                             WaitingFor::NativeReadApplied {
                                 through: token.sequence,
@@ -5278,7 +5280,8 @@ impl Owner {
                     profile,
                     read,
                 } => match self.session.native_core() {
-                    Ok(core) if core.native_sequence() >= *through => Some(
+                    Ok(core) if core.native_sequence() >= *through => Some({
+                        DIAG_APPLIED_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         crate::native_reads::page(
                             &crate::native_reads::Reader {
                                 core,
@@ -5292,8 +5295,8 @@ impl Owner {
                             &mut pending._charge,
                         )
                         .map(Response::NativeRead)
-                        .unwrap_or_else(Response::Error),
-                    ),
+                        .unwrap_or_else(Response::Error)
+                    }),
                     // Short of it, a copy that no longer knows a leader to catch up from answers
                     // behind now; one that does waits on.
                     Ok(core) if !self.session.serves_native_reads() => {
@@ -5672,13 +5675,14 @@ impl Owner {
             }
             // This copy did not apply its token in the request's time: behind, as it would have
             // answered without waiting, where the client may read at the leader.
-            WaitingFor::NativeReadApplied { .. } => Response::Error(
+            WaitingFor::NativeReadApplied { .. } => Response::Error({
+                DIAG_APPLIED_GIVEN_UP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.session
                     .native_core()
                     .map_or(AccessError::Unavailable, |core| AccessError::Behind {
                         published: core.native_sequence(),
-                    }),
-            ),
+                    })
+            }),
             WaitingFor::NativeRead { .. }
             | WaitingFor::Inbox { .. }
             | WaitingFor::RequestStreamRead { .. }
@@ -5999,4 +6003,47 @@ pub(crate) fn add_admission(
         (least, bound) => least.or(bound),
     };
     (windows.saturating_add(window), least)
+}
+
+// diag (not for merge): the owner's door and pipeline every 5 s, and the reads it held for their
+// tokens, under FOCAL_DIAG_TRAFFIC.
+static DIAG_APPLIED_PARKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIAG_APPLIED_SERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIAG_APPLIED_GIVEN_UP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIAG_LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn diag_owner(owner: &Owner, tail: Option<Duration>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if std::env::var_os("FOCAL_DIAG_TRAFFIC").is_none() {
+        return;
+    }
+    let Ok(now) = wall_ms() else { return };
+    let last = DIAG_LAST_MS.load(Relaxed);
+    if now.saturating_sub(last) < 5_000 {
+        return;
+    }
+    DIAG_LAST_MS.store(now, Relaxed);
+    let scalars = owner.session.scalars();
+    let parked_now = owner
+        .pending
+        .iter()
+        .filter(|pending| matches!(pending.waiting, WaitingFor::NativeReadApplied { .. }))
+        .count();
+    let inboxes: usize = owner.inboxes.values().map(VecDeque::len).sum();
+    let us = |d: Option<Duration>| d.map_or(0, |d| d.as_micros());
+    eprintln!(
+        "DIAGP {now} node={} leader={} base_us={} bound_us={} window={} in_flight={} pending={} parked_now={} inboxes={} quorum_tail_us={} parked={} served={} given_up={}",
+        scalars.node_id,
+        u8::from(scalars.role == StateRole::Leader),
+        us(owner.pace.base_service()),
+        us(owner.pace.delay_bound()),
+        owner.pace.write_window().unwrap_or(0),
+        owner.writes.len(),
+        owner.pending.len(),
+        parked_now,
+        inboxes,
+        us(tail),
+        DIAG_APPLIED_PARKED.load(Relaxed),
+        DIAG_APPLIED_SERVED.load(Relaxed),
+        DIAG_APPLIED_GIVEN_UP.load(Relaxed),
+    );
 }
