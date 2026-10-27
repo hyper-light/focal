@@ -615,44 +615,39 @@ impl Shared<'_> {
         let (issuer, _) = self.sides(i)?;
         PROGRESS.started();
         let creating = PROGRESS.at(Stage::Create);
-        let Some((claim, written, _)) = self.step(issuer, i, 0, started, None).await? else {
+        let Some((claim, _, _)) = self.step(issuer, i, 0, started, None).await? else {
             return Ok(());
         };
         drop(creating);
         match self.job.lifecycle {
             Lifecycle::Create => Ok(()),
-            Lifecycle::CancelRelease => self.cancel_release(i, claim, written).await,
-            Lifecycle::Deliver => self.deliver(i, claim, written, started).await,
-            Lifecycle::Work => self.work(i, claim, written, started).await,
+            Lifecycle::CancelRelease => self.cancel_release(i, claim).await,
+            Lifecycle::Deliver => self.deliver(i, claim, started).await,
+            Lifecycle::Work => self.work(i, claim, started).await,
         }
     }
-    /// The issuer cancels the claim it created at `written`, then releases its scope.
-    async fn cancel_release(
-        &self,
-        i: u64,
-        claim: u128,
-        mut written: SessionSeq,
-    ) -> Result<(), LoadError> {
+    /// The issuer cancels the claim it created, then releases its scope.
+    async fn cancel_release(&self, i: u64, claim: u128) -> Result<(), LoadError> {
         let later = [
             NativeAuthoredOperation::ClaimCancel(authored::claim_target(claim)),
             NativeAuthoredOperation::ClaimReleaseScope(authored::claim_target(claim)),
         ];
         let (issuer, _) = self.sides(i)?;
         for (step, operation) in (1u8..).zip(later.iter()) {
-            let Some((sequence, _)) = self
-                .later(issuer, i, step, operation, written, 0..0)
+            if self
+                .later(issuer, i, step, operation, 0..0)
                 .await?
-            else {
+                .is_none()
+            {
                 return Ok(());
-            };
-            written = sequence;
+            }
         }
         PROGRESS.lifecycle();
         let mut outcome = self.outcome.borrow_mut();
         outcome.lifecycles = outcome.lifecycles.saturating_add(1);
         Ok(())
     }
-    /// The claim the issuer created at `created`, delivered: posted by the issuer, found by the
+    /// The claim the issuer created, delivered: posted by the issuer, found by the
     /// consumer in the ledger's events, acquired, answered with a testament and the testament
     /// posted; the testament found by the issuer in the events, received, its whole-work
     /// validation entered, which satisfies the claim, and the claim's scope released, which ends
@@ -660,13 +655,7 @@ impl Shared<'_> {
     /// for the other's step, registered before the write that makes it is sent. Recorded: when
     /// the consumer's testament was posted (the message handled) and when the claim was
     /// satisfied, each from the message's place on the schedule.
-    async fn deliver(
-        &self,
-        i: u64,
-        claim: u128,
-        created: SessionSeq,
-        started: Instant,
-    ) -> Result<(), LoadError> {
+    async fn deliver(&self, i: u64, claim: u128, started: Instant) -> Result<(), LoadError> {
         let (issuer, consumer) = self.sides(i)?;
         let Some((consumer, watch)) = consumer else {
             return Err(LoadError::Shape("deliver without a consumer".into()));
@@ -690,35 +679,29 @@ impl Shared<'_> {
         let posted = watch.expect_posted(claim)?;
         let post = NativeAuthoredOperation::ClaimPost(authored::claim_target(claim));
         let at = PROGRESS.at(Stage::Post);
-        if self
-            .later(issuer, i, 1, &post, created, 0..0)
-            .await?
-            .is_none()
-        {
+        if self.later(issuer, i, 1, &post, 0..0).await?.is_none() {
             watch.forget(claim);
             return Ok(());
         }
         drop(at);
         let at = PROGRESS.at(Stage::WaitPosted);
-        let Some(seen) = watch.wait(posted).await? else {
+        let Some(()) = watch.wait(posted).await? else {
             return self.undelivered(claim, watch);
         };
         drop(at);
         let acquire = NativeAuthoredOperation::ReceiptAcquire(authored::receipt(claim));
         let at = PROGRESS.at(Stage::Acquire);
-        let Some((written, _)) = self
-            .later(consumer, i, 2, &acquire, seen, receipt_ids)
+        if self
+            .later(consumer, i, 2, &acquire, receipt_ids)
             .await?
-        else {
+            .is_none()
+        {
             return Ok(());
-        };
+        }
         drop(at);
         let submit = NativeAuthoredOperation::TestamentSubmit(authored::testament(claim));
         let at = PROGRESS.at(Stage::Submit);
-        let Some((written, minted)) = self
-            .later(consumer, i, 3, &submit, written, testament_ids)
-            .await?
-        else {
+        let Some((_, minted)) = self.later(consumer, i, 3, &submit, testament_ids).await? else {
             return Ok(());
         };
         drop(at);
@@ -731,18 +714,14 @@ impl Shared<'_> {
         let post =
             NativeAuthoredOperation::TestamentPost(authored::testament_target(claim, testament));
         let at = PROGRESS.at(Stage::PostTestament);
-        if self
-            .later(consumer, i, 4, &post, written, 0..0)
-            .await?
-            .is_none()
-        {
+        if self.later(consumer, i, 4, &post, 0..0).await?.is_none() {
             watch.forget(claim);
             return Ok(());
         }
         drop(at);
         let handled = Instant::now();
         let at = PROGRESS.at(Stage::WaitAnswered);
-        let Some((posted, seen)) = watch.wait(answered).await? else {
+        let Some(posted) = watch.wait(answered).await? else {
             return self.undelivered(claim, watch);
         };
         drop(at);
@@ -754,15 +733,15 @@ impl Shared<'_> {
         let target = authored::testament_target(claim, testament);
         let receive = NativeAuthoredOperation::TestamentReceive(target.clone());
         let at = PROGRESS.at(Stage::Receive);
-        let Some((written, _)) = self.later(issuer, i, 5, &receive, seen, 0..0).await? else {
+        if self.later(issuer, i, 5, &receive, 0..0).await?.is_none() {
             return Ok(());
-        };
+        }
         drop(at);
         let enter = NativeAuthoredOperation::ValidationEnterWholeWork(target);
         let at = PROGRESS.at(Stage::Enter);
-        let Some((written, _)) = self.later(issuer, i, 6, &enter, written, 0..0).await? else {
+        if self.later(issuer, i, 6, &enter, 0..0).await?.is_none() {
             return Ok(());
-        };
+        }
         drop(at);
         let satisfied = Instant::now();
         // Delivered once satisfied, whether or not the release that ends its lifecycle commits:
@@ -776,11 +755,7 @@ impl Shared<'_> {
         })?;
         let release = NativeAuthoredOperation::ClaimReleaseScope(authored::claim_target(claim));
         let at = PROGRESS.at(Stage::Release);
-        if self
-            .later(issuer, i, 7, &release, written, 0..0)
-            .await?
-            .is_none()
-        {
+        if self.later(issuer, i, 7, &release, 0..0).await?.is_none() {
             return Ok(());
         }
         drop(at);
@@ -790,7 +765,7 @@ impl Shared<'_> {
         Ok(())
     }
 
-    /// The work claim the issuer created at `created`, done and judged among three agents (02 §3,
+    /// The work claim the issuer created, done and judged among three agents (02 §3,
     /// §6): posted by the issuer; found by the worker in its events, its receipt acquired, a work
     /// artifact submitted for the claim's slot, read back for the reference a manifest binds,
     /// and a testament citing it submitted and posted; the testament found by the issuer in its
@@ -800,13 +775,7 @@ impl Shared<'_> {
     /// learned from the recipient's own events, each waiter registered before the write that
     /// answers it. Recorded: when the testament was posted (the work handed in) and when the
     /// claim was seen satisfied, from the claim's place on the schedule.
-    async fn work(
-        &self,
-        i: u64,
-        claim: u128,
-        created: SessionSeq,
-        started: Instant,
-    ) -> Result<(), LoadError> {
+    async fn work(&self, i: u64, claim: u128, started: Instant) -> Result<(), LoadError> {
         let (issuer, worker) = self.sides(i)?;
         let Some((worker, watch)) = worker else {
             return Err(LoadError::Shape("work without a worker".into()));
@@ -835,35 +804,30 @@ impl Shared<'_> {
         let posted = watch.expect_posted(claim)?;
         let post = NativeAuthoredOperation::ClaimPost(authored::claim_target(claim));
         let at = PROGRESS.at(Stage::Post);
-        if self
-            .later(issuer, i, 1, &post, created, 0..0)
-            .await?
-            .is_none()
-        {
+        if self.later(issuer, i, 1, &post, 0..0).await?.is_none() {
             watch.forget(claim);
             return Ok(());
         }
         drop(at);
         let at = PROGRESS.at(Stage::WaitPosted);
-        let Some(seen) = watch.wait(posted).await? else {
+        let Some(()) = watch.wait(posted).await? else {
             return self.undelivered(claim, watch);
         };
         drop(at);
         // The worker takes the claim and does its work.
         let acquire = NativeAuthoredOperation::ReceiptAcquire(authored::receipt(claim));
         let at = PROGRESS.at(Stage::Acquire);
-        let Some((written, _)) = self
-            .later(worker, i, 2, &acquire, seen, receipt_ids)
+        if self
+            .later(worker, i, 2, &acquire, receipt_ids)
             .await?
-        else {
+            .is_none()
+        {
             return Ok(());
-        };
+        }
         drop(at);
         let artifact = NativeAuthoredOperation::ArtifactSubmit(authored::work_artifact(claim));
         let at = PROGRESS.at(Stage::Artifact);
-        let Some((written, minted)) = self
-            .later(worker, i, 3, &artifact, written, artifact_ids)
-            .await?
+        let Some((written, minted)) = self.later(worker, i, 3, &artifact, artifact_ids).await?
         else {
             return Ok(());
         };
@@ -881,10 +845,7 @@ impl Shared<'_> {
         let submit =
             NativeAuthoredOperation::TestamentSubmit(authored::work_testament(claim, reference));
         let at = PROGRESS.at(Stage::Submit);
-        let Some((written, minted)) = self
-            .later(worker, i, 4, &submit, written, testament_ids)
-            .await?
-        else {
+        let Some((_, minted)) = self.later(worker, i, 4, &submit, testament_ids).await? else {
             return Ok(());
         };
         drop(at);
@@ -903,18 +864,14 @@ impl Shared<'_> {
         let post =
             NativeAuthoredOperation::TestamentPost(authored::testament_target(claim, testament));
         let at = PROGRESS.at(Stage::PostTestament);
-        if self
-            .later(worker, i, 5, &post, written, 0..0)
-            .await?
-            .is_none()
-        {
+        if self.later(worker, i, 5, &post, 0..0).await?.is_none() {
             watch.forget(claim);
             return Ok(());
         }
         drop(at);
         let handled = Instant::now();
         let at = PROGRESS.at(Stage::WaitAnswered);
-        let Some((posted, seen)) = watch.wait(answered).await? else {
+        let Some(posted) = watch.wait(answered).await? else {
             return self.undelivered(claim, watch);
         };
         drop(at);
@@ -928,47 +885,40 @@ impl Shared<'_> {
         let target = authored::testament_target(claim, testament);
         let receive = NativeAuthoredOperation::TestamentReceive(target.clone());
         let at = PROGRESS.at(Stage::Receive);
-        let Some((written, _)) = self.later(issuer, i, 6, &receive, seen, 0..0).await? else {
+        if self.later(issuer, i, 6, &receive, 0..0).await?.is_none() {
             return Ok(());
-        };
+        }
         drop(at);
         let enter = NativeAuthoredOperation::ValidationEnterWholeWork(target);
         let at = PROGRESS.at(Stage::Enter);
-        if self
-            .later(issuer, i, 7, &enter, written, 0..0)
-            .await?
-            .is_none()
-        {
+        if self.later(issuer, i, 7, &enter, 0..0).await?.is_none() {
             watch.forget(claim);
             return Ok(());
         }
         drop(at);
         let at = PROGRESS.at(Stage::WaitEvaluation);
-        let Some((validation, seen)) = watch.wait(due).await? else {
+        let Some(validation) = watch.wait(due).await? else {
             return self.undelivered(claim, watch);
         };
         drop(at);
         // The evaluator judges the work.
         let begin = NativeAuthoredOperation::ValidationBegin(authored::begin(claim, validation));
         let at = PROGRESS.at(Stage::Begin);
-        let Some((written, _)) = self.later(evaluator, i, 8, &begin, seen, 0..0).await? else {
+        if self.later(evaluator, i, 8, &begin, 0..0).await?.is_none() {
             watch.forget(claim);
             return Ok(());
-        };
+        }
         drop(at);
         let report = NativeAuthoredOperation::ValidationReport(authored::report(claim, validation));
         let at = PROGRESS.at(Stage::Report);
-        let Some((_, _)) = self
-            .later(evaluator, i, 9, &report, written, report_ids)
-            .await?
-        else {
+        let Some((_, _)) = self.later(evaluator, i, 9, &report, report_ids).await? else {
             watch.forget(claim);
             return Ok(());
         };
         drop(at);
         // The issuer finds the claim settled by the evaluator's verdict.
         let at = PROGRESS.at(Stage::WaitSettled);
-        let Some((status, written)) = watch.wait(settled).await? else {
+        let Some(status) = watch.wait(settled).await? else {
             return self.undelivered(claim, watch);
         };
         drop(at);
@@ -988,11 +938,7 @@ impl Shared<'_> {
         })?;
         let release = NativeAuthoredOperation::ClaimReleaseScope(authored::claim_target(claim));
         let at = PROGRESS.at(Stage::Release);
-        if self
-            .later(issuer, i, 10, &release, written, 0..0)
-            .await?
-            .is_none()
-        {
+        if self.later(issuer, i, 10, &release, 0..0).await?.is_none() {
             return Ok(());
         }
         drop(at);
@@ -1022,20 +968,19 @@ impl Shared<'_> {
             .ok_or(LoadError::Bound("claim id space"))?;
         Ok(start..end)
     }
-    /// A later step of lifecycle `i`: what `operation` binds to read by `actor` at least at
-    /// `written` (read-your-writes, no read barrier), compiled against it and sent, minting from
-    /// `ids`. The sequence it committed at and the identities it minted; `None` when the read
-    /// failed (the step abandoned, the reason noted) or the step did not commit.
+    /// A later step of lifecycle `i`: what `operation` binds to read by `actor`, compiled against
+    /// it and sent, minting from `ids`. The sequence it committed at and the identities it
+    /// minted; `None` when the read failed (the step abandoned, the reason noted) or the step did
+    /// not commit.
     async fn later(
         &self,
         actor: &Actor<'_>,
         i: u64,
         step: u8,
         operation: &NativeAuthoredOperation,
-        written: SessionSeq,
         ids: std::ops::Range<u128>,
     ) -> Result<Option<(SessionSeq, Vec<NativeIdentity>)>, LoadError> {
-        let Some(objects) = self.read_for(actor, operation, written).await? else {
+        let Some(objects) = self.read_for(actor, operation).await? else {
             let mut outcome = self.outcome.borrow_mut();
             outcome.abandoned = outcome.abandoned.saturating_add(1);
             return Ok(None);
@@ -1051,15 +996,18 @@ impl Shared<'_> {
             .await?
             .map(|(_, sequence, minted)| (sequence, minted)))
     }
-    /// The objects `operation` binds to (`requirements`), as `actor` reads them at least at
-    /// `written`: the objects it names in one page, and each evaluation it binds to selected by
-    /// the owner in a page of its own, as the native client resolves them (its driver's
-    /// `resolve`); `None`, with the reason noted, when they could not be read.
+    /// The objects `operation` binds to (`requirements`), as `actor` reads them linearizable: the
+    /// objects it names in one page, and each evaluation it binds to selected by the owner in a
+    /// page of its own, as the native client resolves them (its driver's `resolve`); `None`, with
+    /// the reason noted, when they could not be read. Linearizable, as `resolve` reads, since what
+    /// a step binds another participant may have changed since the actor's last write, and a
+    /// copy that has applied only that write would serve the revision it replaced: at least at
+    /// the actor's own write, the evaluator's begin read the claim at a follower behind the
+    /// leader and was refused its stale revision.
     async fn read_for(
         &self,
         actor: &Actor<'_>,
         operation: &NativeAuthoredOperation,
-        written: SessionSeq,
     ) -> Result<Option<Vec<NativeObject>>, LoadError> {
         let mut references = Vec::new();
         let mut queries = Vec::new();
@@ -1093,21 +1041,24 @@ impl Shared<'_> {
         }
         let mut objects = Vec::new();
         for (query, wanted) in queries {
-            let Some(page) = self.read_page(actor, query, wanted, written).await? else {
+            let Some(page) = self
+                .read_page(actor, query, wanted, ReadConsistency::Linearizable)
+                .await?
+            else {
                 return Ok(None);
             };
             objects.extend(page);
         }
         Ok(Some(objects))
     }
-    /// One page of `query`, as `actor` reads it at least at `written`, at most `wanted` objects;
+    /// One page of `query`, as `actor` reads it at `consistency`, at most `wanted` objects;
     /// `None`, with the reason noted, when it could not be read or held nothing.
     async fn read_page(
         &self,
         actor: &Actor<'_>,
         query: NativeReadQuery,
         wanted: u32,
-        written: SessionSeq,
+        consistency: ReadConsistency,
     ) -> Result<Option<Vec<NativeObject>>, LoadError> {
         let Ok(_permit) = self.reads.acquire().await else {
             return Err(LoadError::Bound("lifecycle reads"));
@@ -1120,11 +1071,7 @@ impl Shared<'_> {
             request_epoch: RequestEpoch(1),
             request_id: RequestId::from_u128(request),
             operation: Operation::NativeRead(NativeReadRequest {
-                consistency: ReadConsistency::AtLeast(ReadToken {
-                    ledger: self.job.names.ledger,
-                    sequence: written,
-                    route_epoch: RouteEpoch(1),
-                }),
+                consistency,
                 query,
                 max_items: wanted,
             }),
@@ -1143,9 +1090,9 @@ impl Shared<'_> {
             }
         }
     }
-    /// The work artifact `artifact` as `actor` reads it at least at `written`: its reference (its
-    /// identity and content hash), which a testament's manifest binds; `None`, noted, when it
-    /// could not be read.
+    /// The work artifact `artifact` as `actor` reads it at least at `written`, the write that
+    /// submitted it (an artifact is never changed): its reference (its identity and content
+    /// hash), which a testament's manifest binds; `None`, noted, when it could not be read.
     async fn work_reference(
         &self,
         actor: &Actor<'_>,
@@ -1155,6 +1102,11 @@ impl Shared<'_> {
         let query = NativeReadQuery::Objects(vec![focal_wire::NativeObjectRef::Work(
             focal_model::ArtifactId::from_u128(artifact),
         )]);
+        let written = ReadConsistency::AtLeast(ReadToken {
+            ledger: self.job.names.ledger,
+            sequence: written,
+            route_epoch: RouteEpoch(1),
+        });
         let Some(objects) = self.read_page(actor, query, 1, written).await? else {
             return Ok(None);
         };
