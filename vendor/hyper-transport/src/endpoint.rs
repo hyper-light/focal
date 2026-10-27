@@ -2844,7 +2844,12 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                     .join(&mut conn.share, initial, conn.key, conn.serial);
                 if self
                     .pool
-                    .welcome(&mut conn.share, self.limits.streams_per_connection)
+                    .welcome(
+                        &mut conn.share,
+                        self.limits.streams_per_connection,
+                        conn.key,
+                        conn.serial,
+                    )
                     .is_some()
                 {
                     conn.quic

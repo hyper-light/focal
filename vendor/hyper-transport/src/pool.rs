@@ -19,17 +19,27 @@
 //!   pool is overspent (the owner shrank it, or connections hold their handshake's grant past it).
 //!   While another connection waits, it gives one back if it holds more than a fair share (max-min
 //!   fairness among the connections that want streams, Bertsekas and Gallager, *Data Networks*,
-//!   §6.5.2), and all it holds if no exchange of its peer's is left open: credit goes with demand,
-//!   as Breakwater issues credit only to clients with requests to send, and an idle peer that
-//!   wants a stream again says so (STREAMS_BLOCKED) and waits its turn.
+//!   §6.5.2), and all it holds but [`KEPT`] if no exchange of its peer's is left open.
+//! - **What a connection keeps.** A connection gives back neither as an exchange ends nor as it is
+//!   taken back from idle its last [`KEPT`] stream: Breakwater's demand speculation (§3.2.2), where
+//!   each client may hold its latest demand and at least one credit more, and a credit goes to a
+//!   client in the response the server is about to send it. A peer that sends a request at a time
+//!   then sends its next with the stream its last reply gave back, and is never made to say it is
+//!   blocked (STREAMS_BLOCKED) and wait for a grant (MAX_STREAMS) between its requests: two
+//!   packets more each way a request, which Breakwater's demand synchronization (clients telling
+//!   each change of demand, the server answering with explicit credit) was measured to cost, its
+//!   packets received and sent doubled at and below capacity (§5, Figure 8). The pool is
+//!   overcommitted by them, at most one stream a connection, as Breakwater's is (Coc at least
+//!   one), and the owner's door holds what an overload sends past it, as Breakwater's AQM does.
 //! - **Taking back from the idle.** QUIC takes back no stream it announced, so a connection that
-//!   holds credit and opens nothing would keep it from every other forever: it gives back only as
-//!   its exchanges end. A connection with no exchange of its peer's open is queued as idle, once
-//!   (as it joins, and as its last exchange ends with credit kept). While another waits and nothing
-//!   is spare, the endpoint takes back what an idle connection holds, in the pool's account: its
-//!   peer may still open the streams it was told of, so the pool is overcommitted by them, as
-//!   Breakwater overcommits its credit to idle clients and keeps its queue by dropping what an
-//!   overload sends past it (the owner's door).
+//!   holds credit past what it keeps and opens nothing would keep it from every other forever: it
+//!   gives back only as its exchanges end. A connection with no exchange of its peer's open and
+//!   more than it keeps is queued as idle, once (as it joins, and as its last exchange ends with
+//!   credit kept). While another waits and nothing is spare, the endpoint takes back what an idle
+//!   connection holds past what it keeps, in the pool's account: its peer may still open the
+//!   streams it was told of, so the pool is overcommitted by them too, as Breakwater overcommits
+//!   its credit to idle clients and keeps its queue by dropping what an overload sends past it (the
+//!   owner's door).
 //! - **Parking.** An exchange that waits on an event its owner awaits, not on the endpoint's
 //!   service (a long poll: [`crate::Classes::waits`]), holds no credit while it waits: it is parked
 //!   as its head arrives, and its connection is granted a stream of its own for it, so its peer
@@ -42,9 +52,18 @@
 //!   the pool's account like any other. Its stream goes as it ends, granted to no other.
 //! - **Bounds.** A connection waits once and is queued as idle once at most, so each queue holds
 //!   no more than the pooled connections; its entries name a connection by its key and serial,
-//!   and one gone, or one busy again, is passed when reached.
+//!   and one gone, or one busy again, is passed when reached. The streams the pooled connections
+//!   hold at once are at most the pool or [`KEPT`] each, whichever is more, as their handshakes'
+//!   grants and shrinks of the pool fall back to it.
 
 use std::collections::VecDeque;
+
+/// The streams a pooled connection keeps however its pool is contended: one, the least credit
+/// Breakwater's demand speculation leaves a client (Cho et al., OSDI 2020, §3.2.2:
+/// `Coc = max((Ctotal − Cissued) / nc, 1)` unused credits past its latest demand), so a peer that
+/// sends a request at a time sends each with the stream its last reply gave back. None of a pool
+/// sized to nothing ([`Pool::kept`]): its owner takes nothing until it sizes the pool again.
+pub(crate) const KEPT: u32 = 1;
 
 /// A pooled connection's part of the pool, kept with the connection.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -167,6 +186,11 @@ impl Pool {
         }
     }
 
+    /// The streams a connection keeps of this pool ([`KEPT`]): none of one sized to nothing.
+    fn kept(&self) -> u32 {
+        if self.size == 0 { 0 } else { KEPT }
+    }
+
     /// Credit no connection is granted.
     fn spare(&self) -> u64 {
         self.size.saturating_sub(self.granted)
@@ -196,10 +220,10 @@ impl Pool {
         self.went_idle(share, key, serial);
     }
 
-    /// The connection holds credit with no exchange of its peer's open: it is queued as idle,
-    /// once.
+    /// The connection holds credit past what it keeps with no exchange of its peer's open: it is
+    /// queued as idle, once.
     fn went_idle(&mut self, share: &mut Share, key: usize, serial: u64) {
-        if share.granted > 0 && !share.idle {
+        if share.granted > self.kept() && !share.idle {
             share.idle = true;
             self.idle.push_back((key, serial));
         }
@@ -215,25 +239,34 @@ impl Pool {
         self.idle.pop_front()
     }
 
-    /// Takes back what the idle connection holds, in the pool's account, `open` of its peer's
-    /// exchanges open: its new grant, none, if it is idle still. One busy again keeps its grant.
+    /// Takes back what the idle connection holds past what it keeps ([`Pool::kept`]), in the pool's
+    /// account, `open` of its peer's exchanges open: its new grant, if it is idle still and held
+    /// more. One busy again keeps its grant.
     pub(crate) fn reclaim(&mut self, share: &mut Share, open: u32) -> Option<u32> {
         share.idle = false;
         // One busy again keeps its grant, and one that waits for more is granted, not taken from.
-        if !share.pooled || open > 0 || share.granted == 0 || share.wanting {
+        let kept = self.kept();
+        if !share.pooled || open > 0 || share.granted <= kept || share.wanting {
             return None;
         }
-        let back = u64::from(share.granted);
-        share.granted = 0;
+        let back = u64::from(share.granted.saturating_sub(kept));
+        share.granted = kept;
         self.granted = self.granted.saturating_sub(back);
         self.reclaimed = self.reclaimed.saturating_add(back);
-        Some(0)
+        Some(kept)
     }
 
-    /// A connection just joined is granted its fair share at once from what is spare, within
-    /// `most`: its new grant, if it gained any. Its peer then waits no round trip to say it wants
-    /// more; under contention it holds its handshake's grant and asks as any does.
-    pub(crate) fn welcome(&mut self, share: &mut Share, most: u32) -> Option<u32> {
+    /// A connection just joined, named by `key` and `serial`, is granted its fair share at once
+    /// from what is spare, within `most`: its new grant, if it gained any. Its peer then waits no
+    /// round trip to say it wants more; under contention it holds its handshake's grant and asks as
+    /// any does. Raised past what it keeps with nothing of its peer's open yet, it is idle.
+    pub(crate) fn welcome(
+        &mut self,
+        share: &mut Share,
+        most: u32,
+        key: usize,
+        serial: u64,
+    ) -> Option<u32> {
         if !share.pooled {
             return None;
         }
@@ -251,6 +284,7 @@ impl Pool {
             .saturating_add(u32::try_from(raise).unwrap_or(u32::MAX));
         self.granted = self.granted.saturating_add(raise);
         self.grants = self.grants.saturating_add(raise);
+        self.went_idle(share, key, serial);
         Some(share.granted)
     }
 
@@ -360,9 +394,10 @@ impl Pool {
     /// An exchange the connection's peer opened has ended, `open` of its peer's still open, the
     /// connection named by `key` and `serial`: its new grant if it gives streams back. It gives one
     /// back when the pool is overspent; while another connection waits, one when it holds more
-    /// than a fair share, and all it holds when none of its peer's is open. Its own wait is no
-    /// other's: a lone connection that wants more keeps what it holds. One left holding credit with
-    /// none open is queued as idle.
+    /// than a fair share, and all it holds when none of its peer's is open; never what it keeps
+    /// ([`Pool::kept`]), which goes back to its peer with the reply. Its own wait is no other's: a lone
+    /// connection that wants more keeps what it holds. One left holding credit past what it keeps
+    /// with none open is queued as idle.
     pub(crate) fn ended(
         &mut self,
         share: &mut Share,
@@ -374,10 +409,11 @@ impl Pool {
             return None;
         }
         let waited = self.waiting > u64::from(share.wanting);
+        let kept = share.granted.min(self.kept());
         let keep = if waited && open == 0 {
-            0
+            kept
         } else if self.granted > self.size || (waited && u64::from(share.granted) > self.fair()) {
-            share.granted.saturating_sub(1)
+            share.granted.saturating_sub(1).max(kept)
         } else {
             share.granted
         };
@@ -491,28 +527,44 @@ mod tests {
         assert_eq!(pool.stats().granted, 2);
     }
 
-    /// More connections than the pool holds: each holds its handshake's grant, given back as the
-    /// pool is overspent; a connection whose peer has no exchange open gives what it holds to one
-    /// that waits, at once, however small its share, so the streams open at once come back to the
-    /// pool's size and go where they are wanted.
+    /// More connections than the pool holds: each keeps the stream it holds as its exchanges end,
+    /// others waiting or not (`KEPT`, the least credit Breakwater leaves a client), so its peer's
+    /// next request goes with the stream its reply gave back and never waits for a grant. The pool
+    /// is overcommitted by them, one a connection, and one that waits for more is granted nothing
+    /// past it while it is. One granted more while the pool had room gives it back as its
+    /// exchanges end, one an exchange, down to the stream it keeps.
     #[test]
-    fn connections_past_the_pool_give_their_grants_back_to_those_waiting() {
+    fn connections_past_the_pool_keep_one_stream_each() {
         let (mut pool, mut shares) = pool(2, 4, 1);
         assert_eq!(pool.stats().granted, 4, "each holds its handshake's grant");
-        for key in [0, 1] {
-            assert_eq!(pool.ended(&mut shares[key], 0, key, 0), Some(0));
+        pool.wants(&mut shares[0], 0, 0);
+        for key in [1, 2, 3] {
+            assert_eq!(pool.ended(&mut shares[key], 0, key, 0), None);
+            assert_eq!(shares[key].granted, 1, "kept, another waiting");
         }
-        assert_eq!(pool.stats().granted, 2);
+        grant_all(&mut pool, &mut shares, 16);
+        assert_eq!(shares[0].granted, 1, "nothing is spare");
+        assert_eq!(pool.stats().granted, 4);
+        // A pool of eight, the first raised to its fair share, then shrunk under the four.
+        let (mut pool, mut shares) = self::pool(8, 4, 1);
         pool.wants(&mut shares[0], 0, 0);
         grant_all(&mut pool, &mut shares, 16);
-        assert_eq!(shares[0].granted, 0, "nothing is spare");
-        // Connection 2 still has an exchange open: it keeps its one stream, its fair share.
-        assert_eq!(pool.ended(&mut shares[2], 1, 2, 0), None);
-        // Its last one ends: idle, it gives its stream to the one waiting.
-        assert_eq!(pool.ended(&mut shares[2], 0, 2, 0), Some(0));
-        grant_all(&mut pool, &mut shares, 16);
-        assert_eq!(shares[0].granted, 1);
-        assert_eq!(pool.stats().granted, 2);
+        assert_eq!(shares[0].granted, 2);
+        pool.resize(2);
+        assert_eq!(pool.ended(&mut shares[0], 1, 0, 0), Some(1));
+        assert_eq!(pool.ended(&mut shares[0], 0, 0, 0), None, "it keeps one");
+        assert_eq!(pool.stats().granted, 4);
+    }
+
+    /// A pool sized to nothing keeps nothing for its connections: what they hold goes back as
+    /// their exchanges end, and its owner takes nothing until it sizes the pool again.
+    #[test]
+    fn a_pool_sized_to_nothing_keeps_nothing() {
+        let (mut pool, mut shares) = pool(0, 2, 1);
+        assert_eq!(pool.ended(&mut shares[0], 0, 0, 0), Some(0));
+        pool.wants(&mut shares[1], 1, 0);
+        assert_eq!(pool.ended(&mut shares[1], 0, 1, 0), Some(0));
+        assert_eq!(pool.stats().granted, 0);
     }
 
     /// A connection whose peer alone wants more keeps what it holds as its exchanges end: its own
@@ -550,10 +602,14 @@ mod tests {
     #[test]
     fn a_connection_joining_is_welcomed_with_what_is_spare() {
         let (mut pool, mut shares) = pool(8, 1, 1);
-        assert_eq!(pool.welcome(&mut shares[0], 16), Some(8));
+        assert_eq!(pool.welcome(&mut shares[0], 16, 0, 0), Some(8));
         shares.push(Share::default());
         pool.join(&mut shares[1], 1, 1, 0);
-        assert_eq!(pool.welcome(&mut shares[1], 16), None, "nothing spare");
+        assert_eq!(
+            pool.welcome(&mut shares[1], 16, 1, 0),
+            None,
+            "nothing spare"
+        );
         assert_eq!(shares[1].granted, 1);
         assert_eq!(pool.stats().granted, 9);
     }
@@ -574,20 +630,24 @@ mod tests {
         }
     }
 
-    /// An idle connection's credit is taken back for one that waits when nothing is spare, though
-    /// it opened nothing to end: its peer may still open what it was told of (the overcommitment
-    /// counted), and the waiting one is granted its fair share. One waiting is never taken from,
-    /// and one busy again keeps its grant.
+    /// An idle connection's credit past the stream it keeps is taken back for one that waits when
+    /// nothing is spare, though it opened nothing to end: its peer may still open what it was told
+    /// of (the overcommitment counted), and the waiting one is granted its fair share. One waiting
+    /// is never taken from, and one busy again keeps its grant.
     #[test]
     fn an_idle_connections_credit_is_taken_back_for_one_waiting() {
         let (mut pool, mut shares) = pool(8, 1, 1);
-        assert_eq!(pool.welcome(&mut shares[0], 16), Some(8));
+        assert_eq!(pool.welcome(&mut shares[0], 16, 0, 0), Some(8));
         shares.push(Share::default());
         pool.join(&mut shares[1], 1, 1, 0);
         pool.wants(&mut shares[1], 1, 0);
         turn(&mut pool, &mut shares, 16, &[0, 0]);
-        assert_eq!((shares[0].granted, shares[1].granted), (0, 4));
-        assert_eq!(pool.stats().reclaimed, 8);
+        assert_eq!(
+            (shares[0].granted, shares[1].granted),
+            (1, 4),
+            "taken back to the stream it keeps"
+        );
+        assert_eq!(pool.stats().reclaimed, 7);
         // A third joins and waits; the second, busy now, keeps its grant though it was queued idle.
         shares.push(Share::default());
         pool.join(&mut shares[2], 1, 2, 0);
@@ -622,31 +682,33 @@ mod tests {
 
     /// A parked exchange holds a stream of its own beside the grant, within what one connection
     /// may hold, and is no open one in the pool's accounts: a connection whose only open exchange
-    /// is parked is idle, and its grant is taken back for one waiting, the parked stream kept.
-    /// Ended, the parked stream goes with it.
+    /// is parked is idle, and its grant past the stream it keeps is taken back for one waiting,
+    /// the parked stream kept. Ended, the parked stream goes with it.
     #[test]
     fn a_parked_exchange_holds_a_stream_of_its_own_and_none_of_the_pools() {
-        let (mut pool, mut shares) = pool(2, 2, 1);
+        let (mut pool, mut shares) = pool(3, 2, 1);
+        assert_eq!(pool.welcome(&mut shares[0], 4, 0, 0), Some(2));
         // Connection 0's peer parks a wait: its limit rises past its grant, the pool's untouched.
-        assert_eq!(pool.park(&mut shares[0], 4, 0, 0, 0), Some(2));
-        assert_eq!((shares[0].granted, shares[0].parked), (1, 1));
+        assert_eq!(pool.park(&mut shares[0], 4, 0, 0, 0), Some(3));
+        assert_eq!((shares[0].granted, shares[0].parked), (2, 1));
         let stats = pool.stats();
-        assert_eq!((stats.granted, stats.parked, stats.parks), (2, 1, 1));
+        assert_eq!((stats.granted, stats.parked, stats.parks), (3, 1, 1));
         // Connection 1 waits with nothing spare: connection 0, idle in the pool's accounts though
-        // its parked exchange is open, gives its grant back and keeps the parked stream.
+        // its parked exchange is open, gives back its grant past the stream it keeps, and keeps
+        // the parked stream.
         pool.wants(&mut shares[1], 1, 0);
         assert_eq!(pool.next(), None, "nothing spare");
         let idle = pool.next_idle();
         assert_eq!(idle, Some((0, 0)));
-        assert_eq!(pool.reclaim(&mut shares[0], 0), Some(0));
-        assert_eq!((shares[0].granted, shares[0].limit()), (0, 1));
+        assert_eq!(pool.reclaim(&mut shares[0], 0), Some(1));
+        assert_eq!((shares[0].granted, shares[0].limit()), (1, 2));
         assert_eq!(pool.next(), Some((1, 0)));
         assert_eq!(pool.grant(&mut shares[1], 4), 2);
         // The parked exchange ends: its stream goes, granted to no other.
-        assert_eq!(pool.unpark(&mut shares[0]), Some(0));
+        assert_eq!(pool.unpark(&mut shares[0]), Some(1));
         assert_eq!(pool.unpark(&mut shares[0]), None, "nothing parked");
         let stats = pool.stats();
-        assert_eq!((stats.granted, stats.parked), (2, 0));
+        assert_eq!((stats.granted, stats.parked), (3, 0));
     }
 
     /// A connection that holds as many streams as one may parks nothing more: the exchange is
