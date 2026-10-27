@@ -230,6 +230,11 @@ pub struct ClaimState {
     created_revision: crate::ObjectRevision,
     /// The revision of the claim's binding its acceptance manifest was checked for.
     acceptance_revision: crate::ObjectRevision,
+    /// Its acceptance manifest's intent fingerprint ([`ClaimState::acceptance_intent`]), taken once
+    /// as the claim is made, restored or copied: the manifest never changes, nor the ledger,
+    /// object, content and issuer it is bound to (a binding moves by its revision alone, which the
+    /// fingerprint leaves out).
+    acceptance_intent: ContentHash,
     /// Behind its own allocation, made when the claim becomes terminal: an open claim holds a
     /// pointer's width for it, where its widest form (208 bytes) took room in every claim row
     /// (doc 31 M3).
@@ -310,6 +315,7 @@ impl ClaimState {
             lineage,
             acceptance: acceptance.into_body(),
             acceptance_revision,
+            acceptance_intent: ContentHash([0; 32]),
             scopes,
             status: ClaimStatus::Generated,
             receipt: None,
@@ -321,7 +327,8 @@ impl ClaimState {
             created_revision: binding.revision,
             terminal_cut: None,
             origin: ClaimOrigin::Native,
-        })
+        }
+        .with_acceptance_intent())
     }
     #[cfg(test)]
     pub fn generate_child(
@@ -393,6 +400,18 @@ impl ClaimState {
             revision: self.created_revision,
             ..self.binding
         }
+    }
+    /// Its acceptance manifest's intent fingerprint, as `acceptance().intent_fingerprint()` hashes
+    /// it, taken once: every check of a registration or an envelope against the claim compares it,
+    /// and a write made 15 to 30 of them, each hashing the whole manifest again (2.3% of a 1-CPU
+    /// leader's samples at 50 work claims a second, compare CI run 40449727309).
+    pub fn acceptance_intent(&self) -> ContentHash {
+        self.acceptance_intent
+    }
+    /// The claim with its acceptance intent taken from its manifest as bound.
+    pub(super) fn with_acceptance_intent(mut self) -> Self {
+        self.acceptance_intent = self.acceptance().intent_fingerprint();
+        self
     }
     /// Its acceptance manifest, bound to the binding and issuer it was checked for.
     pub fn acceptance(&self) -> aggregation::Acceptance<'_> {

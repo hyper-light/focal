@@ -236,7 +236,7 @@ impl<'a> ParentFacts<'a> {
         registrations.check(claim)?;
         Ok(Self {
             binding: claim.binding(),
-            policy: claim.acceptance().intent_fingerprint(),
+            policy: claim.acceptance_intent(),
             scope_limits: claim.scopes().limits(),
             max_responses: claim.max_responses(),
             heap: heap(claim)?,
@@ -765,7 +765,7 @@ impl CompletionEnvelope {
             record_buffers: None,
             target,
             parent: claim.binding(),
-            policy: claim.acceptance().intent_fingerprint(),
+            policy: claim.acceptance_intent(),
             scope_limits: claim.scopes().limits(),
             max_responses: claim.max_responses(),
             parent_heap,

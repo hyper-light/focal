@@ -330,7 +330,7 @@ impl RespondentEnvelope {
             key,
             parent: claim.binding(),
             holder: parent.holder,
-            policy: claim.acceptance().intent_fingerprint(),
+            policy: claim.acceptance_intent(),
             scope_limits: claim.scopes().limits(),
             max_responses: claim.max_responses(),
             registry_limit: registry.max_rows(),
@@ -510,7 +510,7 @@ impl RespondentEnvelope {
             ..claim.binding()
         })?;
         if claim.binding().revision < self.parent.revision
-            || claim.acceptance().intent_fingerprint() != self.policy
+            || claim.acceptance_intent() != self.policy
             || claim.scopes().limits() != self.scope_limits
             || claim.max_responses() != self.max_responses
         {

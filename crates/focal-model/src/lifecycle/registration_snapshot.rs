@@ -141,7 +141,7 @@ impl RegistrationSet {
             )?;
         }
         work.charge(policy_visits)?;
-        let policy = claim.acceptance().intent_fingerprint();
+        let policy = claim.acceptance_intent();
         let visits = row_quote(fields.rows, claim.acceptance().declarations().len())?;
         work.charge(visits)?;
         let fingerprint = inspect(claim, fields, source, visits, |_| Ok(()))?;

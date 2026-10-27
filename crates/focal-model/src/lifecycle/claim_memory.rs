@@ -173,6 +173,7 @@ impl ClaimState {
                 .acceptance
                 .try_copy(self.acceptance.copy_heap_bytes()?)?,
             acceptance_revision: self.acceptance_revision,
+            acceptance_intent: self.acceptance_intent,
             scopes: self.scopes.try_copy(self.scopes.copy_charge()?)?,
             status: self.status,
             receipt: self.receipt,

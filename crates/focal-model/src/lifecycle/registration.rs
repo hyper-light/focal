@@ -70,7 +70,7 @@ impl RegistrationSet {
         bytes::fits(std::mem::size_of::<Self>(), max_bytes)?;
         Ok(Self {
             revision: claim.binding().revision,
-            policy: claim.acceptance().intent_fingerprint(),
+            policy: claim.acceptance_intent(),
             rows: Vec::new(),
             max_rows,
             sealed: false,
@@ -83,7 +83,7 @@ impl RegistrationSet {
             return Err(ContractError::StaleRevision);
         }
         claim.acceptance().check(claim.binding(), claim.issuer())?;
-        if self.policy != claim.acceptance().intent_fingerprint() {
+        if self.policy != claim.acceptance_intent() {
             return Err(ContractError::InvalidPolicy);
         }
         Ok(())

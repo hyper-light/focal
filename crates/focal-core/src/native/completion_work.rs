@@ -318,7 +318,7 @@ impl CompletionEnvelope {
             record_buffers: None,
             target: CompletionTarget::Work,
             parent: parent.binding(),
-            policy: parent.acceptance().intent_fingerprint(),
+            policy: parent.acceptance_intent(),
             scope_limits: parent.scopes().limits(),
             max_responses: parent.max_responses(),
             parent_heap,

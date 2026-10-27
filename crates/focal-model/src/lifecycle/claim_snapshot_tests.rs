@@ -886,3 +886,27 @@ fn a_claim_hydrates_its_creation_revision_and_refuses_a_definition_bound_elsewhe
     assert_eq!(restored.creation_binding(), claim.creation_binding());
     assert_eq!(restored.binding(), claim.binding());
 }
+
+/// A claim's acceptance intent, taken once, is the fingerprint its manifest hashes to as bound, on
+/// every path a claim takes: made, moved through its revisions, copied and restored from its
+/// snapshot.
+#[test]
+fn a_claims_acceptance_intent_is_its_manifests_fingerprint_on_every_path() {
+    let held = |claim: &ClaimState| {
+        assert_eq!(
+            claim.acceptance_intent(),
+            claim.acceptance().intent_fingerprint()
+        );
+        assert_ne!(claim.acceptance_intent(), crate::ContentHash([0; 32]));
+    };
+    let (mut claim, _) = fixture(9, Some(ValidationMode::Required), true);
+    held(&claim);
+    receive(&mut claim);
+    held(&claim);
+    let copied = claim.try_copy(claim.copy_charge().unwrap()).unwrap();
+    held(&copied);
+    assert_eq!(copied.acceptance_intent(), claim.acceptance_intent());
+    let restored = restore(&claim, &[]);
+    held(&restored);
+    assert_eq!(restored.acceptance_intent(), claim.acceptance_intent());
+}

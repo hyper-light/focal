@@ -346,6 +346,7 @@ impl<R: ClaimResponseSource + ?Sized, S: scope::RegistrySnapshotSource + ?Sized>
             lineage: definition.lineage,
             acceptance: definition.acceptance.into_body(),
             acceptance_revision,
+            acceptance_intent: ContentHash([0; 32]),
             scopes,
             status: self.fields.status,
             receipt: self.fields.receipt,
@@ -357,7 +358,8 @@ impl<R: ClaimResponseSource + ?Sized, S: scope::RegistrySnapshotSource + ?Sized>
             created_revision: definition_binding.revision,
             terminal_cut: self.terminal.map(held_cut).transpose()?,
             origin: self.fields.origin,
-        };
+        }
+        .with_acceptance_intent();
         bytes::fits(
             complete::<ClaimState>(
                 restored.retained_heap_bytes()?,
