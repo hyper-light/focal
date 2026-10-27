@@ -442,7 +442,8 @@ EOF
     faults_start
     if ! timeout "$bound" docker compose -f compose.yaml --profile focal \
       exec -T -e "FOCAL_LOAD_WRITES_CSV=/reports/$report.csv" focal-load \
-      focal-load --shape /reports/shape.yaml --out "/reports/$report"; then
+      focal-load --shape /reports/shape.yaml --out "/reports/$report" \
+      2> >(tee >(grep DIAGS > "$out/$report.diags") >&2); then
       faults_end
       evidence
       exit 1

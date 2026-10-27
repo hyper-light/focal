@@ -1035,12 +1035,14 @@ impl Shared<'_> {
         written: SessionSeq,
         ids: std::ops::Range<u128>,
     ) -> Result<Option<(SessionSeq, Vec<NativeIdentity>)>, LoadError> {
-        let Some(objects) = self.read_for(actor, operation, written).await? else {
+        let Some((objects, described)) = self.read_for(actor, operation, written).await? else {
             let mut outcome = self.outcome.borrow_mut();
             outcome.abandoned = outcome.abandoned.saturating_add(1);
             return Ok(None);
         };
-        Ok(self
+        let read_at = self.run_start.elapsed().as_millis();
+        let refused = self.outcome.borrow().refused;
+        let result = self
             .step(
                 actor,
                 i,
@@ -1049,7 +1051,76 @@ impl Shared<'_> {
                 Some((operation, &objects, ids)),
             )
             .await?
-            .map(|(_, sequence, minted)| (sequence, minted)))
+            .map(|(_, sequence, minted)| (sequence, minted));
+        if step == 8 && result.is_none() && self.outcome.borrow().refused != refused {
+            // diag (not for merge): what the refused step read, against the same reads again at
+            // least at its token and linearizable, at its actor's home.
+            let refused_at = self.run_start.elapsed().as_millis();
+            let again = match self.read_for(actor, operation, written).await {
+                Ok(Some((_, described))) => described,
+                Ok(None) => "none".into(),
+                Err(error) => format!("error {error}"),
+            };
+            let lin = self.diag_linearizable(actor, operation).await;
+            let lin_at = self.run_start.elapsed().as_millis();
+            eprintln!(
+                "DIAGS i={i} seen={} read_at={read_at} refused_at={refused_at} lin_at={lin_at} orig=[{described}] again=[{again}] lin=[{lin}]",
+                written.0
+            );
+        }
+        Ok(result)
+    }
+    /// diag (not for merge): `operation`'s reads linearizable, described.
+    async fn diag_linearizable(
+        &self,
+        actor: &Actor<'_>,
+        operation: &NativeAuthoredOperation,
+    ) -> String {
+        let Ok(requirements) = focal_native_client::requirements(operation) else {
+            return "requirements".into();
+        };
+        let mut described = String::new();
+        for requirement in requirements {
+            let query = match requirement {
+                focal_native_client::Requirement::Objects(objects) => {
+                    NativeReadQuery::Objects(objects)
+                }
+                focal_native_client::Requirement::Evaluation {
+                    claim,
+                    validation,
+                    selector,
+                } => NativeReadQuery::SelectEvaluation(focal_wire::NativeSelectionQuery {
+                    claim,
+                    validation,
+                    selector,
+                    generation: None,
+                    live: true,
+                }),
+            };
+            let Ok(request) = self.protocol_request(actor) else {
+                return "request".into();
+            };
+            let envelope = RequestEnvelope {
+                protocol: focal_wire::NATIVE_PROTOCOL_VERSION,
+                ledger: self.job.names.ledger,
+                route_epoch: RouteEpoch(1),
+                request_epoch: RequestEpoch(1),
+                request_id: RequestId::from_u128(request),
+                operation: Operation::NativeRead(NativeReadRequest {
+                    consistency: ReadConsistency::Linearizable,
+                    query,
+                    max_items: LIFECYCLE_SELECTION_ITEMS,
+                }),
+            };
+            match actor.conn.request(envelope).await {
+                Ok(envelope) => match envelope.result {
+                    Response::NativeRead(page) => described.push_str(&diag_describe(&page)),
+                    other => described.push_str(&format!("reply {other:?};")),
+                },
+                Err(error) => described.push_str(&format!("client {error};")),
+            }
+        }
+        described
     }
     /// The objects `operation` binds to (`requirements`), as `actor` reads them at least at
     /// `written`: the objects it names in one page, and each evaluation it binds to selected by
@@ -1060,7 +1131,7 @@ impl Shared<'_> {
         actor: &Actor<'_>,
         operation: &NativeAuthoredOperation,
         written: SessionSeq,
-    ) -> Result<Option<Vec<NativeObject>>, LoadError> {
+    ) -> Result<Option<(Vec<NativeObject>, String)>, LoadError> {
         let mut references = Vec::new();
         let mut queries = Vec::new();
         for requirement in focal_native_client::requirements(operation)
@@ -1092,13 +1163,17 @@ impl Shared<'_> {
             queries.push((NativeReadQuery::Objects(references), wanted));
         }
         let mut objects = Vec::new();
+        let mut described = String::new();
         for (query, wanted) in queries {
-            let Some(page) = self.read_page(actor, query, wanted, written).await? else {
+            let Some((page, page_described)) =
+                self.read_page(actor, query, wanted, written).await?
+            else {
                 return Ok(None);
             };
             objects.extend(page);
+            described.push_str(&page_described);
         }
-        Ok(Some(objects))
+        Ok(Some((objects, described)))
     }
     /// One page of `query`, as `actor` reads it at least at `written`, at most `wanted` objects;
     /// `None`, with the reason noted, when it could not be read or held nothing.
@@ -1108,7 +1183,7 @@ impl Shared<'_> {
         query: NativeReadQuery,
         wanted: u32,
         written: SessionSeq,
-    ) -> Result<Option<Vec<NativeObject>>, LoadError> {
+    ) -> Result<Option<(Vec<NativeObject>, String)>, LoadError> {
         let Ok(_permit) = self.reads.acquire().await else {
             return Err(LoadError::Bound("lifecycle reads"));
         };
@@ -1131,7 +1206,10 @@ impl Shared<'_> {
         };
         match actor.conn.request(envelope).await {
             Ok(envelope) => match envelope.result {
-                Response::NativeRead(page) if !page.objects.is_empty() => Ok(Some(page.objects)),
+                Response::NativeRead(page) if !page.objects.is_empty() => {
+                    let described = diag_describe(&page);
+                    Ok(Some((page.objects, described)))
+                }
                 other => {
                     self.note(format!("lifecycle read: unexpected reply {other:?}"));
                     Ok(None)
@@ -1155,7 +1233,7 @@ impl Shared<'_> {
         let query = NativeReadQuery::Objects(vec![focal_wire::NativeObjectRef::Work(
             focal_model::ArtifactId::from_u128(artifact),
         )]);
-        let Some(objects) = self.read_page(actor, query, 1, written).await? else {
+        let Some((objects, _)) = self.read_page(actor, query, 1, written).await? else {
             return Ok(None);
         };
         for object in objects {
@@ -2484,4 +2562,30 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
         deliver,
         shape,
     })
+}
+
+/// diag (not for merge): a page's token, the copy's sequence, and each claim's and evaluation's
+/// revision and state in it.
+fn diag_describe(page: &focal_wire::NativeReadPage) -> String {
+    let mut described = format!("t{}/n{}:", page.token.sequence.0, page.native_sequence.0);
+    for object in &page.objects {
+        match object {
+            NativeObject::Claim(claim) => described.push_str(&format!(
+                " c r{} {:?} rel{}",
+                claim.binding.revision.0, claim.status, claim.released
+            )),
+            NativeObject::Evaluation(evaluation) => described.push_str(&format!(
+                " e r{} {:?} {:?} b{} a{:?} f{}",
+                evaluation.binding.revision.0,
+                evaluation.state,
+                evaluation.phase,
+                evaluation.has_begun,
+                evaluation.attempt_index,
+                evaluation.fence.is_some()
+            )),
+            _ => described.push_str(" other"),
+        }
+    }
+    described.push(';');
+    described
 }
