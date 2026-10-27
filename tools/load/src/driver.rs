@@ -41,6 +41,7 @@ use hyper_rt::combine::{Either, race2};
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
+    rc::Rc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -1424,10 +1425,12 @@ struct Agent {
 }
 
 /// A run among agents, as its callers and tails share it: the agents, the watch every agent's
-/// tail tells, and how the tails read.
-struct Agents<'a> {
-    agents: &'a [Agent],
-    watch: &'a Watch,
+/// tail tells, and how the tails read. Owned through `Rc`, so each caller and each tail runs as a
+/// task of its own ([`run_phase`]).
+#[derive(Clone)]
+struct Agents {
+    agents: Rc<[Agent]>,
+    watch: Rc<Watch>,
     poll: Duration,
     wait_ms: u32,
     seed: u64,
@@ -1439,7 +1442,7 @@ async fn worker(
     run_start: Instant,
     generations: &Generations,
     conn: &Conn,
-    (consumer, agents): (Option<ConsumerSide<'_>>, Option<&Agents<'_>>),
+    (consumer, agents): (Option<ConsumerSide<'_>>, Option<&Agents>),
 ) -> Result<Outcome, LoadError> {
     let count = usize::try_from(job.count).map_err(|_| LoadError::Bound("worker count"))?;
     // The shape bounds lifecycles at MAX_CLAIMS; each takes its steps, each
@@ -1498,7 +1501,7 @@ async fn worker(
                                 protocol: std::cell::Cell::new(0),
                             })
                             .collect(),
-                        run.watch,
+                        &*run.watch,
                     )
                 }),
                 reads: hyper_rt::sync::Semaphore::new(
@@ -1542,18 +1545,20 @@ async fn worker(
 /// Runs one phase on every job at once and waits for all of them; the wall
 /// time is the phase's, from the first caller's start to the last's end.
 ///
-/// The callers run together in this task, on this shard, with the run's
-/// connections and generations: a client's requests from several callers
-/// are carried on its one connection together. A wake polls each caller
-/// still running; more throughput than one shard drives comes from more
-/// processes, as the generations already model one participant's.
+/// Each caller, and each agent's inbox tail, runs as a task of its own on this
+/// shard, with the run's connections and generations (`Rc`, one thread): a
+/// client's requests from several callers are carried on its one connection
+/// together, and a wake polls the task it was for. A caller's lifecycles share
+/// its task (`focal_rt::Concurrent`), so a wake of one polls the caller's
+/// others; more throughput than one shard drives comes from more processes,
+/// as the generations already model one participant's.
 /// A `deliver` run's consumer: how its connections are opened and as whom, its principal's
 /// generations, the watch both sides wait on, and how its tails poll.
 struct Consumer<'a> {
     connector: &'a Connector,
     principal: ParticipantId,
-    generations: &'a Generations,
-    watch: &'a Watch,
+    generations: Rc<Generations>,
+    watch: Rc<Watch>,
     poll: Duration,
     /// How long an inbox read is asked to wait at the node; zero polls.
     wait_ms: u32,
@@ -1579,26 +1584,28 @@ fn tail_ids(seed: u64, worker: u128) -> impl FnMut() -> Result<u128, LoadError> 
 async fn run_phase(
     jobs: Vec<Job>,
     phase: Phase,
-    generations: &Generations,
+    generations: Rc<Generations>,
     connector: &Connector,
     connections: u16,
-    (consumer, agents): (Option<&Consumer<'_>>, Option<&Agents<'_>>),
+    (consumer, agents): (Option<&Consumer<'_>>, Option<&Agents>),
 ) -> Result<(Vec<Outcome>, u128, u128), LoadError> {
     let Some(first) = jobs.first() else {
         return Err(LoadError::Bound("zero workers"));
     };
     let names = first.names;
     let limits = first.limits.clone();
-    let conns = (0..connections.max(1))
+    let conns: Rc<[Conn]> = (0..connections.max(1))
         .map(|_| Conn::open(connector, names.issuer, &names, &limits))
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()?
+        .into();
     // A `deliver` run's consumer sends on connections of its own, as a second agent would, and
     // each side's tail reads on one more.
-    let consumer_conns = match consumer {
+    let consumer_conns: Rc<[Conn]> = match consumer {
         Some(side) => (0..connections.max(1))
             .map(|_| Conn::open(side.connector, side.principal, &names, &limits))
-            .collect::<Result<Vec<_>, _>>()?,
-        None => Vec::new(),
+            .collect::<Result<Vec<_>, _>>()?
+            .into(),
+        None => Rc::from(Vec::new()),
     };
     let tail_conns = match consumer {
         Some(side) => Some((
@@ -1609,10 +1616,13 @@ async fn run_phase(
     };
     // The tails the run reads its sides' inboxes with, and the watch they take their places in.
     let (positions, tails) = match (consumer, agents) {
-        (Some(side), _) => (Some(side.watch), 2),
-        (None, Some(run)) => (Some(run.watch), run.agents.len()),
+        (Some(side), _) => (Some(&*side.watch), 2),
+        (None, Some(run)) => (Some(&*run.watch), run.agents.len()),
         (None, None) => (None, 0),
     };
+    if let Some(watch) = positions {
+        watch.reserve_tails(tails)?;
+    }
     let stop = || {
         if let Some(side) = consumer {
             side.watch.stop();
@@ -1640,53 +1650,80 @@ async fn run_phase(
             }
         };
         let run_start = Instant::now();
-        let mut callers = match focal_rt::Concurrent::new(jobs.len()) {
-            Ok(callers) => callers,
-            Err(_) => {
-                stop();
-                return Err(LoadError::Bound("callers"));
-            }
-        };
-        let pushed = (|| {
-            for job in jobs {
-                let slot = usize::from(job.index)
-                    .checked_rem(conns.len())
-                    .ok_or(LoadError::Bound("connections"))?;
+        // Each caller a task of its own: a wake polls the task it was for, where a set polled
+        // every caller and each caller's lifecycles at every wake of any (`focal_rt::Concurrent`),
+        // and the 500 agents' generator polled so in one task spent 12.8% of its samples reading
+        // one-shot replies that had not come (compare CI run 40540102366).
+        let mut callers = Vec::new();
+        if callers.try_reserve_exact(jobs.len()).is_err() {
+            stop();
+            return Err(LoadError::Bound("callers"));
+        }
+        for job in jobs {
+            let index = job.index;
+            let slot = match usize::from(index).checked_rem(conns.len()) {
+                Some(slot) => slot,
+                None => {
+                    abort_all(&callers);
+                    stop();
+                    return Err(LoadError::Bound("connections"));
+                }
+            };
+            let generations = Rc::clone(&generations);
+            let conns = Rc::clone(&conns);
+            let consumer_conns = Rc::clone(&consumer_conns);
+            let side = consumer.map(|side| {
+                (
+                    side.principal,
+                    Rc::clone(&side.generations),
+                    Rc::clone(&side.watch),
+                )
+            });
+            let agents = agents.cloned();
+            let spawned = focal_rt::spawn(async move {
                 let conn = conns.get(slot).ok_or(LoadError::Bound("connections"))?;
-                let side = match consumer {
-                    Some(side) => Some(ConsumerSide {
-                        principal: side.principal,
+                let side = match &side {
+                    Some((principal, generations, watch)) => Some(ConsumerSide {
+                        principal: *principal,
                         conn: consumer_conns
                             .get(slot)
                             .ok_or(LoadError::Bound("consumer connections"))?,
-                        generations: side.generations,
-                        watch: side.watch,
+                        generations,
+                        watch,
                     }),
                     None => None,
                 };
-                let index = job.index;
-                callers
-                    .push(async move {
-                        (
-                            index,
-                            worker(job, phase, run_start, generations, conn, (side, agents)).await,
-                        )
-                    })
-                    .map_err(|_| LoadError::Bound("callers"))?;
+                worker(
+                    job,
+                    phase,
+                    run_start,
+                    &generations,
+                    conn,
+                    (side, agents.as_ref()),
+                )
+                .await
+            });
+            match spawned {
+                Ok(handle) => callers.push((index, handle)),
+                Err(error) => {
+                    abort_all(&callers);
+                    stop();
+                    return Err(LoadError::Runtime(error));
+                }
             }
-            Ok::<(), LoadError>(())
-        })();
-        if let Err(error) = pushed {
-            stop();
-            return Err(error);
         }
         let mut outcomes = Vec::with_capacity(callers.len());
         let mut failed = None;
-        while let Some((index, outcome)) = callers.join_next().await {
-            match outcome {
-                Ok(outcome) => outcomes.push((index, outcome)),
-                Err(error) => {
+        for (index, handle) in callers {
+            match handle.await {
+                Ok(Ok(outcome)) => outcomes.push((index, outcome)),
+                Ok(Err(error)) => {
                     failed.get_or_insert(error);
+                }
+                Err(_) => {
+                    failed.get_or_insert(LoadError::Worker(
+                        "a caller's task ended without its outcome",
+                    ));
                 }
             }
         }
@@ -1702,7 +1739,7 @@ async fn run_phase(
             let (outcomes, consumer_tailed, issuer_tailed) = hyper_rt::combine::join3(
                 collect,
                 watch::tail(
-                    side.watch,
+                    &side.watch,
                     Side::Consumer,
                     (side.poll, side.wait_ms),
                     consumer_tail,
@@ -1711,7 +1748,7 @@ async fn run_phase(
                     tail_ids(side.seed, CONSUMER_TAIL_WORKER),
                 ),
                 watch::tail(
-                    side.watch,
+                    &side.watch,
                     Side::Issuer,
                     (side.poll, side.wait_ms),
                     issuer_tail,
@@ -1728,31 +1765,61 @@ async fn run_phase(
         _ => match agents {
             // Every agent's inbox read beside the callers, each on the agent's one connection.
             Some(run) => {
-                let tails = async {
-                    let mut tails = focal_rt::Concurrent::new(run.agents.len())
-                        .map_err(|_| LoadError::Bound("agent tails"))?;
-                    for agent in run.agents {
-                        tails
-                            .push(watch::tail(
-                                run.watch,
-                                Side::Agent,
-                                (run.poll, run.wait_ms),
-                                &agent.conn,
-                                names.ledger,
-                                agent.principal,
-                                tail_ids(run.seed, AGENT_TAIL_WORKER),
-                            ))
-                            .map_err(|_| LoadError::Bound("agent tails"))?;
+                // Each agent's tail a task of its own, as each caller is: a delivery to one agent
+                // wakes its tail alone.
+                let mut tails = Vec::new();
+                if tails.try_reserve_exact(run.agents.len()).is_err() {
+                    stop();
+                    return Err(LoadError::Bound("agent tails"));
+                }
+                for index in 0..run.agents.len() {
+                    let run = run.clone();
+                    let ledger = names.ledger;
+                    let spawned = focal_rt::spawn(async move {
+                        let agent = run
+                            .agents
+                            .get(index)
+                            .ok_or(LoadError::Bound("agent tails"))?;
+                        watch::tail(
+                            &run.watch,
+                            Side::Agent,
+                            (run.poll, run.wait_ms),
+                            &agent.conn,
+                            ledger,
+                            agent.principal,
+                            tail_ids(run.seed, AGENT_TAIL_WORKER),
+                        )
+                        .await
+                    });
+                    match spawned {
+                        Ok(handle) => tails.push(handle),
+                        Err(error) => {
+                            for tail in &tails {
+                                tail.abort();
+                            }
+                            stop();
+                            return Err(LoadError::Runtime(error));
+                        }
                     }
+                }
+                let tailed = async {
                     let mut failed = None;
-                    while let Some(tailed) = tails.join_next().await {
-                        if let Err(error) = tailed {
-                            failed.get_or_insert(error);
+                    for tail in tails {
+                        match tail.await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                failed.get_or_insert(error);
+                            }
+                            Err(_) => {
+                                failed.get_or_insert(LoadError::Worker(
+                                    "an agent's tail ended without its outcome",
+                                ));
+                            }
                         }
                     }
                     failed.map_or(Ok(()), Err)
                 };
-                let (outcomes, tailed) = hyper_rt::combine::join2(collect, tails).await;
+                let (outcomes, tailed) = hyper_rt::combine::join2(collect, tailed).await;
                 tailed?;
                 outcomes?
             }
@@ -1766,6 +1833,13 @@ async fn run_phase(
         wall_ns,
         run_start_epoch_ns,
     ))
+}
+
+/// Cancels every task in `handles`: a phase that could not start them all runs none of them on.
+fn abort_all<T>(handles: &[(u16, focal_rt::JoinHandle<T>)]) {
+    for (_, handle) in handles {
+        handle.abort();
+    }
 }
 
 /// The wall clock in seconds since the epoch, for a credential's validity.
@@ -2107,11 +2181,11 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
             "deliver's consumer must be a principal of its own".into(),
         ));
     }
-    let consumer_generations = Generations::new();
+    let consumer_generations = Rc::new(Generations::new());
     let watch_bound = usize::from(shape.inflight)
         .checked_mul(usize::from(shape.concurrency))
         .ok_or(LoadError::Bound("messages under way"))?;
-    let watch = Watch::new(watch_bound);
+    let watch = Rc::new(Watch::new(watch_bound));
     // A run among agents: each agent a principal of its own on the embedded node, with its
     // connection and its journal's generations.
     PROGRESS.agents(u64::from(shape.agents.unwrap_or(0)));
@@ -2164,9 +2238,10 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
             .collect::<Result<Vec<_>, LoadError>>()?,
         (None, _) => Vec::new(),
     };
+    let agent_list: Rc<[Agent]> = agent_list.into();
     let agents = shape.agents.map(|_| Agents {
-        agents: &agent_list,
-        watch: &watch,
+        agents: Rc::clone(&agent_list),
+        watch: Rc::clone(&watch),
         poll: Duration::from_millis(u64::from(shape.poll_ms)),
         wait_ms: shape.inbox_wait_ms,
         seed: shape.seed,
@@ -2175,8 +2250,8 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
         Some(consumer_connector) => Some(Consumer {
             connector: consumer_connector,
             principal: names.worker,
-            generations: &consumer_generations,
-            watch: &watch,
+            generations: Rc::clone(&consumer_generations),
+            watch: Rc::clone(&watch),
             poll: Duration::from_millis(u64::from(shape.poll_ms)),
             wait_ms: shape.inbox_wait_ms,
             seed: shape.seed,
@@ -2205,14 +2280,14 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
     }
     // One journal's generations for every caller, as N processes of one
     // participant share one (the audit's F12).
-    let generations = Generations::new();
+    let generations = Rc::new(Generations::new());
     // The write phase, its progress said on stderr as it goes (`progress`): a run that stalls
     // says where, though its report never comes.
     let written = race2(
         run_phase(
             jobs,
             Phase::Write,
-            &generations,
+            Rc::clone(&generations),
             &connector,
             connections,
             (consumer.as_ref(), agents.as_ref()),
@@ -2252,8 +2327,8 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
     )?;
     let deliver = match consumer
         .as_ref()
-        .map(|side| side.watch)
-        .or(agents.as_ref().map(|run| run.watch))
+        .map(|side| &*side.watch)
+        .or(agents.as_ref().map(|run| &*run.watch))
     {
         Some(watch) => {
             let mut measured = DeliveryMeasurements::measure(
@@ -2321,7 +2396,7 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
         let (read_outcomes, read_nanos, _) = run_phase(
             jobs,
             Phase::Read,
-            &generations,
+            Rc::clone(&generations),
             &connector,
             reader_count.min(connections),
             (None, None),
@@ -2340,7 +2415,9 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
         (0, 0, 0, Latency::default())
     };
     // Every handle to the embedded host goes before it closes: its owner joins once the last does,
-    // each agent's connection among them.
+    // each agent's connection among them, held by the run's agents and the list alike (the
+    // phases' tasks, joined, hold none).
+    drop(agents);
     drop(agent_list);
     drop(consumer_connector);
     drop(connector);

@@ -82,10 +82,11 @@ pub struct Watch {
     /// them all to have ([`Watch::all_positioned`]).
     positioned: Cell<usize>,
     positioning: RefCell<Option<std::task::Waker>>,
-    /// The waker of the task the tails run in, to be woken as the run stops: a tail lets go of
-    /// the read it has out at the node then, where it waited for the read's answer, up to a whole
-    /// inbox wait ([`Watch::stopping`]). Every tail of a watch runs in one task, the run's.
-    stopping: RefCell<Option<std::task::Waker>>,
+    /// The wakers of the tasks the tails run in, each once, woken as the run stops: a tail lets go
+    /// of the read it has out at the node then, where it waited for the read's answer, up to a
+    /// whole inbox wait ([`Watch::stopping`]). Each tail runs as a task of its own, so each is
+    /// woken; at most the tails the run reserved for ([`Watch::reserve_tails`]).
+    stopping: RefCell<Vec<std::task::Waker>>,
 }
 
 impl Watch {
@@ -103,8 +104,16 @@ impl Watch {
             agents: Cell::new(TailCounts::default()),
             positioned: Cell::new(0),
             positioning: RefCell::new(None),
-            stopping: RefCell::new(None),
+            stopping: RefCell::new(Vec::new()),
         }
+    }
+    /// Room for `tails` tails' tasks to wait for the run to stop, each once, reserved before any
+    /// waits.
+    pub fn reserve_tails(&self, tails: usize) -> Result<(), LoadError> {
+        self.stopping
+            .borrow_mut()
+            .try_reserve_exact(tails)
+            .map_err(|_| LoadError::Bound("tails waiting for the run to stop"))
     }
     /// Ends once the run stops ([`Watch::stop`]).
     fn stopping(&self) -> impl std::future::Future<Output = ()> + '_ {
@@ -112,7 +121,14 @@ impl Watch {
             if self.stopped.get() {
                 return std::task::Poll::Ready(());
             }
-            *self.stopping.borrow_mut() = Some(cx.waker().clone());
+            let mut waiting = self.stopping.borrow_mut();
+            // Each task once, within the room reserved for the tails: a tail past it is let go at
+            // its read's answer, up to an inbox wait, as every tail was before the room.
+            if !waiting.iter().any(|waker| waker.will_wake(cx.waker()))
+                && waiting.len() < waiting.capacity()
+            {
+                waiting.push(cx.waker().clone());
+            }
             std::task::Poll::Pending
         })
     }
@@ -212,7 +228,7 @@ impl Watch {
         if let Some(waker) = self.positioning.borrow_mut().take() {
             waker.wake();
         }
-        if let Some(waker) = self.stopping.borrow_mut().take() {
+        for waker in self.stopping.borrow_mut().drain(..) {
             waker.wake();
         }
         self.posted.borrow_mut().clear();
