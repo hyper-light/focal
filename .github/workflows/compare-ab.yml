@@ -120,12 +120,13 @@ jobs:
           cache-to: type=gha,mode=max
       # The two sides' nodes are different builds, or the comparison
       # measures one build against itself.
-      - name: A's and B's nodes differ
+      # diag (not for merge): the sides' nodes are one build; their generators differ.
+      - name: A's and B's generators differ
         run: |
-          a=$(docker run --rm focal:bench-a sha256sum /usr/local/bin/focal | cut -d' ' -f1)
-          b=$(docker run --rm focal:bench-b sha256sum /usr/local/bin/focal | cut -d' ' -f1)
-          echo "A's focal: $a"
-          echo "B's focal: $b"
+          a=$(docker run --rm focal:bench-a sha256sum /usr/local/bin/focal-load | cut -d' ' -f1)
+          b=$(docker run --rm focal:bench-b sha256sum /usr/local/bin/focal-load | cut -d' ' -f1)
+          echo "A's focal-load: $a"
+          echo "B's focal-load: $b"
           test "$a" != "$b"
       - run: docker save focal:bench-a focal:bench-b | zstd -T0 -3 > focal-bench-ab.tar.zst
       - uses: actions/upload-artifact@v4
@@ -175,8 +176,9 @@ jobs:
             for rate in ${{ github.event.inputs.rates || (startsWith(github.ref_name, 'ab/work') && '50 100' || '100 1000 4000') }}; do
               for side in $order; do
                 docker tag "focal:bench-$side" focal:bench
+                # diag (not for merge): each side its own generator, both homed over the nodes.
                 # A failed run is recorded and the rest still run.
-                bash tools/compare/compose/run.sh focal "$rate" \
+                FOCAL_LOAD_IMAGE="focal:bench-$side" bash tools/compare/compose/run.sh focal "$rate" \
                   "${{ github.event.inputs.seconds || '60' }}" \
                   "${{ github.event.inputs.warmup || '15' }}" \
                   128 "reports/$side/$round" || echo "$side round $round at $rate/s failed"
