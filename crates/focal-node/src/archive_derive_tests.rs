@@ -35,18 +35,18 @@ fn samples_are_spaced_by_the_grace_and_let_go_past_it() {
     let mut settled = Settled::default();
     let grace = 512_000;
     // Spaced a thousandth of the grace's half apart: 1,000 ms.
-    for (index, time) in [0u64, 500, 1_000, 1_999, 2_000].into_iter().enumerate() {
+    for (index, time) in [1u64, 501, 1_001, 2_000, 2_001].into_iter().enumerate() {
         settled.sample(&budget, SessionSeq(index as u64 + 1), time, time, grace);
     }
     let kept: Vec<_> = settled.samples.iter().map(|(_, time)| *time).collect();
-    assert_eq!(kept, [0, 1_000, 2_000]);
+    assert_eq!(kept, [1, 1_001, 2_001]);
     // Long after: the samples at or before the cut go but the newest of them, which dates every
     // record before it as due.
-    let now = 2_000 + grace + 10_000;
+    let now = 2_001 + grace + 10_000;
     settled.sample(&budget, SessionSeq(100), now, now, grace);
     let kept: Vec<_> = settled.samples.iter().map(|(_, time)| *time).collect();
-    assert_eq!(kept, [2_000, now]);
-    assert_eq!(settled.by(SessionSeq(1)), Some(2_000));
+    assert_eq!(kept, [2_001, now]);
+    assert_eq!(settled.by(SessionSeq(1)), Some(2_001));
     assert!(now - settled.by(SessionSeq(1)).unwrap() >= grace);
 }
 
@@ -127,4 +127,23 @@ fn due_through_agrees_with_the_first_sample_rule() {
             }
         }
     }
+}
+
+/// A core that holds no logical time yet (no record has set one) is not sampled: when its records
+/// settled is unknown, not the epoch. Sampled as the epoch, it stayed the oldest sample for good
+/// and dated every record before it a grace old, so no walk of a session activated before its first
+/// record could end early (`due_through` never none). Its first record's time is sampled as ever.
+#[test]
+fn a_core_with_no_logical_time_is_not_sampled() {
+    let budget = budget();
+    let mut settled = Settled::default();
+    let grace = 86_400_000;
+    let now = 1_800_000_000_000;
+    settled.sample(&budget, SessionSeq(3), 0, now, grace);
+    assert!(settled.samples.is_empty());
+    assert_eq!(settled.due_through(now, grace), None);
+    settled.sample(&budget, SessionSeq(9), now, now, grace);
+    assert_eq!(settled.samples.len(), 1);
+    assert_eq!(settled.due_through(now + 1_000, grace), None);
+    assert_eq!(settled.due_through(now + grace, grace), Some(SessionSeq(9)));
 }

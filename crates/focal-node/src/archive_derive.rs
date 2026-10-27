@@ -35,7 +35,11 @@ pub(crate) struct Settled {
 impl Settled {
     /// The committed core at `at` held logical time `time`, read at logical time `now` under a
     /// grace of `grace_ms`. A sample the buffer cannot be grown for is not taken: the families
-    /// it would have dated are dated by a later one.
+    /// it would have dated are dated by a later one. Nor is one of a core that holds no logical
+    /// time yet (`time` 0, no record has set one): when its records settled is unknown, not the
+    /// epoch, and taken as the epoch it dated every record before it a grace old for good, so a
+    /// walk on a session activated before its first record derived every family it visited (3.8%
+    /// of a 1-CPU leader's samples at 100 work claims a second, compare CI run 40461657046).
     pub(crate) fn sample(
         &mut self,
         budget: &MemoryBudget,
@@ -47,6 +51,9 @@ impl Settled {
         let cut = now.saturating_sub(grace_ms);
         while self.samples.get(1).is_some_and(|(_, time)| *time <= cut) {
             self.samples.pop_front();
+        }
+        if time == 0 {
+            return;
         }
         let gap = grace_ms
             .checked_div(u64::try_from(SETTLE_SAMPLES / 2).unwrap_or(u64::MAX))
