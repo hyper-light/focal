@@ -1150,3 +1150,51 @@ fn a_node_bundle_past_the_inline_bound_seals_and_reads_back() {
         reference
     );
 }
+
+/// The same payload sealed again, as every artifact carrying the same bytes is, is verified where
+/// it lies and promised and written nothing: the volume's estimate, which each committed write
+/// lowers until the next sample, stands. A chunk gone from the volume is promised and written
+/// again, alone, and the object reads back whole.
+#[test]
+fn a_payload_sealed_again_writes_only_what_the_volume_lacks() {
+    let root = tempfile::tempdir().unwrap();
+    // Sampled once, at the first promise: from then on only committed writes move the estimate.
+    let disk = DiskBudget::new(DiskBudgetConfig {
+        headroom: 0,
+        completion_reserve: 0,
+        sample_interval: u32::MAX,
+    })
+    .unwrap();
+    let mut store = ContentStore::open_with_disk(
+        root.path(),
+        limits(),
+        disk.clone(),
+        &crate::store::test_keys(root.path()),
+        ContentForm::Sealed,
+    )
+    .unwrap();
+    let chunk = store.limits.chunk_bytes;
+    let reference = store.seal_import_inline(domain(), REPORT, chunk).unwrap();
+    let free = disk.stats().free.unwrap();
+    assert_eq!(
+        store.seal_import_inline(domain(), REPORT, chunk).unwrap(),
+        reference
+    );
+    assert_eq!(disk.stats().free, Some(free), "nothing promised or written");
+    assert_eq!(disk.stats().outstanding, 0);
+    // A chunk lost: promised and written again, alone.
+    let directory = domain_directory(root.path(), domain());
+    let key = store.keys.domain(&directory, domain(), false).unwrap();
+    let first = ContentHash(*blake3::hash(&REPORT[..chunk]).as_bytes());
+    std::fs::remove_file(key.path(&directory, first, sealing::Kind::Chunk).unwrap()).unwrap();
+    assert_eq!(
+        store.seal_import_inline(domain(), REPORT, chunk).unwrap(),
+        reference
+    );
+    let rewritten = free - disk.stats().free.unwrap();
+    assert!(
+        rewritten > 0 && rewritten <= key.file_bytes(chunk).unwrap() + key.record_bytes(),
+        "{rewritten} bytes promised for one lost chunk"
+    );
+    assert_eq!(store.read_bytes(&reference, REPORT.len()).unwrap(), REPORT);
+}

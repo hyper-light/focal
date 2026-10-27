@@ -550,39 +550,83 @@ impl ContentStore {
             self.limits.max_manifest_bytes,
             STORE_WORKSPACE,
         )?;
-        // All deterministic limits and buffer allocations precede disk writes;
-        // the committed record's payload is completion work on the volume.
-        // Every file as the writer installs it, sealed from the fence on (29 §11): the chunks' and
-        // the manifest's bytes on the volume, and the domain's key record where the writer seals
-        // and the domain has none yet.
+        let reference = ContentRef {
+            domain,
+            root,
+            length,
+            class: ContentClass::Evidence,
+        };
         let directory = domain_directory(&self.root, domain);
         let key = self.keys.domain(&directory, domain, false)?;
+        // What the volume holds of the object already, verified where it lies and its freshness
+        // refreshed, is neither promised nor written again, as a transfer's duplicate chunk and a
+        // repeated completion's manifest are not (the audit's F59): the same payload sealed again,
+        // as every artifact carrying the same bytes is, adds no byte and no flush. A file that does
+        // not open to its bytes is written as one missing.
+        let mut missing = Vec::new();
+        missing
+            .try_reserve_exact(manifest.chunks.len())
+            .map_err(|_| ContentError::Capacity)?;
+        let mut promised = 0u64;
+        for (block, chunk) in bytes.chunks(chunk_bytes).zip(&manifest.chunks) {
+            if missing.iter().any(|(_, hash)| *hash == chunk.hash)
+                || already_held(
+                    &key,
+                    &directory,
+                    chunk.hash,
+                    sealing::Kind::Chunk,
+                    block.len(),
+                )?
+            {
+                continue;
+            }
+            promised = promised
+                .checked_add(key.file_bytes(block.len())?)
+                .ok_or(ContentError::Capacity)?;
+            missing.push((block, chunk.hash));
+        }
+        let manifest_held = already_held(
+            &key,
+            &directory,
+            root,
+            sealing::Kind::Manifest,
+            encoded.len(),
+        )?;
+        if missing.is_empty() && manifest_held {
+            return Ok(reference);
+        }
+        if !manifest_held {
+            promised = promised
+                .checked_add(key.file_bytes(encoded.len())?)
+                .ok_or(ContentError::Capacity)?;
+        }
+        // All deterministic limits and buffer allocations precede disk writes;
+        // the committed record's payload is completion work on the volume.
+        // Every file as the writer installs it, sealed from the fence on (29 §11): the missing
+        // chunks' and the manifest's bytes on the volume, and the domain's key record where the
+        // writer seals and the domain has none yet.
         let objects = disk_reserve(
             &self.disk,
             &self.root,
             DiskKind::Content,
             focal_memory::BudgetLane::Completion,
-            chunk_files_bound(&key, length, chunk_bytes)?
-                .checked_add(key.file_bytes(encoded.len())?)
-                .and_then(|bytes| bytes.checked_add(key.record_bytes()))
+            promised
+                .checked_add(key.record_bytes())
                 .ok_or(ContentError::Capacity)?,
         )?;
         durable_directory(&directory)?;
         let key = self.keys.writable(&directory, domain, key)?;
-        for (block, chunk) in bytes.chunks(chunk_bytes).zip(&manifest.chunks) {
-            install_chunk(&key, &directory, block, chunk.hash)?;
+        for (block, hash) in missing {
+            key.install(&key.path(&directory, hash, sealing::Kind::Chunk)?, block)?;
         }
-        key.install(
-            &key.path(&directory, root, sealing::Kind::Manifest)?,
-            &encoded,
-        )?;
+        if !manifest_held {
+            key.install(
+                &key.path(&directory, root, sealing::Kind::Manifest)?,
+                &encoded,
+            )?;
+        }
         objects.commit();
-        Ok(ContentRef {
-            domain,
-            root,
-            length,
-            class: ContentClass::Evidence,
-        })
+        Ok(reference)
     }
 }
 
