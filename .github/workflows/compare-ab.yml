@@ -9,7 +9,9 @@ name: Interleaved A/B tail latency
 #
 # A branch named ab/<anything> runs it: B is the pushed commit and A the
 # commit named in tools/compare/ab-base (a full SHA). Both sides' nodes are
-# driven by B's generator, so only the nodes differ.
+# driven by B's generator, so only the nodes differ. One named ab/work-<anything>
+# runs focal's work mode among 500 agents (run.sh MODE=work), as
+# compare/work-<anything> does, at 50 and 100 claims a second.
 on:
   push:
     branches: ["ab/**"]
@@ -158,12 +160,14 @@ jobs:
         env:
           NODE_CPUS: "1"
           FOCAL_LOAD_IMAGE: focal:bench-b
+          MODE: ${{ startsWith(github.ref_name, 'ab/work') && 'work' || 'append' }}
+          AGENTS: ${{ startsWith(github.ref_name, 'ab/work') && '500' || '' }}
         run: |
           rounds=${{ github.event.inputs.rounds || '2' }}
           for round in $(seq 1 "$rounds"); do
             order="a b"
             if [ $((round % 2)) -eq 0 ]; then order="b a"; fi
-            for rate in ${{ github.event.inputs.rates || '100 1000 4000' }}; do
+            for rate in ${{ github.event.inputs.rates || (startsWith(github.ref_name, 'ab/work') && '50 100' || '100 1000 4000') }}; do
               for side in $order; do
                 docker tag "focal:bench-$side" focal:bench
                 # A failed run is recorded and the rest still run.
@@ -183,7 +187,7 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
           python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
-          import glob, json, os, statistics
+          import glob, json, os, re, statistics
           def cpu(path, writes):
               """The nodes' CPU over a run, from run.sh's cgroup counters taken
               before and after the load: the busiest node's and all nodes'
@@ -211,7 +215,11 @@ jobs:
               return (busiest["usage_usec"] / writes, sum(d["usage_usec"] for d in nodes) / writes,
                       100 * busiest["usage_usec"] / wall, busiest.get("throttled_usec", 0) / 1000)
           rows = {}
-          for path in glob.glob("tools/compare/compose/reports/*/*/focal-*-128.json"):
+          # Each run's report: focal-<rate>-128.json, or with its mode's suffix
+          # (focal-<rate>-128-work-agents500.json), not the files beside it.
+          reports = [p for p in glob.glob("tools/compare/compose/reports/*/*/focal-*-128*.json")
+                     if re.fullmatch(r"focal-\d+-128(-[a-z0-9]+)*\.json", os.path.basename(p))]
+          for path in reports:
               side, round_ = path.split(os.sep)[-3:-1]
               r = json.load(open(path))
               m = r["measured_writes"]
