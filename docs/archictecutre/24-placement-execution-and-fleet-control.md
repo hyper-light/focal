@@ -1206,7 +1206,16 @@ keeps one connection per route (`focal_wire::RouteConnections`: concurrent
 cold calls to a route join its one dial in flight and share the connection,
 and a failed request forgets a route only while the connection that failed
 is the one cached); the local socket transport cannot follow a hint and
-surfaces it.
+surfaces it. A client may read where it is homed and write at the leader
+(`focal_client::ReadRoute::Home`, 2026-10-27): what does not mutate goes to its transport's
+first route at the newest route epoch it knows of the ledger, a read its home sends
+elsewhere at that epoch goes there for the ledger until it learns a newer one, one its home
+answers with a newer epoch is asked at home again at it (the hint, the leader at that epoch,
+is where its writes then go), and one its home cannot answer (no answer, unavailable, or
+behind its token, [27](27-consensus-roadmap-and-slates-port.md) §5) is asked once of the
+leader its writes found. Clients spread over a placement's voters so read where they are,
+as a Kafka consumer fetches from the replica in its rack (KIP-392), and the leader serves
+their writes; by default (`ReadRoute::Leader`) a client reads where its writes go.
 
 **Limits.** The directory's `leader` is the placement's preferred leader,
 not the log's: without leader transfer the two differ after an expansion,

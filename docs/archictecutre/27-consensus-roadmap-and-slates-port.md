@@ -606,6 +606,20 @@ failed, and with it the hosted partition it served (the split-and-merge test's
 failures on ubuntu CI, 2026-10-02 and 2026-10-03, named once the replica kept the
 error that stopped it).
 
+**Reads at least at a token on a follower** (2026-10-27). A read at least at a sequence
+(`ReadConsistency::AtLeast`, the token a committed answer gave, a client reading what it
+wrote) asked of a copy that has not applied it waits there for that copy to apply it, while
+the copy knows a leader (`WaitingFor::NativeReadApplied`), whoever leads by then: a committed
+sequence stays committed. It is answered behind at its request's deadline, and at once by a
+copy that knows no leader. It was answered behind at once, so a client homed on a follower,
+which writes at the leader and reads at its home, could read nothing it had just written
+until the follower had applied it; the follower is an append or two behind its leader's
+answers. etcd's members wait likewise for their applied index to reach the one a read needs
+(server/etcdserver/read, `ApplyWait`); a Kafka follower refuses such a fetch for the consumer
+to ask again (KIP-392's `OFFSET_NOT_AVAILABLE`), a round trip a time. The client's side is
+`focal_client::ReadRoute::Home` ([24](24-placement-execution-and-fleet-control.md), "Redirects
+at the data service").
+
 ## 6. Order of work
 
 | Stage | Content | Exit evidence |
