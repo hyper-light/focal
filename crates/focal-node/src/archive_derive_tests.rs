@@ -98,3 +98,33 @@ fn the_samples_are_bounded_and_charged_as_their_buffer_grows() {
     assert!(unfunded.samples.is_empty());
     assert_eq!(unfunded.by(SessionSeq(1)), None);
 }
+
+/// A family is due exactly when its last event is at or before the last record past its grace:
+/// `due_through` agrees with the rule [`Settled::by`] dates by, at every record and at every
+/// time, grace 0 among them (the newest sample past its grace too).
+#[test]
+fn due_through_agrees_with_the_first_sample_rule() {
+    let budget = budget();
+    for grace in [0u64, 1, 5, 1_000] {
+        let mut settled = Settled::default();
+        assert_eq!(settled.due_through(10_000, grace), None);
+        let mut sequence = 0;
+        for time in [10u64, 12, 15, 40, 41, 900, 1_500, 4_000] {
+            sequence += 3;
+            settled.sample(&budget, SessionSeq(sequence), time, time, grace);
+            for now in time..time + 2_500 {
+                let through = settled.due_through(now, grace);
+                for record in 0..=sequence + 1 {
+                    let due = settled
+                        .by(SessionSeq(record))
+                        .is_some_and(|at| now.saturating_sub(at) >= grace);
+                    assert_eq!(
+                        due,
+                        through.is_some_and(|through| SessionSeq(record) <= through),
+                        "grace {grace}, now {now}, record {record}: {through:?}",
+                    );
+                }
+            }
+        }
+    }
+}

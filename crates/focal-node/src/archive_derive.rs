@@ -108,6 +108,17 @@ impl Settled {
         let first = self.samples.partition_point(|(at, _)| *at < through);
         self.samples.get(first).map(|(_, time)| *time)
     }
+    /// The last record a grace of `grace_ms` has passed for at logical time `now`, as [`Self::by`]
+    /// dates records: a record is past its grace exactly when it is at or before it. The samples
+    /// past their grace are the oldest ones (time never falls along them), so a walk of them
+    /// stops at the first that is not; none before a sample is a grace old.
+    pub(crate) fn due_through(&self, now: u64, grace_ms: u64) -> Option<SessionSeq> {
+        self.samples
+            .iter()
+            .take_while(|(_, time)| now.saturating_sub(*time) >= grace_ms)
+            .last()
+            .map(|(at, _)| *at)
+    }
 }
 
 /// One family's bundle from the committed core (26 §4): only on the
@@ -194,6 +205,9 @@ fn eligible_in(
     min_age_ms: u64,
     settled: &Settled,
 ) -> Option<focal_core::native::retirement::RetirementFamily> {
+    if !may_be_due(core, settled, now, min_age_ms) {
+        return None;
+    }
     let family = core.retirement_family(root).ok()?;
     if !report.allows_family(family.through) {
         return None;
@@ -201,6 +215,20 @@ fn eligible_in(
     // Its last event settled the grace ago, or its session is short of memory (doc 31 M3).
     core.retirement_due(settled.by(family.through), now, min_age_ms)
         .then_some(family)
+}
+/// Whether any family may be due at logical time `now` under a grace of `min_age_ms`
+/// ([`focal_core::Core::retirement_due`]'s rule): the session is pressed for memory, which waives
+/// the grace, or some record settled the grace ago. Neither, and no family is: none is derived to
+/// learn so (a family's derivation walks its every member, row and event, and a walk derived one
+/// a visit, 3.7% of a leader's processor at 100 work claims a second on compare CI, 2026-10-26,
+/// where the grace is a day and no family is ever due).
+fn may_be_due(
+    core: &focal_core::Core<focal_core::native::NativeState>,
+    settled: &Settled,
+    now: u64,
+    min_age_ms: u64,
+) -> bool {
+    core.native_memory_pressed() || settled.due_through(now, min_age_ms).is_some()
 }
 /// What one cold walk did (doc 31 M2, A2): how many families it retired, deferred and refused,
 /// whether it found more than one batch of offers, whether it submitted a candidate, and where
@@ -245,6 +273,10 @@ pub(crate) fn cold_walk(
         now,
         min_age_ms,
     );
+    // No family may be due: the pass is done, nothing visited.
+    if !may_be_due(core, settled, now, min_age_ms) {
+        return Ok(ColdWalk::default());
+    }
     let candidates = core
         .retirement_candidates(cursor, visits)
         .map_err(|error| LedgerError::Native(error.into()))?;
