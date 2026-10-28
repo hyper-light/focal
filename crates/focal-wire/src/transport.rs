@@ -127,6 +127,16 @@ pub(crate) fn lane_window(limits: &WireLimits) -> usize {
         .max(1)
 }
 
+/// The forward erasure correction's window, in packets (hyper-transport `Limits::fec_window`,
+/// hyper-quic `TransportConfig::fec_window`): measured on hyper-sim's network at a leader's
+/// replication load (hyper-raft `crates/hyper-quic/tests/replication.rs`: two followers each sent
+/// 110 appends of 7.5 KB a second over 80 ms one way, 1 to 5% of each way's datagrams lost), a
+/// window of 64 packets left a path losing 1% uncoded, its commit's median 189 to 202 ms where 128
+/// gave 166 to 167 (163 loss-free), and both coded 3 and 5% to the loss-free path's median. A
+/// connection codes only while its path loses and it sends often enough for a repair to be due
+/// within a loss delay; what its coding holds is charged as it is held, and forgotten where the
+/// budget refuses.
+const FEC_WINDOW: u32 = 128;
 /// The bounds of an endpoint carrying focal's traffic under `limits`, admitting by `admission`.
 pub fn endpoint_limits(
     limits: &WireLimits,
@@ -196,6 +206,9 @@ pub fn endpoint_limits(
         // An endpoint's driver chooses how its connections ask to be acknowledged, from what it
         // serves and sends as (`acknowledgement`); its budget is the same either way.
         acknowledgement: hyper_transport::Acknowledgement::Decimated,
+        // A group's appends to a peer and their answers, each lane ordered, wait a round trip
+        // behind every packet lost before them: coded, a loss is rebuilt from the repairs after it
+        fec_window: Some(FEC_WINDOW),
     })
 }
 

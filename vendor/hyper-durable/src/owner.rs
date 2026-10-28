@@ -35,7 +35,6 @@ use std::task::Waker;
 use std::time::Duration;
 
 use hyper_liveness::{Change, Liveness, PeerId};
-use hyper_timing::Trust;
 
 use crate::budget::Budget;
 use crate::machine::StateMachine;
@@ -235,11 +234,7 @@ impl<L: LogStore, M: StateMachine, B: Budget> Owner<L, M, B> {
                 // and a pair begun anew reports nothing while it trusts. A refusal fences the
                 // replica, as there.
                 if let Some(replica) = entry.replica.as_mut() {
-                    let _ = if liveness.trust(*peer) == Some(Trust::Suspected) {
-                        replica.suspect(*peer)
-                    } else {
-                        replica.trust(*peer)
-                    };
+                    let _ = replica.believe_of(liveness, *peer);
                 }
             }
         }
@@ -253,8 +248,9 @@ impl<L: LogStore, M: StateMachine, B: Budget> Owner<L, M, B> {
     }
 
     /// A change the node's liveness stream reported, taken to every replica with a member on that
-    /// node, each queued for its next turn: a suspicion, trust again, or the node's restart, a new
-    /// incarnation the core trusts and holds to lead nothing it led (`Replica::restarted`). A
+    /// node, each queued for its next turn: a suspicion, trust again, the node's announced stop
+    /// (`Replica::stopped`), or its restart, a new incarnation the core trusts and holds to lead
+    /// nothing it led (`Replica::restarted`). A
     /// replica that refuses it is fenced and reopened by its owner, which tells the new one what
     /// the stream believes ([`Replica::believe_all`](crate::Replica::believe_all)).
     pub fn believe(&mut self, change: &Change) {
@@ -273,6 +269,12 @@ impl<L: LogStore, M: StateMachine, B: Budget> Owner<L, M, B> {
                 Change::Suspected(_) => replica.suspect(peer),
                 Change::Trusted { .. } => replica.trust(peer),
                 Change::Restarted { .. } => replica.restarted(peer),
+                Change::Stopped { .. } => replica.stopped(peer),
+                Change::DiskSlow { .. } => replica.disk_slow(peer),
+                Change::DiskCaughtUp { .. } => replica.disk_caught_up(peer),
+                // The mode's mismatch is the owner's to show (focal's group events); the core
+                // acts on neither.
+                Change::ModeDiffers { .. } | Change::ModeAgrees { .. } => Ok(()),
             };
             if let Ok(slot) = u32::try_from(at) {
                 self.queue_slot(slot);

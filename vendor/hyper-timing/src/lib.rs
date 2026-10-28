@@ -53,7 +53,7 @@ pub use qos::{
     election_span, lateness_bound, mistake_bound,
 };
 mod folds;
-pub use folds::{Exposure, Flushes, FoldFull, Lateness, Wakes};
+pub use folds::{Exposure, FlushTail, Flushes, FoldFull, Lateness, Wakes};
 mod histogram;
 pub use histogram::Histogram;
 mod link;

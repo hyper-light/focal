@@ -121,6 +121,11 @@ pub struct Limits {
     pub retry_bytes: Option<u64>,
     /// How the endpoint's connections ask their peers to acknowledge what they send.
     pub acknowledgement: Acknowledgement,
+    /// The forward erasure correction of its connections' stream data, at most this many packets
+    /// wide (hyper-quic's `TransportConfig::fec_window`): `None` codes nothing. A connection codes
+    /// only while its path loses, and what its coding holds is charged to the budget as it is
+    /// held, its coding forgotten where the budget refuses ([`Stats::fec_refused`]).
+    pub fec_window: Option<u32>,
 }
 
 /// How a connection asks its peer to acknowledge its packets, through the acknowledgement
@@ -236,6 +241,7 @@ impl Limits {
             .send_window(self.window_ceiling)
             .max_idle_timeout(Some(idle))
             .keep_alive_interval(self.keep_alive)
+            .fec_window(self.fec_window)
             .congestion(congestion.clone());
         match self.acknowledgement {
             Acknowledgement::Decimated => transport.decimate_acks(),
@@ -352,6 +358,11 @@ pub struct Stats {
     /// The connections' state as charged, learned from what the owner observes
     /// ([`Endpoint::observe`]).
     pub state: StateStats,
+    /// Connections whose forward erasure correction the budget could not fund as it grew, and so
+    /// forgot what it held ([`Limits::fec_window`]).
+    pub fec_refused: u64,
+    /// The bytes the connections' forward erasure correction holds now, charged as held.
+    pub fec_charged: u64,
 }
 
 /// The QUIC application error code a connection closes with when it ends without a fault.
@@ -459,6 +470,8 @@ struct Conn<R> {
     delivered: Delivered,
     /// The budget's grants for the receive window: the initial one and one per growth.
     grants: Vec<Reservation>,
+    /// The budget's grant for what its forward erasure correction holds, as it holds it.
+    fec: Reservation,
     /// When its window was set back, while its growth's grants go back as its peer's reads pay
     /// what QUIC still owes of the credit given (`Core::repay`).
     set_back: Option<Instant>,
@@ -1057,6 +1070,8 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             let sent = conn
                 .quic
                 .poll_transmit(now, max_datagrams.max(1), out, self.quic.configs());
+            // What it sent may be sources its coding keeps
+            self.core.charge_fec(conn);
             // Sending, or finding nothing to send, moves the connection's timers.
             self.rearm_later(key);
             if let Some(transmit) = sent {
@@ -1834,6 +1849,11 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                 .filter(|conn| conn.room.is_some())
                 .count(),
             state: self.core.state.stats(),
+            fec_charged: self
+                .conns
+                .iter()
+                .flatten()
+                .fold(0u64, |sum, conn| sum.saturating_add(conn.fec.granted())),
             ..self.core.stats
         }
     }
@@ -2286,6 +2306,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             window: Window::new(initial, limits.window_ceiling),
             delivered: Delivered::new(C::RANKS),
             grants,
+            fec: Reservation::default(),
             set_back: None,
             listed: false,
             lost: false,
@@ -2435,6 +2456,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
             }
         }
         self.core.progress(now, &mut conn);
+        self.core.charge_fec(&mut conn);
         self.put(key, conn);
         self.endpoint_events(key);
         let drained = self
@@ -3003,6 +3025,10 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
                 self.room.release(grant.granted());
             }
             self.budget.release(grant);
+        }
+        let fec = std::mem::take(&mut conn.fec);
+        if fec.granted() > 0 {
+            self.budget.release(fec);
         }
         if let Some(share) = self.state.gone() {
             self.budget.release(share);
@@ -4269,6 +4295,46 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Core<C, B, D
         let reserve = class_reserve(C::RANKS.saturating_sub(1));
         if let Ok(window) = VarInt::from_u64(grown.saturating_add(reserve)) {
             conn.quic.set_receive_window(window);
+        }
+    }
+
+    /// What `conn`'s forward erasure correction holds (hyper-quic's `Connection::fec_held_bytes`),
+    /// charged as it is held: grown from the budget on [`Lane::Window`], accounting only, as it
+    /// grows, and given back as it shrinks. Coding the budget refuses is forgotten
+    /// (`Connection::fec_forget`): its losses are repaired by retransmission, so nothing it held
+    /// was owed.
+    fn charge_fec(&mut self, conn: &mut Conn<C::Role>) {
+        let held = u64::try_from(conn.quic.fec_held_bytes()).unwrap_or(u64::MAX);
+        let charged = conn.fec.granted();
+        if held > charged {
+            let grown = match self
+                .budget
+                .reserve(held.saturating_sub(charged), Lane::Window)
+            {
+                Ok(grant) if charged == 0 => {
+                    conn.fec = grant;
+                    true
+                }
+                Ok(grant) => match conn.fec.absorb(grant) {
+                    Ok(()) => true,
+                    Err(grant) => {
+                        self.budget.release(grant);
+                        false
+                    }
+                },
+                Err(_) => false,
+            };
+            if !grown {
+                conn.quic.fec_forget();
+                self.stats.fec_refused = self.stats.fec_refused.saturating_add(1);
+            }
+        }
+        let held = u64::try_from(conn.quic.fec_held_bytes()).unwrap_or(u64::MAX);
+        let excess = conn.fec.granted().saturating_sub(held);
+        if excess > 0
+            && let Some(part) = conn.fec.split(excess)
+        {
+            self.budget.release(part);
         }
     }
 

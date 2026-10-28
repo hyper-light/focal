@@ -131,6 +131,15 @@ impl Budget for FocalBudget {
         let rest = give_back(&mut self.completion, rest);
         give_back(&mut self.ordinary, rest);
     }
+
+    /// A group's replica draws on the node's memory, which its groups share, not an allowance of
+    /// its own: it states no room. The one reader of it is the disk mode's patience
+    /// (`hyper_durable::Disk::Apart`), and the shell opens its replicas in today's
+    /// (`Disk::Flushed`), so nothing weighs a patience against it; the disk mode would need the
+    /// group's own allowance first (hyper-raft `docs/durable.md` §4.2).
+    fn room(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// What wakes the group's owner when the log answers a write that went out with it: the call the
@@ -361,6 +370,9 @@ impl ShellNode {
             elections: Elections::Ticks,
             // One owner period on the shell's clock (module docs).
             quiet: Duration::from_nanos(1),
+            // Today's mode: a leader applies what a majority's disks hold with its own among them
+            // (`FocalBudget::room`)
+            disk: hyper_durable::Disk::Flushed,
         };
         let replica = Replica::open(&settings, store, machine, FocalBudget::new(budget.clone()))
             .map_err(|error| match error {

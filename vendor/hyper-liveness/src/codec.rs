@@ -2,8 +2,16 @@
 //!
 //! ```text
 //! kind (1) version (1) run (8) seq (8) interval (8) floor (8) ask (8) sent (8) late (8)
-//! flushes (8) flush_age (8) echo flag (1) [echo sent (8) echo late (8) echo hold (8)]
+//! flushes (8) flush_age (8) flags (1) [echo sent (8) echo late (8) echo hold (8)]
 //! ```
+//!
+//! The flags: bit 0, an echo follows; bit 1, the run stops here, in order ([`Heartbeat::stopping`]);
+//! bit 2, the sender judges its peers apart from their disks ([`Heartbeat::apart`], kiln's
+//! CP-T2.2); bit 3, in that mode, the sender's own disk is slow ([`Heartbeat::disk_slow`]). Any
+//! other bit set is refused, and so is bit 3 without bit 2. A build that read only bit 0 refuses a
+//! stopping heartbeat as malformed and judges the stop as it judges any silence, which loses it
+//! nothing it had, and refuses one with bit 2, a mode it doesn't run: the version stays, so every
+//! other heartbeat of a new build reads as before.
 //!
 //! The plane seals, authenticates and checksums every datagram (CRC-32C under AES-256-GCM), so the
 //! message carries no checksum of its own. Times are nanoseconds on the sender's clock, never
@@ -19,7 +27,7 @@ pub const KIND: u8 = 0x4c;
 /// count the sender raises at every start, where version 1's `boot` was any value its node never
 /// reused, which a receiver could not order; a version 1 heartbeat is refused, not misread.
 pub const VERSION: u8 = 2;
-/// The bytes before the echo: kind, version, nine eight-byte fields and the echo flag.
+/// The bytes before the echo: kind, version, nine eight-byte fields and the flags.
 const HEAD_BYTES: usize = 2 + 9 * 8 + 1;
 /// The echo's three eight-byte fields.
 const ECHO_BYTES: usize = 3 * 8;
@@ -66,9 +74,30 @@ pub struct Heartbeat {
     /// From the latest of them becoming durable to the send: at most `late + interval`, so the
     /// flush came after the previous heartbeat was due (`docs/durable.md` §8).
     pub flush_age_ns: u64,
+    /// The sender judges its peers' processes apart from their disks (`Liveness::set_disk_apart`,
+    /// kiln's CP-T2.2): its heartbeats leave whatever its flushes are doing.
+    pub apart: bool,
+    /// In that mode, the sender's own disk is slow: it has waited on a write of its own longer than
+    /// its flushes' tail (`Liveness::own_disk_slow`). Its peers report it to their owners
+    /// (`Change::DiskSlow`); what they trust of its process is unchanged.
+    pub disk_slow: bool,
     /// The latest heartbeat the sender had from the receiver, if any.
     pub echo: Option<Echo>,
+    /// The sender's run ends with this heartbeat, in order: its node is stopping and sends no
+    /// more of the run (`Liveness::stop`). No evidence of life, which its proof fields are not
+    /// held to: the receiver takes the run's end from it and nothing else.
+    pub stopping: bool,
 }
+
+/// Format: the flags' bit 0, an echo follows.
+const ECHO: u8 = 1;
+/// Format: the flags' bit 1, the run stops here ([`Heartbeat::stopping`]).
+const STOPPING: u8 = 2;
+/// Format: the flags' bit 2, the sender judges its peers apart from their disks
+/// ([`Heartbeat::apart`]).
+const APART: u8 = 1 << 2;
+/// Format: the flags' bit 3, the sender's own disk is slow, in that mode ([`Heartbeat::disk_slow`]).
+const DISK_SLOW: u8 = 1 << 3;
 
 fn put(out: &mut [u8; MAX_BYTES], at: &mut usize, value: u64) {
     if let Some(slot) = at.checked_add(8).and_then(|end| out.get_mut(*at..end)) {
@@ -103,8 +132,11 @@ impl Heartbeat {
         ] {
             put(out, &mut at, value);
         }
-        if let Some(flag) = out.get_mut(at) {
-            *flag = u8::from(self.echo.is_some());
+        if let Some(flags) = out.get_mut(at) {
+            *flags = if self.echo.is_some() { ECHO } else { 0 }
+                | if self.stopping { STOPPING } else { 0 }
+                | if self.apart { APART } else { 0 }
+                | if self.disk_slow { DISK_SLOW } else { 0 };
         }
         at = at.saturating_add(1);
         if let Some(echo) = self.echo {
@@ -141,15 +173,20 @@ impl Heartbeat {
             flushes,
             flush_age_ns,
         ] = fields;
-        let (flag, mut rest) = rest.split_first().ok_or(Refusal::Truncated)?;
-        let echo = match flag {
-            0 => None,
-            1 => Some(Echo {
+        let (&flags, mut rest) = rest.split_first().ok_or(Refusal::Truncated)?;
+        if flags & !(ECHO | STOPPING | APART | DISK_SLOW) != 0
+            || flags & (APART | DISK_SLOW) == DISK_SLOW
+        {
+            return Err(Refusal::Malformed);
+        }
+        let echo = if flags & ECHO == 0 {
+            None
+        } else {
+            Some(Echo {
                 sent_ns: take(&mut rest)?,
                 late_ns: take(&mut rest)?,
                 hold_ns: take(&mut rest)?,
-            }),
-            _ => return Err(Refusal::Malformed),
+            })
         };
         if !rest.is_empty() {
             return Err(Refusal::Malformed);
@@ -164,7 +201,10 @@ impl Heartbeat {
             late_ns,
             flushes,
             flush_age_ns,
+            apart: flags & APART != 0,
+            disk_slow: flags & DISK_SLOW != 0,
             echo,
+            stopping: flags & STOPPING != 0,
         })
     }
 }
@@ -183,8 +223,9 @@ mod tests {
         (
             prop::array::uniform9(any::<u64>()),
             prop::option::of(prop::array::uniform3(any::<u64>())),
+            any::<(bool, bool, bool)>(),
         )
-            .prop_map(|(f, echo)| Heartbeat {
+            .prop_map(|(f, echo, (stopping, apart, slow))| Heartbeat {
                 run: f[0],
                 seq: f[1],
                 interval_ns: f[2],
@@ -194,11 +235,14 @@ mod tests {
                 late_ns: f[6],
                 flushes: f[7],
                 flush_age_ns: f[8],
+                apart,
+                disk_slow: apart && slow,
                 echo: echo.map(|e| Echo {
                     sent_ns: e[0],
                     late_ns: e[1],
                     hold_ns: e[2],
                 }),
+                stopping,
             })
     }
 
@@ -233,8 +277,11 @@ mod tests {
         }
     }
 
+    /// Today's heartbeat writes its flags as it did, the echo's alone; a flag this build doesn't
+    /// know is refused (a stopping heartbeat by a build that reads only the echo's bit, as this one
+    /// refuses any flag it does not know), and so is a disk's verdict outside the disk mode.
     #[test]
-    fn an_echo_flag_other_than_zero_or_one_is_malformed() {
+    fn a_flag_past_the_known_bits_is_malformed() {
         let beat = Heartbeat {
             run: 1,
             seq: 2,
@@ -245,11 +292,43 @@ mod tests {
             late_ns: 7,
             flushes: 8,
             flush_age_ns: 9,
+            apart: false,
+            disk_slow: false,
             echo: None,
+            stopping: false,
         };
         let mut out = [0u8; MAX_BYTES];
         let mut bytes = beat.encode(&mut out).to_vec();
-        *bytes.last_mut().unwrap() = 2;
-        assert_eq!(Heartbeat::decode(&bytes), Err(Refusal::Malformed));
+        assert_eq!(bytes.last(), Some(&0), "today's flags, no echo");
+        for flags in [1 << 4, 1 << 7, DISK_SLOW, STOPPING | DISK_SLOW] {
+            *bytes.last_mut().unwrap() = flags;
+            assert_eq!(
+                Heartbeat::decode(&bytes),
+                Err(Refusal::Malformed),
+                "flags {flags:#010b}"
+            );
+        }
+        *bytes.last_mut().unwrap() = STOPPING;
+        assert_eq!(
+            Heartbeat::decode(&bytes),
+            Ok(Heartbeat {
+                stopping: true,
+                ..beat
+            })
+        );
+        // The disk mode's bits, and with a stopping sender's.
+        for (flags, stopping, apart, disk_slow) in [
+            (APART, false, true, false),
+            (APART | DISK_SLOW, false, true, true),
+            (STOPPING | APART | DISK_SLOW, true, true, true),
+        ] {
+            *bytes.last_mut().unwrap() = flags;
+            let read = Heartbeat::decode(&bytes).unwrap();
+            assert_eq!(
+                (read.stopping, read.apart, read.disk_slow),
+                (stopping, apart, disk_slow),
+                "flags {flags:#010b}"
+            );
+        }
     }
 }

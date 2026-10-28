@@ -758,11 +758,14 @@ impl StreamsState {
         }
     }
 
+    /// Writes stream frames into `buf` up to `max_buf_size`, every frame stating its length where
+    /// `lengths` (`SendBuffer::poll_transmit_framed`)
     pub(crate) fn write_stream_frames(
         &mut self,
         buf: &mut Vec<u8>,
         max_buf_size: usize,
         fair: bool,
+        lengths: bool,
     ) -> StreamMetaVec {
         let mut stream_frames = StreamMetaVec::new();
         while fits(buf, frame::Stream::SIZE_BOUND, max_buf_size) {
@@ -794,7 +797,8 @@ impl StreamsState {
                 .saturating_sub(buf.len())
                 .saturating_sub(1)
                 .saturating_sub(VarInt::from(id).size());
-            let (offsets, encode_length) = stream.pending.poll_transmit(max_buf_size);
+            let (offsets, encode_length) =
+                stream.pending.poll_transmit_framed(max_buf_size, lengths);
             let fin = offsets.end == stream.pending.offset()
                 && matches!(stream.state, SendState::DataSent { .. });
             if fin {
@@ -1920,7 +1924,7 @@ mod tests {
         high.write(b"high").unwrap();
 
         let mut buf = Vec::with_capacity(40);
-        let meta = server.write_stream_frames(&mut buf, 40, true);
+        let meta = server.write_stream_frames(&mut buf, 40, true, false);
         assert_eq!(meta[0].id, id_high);
         assert_eq!(meta[1].id, id_mid);
         assert_eq!(meta[2].id, id_low);
@@ -1980,7 +1984,7 @@ mod tests {
         high.set_priority(-1).unwrap();
 
         let mut buf = Vec::with_capacity(1000);
-        let meta = server.write_stream_frames(&mut buf, 40, true);
+        let meta = server.write_stream_frames(&mut buf, 40, true, false);
         assert_eq!(meta.len(), 1);
         assert_eq!(meta[0].id, id_high);
 
@@ -1988,7 +1992,7 @@ mod tests {
         assert_eq!(server.pending.len(), 2);
 
         // Send the remaining data. The initial mid priority one should go first now
-        let meta = server.write_stream_frames(&mut buf, 1000, true);
+        let meta = server.write_stream_frames(&mut buf, 1000, true, false);
         assert_eq!(meta.len(), 2);
         assert_eq!(meta[0].id, id_mid);
         assert_eq!(meta[1].id, id_high);
@@ -2050,7 +2054,7 @@ mod tests {
             // loop until all the streams are written
             loop {
                 let buf_len = buf.len();
-                let meta = server.write_stream_frames(&mut buf, buf_len + 40, fair);
+                let meta = server.write_stream_frames(&mut buf, buf_len + 40, fair, false);
                 if meta.is_empty() {
                     break;
                 }
@@ -2122,7 +2126,7 @@ mod tests {
 
         // Write the first chunk of stream_a
         let buf_len = buf.len();
-        let meta = server.write_stream_frames(&mut buf, buf_len + 40, false);
+        let meta = server.write_stream_frames(&mut buf, buf_len + 40, false, false);
         assert!(!meta.is_empty());
         metas.extend(meta);
 
@@ -2139,7 +2143,7 @@ mod tests {
         // loop until all the streams are written
         loop {
             let buf_len = buf.len();
-            let meta = server.write_stream_frames(&mut buf, buf_len + 40, false);
+            let meta = server.write_stream_frames(&mut buf, buf_len + 40, false, false);
             if meta.is_empty() {
                 break;
             }

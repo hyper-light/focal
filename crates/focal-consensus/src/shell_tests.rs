@@ -66,6 +66,7 @@ fn settings() -> Settings {
         },
         elections: Elections::Ticks,
         quiet: Duration::from_millis(50),
+        disk: hyper_durable::Disk::Flushed,
     }
 }
 

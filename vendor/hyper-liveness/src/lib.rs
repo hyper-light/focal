@@ -23,7 +23,9 @@
 //! proof is outstanding judges no peer by it until it comes, and one with nothing durable since a
 //! point waits for its next completion: on a device nodes share, a stall stops every stream at once
 //! (Lifeguard's local health, applied to the device: `docs/timing.md` §2.8, "A judge whose own
-//! proof stalls").
+//! proof stalls"). An owner may judge each peer's process apart from its disk instead
+//! ([`Liveness::set_disk_apart`], kiln's CP-T2.2): a heartbeat then leaves when due whatever a
+//! flush is doing, and only a node's silence is a failure.
 //!
 //! **Timing, all measured.** The sender's interval is the one the receiver's configurator chose
 //! (Chen et al.'s adaptive scheme, the receiver asking in its own heartbeats), never shorter than
@@ -54,8 +56,8 @@
 //! attach. A node whose pool starves before it has measured anything, its links silent, judges by
 //! its pool's latenesses at the most correlation they can carry and by its own stream's, which it
 //! keeps sending (`docs/timing.md` §2.8, "Judged with no evidence of its own"). A receiver expects
-//! the interval it asked (`LinkEstimator::expect_interval`), and a peer's new run is reported
-//! ([`Change::Restarted`]).
+//! the interval it asked (`LinkEstimator::expect_interval`), a peer's new run is reported
+//! ([`Change::Restarted`]), and its announced stop at once ([`Change::Stopped`]).
 //!
 //! **The bound.** Each suspicion states when the sender's last heartbeat was due on the sender's
 //! clock and the bound past it within which NFD-E suspected: the difference of the two clocks'
@@ -91,8 +93,8 @@ use std::time::Duration;
 
 pub use codec::{Echo, Heartbeat, KIND, MAX_BYTES, VERSION, is_liveness};
 use hyper_timing::{
-    Arrivals, Configuration, Detector, ExchangeRtt, Exposure, Flushes, Lateness, LinkEstimator,
-    Trust,
+    Arrivals, Configuration, Detector, ExchangeRtt, Exposure, FlushTail, Flushes, Lateness,
+    LinkEstimator, Trust,
 };
 use pair::Pair;
 
@@ -132,6 +134,12 @@ pub enum Refusal {
     /// A heartbeat too far from its run's schedule for the estimator to sum: a sender that
     /// restarted its schedule.
     OutOfRange,
+    /// A heartbeat of the other disk mode ([`Heartbeat::apart`] against
+    /// [`Liveness::set_disk_apart`]): every member of a group runs one mode (kiln's CP-T2.2,
+    /// Focal's condition 1), and this one is evidence of another kind than this node judges by. The
+    /// pair takes nothing from it and judges its sender by no freshness point until a heartbeat of
+    /// this node's mode comes: a mismatch is this refusal, never a suspicion or a trust.
+    OtherMode,
 }
 
 impl std::fmt::Display for Refusal {
@@ -251,6 +259,55 @@ pub enum Change {
         /// The new run's first heartbeat's arrival.
         at_ns: u64,
     },
+    /// The peer announced that its run ends, in order ([`Heartbeat::stopping`]): suspected at once,
+    /// and until a heartbeat of its next run comes ([`Change::Restarted`]). The owner's core takes
+    /// it as `RawNode::stopped`: it orders the stopping run to campaign never, and drops what the
+    /// run still sends that could take a group's leader from it.
+    Stopped {
+        /// The peer.
+        peer: PeerId,
+        /// The announcement's arrival.
+        at_ns: u64,
+    },
+    /// Judged apart from its disk ([`Liveness::set_disk_apart`], kiln's CP-T2.2): the peer's
+    /// process is alive and its disk is slow. Its heartbeat says its own stream has waited on its
+    /// disk longer than its flushes' tail, RFC 6298's bound over its own measured flushes, and its
+    /// detectors' widest freshness, a stall the flush proof would have been suspected for
+    /// ([`Heartbeat::disk_slow`], [`Liveness::own_disk_slow`]). What the owner trusts of the peer is
+    /// unchanged: a leader names no heir whose disk is slow.
+    DiskSlow {
+        /// The peer.
+        peer: PeerId,
+        /// The heartbeat's arrival.
+        at_ns: u64,
+    },
+    /// Judged apart from its disk, the peer's disk is no longer slow: a completion ended its wait,
+    /// and its heartbeat says so.
+    DiskCaughtUp {
+        /// The peer.
+        peer: PeerId,
+        /// The heartbeat's arrival.
+        at_ns: u64,
+    },
+    /// The peer's heartbeats are of the other disk mode than this node's (kiln's CP-T2.2, Focal's
+    /// condition 1): each is refused (`Refusal::OtherMode`), nothing taken from it, until one of
+    /// this node's mode comes ([`Change::ModeAgrees`]). Told once as the mismatch begins, so that
+    /// a group left mixed is seen, not silent (focal maps it to a group event); meanwhile the peer
+    /// is judged by its heartbeats' arrivals alone, as a peer not yet heard is.
+    ModeDiffers {
+        /// The peer.
+        peer: PeerId,
+        /// The refused heartbeat's arrival.
+        at_ns: u64,
+    },
+    /// The peer's heartbeats are of this node's disk mode again, after [`Change::ModeDiffers`]:
+    /// taken as ever.
+    ModeAgrees {
+        /// The peer.
+        peer: PeerId,
+        /// The heartbeat's arrival.
+        at_ns: u64,
+    },
 }
 
 impl Change {
@@ -258,7 +315,13 @@ impl Change {
     pub fn peer(&self) -> PeerId {
         match self {
             Self::Suspected(suspicion) => suspicion.peer,
-            Self::Trusted { peer, .. } | Self::Restarted { peer, .. } => *peer,
+            Self::Trusted { peer, .. }
+            | Self::Restarted { peer, .. }
+            | Self::Stopped { peer, .. }
+            | Self::DiskSlow { peer, .. }
+            | Self::DiskCaughtUp { peer, .. }
+            | Self::ModeDiffers { peer, .. }
+            | Self::ModeAgrees { peer, .. } => *peer,
         }
     }
 }
@@ -277,6 +340,9 @@ pub struct PairReport {
     pub taken: u64,
     /// Heartbeats refused for their flush proof.
     pub unproven: u64,
+    /// Heartbeats refused for their disk mode, the other one than this node's
+    /// ([`Refusal::OtherMode`]).
+    pub other_mode: u64,
     /// Whether a configured detector of the pair's own judges the peer.
     pub configured: bool,
     /// Whether a margin judges the peer: its own configuration's, or, while it has none, the one
@@ -343,6 +409,24 @@ pub struct Liveness {
     asked: Option<u64>,
     late_most: u64,
     flushes: Flushes,
+    /// Of those flushes, the ones within their tail as each came: the sender's floor in the disk
+    /// mode, whose heartbeats wait on no flush, so a stall's is no measure of what one costs.
+    steady: Flushes,
+    /// The same flushes' tail, RFC 6298's bound over them: what the node's own wait on its disk is
+    /// judged against in the disk mode (kiln's CP-T2.2).
+    flush_tail: FlushTail,
+    /// In the disk mode, this node's own disk is slow: its oldest write not yet durable has waited
+    /// past both `flush_tail` and `widest_freshness`, and it stays slow until that wait is back
+    /// under the smoothed flush.
+    own_disk_slow: bool,
+    /// When the oldest write on the node's log not yet durable was submitted, as its owner said
+    /// ([`on_pending`](Self::on_pending)); none when none is out.
+    pending: Option<u64>,
+    /// When the stream asked the liveness write that is out, if one is: a write pending as well.
+    flush_asked: Option<u64>,
+    /// The widest freshness its pairs held at the last poll: how long its detectors trust a peer
+    /// past its latest heartbeat, what a stall of the disk's would have been suspected after.
+    widest_freshness: Option<Duration>,
     durable: Durable,
     /// Whether a liveness write is out.
     flushing: bool,
@@ -350,6 +434,9 @@ pub struct Liveness {
     /// one to the durable completion that ended it, if one has (`pair::Local`, `docs/timing.md` §2.8,
     /// "A judge whose own proof stalls").
     stall: Option<(u64, Option<u64>)>,
+    /// Whether each peer's process is judged apart from its disk
+    /// ([`set_disk_apart`](Self::set_disk_apart)).
+    apart: bool,
     /// The latest time the stream judged its peers at, a poll's or a heartbeat's arrival: what the
     /// trust it shows is stated at.
     judged_ns: u64,
@@ -405,6 +492,8 @@ pub struct Liveness {
     /// heartbeat, it was three maxima a heartbeat that every configured pair threw away
     /// (`docs/benchmarks.md`, "The node's evidence, kept").
     evidence: Option<Arrivals>,
+    /// The node's run stopped in order ([`Liveness::stop`]): it sends nothing more.
+    stopped: bool,
 }
 
 /// The margins a pair that waits for one takes from its node's pool: its own link's, or, for a
@@ -458,7 +547,8 @@ impl Own {
 }
 
 /// Sends `pair`'s heartbeat due at `now_ns`, if a flush proves it, feeding `own` its lateness where
-/// given. Whether a flush is wanted: one proves the heartbeat due, or the next, already due.
+/// given; a node whose run announced its end sends the announcement again where it is due, and
+/// nothing else. Whether a flush is wanted: one proves the heartbeat due, or the next, already due.
 fn send(
     pair: &mut Pair,
     peer: PeerId,
@@ -468,6 +558,12 @@ fn send(
     own: Option<&mut Own>,
     out: &mut impl Output,
 ) -> bool {
+    if sender.stopped {
+        if pair.goodbye_due(now_ns) {
+            announce(pair, peer, sender, now_ns, message, out);
+        }
+        return false;
+    }
     match pair.send(sender, now_ns, message) {
         pair::Sent::Message(length, lateness) => {
             if let Some(message) = message.get(..length) {
@@ -481,11 +577,29 @@ fn send(
             // Its next slot already due (the interval fell while the stream was behind): the
             // flush that proves it is asked now, and its completion polls the stream. Left to a
             // wake, it asked none, and only a peer's heartbeat polled it again: a node that heard
-            // none sent nothing more.
+            // none sent nothing more. In the disk mode nothing else asks one: a heartbeat's slot in
+            // which nothing became durable asks no probe, which was a flush an interval on an idle
+            // node (Focal's 5a).
             pair.next_due().is_some_and(|due| due <= now_ns)
         }
         pair::Sent::NeedsFlush => true,
         pair::Sent::Nothing => false,
+    }
+}
+
+/// Sends `pair` this run's announcement that it ends ([`Pair::goodbye`]), where the pair shares a
+/// group and its peer has not answered.
+fn announce(
+    pair: &mut Pair,
+    peer: PeerId,
+    sender: &pair::Sender,
+    now_ns: u64,
+    message: &mut [u8; MAX_BYTES],
+    out: &mut impl Output,
+) {
+    let length = pair.goodbye(sender, now_ns, message);
+    if let Some(bytes) = message.get(..length).filter(|bytes| !bytes.is_empty()) {
+        out.heartbeat(peer, bytes);
     }
 }
 
@@ -516,9 +630,16 @@ impl Liveness {
             asked: None,
             late_most: 0,
             flushes: Flushes::new(),
+            steady: Flushes::new(),
+            flush_tail: FlushTail::new(),
+            own_disk_slow: false,
+            pending: None,
+            flush_asked: None,
+            widest_freshness: None,
             durable: Durable::default(),
             flushing: false,
             stall: None,
+            apart: false,
             judged_ns: 0,
             exposure: settings.history,
             last_poll_ns: None,
@@ -532,7 +653,30 @@ impl Liveness {
             own: Own::default(),
             configured: None,
             evidence: None,
+            stopped: false,
         })
+    }
+
+    /// Judges each peer's process apart from its disk (kiln's CP-T2.2): a heartbeat leaves when it is
+    /// due whatever a flush is doing, carrying the durable count and the age of the latest as ever;
+    /// a heartbeat is taken whether or not the sender's count moved; and a freshness point that
+    /// passed is judged at the point, whatever this node's own durability. A node whose disk stalls
+    /// is then not suspected for it: its process goes on heartbeating, and only its silence is a
+    /// failure, so an owner that keeps its group's writes going on the others' disks (a leader's
+    /// commit on a majority without its own, `Config::apply_unpersisted`) loses nothing to the
+    /// stall. What its disk owes is the owner's to bound (a leader that hands over once its own
+    /// writes stay out too long). Every node of a group runs so, or none: a heartbeat of the other
+    /// mode is refused ([`Refusal::OtherMode`]) and its sender judged by no freshness point while
+    /// it speaks it, so a mixed group is told, never misjudged. Set before the first poll; off by
+    /// default, the flush proof as above.
+    pub fn set_disk_apart(&mut self, apart: bool) {
+        self.apart = apart;
+    }
+
+    /// Whether each peer's process is judged apart from its disk
+    /// ([`set_disk_apart`](Self::set_disk_apart)).
+    pub fn disk_apart(&self) -> bool {
+        self.apart
     }
 
     /// What the node has measured of its links, which judges a link with no configuration of its
@@ -589,8 +733,12 @@ impl Liveness {
         Some(arrival_ns.saturating_add(wait))
     }
 
-    /// What the node knows of its own durability, which a point that passed is judged with.
+    /// What the node knows of its own durability, which a point that passed is judged with: nothing
+    /// that holds a point where the node judges its peers apart from its disk.
     fn local(&self) -> pair::Local {
+        if self.apart {
+            return pair::Local::apart();
+        }
         pair::Local {
             durable_ns: self.durable.latest_ns,
             stall: self.stall,
@@ -647,12 +795,13 @@ impl Liveness {
     }
 
     /// One group fewer shared with `peer`: with its last the pair's stream ends and its state
-    /// goes. A peer let go while suspected counts as a failure in the MTBF's evidence.
+    /// goes. A peer let go while suspected counts as a failure in the MTBF's evidence, unless its
+    /// run had announced its stop.
     pub fn detach(&mut self, peer: PeerId) -> Result<(), Refusal> {
         let pair = self.pairs.get_mut(&peer).ok_or(Refusal::UnknownPeer)?;
         pair.groups = pair.groups.saturating_sub(1);
         if pair.groups == 0 {
-            if pair.trust() == Trust::Suspected {
+            if pair.trust() == Trust::Suspected && !pair.stopped() {
                 self.exposure.on_failure();
             }
             self.pairs.remove(&peer);
@@ -687,8 +836,18 @@ impl Liveness {
         );
         // A full fold keeps its mean.
         let _ = self.flushes.on_flush(started_ns, durable_ns);
+        // Judged against the tail as it stood before it: a stall's flush is past it.
+        let took = Duration::from_nanos(durable_ns.saturating_sub(started_ns));
+        let tail = self
+            .flush_tail
+            .tail(self.granularity().unwrap_or(Duration::ZERO));
+        if tail.is_none_or(|tail| took <= tail) {
+            let _ = self.steady.on_flush(started_ns, durable_ns);
+        }
+        self.flush_tail.on_flush(started_ns, durable_ns);
         if write == Write::Liveness {
             self.flushing = false;
+            self.flush_asked = None;
         }
         // Any completion is the device's progress: the stretch the stream waited ends with it.
         if let Some((since, None)) = self.stall
@@ -698,12 +857,60 @@ impl Liveness {
         }
     }
 
+    /// The oldest write on this node's log not yet durable: submitted at `submitted_ns`, or none
+    /// out. Its owner says so after each turn that may have changed it, as its log's writes come and
+    /// go (`hyper_durable::Replica::out_since`, the earliest over the node's replicas). In the disk
+    /// mode the node's own disk is judged by that write's wait, a disk with nothing to do being no
+    /// slow one, and its heartbeats carry the wait as their flush age (kiln's CP-T2.2, Focal's 5a);
+    /// today's mode reads neither.
+    pub fn on_pending(&mut self, submitted_ns: Option<u64>) {
+        self.pending = submitted_ns;
+    }
+
+    /// Judged apart from its disk, whether this node's own disk is slow at `now_ns`: once its
+    /// oldest write not yet durable has waited longer than its flushes' tail (RFC 6298's bound over
+    /// them, `FlushTail`) and the widest freshness its detectors hold, a stall the flush proof would
+    /// have been suspected for, and caught up once that wait is back under its smoothed flush, or no
+    /// write is out; its heartbeats say so (`Heartbeat::disk_slow`). Its flushes' own spikes are
+    /// shorter than its peers' patience with it, and are no verdict; a disk with nothing to do is
+    /// no slow one, and no probe is asked of it (Focal's 5a).
+    fn judge_own_disk(&self, now_ns: u64, granularity: Option<Duration>) -> bool {
+        let tail = self.flush_tail.tail(granularity.unwrap_or(Duration::ZERO));
+        let waited = self
+            .pending_since()
+            .map(|since| Duration::from_nanos(now_ns.saturating_sub(since)));
+        let judged = (
+            waited,
+            tail,
+            self.flush_tail.smoothed(),
+            self.widest_freshness,
+        );
+        let (Some(waited), Some(tail), Some(smoothed), Some(freshness)) = judged else {
+            return false;
+        };
+        self.apart
+            && if self.own_disk_slow {
+                waited > smoothed
+            } else {
+                waited > tail.max(freshness)
+            }
+    }
+
+    /// The oldest write pending on the node's log: its owner's, or the liveness write it asked.
+    fn pending_since(&self) -> Option<u64> {
+        match (self.pending, self.flush_asked) {
+            (Some(log), Some(asked)) => Some(log.min(asked)),
+            (log, asked) => log.or(asked),
+        }
+    }
+
     /// A liveness message from `from`, received at `arrival_ns` on this node's clock (the kernel's
     /// stamp where the owner has one). The peer is judged at the arrival first, so a freshness
     /// point that passed before the message came is a suspicion in whatever order messages and
     /// polls are fed; trust changes go to `out`. A heartbeat from a later run of the peer counts
-    /// as a failure in the MTBF's evidence, the peer having restarted, and one from an earlier
-    /// run than the latest taken is refused as stale.
+    /// as a failure in the MTBF's evidence, the peer having restarted, unless the run before
+    /// announced its stop; one from an earlier run than the latest taken, or from a run after its
+    /// announced stop, is refused as stale.
     pub fn on_heartbeat(
         &mut self,
         from: PeerId,
@@ -723,12 +930,26 @@ impl Liveness {
             exposure: &self.exposure,
             evidence: self.evidence.as_ref(),
             local,
+            apart: self.apart,
         };
-        let mut changes = [None, None, None];
+        let mut changes = [None, None, None, None];
         let mut taken = pair::Taken::default();
         let outcome = pair.take(from, &beat, arrival_ns, &context, &mut changes, &mut taken);
         for change in changes.into_iter().flatten() {
             out.change(change);
+        }
+        if context.apart && outcome.is_ok() {
+            match pair.judge_disk(&beat) {
+                Some(true) => out.change(Change::DiskSlow {
+                    peer: from,
+                    at_ns: arrival_ns,
+                }),
+                Some(false) => out.change(Change::DiskCaughtUp {
+                    peer: from,
+                    at_ns: arrival_ns,
+                }),
+                None => {}
+            }
         }
         // The heartbeat moved this pair's freshness point; the others are as the last poll left
         // them. The earliest of the last poll's wake and this pair's is never past the earliest of
@@ -738,7 +959,10 @@ impl Liveness {
             .into_iter()
             .flatten()
             .min();
-        if taken.restarted {
+        // A restart after a stop the peer announced is its owner's, made in order, not a failure:
+        // the MTBF counts what a detector must catch (`docs/timing.md` §2.2), and an orderly stop
+        // handed over what it led before it ended.
+        if taken.restarted && !taken.after_stop {
             self.exposure.on_failure();
         }
         if taken.configured {
@@ -750,10 +974,49 @@ impl Liveness {
         {
             self.feed_pool(lateness, Duration::from_nanos(beat.interval_ns));
         }
-        if self.evidence.is_none() && outcome.is_ok() {
+        // A heartbeat of the other disk mode is heard as any is: its sender's process is judged by
+        // it (`Refusal::OtherMode`), so a node alone in its mode starves for evidence no longer.
+        let heard = outcome.is_ok() || outcome == Err(Refusal::OtherMode);
+        if self.evidence.is_none() && heard && !taken.stopping {
             self.pool_starves_ns = self.starves(arrival_ns);
         }
         outcome
+    }
+
+    /// This node's run ends in order, at `now_ns`: each peer it shares a group with is sent a
+    /// heartbeat that says so ([`Heartbeat::stopping`]), and the node sends no other heartbeat
+    /// after it. A peer that takes it suspects the node at once and until its next run is heard
+    /// ([`Change::Stopped`]), counts that run, or its letting go of the pair while it suspects the
+    /// node, as no failure in the MTBF's evidence, answers it once with a heartbeat that echoes it
+    /// ([`Liveness::stop_taken`]), and sends the run nothing more. Until a peer answers, its
+    /// announcement goes again at the stream's interval, at the polls after this call, which judge
+    /// as before; taken by a build that does not read it, it costs what an unannounced stop costs:
+    /// the peer suspects the node once its freshness point passes, counts its restart a failure,
+    /// and never answers. A group's remaining voters hold the stopping voter out from the moment
+    /// both took it (`docs/timing.md` §2.9, "A voter's stop announced"): an owner that announces
+    /// before it hands over the groups it leads, its members still running, and hands over once
+    /// each peer answered, gives each group the degraded group's rule before its new leader is
+    /// named. Call it once.
+    pub fn stop(&mut self, now_ns: u64, out: &mut impl Output) {
+        if std::mem::replace(&mut self.stopped, true) {
+            return;
+        }
+        let sender = pair::Sender {
+            local_run: self.run,
+            floor: self.floor_at(self.granularity()),
+            granularity: self.granularity(),
+            durable_count: self.durable.count,
+            durable_ns: self.durable.latest_ns,
+            stopped: true,
+            apart: self.apart,
+            disk_slow: self.own_disk_slow,
+            pending_ns: self.pending_since(),
+        };
+        for (&peer, pair) in &mut self.pairs {
+            announce(pair, peer, &sender, now_ns, &mut self.message, out);
+        }
+        // Woken to send it again where it is not answered, and to judge as before.
+        self.next_wake = self.wake_after(now_ns);
     }
 
     /// Advances to `now_ns`: suspects peers whose freshness passed, sends the heartbeats due that
@@ -774,12 +1037,17 @@ impl Liveness {
         let mut wants_flush = false;
         let granularity = self.granularity();
         let floor = self.floor_at(granularity);
+        self.own_disk_slow = self.judge_own_disk(now_ns, granularity);
         let sender = pair::Sender {
             local_run: self.run,
             floor,
             granularity,
             durable_count: self.durable.count,
             durable_ns: self.durable.latest_ns,
+            stopped: self.stopped,
+            apart: self.apart,
+            disk_slow: self.own_disk_slow,
+            pending_ns: self.pending_since(),
         };
         // The MTBF only for a pair that waits for a margin from the node's evidence, which a
         // configured node has none of: read at every poll, it was a float division and a
@@ -790,8 +1058,10 @@ impl Liveness {
         let evidence = self.evidence_at(now_ns);
         let local = self.local();
         let mut wake: Option<u64> = None;
+        let mut widest_freshness: Option<Duration> = None;
         for (&peer, pair) in &mut self.pairs {
             pair.attached(now_ns);
+            widest_freshness = widest_freshness.max(pair.freshness());
             if let (Some((evidence, measured)), Some(granularity)) = (evidence, granularity) {
                 pool_margins(
                     pair,
@@ -816,6 +1086,7 @@ impl Liveness {
             wants_flush |= send(pair, peer, &sender, now_ns, &mut self.message, own, out);
             wake = earliest(wake, pair, &local, now_ns);
         }
+        self.widest_freshness = widest_freshness;
         // The stream wants a proof it lacks: from now, unless it has waited since earlier.
         if wants_flush && !matches!(self.stall, Some((_, None))) {
             self.stall = Some((now_ns, None));
@@ -823,6 +1094,7 @@ impl Liveness {
         self.judged_ns = self.judged_ns.max(now_ns);
         if wants_flush && !self.flushing {
             self.flushing = true;
+            self.flush_asked = Some(now_ns);
             out.flush();
         }
         self.asked = wake;
@@ -867,14 +1139,24 @@ impl Liveness {
             .min()
     }
 
-    /// The sender's stability floor, `E[flush] + G`: `None` before a flush is measured.
+    /// The sender's stability floor, `E[flush] + G`: `None` before a flush is measured. Judged
+    /// apart from its disk ([`set_disk_apart`](Self::set_disk_apart)), its heartbeats wait on no
+    /// flush, and `E[flush]` is the mean of the flushes within their tail as each came: a stall's,
+    /// past it, measures nothing a heartbeat costs. With every flush in it, the one that ended a
+    /// 13 s stall of every disk raised the floors of a lightly loaded group from 2 to 262 to 308 ms
+    /// at once, its links' intervals with them past the freshness their peers held them to, and
+    /// each suspected the others (kiln's CP-T2.2, a node judged apart asking no probe, Focal's 5a).
     pub fn floor(&self) -> Option<Duration> {
         self.floor_at(self.granularity())
     }
 
     /// The floor at the granularity `G` already read.
     fn floor_at(&self, granularity: Option<Duration>) -> Option<Duration> {
-        let flush = self.flushes.mean()?;
+        let flush = if self.apart {
+            self.steady.mean().or_else(|| self.flushes.mean())
+        } else {
+            self.flushes.mean()
+        }?;
         Some(flush.saturating_add(granularity.unwrap_or(Duration::ZERO)))
     }
 
@@ -882,6 +1164,34 @@ impl Liveness {
     /// the vote round's flush in the election law's ballot (`hyper_timing::Ballot::measure`).
     pub fn flush_mean(&self) -> Option<Duration> {
         self.flushes.mean()
+    }
+
+    /// Judged apart from its disk ([`set_disk_apart`](Self::set_disk_apart)), whether this node's own
+    /// disk is slow: its stream has waited on it longer than its flushes' tail
+    /// ([`flush_tail`](Self::flush_tail)) and the widest freshness its detectors hold (a stall the
+    /// flush proof would have been suspected for), and no completion has ended the wait. Its
+    /// heartbeats say so, and its peers report it ([`Change::DiskSlow`]).
+    pub fn own_disk_slow(&self) -> bool {
+        self.own_disk_slow
+    }
+
+    /// Judged apart from its disk ([`set_disk_apart`](Self::set_disk_apart)), whether `peer`'s disk
+    /// is slow by what its heartbeats say ([`Change::DiskSlow`]); `None` for a peer not attached.
+    pub fn disk_slow(&self, peer: PeerId) -> Option<bool> {
+        self.pairs.get(&peer).map(Pair::disk_slow)
+    }
+
+    /// The smoothed flush, RFC 6298's `SRTT` over this node's log writes, once one is reported.
+    pub fn flush_smoothed(&self) -> Option<Duration> {
+        self.flush_tail.smoothed()
+    }
+
+    /// The bound on this node's flushes' tail, `smoothed + max(4 · deviation, G)` (RFC 6298 §2.3,
+    /// `hyper_timing::FlushTail`) with `G` the granularity measured so far, once a flush is reported:
+    /// a write of the node's own out past it is one its device's measured flushes don't explain.
+    pub fn flush_tail(&self) -> Option<Duration> {
+        self.flush_tail
+            .tail(self.granularity().unwrap_or(Duration::ZERO))
     }
 
     /// A wait the owner began before `deadline_ns`, the stream's [`wake`](Self::wake), that ended
@@ -925,6 +1235,21 @@ impl Liveness {
             .map(|pair| pair.trust_at(&local, self.judged_ns))
     }
 
+    /// Whether `peer`'s run announced its stop and no heartbeat of its next run has come
+    /// ([`Change::Stopped`]): what an owner tells a core it gives the peer anew
+    /// (`RawNode::stopped`).
+    pub fn stopped(&self, peer: PeerId) -> bool {
+        self.pairs.get(&peer).is_some_and(Pair::stopped)
+    }
+
+    /// Whether `peer` took this run's announcement that it ends ([`Liveness::stop`]): a heartbeat
+    /// of the peer's that echoes it came, its answer. From then the peer holds this node out of its
+    /// groups' quorums (`RawNode::stopped`); false before the announcement, for a peer that has not
+    /// answered, and for one this node shares no group with.
+    pub fn stop_taken(&self, peer: PeerId) -> bool {
+        self.pairs.get(&peer).is_some_and(Pair::stop_taken)
+    }
+
     /// The peers this node suspects.
     pub fn suspected(&self) -> impl Iterator<Item = PeerId> + '_ {
         self.pairs
@@ -961,5 +1286,12 @@ impl Liveness {
     /// The MTBF the detectors are configured with, once there is exposure.
     pub fn mtbf(&self) -> Option<Duration> {
         self.exposure.mtbf()
+    }
+
+    /// The failure evidence the MTBF is read from: the history the node started with
+    /// ([`Settings::history`]), the node time watched since, and the failures counted. What an
+    /// owner keeps to start its next run from (`hyper_timing::Exposure::of`).
+    pub fn history(&self) -> Exposure {
+        self.exposure
     }
 }

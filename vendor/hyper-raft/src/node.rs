@@ -652,6 +652,13 @@ impl<S: Storage> RawNode<S> {
     pub fn restarted(&mut self, member: NodeId) -> Result<()> {
         self.operate(|raft| raft.restarted(member))
     }
+    /// The owner's detectors took `member`'s node's announcement that its
+    /// run ends ([`Raft::stopped`]): suspected, ordered to campaign never,
+    /// and what it sends that could take the group's leader dropped, until
+    /// its node is heard again.
+    pub fn stopped(&mut self, member: NodeId) -> Result<()> {
+        self.operate(|raft| raft.stopped(member))
+    }
     /// The owner's node-level detector suspects `member` (core step R-8): its held answers are not
     /// counted toward a commit until [`RawNode::trust_held`]. On ticks or by suspicion alike; one
     /// stream per node pair decides it for every group, never a group's own heartbeats.

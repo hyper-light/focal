@@ -7,6 +7,11 @@ rust-version = "1.98.1"
 license = "MIT"
 repository = "https://github.com/hyper-light/hyper-raft"
 
+[features]
+# A defect planted in the replica's core (`Replica::plant`, `hyper_raft::Mutant`), for a test build
+# that shows its checks catch it; no consumer enables it.
+mutants = ["hyper-raft/mutants"]
+
 [dependencies]
 hyper-block = { version = "0.1.0", path = "../hyper-block" }
 hyper-liveness = { version = "0.1.0", path = "../hyper-liveness" }

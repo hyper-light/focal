@@ -43,6 +43,7 @@ pub struct TransportConfig {
     pub(crate) min_mtu: u16,
     pub(crate) mtu_discovery_config: Option<MtuDiscoveryConfig>,
     pub(crate) pad_to_mtu: bool,
+    pub(crate) fec_window: Option<u32>,
     pub(crate) handshake_copies: bool,
     pub(crate) handshake_copy_burst: Duration,
     pub(crate) ack_frequency_config: Option<AckFrequencyConfig>,
@@ -243,6 +244,22 @@ impl TransportConfig {
         self
     }
 
+    /// Forward erasure correction of the connection's stream data, at most `sources` packets
+    /// wide: what this endpoint holds of the packets it receives to rebuild one lost among them,
+    /// stated to its peer, and the most it combines into a repair of its own packets (RFC 8681's
+    /// sliding-window random linear code; the crate's `erasure` module)
+    ///
+    /// Disabled (`None`) by default. A connection codes only where both of its endpoints state a
+    /// window, the smaller of the two bounding its repairs, and only while its path loses: it
+    /// sends repairs at a rate from the losses it measures, so a packet lost on the way is
+    /// rebuilt from the repairs after it, without the round trip a retransmission takes and the
+    /// wait of every stream byte behind it. A rebuilt packet is still lost to the sender's loss
+    /// detection and congestion control, and is never acknowledged.
+    pub fn fec_window(&mut self, sources: Option<u32>) -> &mut Self {
+        self.fec_window = sources.filter(|sources| *sources > 0);
+        self
+    }
+
     /// Send each packet of the handshake's flights twice, the second in a packet of its own
     ///
     /// Enabled by default. The flights are every Initial and Handshake packet, the 0-RTT and
@@ -434,6 +451,7 @@ impl Default for TransportConfig {
             min_mtu: INITIAL_MTU,
             mtu_discovery_config: Some(MtuDiscoveryConfig::default()),
             pad_to_mtu: false,
+            fec_window: None,
             handshake_copies: true,
             handshake_copy_burst: HANDSHAKE_COPY_BURST,
             ack_frequency_config: None,
@@ -471,6 +489,7 @@ impl fmt::Debug for TransportConfig {
             min_mtu,
             mtu_discovery_config,
             pad_to_mtu,
+            fec_window,
             handshake_copies,
             handshake_copy_burst,
             ack_frequency_config,
@@ -501,6 +520,7 @@ impl fmt::Debug for TransportConfig {
             .field("min_mtu", min_mtu)
             .field("mtu_discovery_config", mtu_discovery_config)
             .field("pad_to_mtu", pad_to_mtu)
+            .field("fec_window", fec_window)
             .field("handshake_copies", handshake_copies)
             .field("handshake_copy_burst", handshake_copy_burst)
             .field("ack_frequency_config", ack_frequency_config)

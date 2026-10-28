@@ -1655,3 +1655,38 @@ can select an appropriate strategy to meet the needs of their applications"). Te
 waits the 25 ms asked on a 1 ms round trip, where decimation acknowledged it at 1 ms; the tenth
 packet is acknowledged at once).
 
+
+## 47. Forward erasure correction of stream data (2026-10-28, found by focal)
+
+`erasure/`, `connection/fec.rs`: a connection whose endpoints both state a window
+(`TransportConfig::fec_window`; transport parameter 0x3fee, frames FEC_SOURCE 0x3fec and FEC_REPAIR
+0x3fed, none registered, so sent only to a peer that states one) codes its 1-RTT packets of stream
+data while its path loses. The code is RFC 8681's sliding-window random linear code over GF(2^8)
+(x^8 + x^4 + x^3 + x^2 + 1, §3.7.1), its coefficients drawn by each repair's key from TinyMT32
+(RFC 8682, its seed-1 validation vector tested), all nonzero (§3.6, DT 15). A source is a packet's
+frames as sent; a repair combines the sources sent since the oldest the peer has not acknowledged,
+none older than the loss delay (RFC 9002 §6.1.2), at most the span over which three repairs go. It
+sends repairs at three times the loss rate RFC 5348 §5.4's average loss interval measures,
+`3p/(1 − p)`, that factor measured (`fec.rs`'s `REPAIRS_PER_LOSS`), and codes only while the window
+holds that span and a repair falls due within each loss delay: a repair that comes after a loss's
+retransmission rebuilds nothing in time, so a sparse connection (an asker's requests) is not coded. A receiver keeps the sources it holds and the repairs' equations in reduced row
+echelon form, and rebuilds a lost packet as soon as they are of full rank, taking its STREAM frames.
+The packet stays lost to its sender's loss detection and congestion control and is never
+acknowledged (RFC 9265 §6.3: "a recovered packet must be considered as a lost packet";
+draft-swett-nwcrg-coding-for-quic-04 §4.5). Every STREAM frame of a source states its length
+(`SendBuffer::poll_transmit_framed`): a rebuilt packet is read with its repair's zero padding after
+it (zeros are PADDING frames, RFC 9000 §19.1), and a frame left to run to its packet's end took that
+padding, and the source frame after it, for stream data. Each side holds what it can afford, up to
+its window: the owner charges `Connection::fec_held_bytes` as it is held and may take it back with
+`Connection::fec_forget`, after which losses are repaired by retransmission alone. Found by focal:
+under 80 ms and 3% loss each way, its leader sent each follower about 720 packets a second, about
+twenty lost a second on each ordered stream, each holding the stream a round trip until its
+retransmission came, and the commit, the first follower's answer, took 1.8 times the loss-free
+path's at the median. `tests/replication.rs` reproduces that load on hyper-sim's network: the code
+over 128 sources brings the commit to the loss-free path's at 1, 3 and 5% loss (164 ms at 3% against
+163 loss-free and 300 to 303 uncoded; 99th percentile 237 to 277 against 464 to 483), its repairs 10%
+of its sources at 3%. Tests: `erasure::tests` (the field against shift-and-reduce, RFC 8682's
+outputs, the coefficients, rebuilds of one and of many losses, late sources, the decoder's bound),
+`connection::fec::tests` (the loss rate, the repair rate and span),
+`replication::the_code_repairs_what_replication_loses`, `a_path_that_loses_nothing_is_not_coded` and
+`a_coded_run_replays_from_its_seed_and_from_its_trace`.

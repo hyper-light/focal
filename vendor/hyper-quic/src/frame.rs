@@ -133,6 +133,11 @@ frame_types! {
     // ACK Frequency
     ACK_FREQUENCY = 0xaf,
     IMMEDIATE_ACK = 0x1f,
+    // Forward erasure correction (`crate::erasure`): hyper-quic's own extension, registered
+    // nowhere, so sent only to a peer whose transport parameters state a window for it
+    // (`TransportParameterId::FecWindow`)
+    FEC_SOURCE = 0x3fec,
+    FEC_REPAIR = 0x3fed,
     // DATAGRAM
 }
 
@@ -152,13 +157,29 @@ pub(crate) enum Frame {
     NewToken(NewToken),
     Stream(Stream),
     MaxData(VarInt),
-    MaxStreamData { id: StreamId, offset: u64 },
-    MaxStreams { dir: Dir, count: u64 },
-    DataBlocked { offset: u64 },
-    StreamDataBlocked { id: StreamId, offset: u64 },
-    StreamsBlocked { dir: Dir, limit: u64 },
+    MaxStreamData {
+        id: StreamId,
+        offset: u64,
+    },
+    MaxStreams {
+        dir: Dir,
+        count: u64,
+    },
+    DataBlocked {
+        offset: u64,
+    },
+    StreamDataBlocked {
+        id: StreamId,
+        offset: u64,
+    },
+    StreamsBlocked {
+        dir: Dir,
+        limit: u64,
+    },
     NewConnectionId(NewConnectionId),
-    RetireConnectionId { sequence: u64 },
+    RetireConnectionId {
+        sequence: u64,
+    },
     PathChallenge(u64),
     PathResponse(u64),
     Close(Close),
@@ -166,6 +187,9 @@ pub(crate) enum Frame {
     AckFrequency(AckFrequency),
     ImmediateAck,
     HandshakeDone,
+    /// The packet is the source numbered so (`crate::erasure`).
+    FecSource(u64),
+    FecRepair(FecRepair),
 }
 
 impl Frame {
@@ -207,6 +231,8 @@ impl Frame {
             AckFrequency(_) => FrameType::ACK_FREQUENCY,
             ImmediateAck => FrameType::IMMEDIATE_ACK,
             HandshakeDone => FrameType::HANDSHAKE_DONE,
+            FecSource(_) => FrameType::FEC_SOURCE,
+            FecRepair(_) => FrameType::FEC_REPAIR,
         }
     }
 
@@ -730,6 +756,13 @@ impl Iter {
                 reordering_threshold: self.bytes.get()?,
             }),
             FrameType::IMMEDIATE_ACK => Frame::ImmediateAck,
+            FrameType::FEC_SOURCE => Frame::FecSource(self.bytes.get_var()?),
+            FrameType::FEC_REPAIR => Frame::FecRepair(FecRepair {
+                first: self.bytes.get_var()?,
+                count: self.bytes.get_var()?,
+                key: self.bytes.get()?,
+                payload: self.take_len()?,
+            }),
             _ => {
                 if let Some(s) = ty.stream() {
                     Frame::Stream(Stream {
@@ -994,6 +1027,47 @@ impl AckFrequency {
         buf.write(self.request_max_ack_delay);
         buf.write(self.reordering_threshold);
     }
+}
+
+/// A repair symbol (`crate::erasure`): the sources from `first`, `count` of them, combined by the
+/// coefficients of `key`, at the length of the longest.
+#[derive(Debug, Clone)]
+pub(crate) struct FecRepair {
+    pub(crate) first: u64,
+    pub(crate) count: u64,
+    pub(crate) key: u16,
+    pub(crate) payload: Bytes,
+}
+
+impl FecRepair {
+    /// The most a repair frame takes beside its payload: its type, three variable-length integers
+    /// of at most 8 bytes each (the first source, the count and the payload's length) and the
+    /// key's two bytes.
+    pub(crate) const OVERHEAD_MAX: usize = 2 + 8 + 8 + 2 + 8;
+
+    /// Writes a repair frame's header for a payload of `length` bytes, which follow it.
+    pub(crate) fn encode_header<W: BufMut>(
+        buf: &mut W,
+        first: u64,
+        count: u64,
+        key: u16,
+        length: usize,
+    ) {
+        buf.write(FrameType::FEC_REPAIR);
+        buf.write_var(first);
+        buf.write_var(count);
+        buf.write(key);
+        buf.write_var(u64::try_from(length).unwrap_or(u64::MAX));
+    }
+}
+
+/// The most a source frame takes: its type and a variable-length integer of at most 8 bytes.
+pub(crate) const FEC_SOURCE_MAX: usize = 2 + 8;
+
+/// Writes a source frame naming the packet's number among the sources.
+pub(crate) fn encode_fec_source<W: BufMut>(buf: &mut W, id: u64) {
+    buf.write(FrameType::FEC_SOURCE);
+    buf.write_var(id);
 }
 
 #[cfg(test)]

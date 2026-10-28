@@ -89,6 +89,11 @@ macro_rules! make_struct {
             /// Frequency
             pub(crate) min_ack_delay: Option<VarInt>,
 
+            /// The sources of consecutive numbers the endpoint holds to rebuild those lost
+            /// (`crate::erasure`): present, it takes the forward erasure correction frames, and
+            /// a repair over more sources than this is of no use to it
+            pub(crate) fec_window: Option<VarInt>,
+
             // Server-only
             /// The value of the Destination Connection ID field from the first Initial packet sent
             /// by the client
@@ -126,6 +131,7 @@ macro_rules! make_struct {
                     initial_src_cid: None,
                     grease_quic_bit: false,
                     min_ack_delay: None,
+                    fec_window: None,
 
                     original_dst_cid: None,
                     retry_src_cid: None,
@@ -174,6 +180,10 @@ impl TransportParameters {
             min_ack_delay: u64::try_from(TIMER_GRANULARITY.as_micros())
                 .ok()
                 .and_then(|micros| VarInt::from_u64(micros).ok()),
+            fec_window: config
+                .fec_window
+                .filter(|window| *window > 0)
+                .map(VarInt::from_u32),
             grease_transport_parameter: Some(ReservedTransportParameter::random(rng)),
             write_order: Some({
                 let mut order = DEFAULT_WRITE_ORDER;
@@ -337,7 +347,8 @@ impl TransportParameters {
                 self.write_flag(id, w)
             }
             TransportParameterId::MaxDatagramFrameSize
-            | TransportParameterId::MinAckDelayDraft07 => self.write_optional_varint(id, w),
+            | TransportParameterId::MinAckDelayDraft07
+            | TransportParameterId::FecWindow => self.write_optional_varint(id, w),
             TransportParameterId::PreferredAddress => {
                 if let Some(ref x) = self.preferred_address {
                     w.write_var(id as u64);
@@ -368,6 +379,7 @@ impl TransportParameters {
     fn write_optional_varint<W: BufMut>(&self, id: TransportParameterId, w: &mut W) {
         let value = match id {
             TransportParameterId::MaxDatagramFrameSize => self.max_datagram_frame_size,
+            TransportParameterId::FecWindow => self.fec_window,
             _ => self.min_ack_delay,
         };
         if let Some(x) = value {
@@ -482,6 +494,12 @@ impl TransportParameters {
                     _ => return Err(Error::Malformed),
                 },
                 TransportParameterId::MinAckDelayDraft07 => params.min_ack_delay = Some(r.get()?),
+                TransportParameterId::FecWindow => {
+                    if len > 8 || params.fec_window.is_some() {
+                        return Err(Error::Malformed);
+                    }
+                    params.fec_window = Some(r.get()?);
+                }
                 _ => {
                     macro_rules! parse {
                         {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {
@@ -656,11 +674,16 @@ pub(crate) enum TransportParameterId {
 
     // https://datatracker.ietf.org/doc/html/draft-ietf-quic-ack-frequency#section-10.1
     MinAckDelayDraft07 = 0xFF04DE1B,
+
+    // hyper-quic's forward erasure correction (`crate::erasure`), registered nowhere: an
+    // identifier of no reserved form (RFC 9000 §18.1's 31 * N + 27 is greased), so a peer that
+    // does not know it ignores it, as RFC 9000 §7.4.2 requires
+    FecWindow = 0x3fee,
 }
 
 impl TransportParameterId {
     /// Array with all supported transport parameter IDs
-    const SUPPORTED: [Self; 21] = [
+    const SUPPORTED: [Self; 22] = [
         Self::MaxIdleTimeout,
         Self::MaxUdpPayloadSize,
         Self::InitialMaxData,
@@ -682,6 +705,7 @@ impl TransportParameterId {
         Self::RetrySourceConnectionId,
         Self::GreaseQuicBit,
         Self::MinAckDelayDraft07,
+        Self::FecWindow,
     ];
 }
 
@@ -719,7 +743,7 @@ fn write_unless_default<W: BufMut>(
 
 /// The order parameters are written in when none is chosen: each supported ID's index
 const DEFAULT_WRITE_ORDER: [u8; TransportParameterId::SUPPORTED.len()] = [
-    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
 ];
 
 fn decode_cid(len: usize, value: &mut Option<ConnectionId>, r: &mut impl Buf) -> Result<(), Error> {

@@ -198,6 +198,15 @@ fn group_event(event: &focal_bus::member::GroupEvent) -> serde_json::Value {
         GroupEvent::Restarted { peer } => {
             serde_json::json!({ "condition": "Restarted", "unix_ms": unix_ms, "peer": peer })
         }
+        GroupEvent::Stopped { peer } => {
+            serde_json::json!({ "condition": "Stopped", "unix_ms": unix_ms, "peer": peer })
+        }
+        GroupEvent::ModeDiffers { peer } => {
+            serde_json::json!({ "condition": "ModeDiffers", "unix_ms": unix_ms, "peer": peer })
+        }
+        GroupEvent::ModeAgrees { peer } => {
+            serde_json::json!({ "condition": "ModeAgrees", "unix_ms": unix_ms, "peer": peer })
+        }
         GroupEvent::Term { term, leader } => serde_json::json!({
             "condition": "Term",
             "unix_ms": unix_ms,

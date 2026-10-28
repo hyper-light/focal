@@ -131,7 +131,20 @@ impl SendBuffer {
     ///
     /// The room left saturates at zero: metadata that does not fit leaves no room for data, where
     /// upstream's subtraction underflowed (it asserted the guarantee in debug builds only).
-    pub(super) fn poll_transmit(&mut self, mut max_len: usize) -> (Range<u64>, bool) {
+    #[cfg(test)]
+    pub(super) fn poll_transmit(&mut self, max_len: usize) -> (Range<u64>, bool) {
+        self.poll_transmit_framed(max_len, false)
+    }
+
+    /// [`Self::poll_transmit`], every frame stating its length where `lengths`, even one that
+    /// would fill its packet: a frame read past its packet's end then still ends where it was
+    /// sent, as one in a packet an erasure code rebuilds is read with the padding of its repair's
+    /// length after it (`crate::erasure`)
+    pub(super) fn poll_transmit_framed(
+        &mut self,
+        mut max_len: usize,
+        lengths: bool,
+    ) -> (Range<u64>, bool) {
         let mut encode_length = false;
 
         if let Some(range) = self.retransmits.pop_min() {
@@ -142,7 +155,7 @@ impl SendBuffer {
             if range.start != 0 {
                 max_len = max_len.saturating_sub(VarInt::size_of(range.start));
             }
-            if range.end.saturating_sub(range.start) < len_u64(max_len) {
+            if lengths || range.end.saturating_sub(range.start) < len_u64(max_len) {
                 encode_length = true;
                 max_len = max_len.saturating_sub(8);
             }
@@ -161,7 +174,7 @@ impl SendBuffer {
         if self.unsent != 0 {
             max_len = max_len.saturating_sub(VarInt::size_of(self.unsent));
         }
-        if self.offset.saturating_sub(self.unsent) < len_u64(max_len) {
+        if lengths || self.offset.saturating_sub(self.unsent) < len_u64(max_len) {
             encode_length = true;
             max_len = max_len.saturating_sub(8);
         }

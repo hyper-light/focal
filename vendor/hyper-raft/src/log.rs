@@ -472,6 +472,13 @@ impl<S: Storage> Log<S> {
     pub fn unstable(&self) -> &Unstable {
         &self.unstable
     }
+    /// Gives back the room the entries not yet durable hold past what they take: a backlog's room
+    /// stays with their vector once it drains, kept for what is appended next (core step R-4), and
+    /// an owner short of memory asks for it back (kiln's CP-T2.2: a member whose stalled disk let
+    /// go held its backlog's slots, empty, past its budget, and refused the entries it lacked).
+    pub fn trim(&mut self) {
+        self.unstable.entries.shrink_to_fit();
+    }
     /// The index of the first entry the log holds.
     pub fn first_index(&self) -> Result<u64> {
         match self.unstable.first_index() {

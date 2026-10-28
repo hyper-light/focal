@@ -22,6 +22,14 @@ pub trait Budget {
 
     /// Gives back `bytes`.
     fn release(&mut self, bytes: u64);
+
+    /// The free bytes of this replica's own allowance, the room its backlog may grow into before a
+    /// reservation is refused: what a leader judged apart from its disk weighs its patience with
+    /// that disk against (kiln's CP-T2.2, Focal's condition 5, `docs/durable.md` §4.2). The
+    /// allowance is the group's own, never a room other groups' replicas share, so one group's
+    /// stall spends no other's memory. `None` for a budget that refuses nothing: its replica's
+    /// patience never ends for memory, waiting being free.
+    fn room(&self) -> Option<usize>;
 }
 
 /// The budget of an owner that bounds memory otherwise: it admits everything and counts nothing.
@@ -39,6 +47,11 @@ impl Budget for Unbounded {
     fn charge(&mut self, _bytes: u64) {}
     #[inline]
     fn release(&mut self, _bytes: u64) {}
+    /// Refuses nothing: no room to fill.
+    #[inline]
+    fn room(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// A budget of a fixed number of bytes, which the owner sets from the memory it gives its
@@ -86,5 +99,9 @@ impl Budget for Bytes {
     fn release(&mut self, bytes: u64) {
         // Saturating: a release past what was used is a release of everything.
         self.used = self.used.saturating_sub(bytes);
+    }
+    /// The limit less what is reserved and charged.
+    fn room(&self) -> Option<usize> {
+        Some(usize::try_from(self.limit.saturating_sub(self.used)).unwrap_or(usize::MAX))
     }
 }

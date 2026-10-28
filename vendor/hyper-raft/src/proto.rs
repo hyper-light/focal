@@ -285,6 +285,13 @@ use crate::{
 /// other's.
 pub const CAMPAIGN_TRANSFER: &[u8] = b"CampaignTransfer";
 
+/// What an order to campaign (`MsgTimeoutNow`) carries from a leader that leads on while its
+/// detectors leave it no quorum: campaign only where this member and the voters it trusts, the
+/// leader apart, are a quorum, so that it could be elected without the leader's vote
+/// (`docs/timing.md` §2.9, "A leader its detectors leave no quorum"). An order with no context is
+/// acted on as before, by a member of a build that reads no context here too.
+pub const IF_ELECTED_WITHOUT: &[u8] = b"IfElectedWithout";
+
 /// The bytes the entry takes in a message (`docs/raft.md` §3.1): what the core's byte bounds
 /// count, so a message's bytes are the sum of its entries' and its fixed part.
 pub fn encoded_bytes(entry: &Entry) -> u64 {

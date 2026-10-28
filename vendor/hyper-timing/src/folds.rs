@@ -209,6 +209,56 @@ impl Flushes {
     }
 }
 
+/// A node's flush times, folded as RFC 6298 folds round trips (§2.2 and §2.3: the smoothed time and
+/// its mean deviation, alpha 1/8 and beta 1/4; the fold [`ExchangeRtt`](crate::ExchangeRtt) keeps by
+/// RFC 9002 §5.3, which states the same), to bound their tail, `smoothed + max(4 · deviation, G)`
+/// with `G` the owner's measured granularity: what a write out on the node's device is judged
+/// against (kiln's CP-T2.2). A write out past the tail is one the device's own measured flushes don't
+/// explain. Every flush folds in, a stall's among them, so a device that stalls often is held to a
+/// wider tail than one that never has: the bound follows the device as it measures, nothing picked.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FlushTail {
+    fold: crate::ExchangeRtt,
+}
+
+impl FlushTail {
+    /// A fold with no flush.
+    pub const fn new() -> Self {
+        Self {
+            fold: crate::ExchangeRtt::new(),
+        }
+    }
+
+    /// A flush that started at `started_ns` and was durable at `durable_ns`, on one monotonic clock.
+    pub fn on_flush(&mut self, started_ns: u64, durable_ns: u64) {
+        // Saturating: a clock read out of order is a flush of no measurable length.
+        self.on_sample(durable_ns.saturating_sub(started_ns));
+    }
+
+    /// One flush's time, or another duration the fold bounds the same way, nanoseconds: a peer's
+    /// flush age as its heartbeats carry it (kiln's CP-T2.2, hyper-liveness's disk verdicts).
+    pub fn on_sample(&mut self, sample_ns: u64) {
+        self.fold.on_sample(sample_ns);
+    }
+
+    /// The flushes folded in.
+    pub const fn flushes(&self) -> u64 {
+        self.fold.samples()
+    }
+
+    /// The smoothed flush, RFC 6298's `SRTT` over flushes, or `None` before one.
+    pub fn smoothed(&self) -> Option<Duration> {
+        (self.fold.samples() > 0).then(|| Duration::from_nanos(self.fold.smoothed_ns()))
+    }
+
+    /// The bound on the flushes' tail, `smoothed + max(4 · deviation, G)`: RFC 6298 §2.3's `RTO`
+    /// over flushes, or `None` before one.
+    pub fn tail(&self, granularity: Duration) -> Option<Duration> {
+        let granularity_ns = u64::try_from(granularity.as_nanos()).unwrap_or(u64::MAX);
+        self.fold.tail_ns(granularity_ns).map(Duration::from_nanos)
+    }
+}
+
 /// The fleet's node failures over its exposure, for the MTBF (`docs/timing.md` §2.6, item 3): the
 /// Jeffreys posterior for a Poisson rate after `k` failures in node exposure `T` is
 /// `Gamma(k + ½, T)`, mean rate `(k + ½)/T` (Jeffreys 1946), so `MTBF = T / (k + ½)`. Before the
@@ -227,6 +277,14 @@ impl Exposure {
             exposure: Duration::ZERO,
             failures: 0,
         }
+    }
+
+    /// The evidence an owner kept: `exposure` of node time run and `failures` counted over it, as
+    /// stored totals (mantle keeps each node's uptime and its crashes in its root range and gives
+    /// their sums at each start). Taken whole, not rebuilt by a call of [`Exposure::on_failure`]
+    /// for each failure stored, a loop bounded only by a stored value.
+    pub const fn of(exposure: Duration, failures: u64) -> Self {
+        Self { exposure, failures }
     }
 
     /// Node time run: the sum over nodes of the time each was up. Saturating: past `Duration::MAX`
@@ -259,6 +317,67 @@ impl Exposure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RFC 6298 §2.2 and §2.3 over durations, in real arithmetic: the smoothed time and the bound
+    /// `SRTT + max(G, K · RTTVAR)`, what the fold is checked against.
+    fn rfc_6298(samples: &[u64], granularity: f64) -> (f64, f64) {
+        let (mut srtt, mut rttvar) = (0.0f64, 0.0f64);
+        for (i, &r) in samples.iter().enumerate() {
+            let r = r as f64;
+            if i == 0 {
+                srtt = r;
+                rttvar = r / 2.0;
+            } else {
+                rttvar = 0.75 * rttvar + 0.25 * (srtt - r).abs();
+                srtt = 0.875 * srtt + 0.125 * r;
+            }
+        }
+        (srtt, srtt + granularity.max(4.0 * rttvar))
+    }
+
+    #[test]
+    fn a_flush_tail_is_rfc_6298s_bound_over_the_flushes() {
+        const MS: u64 = 1_000_000;
+        // A first flush, a steady run, a run with one long flush (a stall), and a long steady run.
+        let runs: [&[u64]; 4] = [
+            &[MS],
+            &[MS, 1_200_000, 900_000],
+            &[MS, 1_200_000, 900_000, 600 * MS, MS, MS],
+            &[MS; 40],
+        ];
+        for samples in runs {
+            for granularity in [0, 50_000, MS] {
+                let g = Duration::from_nanos(granularity);
+                let mut tail = FlushTail::new();
+                assert_eq!((tail.tail(g), tail.smoothed()), (None, None), "no flush");
+                for (i, &flush) in samples.iter().enumerate() {
+                    let started = i as u64 * 1_000 * MS;
+                    tail.on_flush(started, started + flush);
+                }
+                assert_eq!(tail.flushes(), samples.len() as u64);
+                let (srtt, bound) = rfc_6298(samples, granularity as f64);
+                let (got_srtt, got_bound) = (
+                    tail.smoothed().unwrap().as_nanos() as f64,
+                    tail.tail(g).unwrap().as_nanos() as f64,
+                );
+                // The fold works in whole nanoseconds, each of its shifts truncating: within a few
+                // nanoseconds a sample of the real arithmetic.
+                let slack = 5.0 * samples.len() as f64;
+                assert!(
+                    (got_srtt - srtt).abs() <= slack && (got_bound - bound).abs() <= slack,
+                    "{samples:?} at G {granularity}: smoothed {got_srtt} and tail {got_bound}, \
+                     RFC 6298's {srtt} and {bound}"
+                );
+            }
+        }
+        // A steady run's deviation decays under G, which then bounds the tail alone.
+        let mut steady = FlushTail::new();
+        for i in 0..40 {
+            steady.on_flush(i * 10 * MS, i * 10 * MS + MS);
+        }
+        let g = Duration::from_millis(1);
+        assert_eq!(steady.tail(g), Some(steady.smoothed().unwrap() + g));
+    }
 
     #[test]
     fn a_mean_past_a_u64_sum_is_the_wide_quotient() {
@@ -361,5 +480,30 @@ mod tests {
         fleet.on_exposure(Duration::from_secs(3_600));
         assert_eq!(fleet.mtbf(), Some(Duration::from_secs(4_800)), "T / 1.5");
         assert_eq!(fleet.failures(), 1);
+    }
+
+    /// Stored totals give the evidence they were taken from: the same MTBF as the folds that made
+    /// them, at once for any count, and none before any exposure.
+    #[test]
+    fn stored_totals_are_the_evidence_they_were_taken_from() {
+        let mut folded = Exposure::new();
+        folded.on_exposure(Duration::from_secs(5_400));
+        for _ in 0..3 {
+            folded.on_failure();
+        }
+        let stored = Exposure::of(Duration::from_secs(5_400), 3);
+        assert_eq!(stored, folded);
+        assert_eq!(
+            stored.mtbf(),
+            Duration::try_from_secs_f64(5_400.0 / 3.5).ok(),
+            "T / (k + 1/2)"
+        );
+        let most = Exposure::of(Duration::from_secs(1), u64::MAX);
+        assert_eq!(most.failures(), u64::MAX);
+        assert!(
+            most.mtbf()
+                .is_some_and(|mtbf| mtbf < Duration::from_nanos(1))
+        );
+        assert_eq!(Exposure::of(Duration::ZERO, 7).mtbf(), None);
     }
 }

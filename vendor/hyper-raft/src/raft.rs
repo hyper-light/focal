@@ -942,6 +942,13 @@ impl Outgoing {
             self.spares.insert(at.saturating_sub(1), emptied);
         }
     }
+    /// Gives back the room the queues hold past what waits ([`Raft::trim`]): the spares owners
+    /// gave back, and the queue's own slots past its messages. The room a burst grew is kept for
+    /// the next burst (`Outgoing::recycle`), and a member short of memory asks for it back.
+    pub(crate) fn trim(&mut self) {
+        self.spares = Vec::new();
+        self.msgs.shrink_to_fit();
+    }
     /// Whether the counter says what a walk of the messages says.
     pub(crate) fn check(&self) -> Result<()> {
         let payload = self.msgs.iter().fold(0usize, |bytes, message| {
@@ -1503,6 +1510,14 @@ impl<S: Storage> Raft<S> {
     /// This member's log.
     pub fn log(&self) -> &Log<S> {
         &self.log
+    }
+    /// Gives back the room this member holds spare: its entries' slots not yet durable past what
+    /// they take ([`Log::trim`]), and its message queues' past what waits
+    /// ([`Outgoing::trim`]). Each is kept so that the next burst grows nothing; an owner short of
+    /// memory asks for it back (hyper-durable's budget, kiln's CP-T2.2).
+    pub fn trim(&mut self) {
+        self.log.trim();
+        self.msgs.trim();
     }
     /// The storage this member reads.
     pub fn store(&self) -> &S {
@@ -2131,6 +2146,7 @@ impl<S: Storage> Raft<S> {
             watch.campaign = Arm::Unset { round: true };
             watch.beat = Arm::Off;
             watch.transfer = Arm::Off;
+            watch.order = Arm::Off;
         }
         self.lead_transferee = None;
         self.self_vote = false;
@@ -2357,6 +2373,13 @@ impl<S: Storage> Raft<S> {
             .as_ref()
             .is_some_and(|watch| watch.suspects(member))
     }
+    /// Whether `member`'s node announced its run ends and has not been heard since
+    /// ([`Raft::stopped`]); never on ticks.
+    pub fn stops(&self, member: NodeId) -> bool {
+        self.watch
+            .as_ref()
+            .is_some_and(|watch| watch.stopped(member))
+    }
     /// The members the owner's detectors suspect, in order; none on ticks.
     pub fn suspected(&self) -> &[NodeId] {
         self.watch.as_ref().map_or(&[], |watch| watch.suspected())
@@ -2381,9 +2404,10 @@ impl<S: Storage> Raft<S> {
             .ok_or(Error::Settings("elections run on ticks"))
     }
     /// The owner's detectors suspect `member`'s node. A follower that knows
-    /// it for its leader campaigns after its delay; a leader whose
-    /// detectors leave it no quorum steps down, and a transfer to it is
-    /// given up. A member never suspects itself.
+    /// it for its leader campaigns after its delay, and a pre-candidate they
+    /// leave no quorum asks no more; a leader they leave no quorum leads on
+    /// and hands over to an heir that can be elected without it, and a
+    /// transfer to `member` is given up. A member never suspects itself.
     pub fn suspect(&mut self, member: NodeId) -> Result<()> {
         let (id, leader, state) = (self.id, self.leader_id, self.state);
         let members = self.config.limits.members;
@@ -2395,6 +2419,9 @@ impl<S: Storage> Raft<S> {
             if member == leader && watch.campaign == Arm::Off {
                 watch.campaign = Arm::Unset { round: false };
             }
+            if state == StateRole::PreCandidate && !self.trusted_quorum() {
+                self.stop_asking()?;
+            }
             return Ok(());
         }
         if self.lead_transferee == Some(member) {
@@ -2402,44 +2429,120 @@ impl<S: Storage> Raft<S> {
             self.watch_mut()?.transfer = Arm::Off;
         }
         if !self.trusted_quorum() {
-            self.step_down()?;
+            self.left_no_quorum()?;
         }
         Ok(())
     }
-    /// Check-quorum, from the detectors (Raft §6.2): a leader they leave no
-    /// quorum steps down, and hands over.
+    /// The owner's detectors took `member`'s node's announcement that its run ends, in order
+    /// (hyper-liveness `Change::Stopped`): it is suspected, as by [`Raft::suspect`], at once where
+    /// a silence is suspected only once a freshness point passes; and until its node is heard
+    /// again ([`Raft::restarted`], [`Raft::trust`]) this member orders it to campaign never, and
+    /// drops its requests for votes and whatever it sends of a later term than this member's
+    /// (`Raft::drops`). A stopping node may still run its members for a while (an owner closing
+    /// its connections, or one that announces before it hands over what it leads), and what they
+    /// sent may arrive after the announcement: a campaign of its, forced by an order it took, or a
+    /// later term it reached, would take the leader from a group whose remaining voters keep one by
+    /// the degraded group's rule (`docs/timing.md` §2.9, "A voter's stop announced";
+    /// `docs/models/SuspicionStopNoDrop.cfg`). Dropped as lost messages are, they cost Raft's
+    /// safety nothing. A member never takes itself for stopped.
+    pub fn stopped(&mut self, member: NodeId) -> Result<()> {
+        if member == self.id {
+            return Ok(());
+        }
+        self.suspect(member)?;
+        let members = self.config.limits.members;
+        self.watch_mut()?.stop(member, members)
+    }
+    /// Whether `message` comes from a member whose node announced its run ends
+    /// ([`Raft::stopped`]) and could take this group's leader: a request for votes, of any term,
+    /// forced or not, or anything of a later term than this member's.
+    fn drops(&self, message: &Message) -> bool {
+        message.from != self.id
+            && self.stops(message.from)
+            && (matches!(
+                message.msg_type,
+                MessageType::MsgRequestVote | MessageType::MsgRequestPreVote
+            ) || message.term > self.term)
+    }
+    /// Check-quorum, from the detectors (Raft §6.2): a leader they leave no quorum leads on, and
+    /// orders its heirs in turn to campaign where each can be elected without it
+    /// ([`proto::IF_ELECTED_WITHOUT`]); the order is armed here and given at its wakes
+    /// (`Raft::wake_leader`). A step-down could hand its quorum to no voter that can lead without
+    /// it: a voter elected by its vote hears it and is heard by it, so it could lead as well. Where
+    /// a voter can be elected without it, that voter's order is what elects it: the voters it does
+    /// not hear may hear it and trust it, and nothing else would make them campaign (a leader whose
+    /// plane went deaf, `Raft::hand_over`). It commits nothing without a quorum meanwhile, and
+    /// answers no read without one's answers (thesis §6.4); a step-down made it say it led nothing
+    /// while no other could lead, which a mistake between the two live voters of three, the third
+    /// stopped, cost its group each time (mantle's roll, serve-cell `abef6120`; `docs/timing.md`
+    /// §2.9, "A leader its detectors leave no quorum").
     ///
-    /// It orders a hand-over at once only to a voter it trusts. Trusting none, it may be the one
-    /// that stalled (a host that froze suspects every peer at once), and its followers trust it:
-    /// the `led` path in `wake_follower` decides a round and a draw later, campaigning if it trusts
-    /// a quorum again, which re-elects it, and otherwise handing over over every voter. Ordered at
-    /// the step-down, the heir's campaign moved the group's leadership at every short stall
+    /// It orders at once only a voter it trusts. Trusting none, it may be the one that stalled (a
+    /// host that froze suspects every peer at once), and its followers trust it: it orders a round
+    /// and a draw later, unless it trusts a quorum again first, which ends the order with nothing
+    /// lost. Ordered at once, the heir's campaign moved the group's leadership at every short stall
     /// (mantle's cluster tests on a loaded Linux runner, run 39525134119).
-    fn step_down(&mut self) -> Result<()> {
+    fn left_no_quorum(&mut self) -> Result<()> {
         let id = self.id;
         let configuration = self.tracker.configuration();
         let trusted_heir = self.tracker.iter().any(|(member, _)| {
             member != id && configuration.votes(member) && !self.suspects(member)
         });
-        if trusted_heir {
-            self.hand_over()?;
+        let watch = self.watch_mut()?;
+        if watch.order == Arm::Off {
+            // Each time it is left no quorum its orders start from the heir that holds the most,
+            // trusted ones first.
+            watch.handovers = 0;
+            watch.order = if trusted_heir {
+                Arm::At(watch.now)
+            } else {
+                Arm::Unset { round: true }
+            };
         }
+        Ok(())
+    }
+    /// A pre-candidate its detectors leave no quorum asks no more: its campaign could win only by
+    /// the vote of a member it suspects, a leader it left among them, and a leader votes for no
+    /// one while it leads. It follows the leader it left again, in its term, hearing what that
+    /// leader sends: asking, it dropped it, so a leader left no other voter (the third of three
+    /// stopped) committed nothing (mantle's roll, its first stop). It campaigns again once it and
+    /// those it trusts are a quorum.
+    fn stop_asking(&mut self) -> Result<()> {
+        let left = self.watch.as_ref().map_or(0, |watch| watch.left);
         let term = self.term;
-        self.become_follower(term, 0)
+        self.become_follower(term, left)
+    }
+    /// Whether this member and those it trusts, `member` apart, are a quorum of each half of its
+    /// configuration: whether it could be elected without `member`'s vote. Always on ticks.
+    fn elected_without(&self, member: NodeId) -> bool {
+        let Some(watch) = self.watch.as_ref() else {
+            return true;
+        };
+        let (id, whole) = (self.id, self.lost.is_none());
+        self.tracker.quorum_of(|voter| {
+            if voter == id {
+                whole
+            } else {
+                voter != member && !watch.suspects(voter)
+            }
+        })
     }
     /// A leader that stops leading in its term tells a voter to campaign at
-    /// once (a transfer's order, Raft dissertation §3.10). Its followers
-    /// trust its node, which lives, and by suspicion nothing else would make
-    /// them campaign: the heir's campaign moves them to its term, where they
-    /// know no leader. An heir that cannot win leaves them so all the same,
-    /// and they elect among themselves.
+    /// once (a transfer's order, Raft dissertation §3.10); one that leads on
+    /// with no quorum its detectors trust tells it to campaign only where it
+    /// can be elected without the leader's vote (`if_elected_without`,
+    /// [`proto::IF_ELECTED_WITHOUT`]). Its followers trust its node, which
+    /// lives, and by suspicion nothing else would make them campaign: the
+    /// heir's campaign moves them to its term, where they know no leader. An
+    /// heir that cannot win leaves them so all the same, and they elect among
+    /// themselves.
     ///
     /// The heirs are every other voter, in order: those its detectors trust
     /// before those they suspect, then the most of its log held first, then
     /// by id; each hand-over names the next (`Watch::handovers`). A voter it
     /// suspects is still an heir: a suspicion says it does not hear that
-    /// voter, not that the voter does not hear it, and a leader steps down
-    /// exactly when it hears no quorum, so it may suspect every other voter
+    /// voter, not that the voter does not hear it, and a leader is left no
+    /// quorum exactly when it hears none, so it may suspect every other voter
     /// while they all hear and trust it. Handing over to none, it left them
     /// leaderless for as long as its suspicions lasted (mantle's node
     /// simulation, a leader whose plane went deaf; mantle's Windows CI, run
@@ -2447,15 +2550,17 @@ impl<S: Storage> Raft<S> {
     /// first may be dead, or one that cannot campaign (a learner by its own
     /// configuration) or cannot win, while its followers keep their lease on
     /// it (R-7, seed 75 of the faults at rest by suspicion: it named the same
-    /// heir for good). Only the order at the step-down knows what each holds:
-    /// a follower's progress is reset, as is a restarted leader's, so the
-    /// orders after it turn through the heirs it trusts and then the rest.
-    fn hand_over(&mut self) -> Result<()> {
+    /// heir for good). Only a leader knows what each holds: a follower's
+    /// progress is reset, as is a restarted leader's, so the orders of a
+    /// member that led turn through the heirs it trusts and then the rest.
+    fn hand_over(&mut self, if_elected_without: bool) -> Result<()> {
         let configuration = self.tracker.configuration();
         let heirs = || {
             self.tracker
                 .iter()
-                .filter(|(member, _)| *member != self.id && configuration.votes(*member))
+                .filter(|(member, _)| {
+                    *member != self.id && configuration.votes(*member) && !self.stops(*member)
+                })
                 .map(|(member, progress)| {
                     (
                         self.suspects(member),
@@ -2471,9 +2576,9 @@ impl<S: Storage> Raft<S> {
             .checked_rem(heirs().count())
             .unwrap_or(0);
         // The heir `turn` places ahead of it: the configuration names a
-        // bounded few members (`Limits::members`), and a hand-over comes once
-        // a step-down and once a round after, so counting each heir's place
-        // costs nothing that matters and allocates nothing.
+        // bounded few members (`Limits::members`), and a hand-over comes at
+        // most once an expected election, so counting each heir's place costs
+        // nothing that matters and allocates nothing.
         let Some((_, _, heir)) =
             heirs().find(|key| heirs().filter(|other| other < key).count() == turn)
         else {
@@ -2483,7 +2588,11 @@ impl<S: Storage> Raft<S> {
             watch.handovers = watch.handovers.wrapping_add(1);
             watch.ordered = Some(watch.now);
         }
-        self.send(proto::message(heir, MessageType::MsgTimeoutNow))
+        let mut order = proto::message(heir, MessageType::MsgTimeoutNow);
+        if if_elected_without {
+            order.context = proto::IF_ELECTED_WITHOUT.to_vec();
+        }
+        self.send(order)
     }
     /// The owner's detectors saw `member`'s node start again: it is
     /// trusted, and leads nothing it led before it stopped. A follower that
@@ -2498,8 +2607,11 @@ impl<S: Storage> Raft<S> {
         if self.state == StateRole::Leader {
             // What was in flight to it went with the incarnation that
             // stopped: its window is empty, and it is probed from what it
-            // is known to hold, not waited on.
-            if let Some(progress) = self.tracker.get_mut(member) {
+            // is known to hold, not waited on; unless nothing was in
+            // flight and it holds all there is (`Raft::holds_all`).
+            if !self.holds_all(member)?
+                && let Some(progress) = self.tracker.get_mut(member)
+            {
                 progress.become_probe();
             }
             return self.probe(member);
@@ -2509,6 +2621,21 @@ impl<S: Storage> Raft<S> {
         }
         Ok(())
     }
+    /// Whether a leader replicates to `member` with nothing in flight to it, and it holds this
+    /// leader's whole log: nothing sent to it can have been lost, and a probe of it would never
+    /// be answered, since an answer moves a probe on only with news (`Progress::maybe_update`).
+    /// Probed all the same, as when the leader trusted it again or saw it start again, it stayed
+    /// probed until the group's next write, and a leader beats while a member is probed
+    /// (`Raft::active`): an idle group beat once a round for good after a mistake of its
+    /// detectors was withdrawn.
+    fn holds_all(&self, member: NodeId) -> Result<bool> {
+        let last = self.log.last_index()?;
+        Ok(self.tracker.get(member).is_some_and(|progress| {
+            progress.state == ProgressState::Replicate
+                && progress.inflights.count() == 0
+                && progress.matched >= last
+        }))
+    }
     /// The owner's detectors trust `member`'s node again. A follower that
     /// knows it for its leader no longer campaigns for it; a leader tells
     /// it who leads, so a member cut off while the group was idle catches
@@ -2517,13 +2644,16 @@ impl<S: Storage> Raft<S> {
     /// a member cut off while its group committed was sent a window of what
     /// the cut lost, and would be asked where it is only once a beat passed
     /// with that window unanswered, or, by a leader the owner has given no
-    /// timing yet, never.
+    /// timing yet, never. One sent nothing that it lacks lost nothing
+    /// (`Raft::holds_all`).
     pub fn trust(&mut self, member: NodeId) -> Result<()> {
         if !self.watch_mut()?.trust(member) {
             return Ok(());
         }
         if self.state == StateRole::Leader && member != self.id {
-            self.unreachable(member);
+            if !self.holds_all(member)? {
+                self.unreachable(member);
+            }
             self.probe(member)?;
         }
         Ok(())
@@ -2608,7 +2738,12 @@ impl<S: Storage> Raft<S> {
     /// it trusts that is behind it, has not said it holds the commit, is
     /// probed, sent a snapshot or has messages out. A member it suspects is
     /// left out, as CockroachDB quiesces a range whose behind replicas are
-    /// on dead nodes; it is told again once trusted.
+    /// on dead nodes; it is told again once trusted. While the members it
+    /// trusts leave it no quorum it counts them all: it commits only by some
+    /// it suspects, and an append lost on its way to one waited, unsent
+    /// again, until the leader trusted it. A member whose node announced its
+    /// stop it never counts: its run is ending, and beats on its account
+    /// would go on until its next run is heard.
     fn active(&self) -> Result<bool> {
         if self.lead_transferee.is_some() || !self.read_only.is_empty() {
             return Ok(true);
@@ -2617,9 +2752,11 @@ impl<S: Storage> Raft<S> {
             return Ok(true);
         };
         let (last, committed, id) = (self.log.last_index()?, self.log.committed(), self.id);
+        let quorum = self.trusted_quorum();
         Ok(self.tracker.iter().any(|(member, progress)| {
             member != id
-                && !watch.suspects(member)
+                && !watch.stopped(member)
+                && (!quorum || !watch.suspects(member))
                 && (progress.matched < last
                     || progress.committed_index < committed
                     || progress.state != ProgressState::Replicate
@@ -2639,10 +2776,11 @@ impl<S: Storage> Raft<S> {
         self.local(MessageType::MsgBeat)
     }
     /// When the member is next to be woken ([`Raft::wake`]), on the owner's
-    /// clock: a campaign, a leader's beat or a transfer's end. None when
-    /// nothing is timed: a follower that trusts its leader, a leader with
-    /// nothing in flight, a member whose campaigns are held or whose
-    /// detectors leave it no quorum, or on ticks.
+    /// clock: a campaign, a leader's beat, a transfer's end or a leader's
+    /// order to an heir that can be elected without it. None when nothing is
+    /// timed: a follower that trusts its leader, a leader with nothing in
+    /// flight and a quorum its detectors trust, a member whose campaigns are
+    /// held or whose detectors leave it no quorum, or on ticks.
     pub fn deadline(&self) -> Option<u64> {
         let watch = self.watch.as_ref()?;
         // The rules that hold a campaign are asked only of one that is armed: an owner that scans
@@ -2655,36 +2793,38 @@ impl<S: Storage> Raft<S> {
                     && self.may_lead()
                     && self.trusted_quorum())
         });
-        [campaign, Watch::due(watch.beat), Watch::due(watch.transfer)]
-            .into_iter()
-            .flatten()
-            .min()
+        let order = Watch::due(watch.order)
+            .filter(|_| self.state == StateRole::Leader && !self.trusted_quorum());
+        [
+            campaign,
+            Watch::due(watch.beat),
+            Watch::due(watch.transfer),
+            order,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
     /// The owner's clock reads `now`, nanoseconds: what was armed since
     /// the last wake is timed from it, and what is due is done. True when
-    /// the member acted: it campaigned, stepped down, beat or gave up a
+    /// the member acted: it campaigned, beat, ordered an heir or gave up a
     /// transfer. Nothing on ticks.
     pub fn wake(&mut self, now: u64) -> Result<bool> {
         let Some(watch) = self.watch.as_mut() else {
             return Ok(false);
         };
         watch.now = watch.now.max(now);
-        let mut acted = false;
         if self.state == StateRole::Leader {
-            if self.trusted_quorum() {
-                return self.wake_leader(now);
-            }
-            self.step_down()?;
-            acted = true;
+            return self.wake_leader(now);
         }
-        Ok(self.wake_follower(now)? || acted)
+        self.wake_follower(now)
     }
     fn wake_leader(&mut self, now: u64) -> Result<bool> {
+        let mut acted = self.wake_order(now)?;
         let active = self.active()?;
         let watch = self.watch_mut()?;
         let (round, beat, transfer) = (watch.round(), watch.beat, watch.transfer);
         watch.campaign = Arm::Off;
-        let mut acted = false;
         let transfer = match (self.lead_transferee, transfer, round) {
             (None, ..) => Arm::Off,
             (Some(_), Arm::At(at), _) if now >= at => {
@@ -2720,6 +2860,46 @@ impl<S: Storage> Raft<S> {
         }
         Ok(acted)
     }
+    /// A leader's order to an heir while its detectors leave it no quorum (`Raft::left_no_quorum`):
+    /// timed as a follower's campaign is, a round and a draw from when it was armed, and given again
+    /// a round and a draw after each, never within the election the law expects of the last
+    /// (`Watch::ordered`, as for a member that led: each order may force a campaign, and a second
+    /// before the first can finish makes two candidates that split the vote). Off once they leave
+    /// it a quorum again. Whether it ordered.
+    fn wake_order(&mut self, now: u64) -> Result<bool> {
+        let quorum = self.trusted_quorum();
+        if !quorum {
+            // Left no quorum by more than a suspicion (a change of its configuration, a member's
+            // restart taken back): armed as `Raft::suspect` arms it.
+            self.left_no_quorum()?;
+        }
+        let local = self.config.seed;
+        let watch = self.watch_mut()?;
+        let due = match watch.order {
+            _ if quorum => {
+                watch.order = Arm::Off;
+                false
+            }
+            Arm::At(at) => now >= at,
+            Arm::Unset { round } => {
+                watch.order = watch.after(now, round, local);
+                false
+            }
+            Arm::Off => false,
+        };
+        if !due {
+            return Ok(false);
+        }
+        if let (Some(last), Some(election)) = (watch.ordered, watch.election())
+            && now < last.saturating_add(election)
+        {
+            watch.order = Arm::At(last.saturating_add(election));
+            return Ok(false);
+        }
+        watch.order = watch.after(now, true, local);
+        self.hand_over(true)?;
+        Ok(true)
+    }
     /// It follows `leader` in its term: if it thought it might have led
     /// this term, it did not, for a term has one leader.
     fn followed(&mut self, leader: NodeId) {
@@ -2741,6 +2921,11 @@ impl<S: Storage> Raft<S> {
             && self.tracker.configuration().votes(self.leader_id)
     }
     fn wake_follower(&mut self, now: u64) -> Result<bool> {
+        // Left no quorum by more than a suspicion (a change of its configuration), as
+        // `Raft::suspect` finds it.
+        if self.state == StateRole::PreCandidate && !self.trusted_quorum() {
+            self.stop_asking()?;
+        }
         let (promotable, local, term) = (self.promotable(), self.config.seed, self.term);
         let alone = self.tracker.is_singleton() && self.tracker.configuration().votes(self.id);
         // A sole voter's campaign in its term waits for its own vote to be durable (I9), which
@@ -2817,7 +3002,8 @@ impl<S: Storage> Raft<S> {
             }
             // It cannot campaign, and its followers trust it: it hands over
             // again, a round and a draw after the last, as a candidate asks
-            // again, for the order may have been lost.
+            // again, for the order may have been lost. It leads nothing, so
+            // its vote is free: the heir campaigns whoever it trusts.
             let watch = self.watch_mut()?;
             watch.campaign = match (watch.round(), watch.draw(local)) {
                 (Some(tail), Some(delay)) => {
@@ -2825,7 +3011,7 @@ impl<S: Storage> Raft<S> {
                 }
                 _ => Arm::Unset { round: true },
             };
-            self.hand_over()?;
+            self.hand_over(false)?;
             return Ok(true);
         }
         self.watch_mut()?.campaign = Arm::Off;
@@ -2874,7 +3060,14 @@ impl<S: Storage> Raft<S> {
         if self.term.checked_add(1).is_none_or(|term| term > LAST) {
             return Err(Error::Capacity("terms"));
         }
-        // Asking changes neither the term nor the vote.
+        // Asking changes neither the term nor the vote. The leader it leaves is kept while it asks
+        // again, which it knows no longer, for it follows that leader again if its asking can no
+        // longer win (`Raft::stop_asking`).
+        if self.state != StateRole::PreCandidate
+            && let Some(watch) = self.watch.as_mut()
+        {
+            watch.left = self.leader_id;
+        }
         self.state = StateRole::PreCandidate;
         self.tracker.reset_votes();
         self.leader_id = 0;
@@ -3080,6 +3273,11 @@ impl<S: Storage> Raft<S> {
     pub fn step(&mut self, message: Message) -> Result<()> {
         if self.msgs.len() >= self.config.limits.pending_messages {
             return Err(Error::Capacity("messages that wait to be taken"));
+        }
+        // Before the fast track's too: a fast vote of a later term deposes a leader as any
+        // message of one does.
+        if self.drops(&message) {
+            return Ok(());
         }
         if message.msg_type == fast::FAST_PROPOSE {
             return self.hear_proposal(message);
@@ -3827,13 +4025,24 @@ impl<S: Storage> Raft<S> {
                 // hand-over. Ignored, the leader would wait an election
                 // timeout for it and take no proposal meanwhile. One that
                 // asks for votes has a later term than whoever told it.
-                if self.state == StateRole::PreCandidate && self.promotable() {
+                if self.state == StateRole::PreCandidate
+                    && self.promotable()
+                    && self.takes_order(&message)
+                {
                     self.hup(true)?;
                 }
                 Ok(())
             }
             _ => Ok(()),
         }
+    }
+    /// Whether an order to campaign is one this member acts on: any but a leader's that leads on
+    /// with no quorum its detectors trust ([`proto::IF_ELECTED_WITHOUT`]), which it takes only
+    /// where it could be elected without that leader's vote. Elected by it, it would be one the
+    /// leader hears and is heard by, which could have gone on leading: the order would cost the
+    /// group its leader and gain it nothing (`Raft::left_no_quorum`).
+    fn takes_order(&self, order: &Message) -> bool {
+        order.context.as_slice() != proto::IF_ELECTED_WITHOUT || self.elected_without(order.from)
     }
     fn forward(&mut self, mut message: Message) -> Result<()> {
         message.to = self.leader_id;
@@ -3886,6 +4095,9 @@ impl<S: Storage> Raft<S> {
             MessageType::MsgTimeoutNow => {
                 // The leader asks: the group is not cut off, and there is nothing to ask about
                 // first. One the newest configuration in its log names no voter says so.
+                if !self.takes_order(&message) {
+                    return Ok(());
+                }
                 self.hup(true)
             }
             MessageType::MsgReadIndexResp => {
@@ -4492,7 +4704,7 @@ impl<S: Storage> Raft<S> {
                 Some(heir) => self.send(proto::message(heir, MessageType::MsgTimeoutNow))?,
                 // By suspicion its followers trust its node, which lives: none
                 // would campaign. The voter that holds the most is told to.
-                None if self.watch.is_some() => self.hand_over()?,
+                None if self.watch.is_some() => self.hand_over(false)?,
                 None => {}
             }
             let term = self.term;

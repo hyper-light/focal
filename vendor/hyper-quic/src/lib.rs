@@ -53,6 +53,7 @@ use std::{
 mod cid_queue;
 pub mod coding;
 mod constant_time;
+mod erasure;
 mod float;
 mod range_set;
 #[cfg(test)]

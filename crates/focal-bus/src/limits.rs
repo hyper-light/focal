@@ -142,6 +142,17 @@ fn lane_window() -> Result<usize, BusError> {
         .ok_or(BusError::Configuration("the lane window"))
 }
 
+/// The forward erasure correction's window, in packets (hyper-transport `Limits::fec_window`,
+/// hyper-quic `TransportConfig::fec_window`): measured on hyper-sim's network at a leader's
+/// replication load, focal-wire's own (hyper-raft `crates/hyper-quic/tests/replication.rs`: two followers each sent
+/// 110 appends of 7.5 KB a second over 80 ms one way, 1 to 5% of each way's datagrams lost), a
+/// window of 64 packets left a path losing 1% uncoded, its commit's median 189 to 202 ms where 128
+/// gave 166 to 167 (163 loss-free), and both coded 3 and 5% to the loss-free path's median. A
+/// connection codes only while its path loses and it sends often enough for a repair to be due
+/// within a loss delay; what its coding holds is charged as it is held, and forgotten where the
+/// budget refuses.
+const FEC_WINDOW: u32 = 128;
+
 /// Derived: the most a connection's receive window grows to: the largest stream window the
 /// transport keeps (`stream_window_ceiling`, about 2.3 MB) for each stream a peer sends on at once,
 /// its lane and its subscribe. Windows grow only as they are used (the transport's auto-tuning,
@@ -200,6 +211,9 @@ fn limits(identities: usize, lanes: u32) -> Result<Limits, BusError> {
         // acknowledgements, as decimation was measured on (hyper-raft docs/transport.md §4k: a
         // node's acknowledgements fell from 0.50 to 0.14 a message at 100,000 a second).
         acknowledgement: hyper_transport::Acknowledgement::Decimated,
+        // A part's publishes, deliveries and replication are ordered streams, every message behind
+        // a lost packet waiting a round trip for it: coded, a loss is rebuilt from the repairs after it
+        fec_window: Some(FEC_WINDOW),
     })
 }
 

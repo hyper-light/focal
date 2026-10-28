@@ -359,6 +359,22 @@ pub enum GroupEvent {
         /// The peer.
         peer: u64,
     },
+    /// A peer announced that its run ends, in order: suspected at once until its next run is heard.
+    Stopped {
+        /// The peer.
+        peer: u64,
+    },
+    /// A peer's heartbeats are of the other disk mode (`hyper_durable::Disk`): each is refused
+    /// until one of this node's mode comes. The group is mixed, which its definition never makes.
+    ModeDiffers {
+        /// The peer.
+        peer: u64,
+    },
+    /// A peer's heartbeats are of this node's disk mode again.
+    ModeAgrees {
+        /// The peer.
+        peer: u64,
+    },
     /// The replica stood in `term`, believing `leader` led it: zero while an election is under
     /// way, then once more as the leader is known.
     Term {
@@ -460,6 +476,15 @@ impl ReplicaBudget for MemberBudget {
         let rest = usize::try_from(bytes.saturating_sub(repaid)).unwrap_or(usize::MAX);
         let rest = give_back(&mut self.completion, rest);
         give_back(&mut self.ordinary, rest);
+    }
+
+    /// focal's replicas draw on the node's memory, which its groups share, not an allowance of
+    /// their own: a member states no room. The one reader of it is the disk mode's patience
+    /// (`hyper_durable::Disk::Apart`), and a member opens in today's (`Disk::Flushed`), so nothing
+    /// weighs a patience against it; the disk mode would need the group's own allowance first
+    /// (hyper-raft `docs/durable.md` §4.2).
+    fn room(&self) -> Option<usize> {
+        None
     }
 }
 
@@ -1004,6 +1029,9 @@ impl Member {
             // as it moves (`Member::restate_period`); before the stream schedules a heartbeat there
             // is none, and a commit that moved alone is written the moment no write is out.
             quiet: Duration::ZERO,
+            // Today's mode: each peer judged by its heartbeats' flush proof, a leader applying
+            // what a majority's disks hold with its own among them (`MemberBudget::room`)
+            disk: hyper_durable::Disk::Flushed,
         };
         let replica = Replica::open(&shell, store, machine, MemberBudget::new(budget))
             .map_err(|_| BusError::Configuration("the part's replica could not be opened"))?;
@@ -1794,6 +1822,25 @@ impl Member {
                         waiting.clear();
                     }
                     self.replica.restarted(peer)
+                }
+                // The peer announced its run ends: suspected at once, ordered to campaign never,
+                // until a heartbeat of its next run (`Replica::stopped`)
+                Change::Stopped { .. } => {
+                    tell(&GroupEvent::Stopped { peer });
+                    self.replica.stopped(peer)
+                }
+                // Told only in the disk mode, which a member does not run (`MemberBudget::room`)
+                Change::DiskSlow { .. } => self.replica.disk_slow(peer),
+                Change::DiskCaughtUp { .. } => self.replica.disk_caught_up(peer),
+                // A peer of the other disk mode: its heartbeats are refused until one of this
+                // node's comes, and the group shown mixed, not left silent
+                Change::ModeDiffers { .. } => {
+                    tell(&GroupEvent::ModeDiffers { peer });
+                    Ok(())
+                }
+                Change::ModeAgrees { .. } => {
+                    tell(&GroupEvent::ModeAgrees { peer });
+                    Ok(())
                 }
             };
         }

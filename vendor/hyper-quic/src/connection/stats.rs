@@ -35,6 +35,10 @@ impl UdpStats {
 pub struct FrameStats {
     /// ACK frames
     pub acks: u64,
+    /// FEC_SOURCE frames: packets sent or received as sources of the erasure code
+    pub fec_source: u64,
+    /// FEC_REPAIR frames: the code's repairs
+    pub fec_repair: u64,
     /// ACK_FREQUENCY frames
     pub ack_frequency: u64,
     /// CRYPTO frames
@@ -129,6 +133,8 @@ impl FrameStats {
             Frame::AckFrequency(_) => self.ack_frequency = self.ack_frequency.saturating_add(1),
             Frame::ImmediateAck => self.immediate_ack = self.immediate_ack.saturating_add(1),
             Frame::HandshakeDone => self.handshake_done = self.handshake_done.saturating_add(1),
+            Frame::FecSource(_) => self.fec_source = self.fec_source.saturating_add(1),
+            Frame::FecRepair(_) => self.fec_repair = self.fec_repair.saturating_add(1),
         }
     }
 }
@@ -142,6 +148,8 @@ impl std::fmt::Debug for FrameStats {
             .field("CRYPTO", &self.crypto)
             .field("DATA_BLOCKED", &self.data_blocked)
             .field("DATAGRAM", &self.datagram)
+            .field("FEC_REPAIR", &self.fec_repair)
+            .field("FEC_SOURCE", &self.fec_source)
             .field("HANDSHAKE_DONE", &self.handshake_done)
             .field("IMMEDIATE_ACK", &self.immediate_ack)
             .field("MAX_DATA", &self.max_data)
@@ -250,4 +258,9 @@ pub struct ConnectionStats {
     pub frame_rx: FrameStats,
     /// Statistics related to the current transmission path
     pub path: PathStats,
+    /// The peer's packets rebuilt from its erasure code's repairs (`TransportConfig::fec_window`)
+    pub fec_rebuilt: u64,
+    /// The peer's sources its repairs did not rebuild before they fell out of the window: left to
+    /// retransmission
+    pub fec_unrebuilt: u64,
 }
