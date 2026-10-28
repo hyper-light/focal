@@ -634,6 +634,32 @@ impl Owner {
                 };
                 self.on_event(event);
             }
+            // And the answers and commands queued behind what woke the owner, a turn of each, so
+            // that what they send leaves with this flush: frames, answers and requests asked for
+            // together share their connections' datagrams, where each went out in one of its own
+            // (the 1-CPU leader of compare's work mode wrote its followers 2,176 stream frames a
+            // second in 2,160 datagrams, run 40597298799).
+            for _ in 0..hyper_rt_transport::TURNS {
+                match answers.try_recv() {
+                    Ok(Some((exchange, reply))) => self.answer(exchange, reply),
+                    // The owner holds a sender of its own: never closed while it runs.
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            if asked {
+                for _ in 0..hyper_rt_transport::TURNS {
+                    match commands.try_recv() {
+                        Ok(Some(command)) => self.on_command(command),
+                        Ok(None) => break,
+                        // Every handle is gone: nothing more will be asked.
+                        Err(_) => {
+                            asked = false;
+                            self.closing = true;
+                            break;
+                        }
+                    }
+                }
+            }
             // A withdrawal whose wake this owner missed (its queue was full) is seen here.
             let revision = self.driver.endpoint().directory().revision();
             if revision != self.revision {
