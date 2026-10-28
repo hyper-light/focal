@@ -124,6 +124,8 @@ jobs:
       # The two sides' nodes are different builds, or the comparison
       # measures one build against itself.
       - name: A's and B's nodes differ
+        # ab/work-loss-ref measures one build loss-free (A) against itself under loss (B)
+        if: ${{ !startsWith(github.ref_name, 'ab/work-loss-ref') }}
         run: |
           a=$(docker run --rm focal:bench-a sha256sum /usr/local/bin/focal | cut -d' ' -f1)
           b=$(docker run --rm focal:bench-b sha256sum /usr/local/bin/focal | cut -d' ' -f1)
@@ -173,6 +175,8 @@ jobs:
           # A branch named ab/work-loss-<anything> runs under the loss goal's path: 80 ms and 3%
           # of every node's datagrams lost, at 20 claims a second, three rounds
           FAULTS: ${{ github.event.inputs.faults || (startsWith(github.ref_name, 'ab/work-loss') && 'netem=delay 80ms loss 3%' || '') }}
+          # ab/work-loss-ref: side A runs loss-free, the reference the loss goal's median is held to
+          A_CLEAN: ${{ startsWith(github.ref_name, 'ab/work-loss-ref') && '1' || '' }}
         run: |
           rounds=${{ github.event.inputs.rounds || (startsWith(github.ref_name, 'ab/work-loss') && '3' || '2') }}
           for round in $(seq 1 "$rounds"); do
@@ -182,7 +186,9 @@ jobs:
               for side in $order; do
                 docker tag "focal:bench-$side" focal:bench
                 # A failed run is recorded and the rest still run.
-                bash tools/compare/compose/run.sh focal "$rate" \
+                faults=$FAULTS
+                if [ "$side" = a ] && [ -n "$A_CLEAN" ]; then faults=; fi
+                FAULTS=$faults bash tools/compare/compose/run.sh focal "$rate" \
                   "${{ github.event.inputs.seconds || '60' }}" \
                   "${{ github.event.inputs.warmup || '15' }}" \
                   128 "reports/$side/$round" || echo "$side round $round at $rate/s failed"
