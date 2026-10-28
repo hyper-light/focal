@@ -710,6 +710,11 @@ struct Core<C: Classes, B, D> {
     /// What the connections' own state is charged, learned from what the owner observes the
     /// endpoint's work holds (docs/transport.md §4x).
     state: StateAccount,
+    /// DIAG (not for merge): when the per-connection dump last ran, and each connection's
+    /// counters then, by serial.
+    diagq_at: Option<std::time::Instant>,
+    diagq_prev: std::collections::BTreeMap<u64, [u64; 8]>,
+    diagq_calls: u64,
 }
 
 /// The attempts an endpoint refused (its places taken, or a bound it holds), each by its client's
@@ -970,6 +975,9 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
                     ..Refused::default()
                 },
                 state: StateAccount::new(state_charge::<C>(&limits)),
+                diagq_at: None,
+                diagq_prev: std::collections::BTreeMap::new(),
+                diagq_calls: 0,
             },
             receive: Receive::new(limits.receive_chunks),
             scratch: Vec::new(),
@@ -1344,6 +1352,7 @@ impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, 
     /// documentation): an exchange's slot, a peer's entry, or a seat of a lane's window, and a
     /// lane paused for want of one is read again.
     pub fn poll_event(&mut self) -> Option<Event<C>> {
+        self.diagq_dump();
         let Waiting { event, lane } = self.core.events.pop_front()?;
         match event {
             Event::Request { exchange, .. }
@@ -4925,5 +4934,84 @@ fn priority<C: Classes>(rank: u8) -> i32 {
 fn bind_stream(by_stream: &mut Vec<(StreamId, u64)>, stream: StreamId, id: u64) {
     if let Err(at) = by_stream.binary_search_by_key(&stream, |(held, _)| *held) {
         by_stream.insert(at, (stream, id));
+    }
+}
+
+// DIAG (not for merge): every five seconds, the four connections that sent the most packets since
+// the last dump, each with its path's state and what changed: its round trip, congestion window,
+// congestion events, losses, probe timeouts in a row and bytes in flight.
+impl<C: Classes, B: Budget<C::Class>, D: Directory<Role = C::Role>> Endpoint<C, B, D> {
+    fn diagq_dump(&mut self) {
+        self.core.diagq_calls = self.core.diagq_calls.wrapping_add(1);
+        if self.core.diagq_calls % 64 != 0 {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .core
+            .diagq_at
+            .is_some_and(|at| now.duration_since(at) < std::time::Duration::from_secs(5))
+        {
+            return;
+        }
+        self.core.diagq_at = Some(now);
+        let mut rows = Vec::new();
+        let mut seen = std::collections::BTreeMap::new();
+        for conn in self.conns.iter().flatten() {
+            let s = conn.quic.stats();
+            let (pto, in_flight) = conn.quic.diag_recovery();
+            let now_counts = [
+                s.path.sent_packets,
+                s.path.lost_packets,
+                s.path.lost_bytes,
+                s.path.congestion_events,
+                s.path.spurious_losses,
+                s.frame_rx.stream_data_blocked,
+                s.frame_tx.stream_data_blocked,
+                s.udp_tx.bytes,
+            ];
+            let before = self.core.diagq_prev.get(&conn.serial).copied().unwrap_or([0; 8]);
+            let mut delta = [0u64; 8];
+            for (i, d) in delta.iter_mut().enumerate() {
+                *d = now_counts[i].saturating_sub(before[i]);
+            }
+            seen.insert(conn.serial, now_counts);
+            let peer = conn
+                .peer
+                .as_ref()
+                .map(|(peer, _)| format!("{peer:?}"))
+                .unwrap_or_else(|| "-".into());
+            rows.push((
+                delta[0],
+                format!(
+                    " [peer={} rtt_ms={} min_rtt_ms={} cwnd={} sent={} lost={} lost_bytes={} cong={} spurious={} rx_sdb={} tx_sdb={} tx_bytes={} pto={} in_flight={}]",
+                    peer.chars().take(24).collect::<String>(),
+                    s.path.rtt.as_millis(),
+                    s.path.min_rtt.as_millis(),
+                    s.path.cwnd,
+                    delta[0],
+                    delta[1],
+                    delta[2],
+                    delta[3],
+                    delta[4],
+                    delta[5],
+                    delta[6],
+                    delta[7],
+                    pto,
+                    in_flight
+                ),
+            ));
+        }
+        self.core.diagq_prev = seen;
+        rows.sort_by(|a, b| b.0.cmp(&a.0));
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let mut line = format!("DIAGQ {epoch} ep={:p} conns={}", self as *const Self, rows.len());
+        for (_, row) in rows.iter().take(4) {
+            line.push_str(row);
+        }
+        eprintln!("{line}");
     }
 }
