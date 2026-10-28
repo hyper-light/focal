@@ -136,6 +136,7 @@ pub(crate) fn lane_window(limits: &WireLimits) -> usize {
 /// connection codes only while its path loses and it sends often enough for a repair to be due
 /// within a loss delay; what its coding holds is charged as it is held, and forgotten where the
 /// budget refuses.
+#[allow(dead_code)]
 const FEC_WINDOW: u32 = 128;
 /// The bounds of an endpoint carrying focal's traffic under `limits`, admitting by `admission`.
 pub fn endpoint_limits(
@@ -208,7 +209,7 @@ pub fn endpoint_limits(
         acknowledgement: hyper_transport::Acknowledgement::Decimated,
         // A group's appends to a peer and their answers, each lane ordered, wait a round trip
         // behind every packet lost before them: coded, a loss is rebuilt from the repairs after it
-        fec_window: Some(FEC_WINDOW),
+        fec_window: None,
     })
 }
 
