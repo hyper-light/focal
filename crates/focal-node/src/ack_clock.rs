@@ -43,6 +43,51 @@ pub(crate) struct AckClock {
 struct PeerClock {
     timed: Option<Timed>,
     answers: focal_timing::ExchangeRtt,
+    /// diag (not for merge): every append in flight, its last index and when it left.
+    flight: std::collections::VecDeque<(u64, Instant)>,
+    /// diag: append-to-answer times since the last report, in log2 buckets of microseconds.
+    hist: [u64; 32],
+    appends: u64,
+    answered_appends: u64,
+    max_us: u64,
+}
+
+/// diag (not for merge): each peer's appends and their answer times since the last call, as a
+/// line; the counts reset.
+pub(crate) fn diag_report(clock: &mut AckClock) -> String {
+    let mut out = String::new();
+    for (peer, c) in clock.peers.iter_mut() {
+        let total: u64 = c.hist.iter().sum();
+        let quantile = |q: f64| -> u64 {
+            if total == 0 {
+                return 0;
+            }
+            let want = ((total as f64) * q).ceil() as u64;
+            let mut seen = 0u64;
+            for (bucket, count) in c.hist.iter().enumerate() {
+                seen += count;
+                if seen >= want {
+                    return 1u64 << bucket;
+                }
+            }
+            0
+        };
+        out.push_str(&format!(
+            " peer={peer} appends={} answered={} p50_us<={} p90_us<={} p99_us<={} max_us={} inflight={}",
+            c.appends,
+            c.answered_appends,
+            quantile(0.5),
+            quantile(0.9),
+            quantile(0.99),
+            c.max_us,
+            c.flight.len()
+        ));
+        c.hist = [0; 32];
+        c.appends = 0;
+        c.answered_appends = 0;
+        c.max_us = 0;
+    }
+    out
 }
 
 /// A message timed: what answers it, the term it left in, and when.
@@ -80,6 +125,15 @@ impl AckClock {
             return;
         }
         let clock = self.peers.entry(message.to).or_default();
+        // diag: every append in flight.
+        if let Awaits::Append(last) = awaits
+            && !message.entries.is_empty()
+        {
+            clock.appends += 1;
+            if clock.flight.len() < 4096 {
+                clock.flight.push_back((last, now));
+            }
+        }
         // A message of an older term is never answered in this one: the newer takes its place.
         if clock.timed.is_none_or(|timed| timed.term != message.term) {
             clock.timed = Some(Timed {
@@ -96,6 +150,20 @@ impl AckClock {
         let Some(clock) = self.peers.get_mut(&stepped.from) else {
             return;
         };
+        // diag: every append the answer covers.
+        if stepped.msg_type == MessageType::MsgAppendResponse && !stepped.reject {
+            while let Some(&(last, sent)) = clock.flight.front() {
+                if last > stepped.index {
+                    break;
+                }
+                clock.flight.pop_front();
+                let us = now.saturating_duration_since(sent).as_micros() as u64;
+                let bucket = (64 - us.max(1).leading_zeros() as usize - 1).min(31);
+                clock.hist[bucket] += 1;
+                clock.answered_appends += 1;
+                clock.max_us = clock.max_us.max(us);
+            }
+        }
         let Some(timed) = clock.timed else {
             return;
         };
