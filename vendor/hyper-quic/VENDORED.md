@@ -1673,12 +1673,22 @@ retransmission rebuilds nothing in time, so a sparse connection (an asker's requ
 A connection that codes stops only once its rule has failed for a whole loss delay, and its
 receiver forgets what it holds only once its packets of stream data have been no sources for one: a
 stop costs every equation still to solve. While a repair is due, the datagrams its window and pacer
-cut are no shorter than the repair's packet, which goes first, so a repair is never dropped for a
-datagram cut short of it, only for a path whose MTU fell below its sources (counted,
-`ConnectionStats::fec_repairs_dropped`): dropped with its window each time the pacer ran short,
-focal's leader sent a repair for 4.9% of its sources where 9.6% were due and its followers rebuilt 16
-to 20% of their losses. A receiver keeps the sources it holds and the repairs' equations in reduced row
-echelon form, and rebuilds a lost packet as soon as they are of full rank, taking its STREAM frames.
+cut are no shorter than the repair's packet, which goes first; and a datagram is begun for a repair
+only where its frames' space holds it whole (`Connection::can_send_1rtt`, as for RFC 9221's
+datagrams upstream): a GSO batch's datagrams after the first are the first's size, so a repair
+larger than that waits for the next batch, which it begins. A repair is dropped, with its window,
+only for a path whose MTU fell below its sources (counted, `ConnectionStats::fec_repairs_dropped`).
+Dropped each time a pacer ran short or a batch began with a smaller datagram, focal's leader sent a
+repair for 4.9% of its sources where 9.6% were due, and its followers rebuilt 16 to 22% of their
+losses; `tests/replication.rs` had asked its connections for one datagram at a time and never made
+a batch, and asked for focal's 64 (`UDP_MAX_SEGMENTS`) it showed the same, a repair for 5.2% of the
+sources and 40% of the losses rebuilt, the commit's median 259 ms against 163 loss-free. A packet
+begun for a repair alone is ack-eliciting, in flight and under the window and the pacer: begun as
+one of acknowledgements, the repair after a burst's last source had been none of them. A receiver keeps the sources it holds and the repairs' equations in reduced row
+echelon form, and rebuilds a lost packet as soon as they are of full rank, taking its STREAM frames;
+a source missing when its window passes it is counted left to retransmission
+(`ConnectionStats::fec_unrebuilt`), which had counted the losses still to rebuild too and fell as
+they were rebuilt.
 The packet stays lost to its sender's loss detection and congestion control and is never
 acknowledged (RFC 9265 §6.3: "a recovered packet must be considered as a lost packet";
 draft-swett-nwcrg-coding-for-quic-04 §4.5). Every STREAM frame of a source states its length
@@ -1690,10 +1700,15 @@ its window: the owner charges `Connection::fec_held_bytes` as it is held and may
 under 80 ms and 3% loss each way, its leader sent each follower about 720 packets a second, about
 twenty lost a second on each ordered stream, each holding the stream a round trip until its
 retransmission came, and the commit, the first follower's answer, took 1.8 times the loss-free
-path's at the median. `tests/replication.rs` reproduces that load on hyper-sim's network: the code
-over 128 sources brings the commit to the loss-free path's at 1, 3 and 5% loss (164 ms at 3% against
-163 loss-free and 300 to 303 uncoded; 99th percentile 237 to 277 against 464 to 483), its repairs 10%
-of its sources at 3%. Tests: `erasure::tests` (the field against shift-and-reduce, RFC 8682's
+path's at the median. `tests/replication.rs` reproduces that load on hyper-sim's network, in
+focal's batches of 64 datagrams, measured once every follower has answered its catch-up: the code
+over 128 sources brings the commit to the loss-free path's at 1, 3, 5 and 10% loss (164 to 165 ms
+at 3% against 163 loss-free and 291 to 293 uncoded, its 99th percentile 286 against 440 to 476;
+166 ms at 10% against 433 to 443, its 99th percentile 283 to 299 against 655 to 666), its repairs
+10% of its sources at 3% and 96% of the losses rebuilt. Measured from a fixed ten seconds, the coded
+commit's 99th percentile at 10% loss was 1.1 to 1.3 s: the appends written behind the catch-up were
+still draining, the code's repairs and retransmissions taking half as much of the bottleneck again.
+Tests: `erasure::tests` (the field against shift-and-reduce, RFC 8682's
 outputs, the coefficients, rebuilds of one and of many losses, late sources, the decoder's bound),
 `connection::fec::tests` (the loss rate, the repair rate and span),
 `replication::the_code_repairs_what_replication_loses`, `a_path_that_loses_nothing_is_not_coded` and

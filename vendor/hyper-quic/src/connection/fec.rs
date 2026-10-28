@@ -128,7 +128,7 @@ pub(super) struct Sending {
     coding: bool,
     /// Since when its rule has failed while it codes: it stops a loss delay later (`decide`).
     failing_since: Option<Instant>,
-    /// The repairs dropped for a path's fallen MTU (`repair`).
+    /// The repairs dropped for a path's fallen MTU (`drop_unfitting`).
     dropped: u64,
 }
 
@@ -250,7 +250,13 @@ impl Sending {
             return;
         }
         self.credit = self.credit.saturating_add(self.repair_ppm());
-        if self.credit < PPM || self.ready.is_some() {
+        if self.credit < PPM {
+            return;
+        }
+        // A repair waiting for a datagram to hold it (`repair`) leaves one more owed at most: the
+        // sources sent meanwhile in smaller datagrams queue no burst of repairs behind it
+        if self.ready.is_some() {
+            self.credit = PPM;
             return;
         }
         self.credit = self.credit.saturating_sub(PPM);
@@ -268,18 +274,27 @@ impl Sending {
             .map(|_| self.scratch.len().saturating_add(FecRepair::OVERHEAD_MAX))
     }
 
-    /// The repair due, if it fits a packet's `room`; it is no longer due either way. A datagram
-    /// is cut by its window or pacer no shorter than the repair due (`Connection::congestion_room`),
-    /// so one that does not fit was made of sources cut for a larger packet than the path now
-    /// carries (its MTU fell): what they hold has no repair that fits, and they are forgotten.
+    /// The repair due, taken, if it fits a packet's `room`; kept for a later packet if not. A
+    /// datagram is cut by its window or pacer no shorter than the repair due
+    /// (`Connection::congestion_room`), and is begun for it only where its frames' space holds it
+    /// (`Fec::repair_fits`), so a repair kept waits for the batch after a smaller one.
     pub(super) fn repair(&mut self, room: usize) -> Option<(Span, &[u8])> {
-        let made = self.ready.take()?;
         if self.scratch.len().saturating_add(FecRepair::OVERHEAD_MAX) > room {
-            self.encoder.forget_all();
-            self.dropped = self.dropped.saturating_add(1);
             return None;
         }
+        let made = self.ready.take()?;
         Some((made, &self.scratch))
+    }
+
+    /// Drops the repair due if no packet the path carries now holds it, `space` being a whole
+    /// datagram's room for frames: its sources were cut for a larger packet than the path's MTU
+    /// now allows, so they have no repair that fits, and they are forgotten.
+    pub(super) fn drop_unfitting(&mut self, space: usize) {
+        if self.repair_bytes().is_some_and(|bytes| bytes > space) {
+            self.ready = None;
+            self.encoder.forget_all();
+            self.dropped = self.dropped.saturating_add(1);
+        }
     }
 
     /// The repairs made and dropped for a path's fallen MTU.
@@ -363,6 +378,13 @@ impl Fec {
     /// The bytes of a packet's frames the repair due takes (`Sending::repair_bytes`).
     pub(super) fn repair_bytes(&self) -> Option<usize> {
         self.sending.as_ref().and_then(Sending::repair_bytes)
+    }
+
+    /// Whether a repair is due that a packet of `space` bytes of frames holds: what a datagram
+    /// is begun for. In a GSO batch every datagram after the first is the first's size, and a
+    /// repair due that it cannot hold waits for the next batch, which it begins.
+    pub(super) fn repair_fits(&self, space: usize) -> bool {
+        self.repair_bytes().is_some_and(|bytes| bytes <= space)
     }
 
     /// Forgets what both sides hold.
@@ -458,5 +480,56 @@ mod tests {
         assert!(sending.decide(at(499), delay));
         assert!(!sending.decide(at(500), delay));
         assert!(!sending.active());
+    }
+
+    #[test]
+    fn a_repair_waits_for_a_datagram_that_holds_it_and_is_dropped_only_past_the_mtu() {
+        // A loss every 33 packets: a repair owed every 10.7 sources
+        let mut losses = LossRate::default();
+        for _ in 0..40 {
+            for _ in 0..32 {
+                losses.delivered();
+            }
+            losses.lost();
+        }
+        let mut sending = Sending {
+            losses,
+            ..Sending::new(64)
+        };
+        let (now, delay) = (Instant::now(), Duration::from_millis(100));
+        let source = [0x08; 1_000];
+        let mut packet = 0u64;
+        while !sending.due() {
+            sending.sent(&source, packet, now, delay);
+            packet += 1;
+        }
+        let bytes = 1_000 + FecRepair::OVERHEAD_MAX;
+        assert_eq!(sending.repair_bytes(), Some(bytes));
+        // A smaller datagram, as a batch's after a smaller first, leaves it due
+        assert!(sending.repair(bytes - 1).is_none());
+        assert!(sending.due());
+        // and the sources sent meanwhile owe one repair more at most
+        for _ in 0..40 {
+            sending.sent(&source, packet, now, delay);
+            packet += 1;
+        }
+        assert_eq!(sending.credit, PPM);
+        // It covers the eleven sources sent when it was made
+        let (span, payload) = sending.repair(bytes).unwrap();
+        assert_eq!((span.first, span.count, payload.len()), (0, 11, 1_000));
+        assert!(!sending.due());
+        sending.sent(&source, packet, now, delay);
+        assert!(
+            sending.due(),
+            "the repair owed is made with the next source"
+        );
+        // Dropped, its window with it, only once the path's MTU holds it no more
+        sending.drop_unfitting(bytes);
+        assert!(sending.due());
+        assert_eq!(sending.dropped(), 0);
+        sending.drop_unfitting(bytes - 1);
+        assert!(!sending.due());
+        assert_eq!(sending.dropped(), 1);
+        assert_eq!(sending.encoder.held(), 0, "its sources forgotten");
     }
 }

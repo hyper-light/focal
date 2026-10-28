@@ -262,12 +262,15 @@ pub(crate) struct Decoder {
     rows: Vec<Row>,
     /// Sources numbered below this are forgotten.
     floor: u64,
-    /// The lowest and the highest numbers a source or a repair named.
-    first: Option<u64>,
+    /// The highest number a source or a repair named.
     high: Option<u64>,
-    /// The sources received and rebuilt.
-    received: u64,
-    rebuilt: u64,
+    /// For each number from `from` to `high`, whether its source was received or rebuilt: the
+    /// window's, at most `capacity`. A number the floor passes unsettled was left.
+    settled: VecDeque<bool>,
+    /// The number `settled` starts at.
+    from: u64,
+    /// The sources named that the floor passed neither received nor rebuilt.
+    left: u64,
     capacity: usize,
     coefficients: Vec<u8>,
 }
@@ -279,28 +282,23 @@ impl Decoder {
             known: BTreeMap::new(),
             rows: Vec::new(),
             floor: 0,
-            first: None,
             high: None,
-            received: 0,
-            rebuilt: 0,
+            settled: VecDeque::new(),
+            from: 0,
+            left: 0,
             capacity: capacity.max(1),
             coefficients: Vec::new(),
         }
     }
 
-    /// The sources named and neither received nor rebuilt: those the code left, or has yet to
-    /// rebuild, for retransmission.
-    pub(crate) fn forgotten(&self) -> u64 {
-        let (Some(first), Some(high)) = (self.first, self.high) else {
-            return 0;
-        };
-        high.saturating_sub(first)
-            .saturating_add(1)
-            .saturating_sub(self.received)
-            .saturating_sub(self.rebuilt)
+    /// The sources named that fell out of the window neither received nor rebuilt: left to
+    /// retransmission. A source missing within the window may yet be rebuilt, so it counts only
+    /// once the window has passed it, and the count only grows.
+    pub(crate) fn left(&self) -> u64 {
+        self.left
     }
 
-    /// The bytes held for sources and equations.
+    /// The bytes held for sources, equations and the record of what was settled.
     pub(crate) fn held_bytes(&self) -> usize {
         let known = self.known.values().fold(0usize, |sum, payload| {
             sum.saturating_add(payload.capacity())
@@ -308,6 +306,7 @@ impl Decoder {
         self.rows
             .iter()
             .fold(known, |sum, row| sum.saturating_add(row.payload.capacity()))
+            .saturating_add(self.settled.capacity())
     }
 
     /// The equations waiting on sources missing.
@@ -329,17 +328,86 @@ impl Decoder {
         if span > capacity {
             self.raise_floor(id.saturating_sub(capacity.saturating_sub(1)));
         }
-        self.first = Some(self.first.map_or(id, |first| first.min(id)));
+        self.record(id);
         self.high = Some(self.high.map_or(id, |high| high.max(id)));
     }
 
+    /// Extends the record of what was settled to hold `id`, at or above the floor and so within
+    /// the window: each number new to it is missing until received or rebuilt. A number whose
+    /// record cannot be had is counted left once the floor passes it, as one never received.
+    fn record(&mut self, id: u64) {
+        if self.high.is_none() {
+            // The first number named begins the record
+            self.from = id;
+        }
+        if id < self.from {
+            // Below the record's start and at or above the floor: an early source come late
+            let before = self.from.saturating_sub(id);
+            if !self.reserve(before) {
+                return;
+            }
+            for _ in 0..before {
+                self.settled.push_front(false);
+            }
+            self.from = id;
+            return;
+        }
+        let end = self
+            .from
+            .saturating_add(u64::try_from(self.settled.len()).unwrap_or(u64::MAX));
+        let Some(after) = id.checked_sub(end).and_then(|gap| gap.checked_add(1)) else {
+            return;
+        };
+        if !self.reserve(after) {
+            return;
+        }
+        for _ in 0..after {
+            self.settled.push_back(false);
+        }
+    }
+
+    /// Room in the record for `more` numbers: never more than the window's, as `reach` holds the
+    /// record within it.
+    fn reserve(&mut self, more: u64) -> bool {
+        usize::try_from(more).is_ok_and(|more| {
+            self.settled.len().saturating_add(more) <= self.capacity
+                && self.settled.try_reserve(more).is_ok()
+        })
+    }
+
+    /// Records `id`'s source as received or rebuilt.
+    fn settle(&mut self, id: u64) {
+        let index = id
+            .checked_sub(self.from)
+            .and_then(|index| usize::try_from(index).ok());
+        if let Some(slot) = index.and_then(|index| self.settled.get_mut(index)) {
+            *slot = true;
+        }
+    }
+
     /// Forgets every source and equation below `floor`: the sources missing below it are given
-    /// up to retransmission.
+    /// up to retransmission, counted as left; so are the numbers it passes beyond the record's
+    /// end, named by the later source that raised it (and sent, as every number is).
     fn raise_floor(&mut self, floor: u64) {
         if floor <= self.floor {
             return;
         }
         self.floor = floor;
+        while self.from < floor {
+            match self.settled.pop_front() {
+                Some(true) => {}
+                Some(false) => self.left = self.left.saturating_add(1),
+                None => {
+                    if self.high.is_some() {
+                        let passed = floor.saturating_sub(self.from);
+                        self.left = self.left.saturating_add(passed);
+                    }
+                    self.from = floor;
+                    break;
+                }
+            }
+            self.from = self.from.saturating_add(1);
+        }
         self.known = self.known.split_off(&floor);
         self.rows
             .retain(|row| row.terms.keys().next().is_none_or(|first| *first >= floor));
@@ -362,12 +430,13 @@ impl Decoder {
             return;
         }
         self.reach(id);
+        // Received, its frames read, whether or not it can be held
+        self.settle(id);
         let mut copy = Vec::new();
         if copy.try_reserve_exact(payload.len()).is_err() {
             return;
         }
         copy.extend_from_slice(payload);
-        self.received = self.received.saturating_add(1);
         self.substitute(id, &copy, rebuilt);
         self.known.insert(id, copy);
     }
@@ -393,7 +462,9 @@ impl Decoder {
         if span.first < self.floor {
             return;
         }
-        self.first = Some(self.first.map_or(span.first, |first| first.min(span.first)));
+        // The numbers it names below the record's start, to its first, are missing until
+        // received or rebuilt
+        self.record(span.first);
         // The sender's window only moves forward, so no later repair names a source below this
         // one's first: the sources held below it serve nothing more. The equations over sources
         // missing below it stay, as they may yet solve the ones above.
@@ -513,7 +584,7 @@ impl Decoder {
                 copy.extend_from_slice(&row.payload);
                 rebuilt.push(copy);
             }
-            self.rebuilt = self.rebuilt.saturating_add(1);
+            self.settle(id);
             self.known.insert(id, row.payload);
         }
     }

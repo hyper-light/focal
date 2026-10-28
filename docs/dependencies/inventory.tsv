@@ -95,21 +95,21 @@ heck	0.5.0	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-ind
 home	0.5.12	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
 http	1.5.0	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
 httparse	1.10.1	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
-hyper-block	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=6c375d342fc3dc55339a8f34154cc1804fd31a1c#6c375d342fc3dc55339a8f34154cc1804fd31a1c
-hyper-datagram	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=6c375d342fc3dc55339a8f34154cc1804fd31a1c#6c375d342fc3dc55339a8f34154cc1804fd31a1c
-hyper-durable	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=6c375d342fc3dc55339a8f34154cc1804fd31a1c#6c375d342fc3dc55339a8f34154cc1804fd31a1c
-hyper-heap	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=6c375d342fc3dc55339a8f34154cc1804fd31a1c#6c375d342fc3dc55339a8f34154cc1804fd31a1c
-hyper-liveness	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=6c375d342fc3dc55339a8f34154cc1804fd31a1c#6c375d342fc3dc55339a8f34154cc1804fd31a1c
-hyper-log	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=6c375d342fc3dc55339a8f34154cc1804fd31a1c#6c375d342fc3dc55339a8f34154cc1804fd31a1c
-hyper-measure	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=6c375d342fc3dc55339a8f34154cc1804fd31a1c#6c375d342fc3dc55339a8f34154cc1804fd31a1c
-hyper-quic	0.1.0	MIT OR Apache-2.0	git+https://github.com/hyper-light/hyper-raft?rev=6c375d342fc3dc55339a8f34154cc1804fd31a1c#6c375d342fc3dc55339a8f34154cc1804fd31a1c
-hyper-raft	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=6c375d342fc3dc55339a8f34154cc1804fd31a1c#6c375d342fc3dc55339a8f34154cc1804fd31a1c
-hyper-rt	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=6c375d342fc3dc55339a8f34154cc1804fd31a1c#6c375d342fc3dc55339a8f34154cc1804fd31a1c
-hyper-rt-transport	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=6c375d342fc3dc55339a8f34154cc1804fd31a1c#6c375d342fc3dc55339a8f34154cc1804fd31a1c
-hyper-seal	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=6c375d342fc3dc55339a8f34154cc1804fd31a1c#6c375d342fc3dc55339a8f34154cc1804fd31a1c
-hyper-timing	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=6c375d342fc3dc55339a8f34154cc1804fd31a1c#6c375d342fc3dc55339a8f34154cc1804fd31a1c
-hyper-tls	0.1.0	Apache-2.0 OR ISC OR MIT	git+https://github.com/hyper-light/hyper-raft?rev=6c375d342fc3dc55339a8f34154cc1804fd31a1c#6c375d342fc3dc55339a8f34154cc1804fd31a1c
-hyper-transport	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=6c375d342fc3dc55339a8f34154cc1804fd31a1c#6c375d342fc3dc55339a8f34154cc1804fd31a1c
+hyper-block	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=62f568df89ce8c60a3bf0eed1955189927e0bb9f#62f568df89ce8c60a3bf0eed1955189927e0bb9f
+hyper-datagram	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=62f568df89ce8c60a3bf0eed1955189927e0bb9f#62f568df89ce8c60a3bf0eed1955189927e0bb9f
+hyper-durable	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=62f568df89ce8c60a3bf0eed1955189927e0bb9f#62f568df89ce8c60a3bf0eed1955189927e0bb9f
+hyper-heap	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=62f568df89ce8c60a3bf0eed1955189927e0bb9f#62f568df89ce8c60a3bf0eed1955189927e0bb9f
+hyper-liveness	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=62f568df89ce8c60a3bf0eed1955189927e0bb9f#62f568df89ce8c60a3bf0eed1955189927e0bb9f
+hyper-log	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=62f568df89ce8c60a3bf0eed1955189927e0bb9f#62f568df89ce8c60a3bf0eed1955189927e0bb9f
+hyper-measure	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=62f568df89ce8c60a3bf0eed1955189927e0bb9f#62f568df89ce8c60a3bf0eed1955189927e0bb9f
+hyper-quic	0.1.0	MIT OR Apache-2.0	git+https://github.com/hyper-light/hyper-raft?rev=62f568df89ce8c60a3bf0eed1955189927e0bb9f#62f568df89ce8c60a3bf0eed1955189927e0bb9f
+hyper-raft	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=62f568df89ce8c60a3bf0eed1955189927e0bb9f#62f568df89ce8c60a3bf0eed1955189927e0bb9f
+hyper-rt	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=62f568df89ce8c60a3bf0eed1955189927e0bb9f#62f568df89ce8c60a3bf0eed1955189927e0bb9f
+hyper-rt-transport	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=62f568df89ce8c60a3bf0eed1955189927e0bb9f#62f568df89ce8c60a3bf0eed1955189927e0bb9f
+hyper-seal	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=62f568df89ce8c60a3bf0eed1955189927e0bb9f#62f568df89ce8c60a3bf0eed1955189927e0bb9f
+hyper-timing	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=62f568df89ce8c60a3bf0eed1955189927e0bb9f#62f568df89ce8c60a3bf0eed1955189927e0bb9f
+hyper-tls	0.1.0	Apache-2.0 OR ISC OR MIT	git+https://github.com/hyper-light/hyper-raft?rev=62f568df89ce8c60a3bf0eed1955189927e0bb9f#62f568df89ce8c60a3bf0eed1955189927e0bb9f
+hyper-transport	0.1.0	MIT	git+https://github.com/hyper-light/hyper-raft?rev=62f568df89ce8c60a3bf0eed1955189927e0bb9f#62f568df89ce8c60a3bf0eed1955189927e0bb9f
 icu_collections	2.3.0	Unicode-3.0	registry+https://github.com/rust-lang/crates.io-index
 icu_locale_core	2.3.0	Unicode-3.0	registry+https://github.com/rust-lang/crates.io-index
 icu_normalizer	2.3.0	Unicode-3.0	registry+https://github.com/rust-lang/crates.io-index

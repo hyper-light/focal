@@ -276,6 +276,49 @@ fn sliding_repairs_rebuild_losses_across_overlapping_spans() {
 }
 
 #[test]
+fn a_loss_counts_as_left_only_once_the_window_passes_it_unrebuilt() {
+    let mut draws = Draws(7);
+    let mut encoder = Encoder::new(8);
+    let mut decoder = Decoder::new(8);
+    let mut rebuilt = Vec::new();
+    // Sources 0 to 7, 2 and 5 lost, two repairs over all eight: both rebuilt, none left
+    for id in 0..8u64 {
+        let payload = draws.payload(500);
+        assert!(encoder.sent(&payload, 0, Instant::now()));
+        if id != 2 && id != 5 {
+            decoder.received(id, &payload, &mut rebuilt);
+        }
+    }
+    for _ in 0..2 {
+        let mut repair = Vec::new();
+        let span = encoder.repair(8, &mut repair).unwrap();
+        decoder.repair(span, &repair, &mut rebuilt);
+    }
+    assert_eq!(rebuilt.len(), 2);
+    assert_eq!(decoder.left(), 0);
+    // 8 to 17, 10 lost and never repaired: within the window it may yet be rebuilt
+    for id in 8..18u64 {
+        if id != 10 {
+            decoder.received(id, &draws.payload(500), &mut rebuilt);
+        }
+    }
+    assert_eq!(decoder.left(), 0, "10 is within the window, 10 to 17");
+    decoder.received(18, &draws.payload(500), &mut rebuilt);
+    assert_eq!(decoder.left(), 1, "the window passed 10");
+    // 19 to 22, 20 lost: forgetting the window leaves it
+    for id in [19, 21, 22] {
+        decoder.received(id, &draws.payload(500), &mut rebuilt);
+    }
+    decoder.forget_all();
+    assert_eq!(decoder.left(), 2);
+    // 23 to 40, only 40 received: the ten its window passes at once are left, the seven within
+    // it are not yet
+    decoder.received(40, &draws.payload(500), &mut rebuilt);
+    assert_eq!(decoder.left(), 12);
+    assert!(decoder.settled.len() <= 8);
+}
+
+#[test]
 fn the_decoder_holds_no_more_than_its_bound_and_forgets_what_falls_below() {
     let mut draws = Draws(5);
     let mut encoder = Encoder::new(8);
@@ -299,6 +342,7 @@ fn the_decoder_holds_no_more_than_its_bound_and_forgets_what_falls_below() {
         }
         assert!(decoder.known.len() <= 8);
         assert!(decoder.rows.len() <= 8);
+        assert!(decoder.settled.len() <= 8);
         assert!(decoder.known.keys().all(|known| *known >= decoder.floor));
     }
     // A repair over sources now forgotten is dropped

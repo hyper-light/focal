@@ -1711,7 +1711,7 @@ impl Connection {
         }
         let mut can_send = self.spaces.get(space_id).can_send(&self.streams);
         if space_id == SpaceId::Data {
-            can_send.other |= self.can_send_1rtt(frame_space_1rtt) || self.fec.repair_due();
+            can_send.other |= self.can_send_1rtt(frame_space_1rtt);
         }
         can_send
     }
@@ -1963,7 +1963,7 @@ impl Connection {
             .fec
             .receiving
             .as_ref()
-            .map_or(0, crate::erasure::Decoder::forgotten);
+            .map_or(0, crate::erasure::Decoder::left);
         stats.fec_repairs_dropped = self.fec.sending.as_ref().map_or(0, fec::Sending::dropped);
         stats.path.warm_up_pending = self.resume.warm_up_pending();
 
@@ -4973,21 +4973,30 @@ impl Connection {
             );
         }
 
-        // The source's frames as its receiver will read them, padding aside, kept for the
-        // repairs after it
+        // A packet begun for a frame its room then could not hold (cut below the frame space it
+        // was begun for: a server's anti-amplification limit before its peer's address is
+        // validated) is still the ack-eliciting packet it was begun as, and its peer acknowledges
+        // it as the window counts it
+        if space_id == SpaceId::Data && buf.len() == pre_payload_len {
+            buf.write(frame::FrameType::PING);
+            sent.non_retransmits = true;
+            self.stats.frame_tx.ping = self.stats.frame_tx.ping.saturating_add(1);
+        }
+
         if source {
-            let loss_delay = self.loss_delay();
-            if let Some(sending) = &mut self.fec.sending {
-                sending.sent(
-                    buf.get(pre_payload_len..).unwrap_or(&[]),
-                    pn,
-                    now,
-                    loss_delay,
-                );
-            }
+            self.keep_source(now, buf.get(pre_payload_len..).unwrap_or(&[]), pn);
         }
 
         sent
+    }
+
+    /// Keeps a source's frames, `payload`, numbered `pn`, as its receiver will read them, padding
+    /// aside, for the repairs after it (`fec::Sending::sent`).
+    fn keep_source(&mut self, now: Instant, payload: &[u8], pn: u64) {
+        let loss_delay = self.loss_delay();
+        if let Some(sending) = &mut self.fec.sending {
+            sending.sent(payload, pn, now, loss_delay);
+        }
     }
 
     /// Writes the stream frames that fit `max_size`, and, where the connection codes and `coded`
@@ -5035,9 +5044,9 @@ impl Connection {
         true
     }
 
-    /// Writes the repair due, if it fits the packet's room: true when it did. A packet begun for
-    /// a repair that no longer fits (the path's MTU fell) carries a PING in its place, so that
-    /// it is still the ack-eliciting packet it was begun as, whatever else is written in it.
+    /// Writes the repair due, if it fits the packet's room: true when it did. One past what a
+    /// datagram of the path's MTU holds is dropped (`fec::Sending::drop_unfitting`); one past this
+    /// packet's room waits for a later one.
     fn write_fec_repair(
         &mut self,
         buf: &mut Vec<u8>,
@@ -5045,13 +5054,14 @@ impl Connection {
         sent: &mut SentFrames,
     ) -> bool {
         let room = max_size.saturating_sub(buf.len());
+        // What a whole datagram of the path's MTU holds: a repair past it is never sent
+        let mtu_space =
+            usize::from(self.path.current_mtu()).saturating_sub(self.predict_1rtt_overhead(None));
         let Some(sending) = &mut self.fec.sending else {
             return false;
         };
+        sending.drop_unfitting(mtu_space);
         let Some((span, payload)) = sending.repair(room) else {
-            buf.write(frame::FrameType::PING);
-            sent.non_retransmits = true;
-            self.stats.frame_tx.ping = self.stats.frame_tx.ping.saturating_add(1);
             return false;
         };
         frame::FecRepair::encode_header(buf, span.first, span.count, span.key, payload.len());
@@ -5726,6 +5736,11 @@ impl Connection {
                 .is_some_and(|(_, x)| x.challenge_pending)
             || !self.path_responses.is_empty()
             || self.datagrams.outgoing.can_send_1rtt(max_size)
+            // A repair alone is a packet of its own, ack-eliciting: begun as one, it is in flight
+            // and under the window and the pacer, where begun for nothing else it was none of
+            // them. And it holds a datagram only whole: a GSO batch's datagrams after the first,
+            // that one's size, leave a repair larger than it to begin the next batch.
+            || self.fec.repair_fits(max_size)
     }
 
     /// Update counters to account for a packet becoming acknowledged, lost, or abandoned
