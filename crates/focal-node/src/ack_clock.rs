@@ -34,6 +34,11 @@ const PEERS: usize = crate::fleet::LOST_PEERS;
 #[derive(Default)]
 pub(crate) struct AckClock {
     peers: BTreeMap<u64, PeerClock>,
+    /// diag (not for merge): each append's last index and when it first left to any peer, until a
+    /// peer's answer covers it: the commit's replication, as hyper-quic's replication test times it.
+    firsts: std::collections::VecDeque<(u64, Instant)>,
+    first_sent: u64,
+    first_hist: Vec<u64>,
     /// The voters' lateness, gathered each time the quorum's is asked for: kept, so asking
     /// allocates only when the voters outgrow it.
     scratch: Vec<Duration>,
@@ -43,6 +48,77 @@ pub(crate) struct AckClock {
 struct PeerClock {
     timed: Option<Timed>,
     answers: focal_timing::ExchangeRtt,
+    /// diag (not for merge): every append in flight, its last index and when it left.
+    flight: std::collections::VecDeque<(u64, Instant)>,
+    /// diag: append-to-answer times since the last report, in log2 buckets of microseconds.
+    hist: Vec<u64>,
+    appends: u64,
+    answered_appends: u64,
+    max_us: u64,
+}
+
+/// diag (not for merge): each peer's appends and their answer times since the last call, as a
+/// line; the counts reset.
+pub(crate) fn diag_report(clock: &mut AckClock) -> String {
+    let mut out = String::new();
+    {
+        let total: u64 = clock.first_hist.iter().sum();
+        let quantile = |q: f64| -> u64 {
+            if total == 0 {
+                return 0;
+            }
+            let want = ((total as f64) * q).ceil() as u64;
+            let mut seen = 0u64;
+            for (bucket, count) in clock.first_hist.iter().enumerate() {
+                seen += count;
+                if seen >= want {
+                    return (bucket as u64 + 1) * 10;
+                }
+            }
+            0
+        };
+        out.push_str(&format!(
+            " first: n={} p10_ms<{} p50_ms<{} p90_ms<{} p99_ms<{}",
+            total,
+            quantile(0.1),
+            quantile(0.5),
+            quantile(0.9),
+            quantile(0.99),
+        ));
+        clock.first_hist.iter_mut().for_each(|count| *count = 0);
+    }
+    for (peer, c) in clock.peers.iter_mut() {
+        let total: u64 = c.hist.iter().sum();
+        let quantile = |q: f64| -> u64 {
+            if total == 0 {
+                return 0;
+            }
+            let want = ((total as f64) * q).ceil() as u64;
+            let mut seen = 0u64;
+            for (bucket, count) in c.hist.iter().enumerate() {
+                seen += count;
+                if seen >= want {
+                    return (bucket as u64 + 1) * 10_000;
+                }
+            }
+            0
+        };
+        out.push_str(&format!(
+            " peer={peer} appends={} answered={} p50_us<{} p90_us<{} p99_us<{} max_us={} inflight={}",
+            c.appends,
+            c.answered_appends,
+            quantile(0.5),
+            quantile(0.9),
+            quantile(0.99),
+            c.max_us,
+            c.flight.len()
+        ));
+        c.hist.iter_mut().for_each(|count| *count = 0);
+        c.appends = 0;
+        c.answered_appends = 0;
+        c.max_us = 0;
+    }
+    out
 }
 
 /// A message timed: what answers it, the term it left in, and when.
@@ -79,7 +155,26 @@ impl AckClock {
         if !self.peers.contains_key(&message.to) && self.peers.len() >= PEERS {
             return;
         }
+        // diag: an append's first leaving, to any peer
+        if let Awaits::Append(last) = awaits
+            && !message.entries.is_empty()
+            && last > self.first_sent
+        {
+            self.first_sent = last;
+            if self.firsts.len() < 4096 {
+                self.firsts.push_back((last, now));
+            }
+        }
         let clock = self.peers.entry(message.to).or_default();
+        // diag: every append in flight.
+        if let Awaits::Append(last) = awaits
+            && !message.entries.is_empty()
+        {
+            clock.appends += 1;
+            if clock.flight.len() < 4096 {
+                clock.flight.push_back((last, now));
+            }
+        }
         // A message of an older term is never answered in this one: the newer takes its place.
         if clock.timed.is_none_or(|timed| timed.term != message.term) {
             clock.timed = Some(Timed {
@@ -93,9 +188,39 @@ impl AckClock {
     /// A peer's message was stepped at `now`: the answer to the message timed, if it is one,
     /// is a sample of how late its peer answers.
     pub(crate) fn stepped(&mut self, stepped: Stepped, now: Instant) {
+        // diag: the first answer covering an append is its replication's end
+        if stepped.msg_type == MessageType::MsgAppendResponse && !stepped.reject {
+            while let Some(&(last, sent)) = self.firsts.front() {
+                if last > stepped.index {
+                    break;
+                }
+                self.firsts.pop_front();
+                let ms = now.saturating_duration_since(sent).as_millis() as usize;
+                if self.first_hist.is_empty() {
+                    self.first_hist.resize(256, 0);
+                }
+                self.first_hist[(ms / 10).min(255)] += 1;
+            }
+        }
         let Some(clock) = self.peers.get_mut(&stepped.from) else {
             return;
         };
+        // diag: every append the answer covers.
+        if stepped.msg_type == MessageType::MsgAppendResponse && !stepped.reject {
+            while let Some(&(last, sent)) = clock.flight.front() {
+                if last > stepped.index {
+                    break;
+                }
+                clock.flight.pop_front();
+                let us = now.saturating_duration_since(sent).as_micros() as u64;
+                if clock.hist.is_empty() {
+                    clock.hist.resize(256, 0);
+                }
+                clock.hist[(us as usize / 10_000).min(255)] += 1;
+                clock.answered_appends += 1;
+                clock.max_us = clock.max_us.max(us);
+            }
+        }
         let Some(timed) = clock.timed else {
             return;
         };
