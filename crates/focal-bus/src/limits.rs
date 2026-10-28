@@ -144,10 +144,12 @@ fn lane_window() -> Result<usize, BusError> {
 
 /// The forward erasure correction's window, in packets (hyper-transport `Limits::fec_window`,
 /// hyper-quic `TransportConfig::fec_window`): measured on hyper-sim's network at a leader's
-/// replication load, focal-wire's own (hyper-raft `crates/hyper-quic/tests/replication.rs`: two followers each sent
-/// 110 appends of 7.5 KB a second over 80 ms one way, 1 to 5% of each way's datagrams lost), a
-/// window of 64 packets left a path losing 1% uncoded, its commit's median 189 to 202 ms where 128
-/// gave 166 to 167 (163 loss-free), and both coded 3 and 5% to the loss-free path's median. A
+/// replication load, focal-wire's own (hyper-raft `crates/hyper-quic/tests/replication.rs` at 62f568d: two
+/// followers each sent 110 appends of 7.5 KB a second over 80 ms one way in batches of 64
+/// datagrams, 1 to 10% of each way's datagrams lost), a window of 64 packets coded a path losing 1%
+/// only while its measured rate rose past 1.5% (the span three repairs go over held within 64), its
+/// commit's median 179 to 184 ms where 128 gave 165 (163 loss-free), and both coded 3, 5 and 10% to
+/// the loss-free path's median. A
 /// connection codes only while its path loses and it sends often enough for a repair to be due
 /// within a loss delay; what its coding holds is charged as it is held, and forgotten where the
 /// budget refuses.
