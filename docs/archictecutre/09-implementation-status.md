@@ -17549,3 +17549,129 @@ What remains on the EPYC 7763, where the goal is not yet met:
   from its bytes, about 10% of a follower.
 - **The leader's replication.** A claim's creation record of 2,919 bytes compresses to 850 with
   zstd at level 1; the replication to two followers is about 5.3 of the leader's datagrams a write.
+
+### 2026-10-28 — The work-mode cliff closed: the generator's tasks and reads, a copy's share of its leader's reads, one flush a turn
+
+The work-mode cliff's last four causes (the two entries before this one name the first eight): two
+in the generator, focal-load, and two in the nodes.
+
+- **The generator ran out of CPU before the leader did.** focal-load ran its callers (each with
+  up to 64 lifecycles) and its 500 agents' inbox tails in one task, and a `focal_rt::Concurrent`
+  set polls every future it runs at each wake (a hyper-rt future registers the task that polls
+  it, never a waker of its own), so each reply polled every other lifecycle and tail:
+  `OneshotReceiver::try_recv` alone took 12.8% of its samples. Each caller and each tail now runs
+  as a task of its own, sharing the run's agents, watch and generations by `Rc` (one thread); a
+  caller's lifecycles still share its task. The watch keeps a waker for every task that waits on
+  the run's stop, where it kept one (every tail had shared one task), and the run's agents go with
+  the list before the embedded host closes, whose owner joins once its last connection does.
+- **The homed agents' reads were refused stale revisions.** Every homed run refused 0.9% of its
+  lifecycles at 50 claims a second and 3 to 4% at 100, every refusal a work claim's
+  `ValidationBegin` refused the claim's stale revision; no run with every read at the leader
+  refused one. The entry before this one says a follower serves a read at least at a token once it
+  has applied it; it does, but the token was not the right one. focal-load read what a step binds
+  at least at the last write the actor knew of, and the evaluator knew the sequence its evaluation
+  was materialized at, the testament's receipt. By the time it read, the issuer's whole-work entry
+  had committed and moved the claim from TestamentAcknowledged to Validating, but a follower that
+  had applied the receipt and not yet the entry served the claim's revision before it. A diag
+  logged each refused begin's read against the same reads again: in every one of 510 (EPYC 7763
+  and Intel Xeon 6973P-C runners), the claim read was TestamentAcknowledged where a read after the
+  refusal found it Validating, and the evaluation was the same. focal-load now reads what a step
+  binds linearizable, as the native client's `resolve` reads, and a read asked after a write
+  committed is served at or past it; only the work artifact, which never changes, is still read at
+  least at the write that submitted it.
+
+The generator's tasks, measured on EPYC 7763 runners against the same nodes (homed, with the
+door's held depth) at 100 claims a second, the generator before them in run 40567691127's two B
+rounds and after them in run 40582966585:
+
+| Generator | Writes a second | Generator busy | Its CPU a write | Write p99 |
+|---|---|---|---|---|
+| one task | 868 and 972 | 53 and 63% | 611 and 652 µs | 631 and 836 ms |
+| a task a caller and a tail | 1,002 | 49% | 493 µs | 439 ms |
+
+`OneshotReceiver::try_recv` went from 13.2% of the generator's samples to 0.9% (runs 40540102366,
+EPYC 7763, and 40574804389, EPYC 9V45, where the generator was 31% busy at 1,041 writes a second).
+Run 40582966585 refused 285 lifecycles at the begin (below), each a write the leader did not take.
+
+The reads made linearizable, measured in an interleaved A/B on one EPYC 7763 runner (run
+40584468171), each side its own generator, both homed:
+
+| Rate | Side | Write p99 | Writes a second | Leader µs a write | Refused | Abandoned |
+|---|---|---|---|---|---|---|
+| 50/s | at least at the last write | 29 ms | 516 | 1,739 | 24 and 35 | 0 |
+| 50/s | linearizable | 33 ms | 518 | 1,812 | 0 | 0 |
+| 100/s | at least at the last write | 447 and 483 ms | 1,001 and 1,005 | 943 | 244 and 283 | 0 |
+| 100/s | linearizable | 1,134 and 837 ms | 923 and 936 | 1,004 | 0 | 140 and 63 |
+
+The refusals end, at about 60 µs more of the 1-CPU leader's CPU a write: each read a follower
+serves forwards its barrier to the leader and is answered, and each read asks a round of
+heartbeats of the leader's next drain. At 50 claims a second the leader sent 2.7 datagrams more
+for each read and received 2.9 more, one round each; at 100, about one more each way, rounds
+sharing drains that carry appends. The leader's own read code was under half a percent of its
+samples; the cost is the datagrams (run 40597298799's profile). At 100 claims a second the leader
+refused 1,165 and 984 of its peers' frames a round, none where the reads asked no barrier:
+forwarded barriers past the reads its core holds (`DurableNode::pending_reads`, 129), refused
+unanswered, so their reads waited out their askers' attempts and 140 and 63 lifecycles were
+abandoned.
+
+- **A copy asked more reads at once than its leader could hold.** Each copy now keeps at most its
+  share of its leader's reads out as barriers, the bound divided among the members that may ask
+  (doc 27 §10, which named the defect open); short of it every read asks a barrier at once, and at
+  it the reads asked meanwhile share the next barrier back, as etcd's members ask one read index
+  for every read that waited.
+
+  On an EPYC 9V74 (run 40607480739), where a barrier for each read lost 2 lifecycles in one
+  round, the window lost none and cost nothing measurable: write p99 at 100 claims a second
+  420 → 415 ms and the leader's CPU a write 937 → 936 µs (medians of two rounds a side), the same
+  at 50 claims a second (21 ms, 1,766 → 1,763 µs). The window binds only where the leader falls
+  behind its reads, as the EPYC 7763 did.
+
+- **Each frame the leader sent left in a datagram of its own.** A node's network owner took one
+  thing at a time, an endpoint event, an answer or a command, and flushed before it waited again,
+  so what queued behind it, the appends, heartbeats and read answers of one drain to the same
+  follower, or the answers of one drain to its clients, went out a datagram and a send each: the
+  leader wrote its followers 2,176 stream frames a second in 2,160 datagrams at 100 claims a
+  second (run 40597298799). It now takes the answers and commands queued behind what woke it, a
+  turn of each as it takes the endpoint's events (hyper-rt-transport's `TURNS`, the bound
+  hyper-tokio takes from tokio's cooperative budget), and flushes once, as the event bus's D8 has
+  each part drain what arrived and flush once (doc 32).
+
+  Measured in an interleaved A/B on an EPYC 7763 (run 40608520375), two rounds a side, both with
+  the window:
+
+  | Rate | Leader datagrams a write, out and in | Each follower's out | Leader µs a write | Write p99 |
+  |---|---|---|---|---|
+  | 50/s, one at a time | 12.0 and 13.6 | 5.8 | 1,814 | 31 and 41 ms |
+  | 50/s, a turn | 9.5 and 9.8 | 3.9 | 1,773 | 30 and 82 ms |
+  | 100/s, one at a time | 5.1 and 5.8 | 2.1 | 1,008 | 2,710 and 1,375 ms |
+  | 100/s, a turn | 4.4 and 5.1 | 1.7 | 962 | 713 and 734 ms |
+
+  The followers' datagrams fell the most: their appends' answers and forwarded barriers now leave
+  together. The generator's did not change: each of its agents is a connection of its own. Every
+  lifecycle was written on both sides, none refused or abandoned.
+
+The four together, in compare CI's work mode on an EPYC 7763, the slowest runner class seen
+(compare/work-stack-1, run 40609035896): every lifecycle written and judged, none refused, none
+unknown and none abandoned, and the write p99 at 100 claims a second 443 ms, where the first entry
+of this cliff measured 29.6 s.
+
+| Claims a second | Write p50 | Write p99 | Writes a second | Lifecycles | Leader busy | Leader µs a write |
+|---|---|---|---|---|---|---|
+| 20 | 1.7 ms | 5.2 ms | 207 | 1,500 of 1,500 | 51% | 2,468 |
+| 50 | 3.2 ms | 21.7 ms | 516 | 3,750 of 3,750 | 92% | 1,782 |
+| 100 | 162 ms | 443 ms | 1,005 | 7,500 of 7,500 | 94% | 938 |
+
+At 100 claims a second the leader is 94% busy and was throttled 43% of the run's periods: the goal
+is met with little headroom on that class, and what follows is where the headroom is.
+
+What remains on the EPYC 7763:
+
+- **Each read's datagrams.** A linearizable read costs the leader a round of heartbeats and, for
+  a follower's, its barrier and the answer. The appends a leader sends under writes could carry
+  the round, so a quorum's answers to them confirm the reads with no heartbeat of their own; a
+  leader's append carries no context today, and the window a member is charged assumes it does not
+  (hyper-raft `wire.rs`).
+- **The leader's write path.** Preparing a write was 35% of the leader's samples on an Intel Xeon
+  Platinum 8573C (run 40597298799), `memcpy` 9.8% of all of them and BLAKE3 6.2%, both spread over
+  the record's encoding, the response's stamp checked at each encoding, artifact descriptors and
+  intent fingerprints.
