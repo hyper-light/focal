@@ -1958,6 +1958,11 @@ impl Connection {
         self.fec.held_bytes()
     }
 
+    /// DIAG (not for merge): probe timeouts in a row, and the bytes in flight.
+    pub fn diag_recovery(&self) -> (u32, u64) {
+        (self.pto_count, self.path.in_flight.bytes)
+    }
+
     /// Returns connection statistics
     pub fn stats(&self) -> ConnectionStats {
         let mut stats = self.stats;

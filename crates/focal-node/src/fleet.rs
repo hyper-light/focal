@@ -1245,6 +1245,8 @@ struct Owner {
     /// How late each peer answers this replica's appends and heartbeats (27 §8.4): its
     /// quorum's patience, published at each tick.
     acks: crate::ack_clock::AckClock,
+    /// diag (not for merge): when the leader last reported its appends' answer times.
+    diag_last: Instant,
     /// `ReplicaProgress::frames_held`, `frames_let_go` and `frames_stale`.
     frames_held: u64,
     frames_let_go: u64,
@@ -1492,6 +1494,7 @@ impl ReplicaHost {
             appends_rejected_in_order: 0,
             append_streams: std::collections::BTreeMap::new(),
             acks: crate::ack_clock::AckClock::default(),
+            diag_last: Instant::now(),
             frames_held: 0,
             frames_let_go: 0,
             frames_stale: 0,
@@ -2594,6 +2597,15 @@ impl Owner {
         // patience before it asks whether a quorum heard it (27 §8.4): how late
         // they answer this replica's messages, as it stepped their answers.
         let scalars = self.session.scalars();
+        // diag (not for merge): every 5 s, the leader's appends to each peer and their answers.
+        if scalars.role == StateRole::Leader && self.diag_last.elapsed() >= Duration::from_secs(5) {
+            self.diag_last = Instant::now();
+            let line = crate::ack_clock::diag_report(&mut self.acks);
+            let unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_millis());
+            eprintln!("DIAGR {unix_ms} ledger={:?}{line}", self.session.ledger());
+        }
         let tail = self
             .acks
             .quorum_tail(self.session.members().voters, scalars.node_id);
