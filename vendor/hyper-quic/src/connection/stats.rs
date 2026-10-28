@@ -263,4 +263,6 @@ pub struct ConnectionStats {
     /// The peer's sources its repairs did not rebuild before they fell out of the window: left to
     /// retransmission
     pub fec_unrebuilt: u64,
+    /// The repairs dropped because the path's MTU fell below the sources they covered
+    pub fec_repairs_dropped: u64,
 }

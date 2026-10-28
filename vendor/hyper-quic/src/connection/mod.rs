@@ -1048,8 +1048,21 @@ impl Connection {
             Some(builder) => tx.buf_capacity.saturating_sub(builder.partial_encode.start),
             None => 0,
         } as u64;
-        let floor = u64::from(INITIAL_MTU);
-        let mut wanted = u64::try_from(room.min(tx.segment_size)).unwrap_or(u64::MAX);
+        // A datagram is cut no shorter than RFC 9000 §14's smallest, nor, while a repair of the
+        // erasure code is due, than the repair's packet, which goes first in it and is never cut:
+        // cut shorter, it was dropped with the sources it covered, its repairs had a sixth of a
+        // lossy path's datagrams' room each time its pacer or window ran short (focal's leader, a
+        // repair for 4.9% of its sources where 9.6% were due and 16 to 20% of its losses rebuilt)
+        let datagram = room.min(tx.segment_size);
+        let repair = self
+            .fec
+            .repair_bytes()
+            .map(|bytes| bytes.saturating_add(self.predict_1rtt_overhead(None)));
+        let floor = u64::try_from(repair.map_or(usize::from(INITIAL_MTU), |repair| {
+            repair.max(usize::from(INITIAL_MTU)).min(datagram)
+        }))
+        .unwrap_or(u64::MAX);
+        let mut wanted = u64::try_from(datagram).unwrap_or(u64::MAX);
 
         // Byte counts: saturating can only over-state them, which blocks rather than over-sends
         let bytes_to_send = wanted.saturating_add(untracked_bytes);
@@ -1951,6 +1964,7 @@ impl Connection {
             .receiving
             .as_ref()
             .map_or(0, crate::erasure::Decoder::forgotten);
+        stats.fec_repairs_dropped = self.fec.sending.as_ref().map_or(0, fec::Sending::dropped);
         stats.path.warm_up_pending = self.resume.warm_up_pending();
 
         stats
@@ -4302,7 +4316,7 @@ impl Connection {
         }
 
         if !packet.header.is_0rtt() {
-            self.read_fec_payload(source, &whole, carries_stream);
+            self.read_fec_payload(now, source, &whole, carries_stream);
         }
 
         self.after_payload(now, remote, number, ack_eliciting, is_probing_packet, close);
@@ -4310,19 +4324,35 @@ impl Connection {
     }
 
     /// A 1-RTT packet's payload, to the erasure code's receiving side: a source is held and what
-    /// it rebuilds read. A peer that codes makes every 1-RTT packet of stream data a source, so
-    /// one that carries stream data and is none says it codes no longer, and what is held for its
-    /// repairs serves nothing.
-    fn read_fec_payload(&mut self, source: Option<u64>, payload: &[u8], carries_stream: bool) {
+    /// it rebuilds read. A peer that codes makes every 1-RTT packet of stream data a source, and
+    /// stops only once its rule has failed for a loss delay (`fec::Sending::decide`), so packets of
+    /// stream data that have been none for a loss delay say it codes no longer, and what is held
+    /// for its repairs serves nothing.
+    fn read_fec_payload(
+        &mut self,
+        now: Instant,
+        source: Option<u64>,
+        payload: &[u8],
+        carries_stream: bool,
+    ) {
+        let loss_delay = self.loss_delay();
         let Some(decoder) = &mut self.fec.receiving else {
             return;
         };
         match source {
             Some(id) => {
+                self.fec.last_source = Some(now);
                 decoder.received(id, payload, &mut self.fec.rebuilt);
                 self.read_rebuilt();
             }
-            None if carries_stream => decoder.forget_all(),
+            None if carries_stream
+                && self
+                    .fec
+                    .last_source
+                    .is_none_or(|last| now.saturating_duration_since(last) >= loss_delay) =>
+            {
+                decoder.forget_all();
+            }
             None => {}
         }
     }
@@ -4973,15 +5003,8 @@ impl Connection {
         coded: bool,
         sent: &mut SentFrames,
     ) -> bool {
-        let coding = coded && self.fec.sources_active();
-        // A connection that codes no longer keeps nothing for repairs
-        if coded
-            && !coding
-            && let Some(sending) = &mut self.fec.sending
-            && sending.holds()
-        {
-            sending.forget();
-        }
+        let loss_delay = self.loss_delay();
+        let coding = coded && self.fec.decide(now, loss_delay);
         let stream_max = if coding {
             max_size.saturating_sub(fec::SOURCE_RESERVE)
         } else {
@@ -4998,7 +5021,6 @@ impl Connection {
         if sent.stream_frames.is_empty() {
             return false;
         }
-        let loss_delay = self.loss_delay();
         if coded && let Some(sending) = &mut self.fec.sending {
             sending.stream_packet(now, loss_delay);
         }

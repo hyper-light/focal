@@ -1669,7 +1669,15 @@ none older than the loss delay (RFC 9002 §6.1.2), at most the span over which t
 sends repairs at three times the loss rate RFC 5348 §5.4's average loss interval measures,
 `3p/(1 − p)`, that factor measured (`fec.rs`'s `REPAIRS_PER_LOSS`), and codes only while the window
 holds that span and a repair falls due within each loss delay: a repair that comes after a loss's
-retransmission rebuilds nothing in time, so a sparse connection (an asker's requests) is not coded. A receiver keeps the sources it holds and the repairs' equations in reduced row
+retransmission rebuilds nothing in time, so a sparse connection (an asker's requests) is not coded.
+A connection that codes stops only once its rule has failed for a whole loss delay, and its
+receiver forgets what it holds only once its packets of stream data have been no sources for one: a
+stop costs every equation still to solve. While a repair is due, the datagrams its window and pacer
+cut are no shorter than the repair's packet, which goes first, so a repair is never dropped for a
+datagram cut short of it, only for a path whose MTU fell below its sources (counted,
+`ConnectionStats::fec_repairs_dropped`): dropped with its window each time the pacer ran short,
+focal's leader sent a repair for 4.9% of its sources where 9.6% were due and its followers rebuilt 16
+to 20% of their losses. A receiver keeps the sources it holds and the repairs' equations in reduced row
 echelon form, and rebuilds a lost packet as soon as they are of full rank, taking its STREAM frames.
 The packet stays lost to its sender's loss detection and congestion control and is never
 acknowledged (RFC 9265 §6.3: "a recovered packet must be considered as a lost packet";

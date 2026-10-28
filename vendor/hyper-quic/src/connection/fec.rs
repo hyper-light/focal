@@ -124,6 +124,12 @@ pub(super) struct Sending {
     ready: Option<Span>,
     /// A repair's bytes, kept for the next.
     scratch: Vec<u8>,
+    /// Whether the connection codes: its packets of stream data are sources.
+    coding: bool,
+    /// Since when its rule has failed while it codes: it stops a loss delay later (`decide`).
+    failing_since: Option<Instant>,
+    /// The repairs dropped for a path's fallen MTU (`repair`).
+    dropped: u64,
 }
 
 impl Sending {
@@ -136,11 +142,14 @@ impl Sending {
             limit: limit.max(1),
             ready: None,
             scratch: Vec::new(),
+            coding: false,
+            failing_since: None,
+            dropped: 0,
         }
     }
 
-    /// The repairs per million sources: twice the losses, `2p / (1 − p)`; zero while the path
-    /// loses nothing.
+    /// The repairs per million sources: `REPAIRS_PER_LOSS` times the losses, `3p / (1 − p)`; zero
+    /// while the path loses nothing.
     fn repair_ppm(&self) -> u64 {
         let lost = self.losses.ppm();
         if lost == 0 {
@@ -166,14 +175,43 @@ impl Sending {
         (self.repair_ppm() > 0 && span <= self.limit).then_some(span.max(1))
     }
 
-    /// Whether the connection codes now: its path loses, and often enough that a span covering
-    /// each source as many times as `SPANS_PER_SOURCE` fits the window; and it sends packets of
-    /// stream data often enough that a repair is due within each loss delay. A rarer loss, or a
-    /// sparser connection, is left to retransmission: a code that sparse would rebuild few
-    /// losses in time, and each source it marked would still give up its packet's reserve for a
-    /// repair.
-    pub(super) fn active(&self) -> bool {
+    /// The rule a connection codes by: its path loses, and often enough that a span covering each
+    /// source as many times as `SPANS_PER_SOURCE` fits the window; and it sends packets of stream
+    /// data often enough that a repair is due within each loss delay. A rarer loss, or a sparser
+    /// connection, is left to retransmission: a code that sparse would rebuild few losses in time,
+    /// and each source it marked would still give up its packet's reserve for a repair.
+    fn rule(&self) -> bool {
         self.span().is_some() && self.meter.per_period().saturating_mul(self.repair_ppm()) >= PPM
+    }
+
+    /// Whether the connection codes the packet it is building at `now`: it starts as soon as its
+    /// rule holds, and stops only once the rule has failed for a whole loss delay. A connection
+    /// that stops forgets what it kept, and its receiver, whose packets of stream data are then no
+    /// sources, everything it held for the losses still to rebuild: a rule failing for a moment (a
+    /// burst's lull, a loss rate measured at its threshold) cost every pending equation.
+    pub(super) fn decide(&mut self, now: Instant, loss_delay: Duration) -> bool {
+        if self.rule() {
+            self.coding = true;
+            self.failing_since = None;
+            return true;
+        }
+        if !self.coding {
+            return false;
+        }
+        let since = *self.failing_since.get_or_insert(now);
+        if now.saturating_duration_since(since) < loss_delay {
+            return true;
+        }
+        self.coding = false;
+        self.failing_since = None;
+        self.forget();
+        false
+    }
+
+    /// Whether the connection codes.
+    #[cfg(test)]
+    pub(super) fn active(&self) -> bool {
+        self.coding
     }
 
     /// A packet of stream data was sent at `now`, coded or not: its rate decides whether the
@@ -223,16 +261,30 @@ impl Sending {
         self.ready = self.encoder.repair(span, &mut self.scratch);
     }
 
-    /// The repair due, if it fits a packet's `room`; it is no longer due either way. One that does
-    /// not fit was made of sources cut for a larger packet than this one (the path's MTU fell):
-    /// what they hold no longer has a repair that fits, and they are forgotten.
+    /// The bytes the repair due takes of a packet's frames: what a datagram that carries it must
+    /// hold (`Connection::congestion_room`), none while no repair is due.
+    pub(super) fn repair_bytes(&self) -> Option<usize> {
+        self.ready
+            .map(|_| self.scratch.len().saturating_add(FecRepair::OVERHEAD_MAX))
+    }
+
+    /// The repair due, if it fits a packet's `room`; it is no longer due either way. A datagram
+    /// is cut by its window or pacer no shorter than the repair due (`Connection::congestion_room`),
+    /// so one that does not fit was made of sources cut for a larger packet than the path now
+    /// carries (its MTU fell): what they hold has no repair that fits, and they are forgotten.
     pub(super) fn repair(&mut self, room: usize) -> Option<(Span, &[u8])> {
         let made = self.ready.take()?;
         if self.scratch.len().saturating_add(FecRepair::OVERHEAD_MAX) > room {
             self.encoder.forget_all();
+            self.dropped = self.dropped.saturating_add(1);
             return None;
         }
         Some((made, &self.scratch))
+    }
+
+    /// The repairs made and dropped for a path's fallen MTU.
+    pub(super) fn dropped(&self) -> u64 {
+        self.dropped
     }
 
     /// Forgets the sources kept and the repair made of them: the connection codes no longer, or
@@ -242,11 +294,6 @@ impl Sending {
         self.ready = None;
         self.credit = 0;
         self.scratch = Vec::new();
-    }
-
-    /// Whether sources are kept.
-    pub(super) fn holds(&self) -> bool {
-        self.encoder.held() > 0 || self.ready.is_some()
     }
 
     /// The bytes held for the sources kept.
@@ -294,18 +341,28 @@ pub(super) struct Fec {
     pub(super) receiving: Option<Decoder>,
     /// The sources the last packet's frames rebuilt, to be read as packets' frames are.
     pub(super) rebuilt: Vec<Vec<u8>>,
+    /// When the peer's last source arrived: a peer whose packets of stream data have been no
+    /// sources for a loss delay codes no longer.
+    pub(super) last_source: Option<Instant>,
 }
 
 impl Fec {
-    /// The sending side codes now, and the packet being built is to be a source if it carries
-    /// stream data.
-    pub(super) fn sources_active(&self) -> bool {
-        self.sending.as_ref().is_some_and(Sending::active)
+    /// Whether the packet being built at `now` is to be a source if it carries stream data
+    /// (`Sending::decide`).
+    pub(super) fn decide(&mut self, now: Instant, loss_delay: Duration) -> bool {
+        self.sending
+            .as_mut()
+            .is_some_and(|sending| sending.decide(now, loss_delay))
     }
 
     /// A repair waits to be sent.
     pub(super) fn repair_due(&self) -> bool {
         self.sending.as_ref().is_some_and(Sending::due)
+    }
+
+    /// The bytes of a packet's frames the repair due takes (`Sending::repair_bytes`).
+    pub(super) fn repair_bytes(&self) -> Option<usize> {
+        self.sending.as_ref().and_then(Sending::repair_bytes)
     }
 
     /// Forgets what both sides hold.
@@ -379,19 +436,27 @@ mod tests {
         // takes 11 packets within it
         let mut sending = sending;
         let (now, delay) = (Instant::now(), Duration::from_millis(100));
-        for packet in 0..10u32 {
-            sending.stream_packet(now + Duration::from_millis(u64::from(packet)), delay);
+        let at = |ms: u64| now + Duration::from_millis(ms);
+        for packet in 0..10u64 {
+            sending.stream_packet(at(packet), delay);
         }
         assert!(
-            !sending.active(),
+            !sending.decide(at(9), delay),
             "10 packets a loss delay owe no repair within it"
         );
-        sending.stream_packet(now + Duration::from_millis(10), delay);
-        assert!(sending.active());
-        // A period past, the count stays the last period's; two past, it is forgotten
-        sending.stream_packet(now + Duration::from_millis(150), delay);
-        assert!(sending.active());
-        sending.stream_packet(now + Duration::from_millis(400), delay);
+        sending.stream_packet(at(10), delay);
+        assert!(sending.decide(at(10), delay));
+        // A period past, the count stays the last period's
+        sending.stream_packet(at(150), delay);
+        assert!(sending.decide(at(150), delay));
+        // Two past, it is forgotten and the rule fails: the connection codes a loss delay more
+        sending.stream_packet(at(400), delay);
+        assert!(
+            sending.decide(at(400), delay),
+            "it stops a loss delay after its rule fails"
+        );
+        assert!(sending.decide(at(499), delay));
+        assert!(!sending.decide(at(500), delay));
         assert!(!sending.active());
     }
 }

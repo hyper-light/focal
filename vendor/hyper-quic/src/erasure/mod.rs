@@ -80,6 +80,7 @@ impl Encoder {
     }
 
     /// The sources held.
+    #[cfg(test)]
     pub(crate) fn held(&self) -> usize {
         self.window.len()
     }
