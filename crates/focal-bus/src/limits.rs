@@ -151,6 +151,7 @@ fn lane_window() -> Result<usize, BusError> {
 /// connection codes only while its path loses and it sends often enough for a repair to be due
 /// within a loss delay; what its coding holds is charged as it is held, and forgotten where the
 /// budget refuses.
+#[allow(dead_code)]
 const FEC_WINDOW: u32 = 128;
 
 /// Derived: the most a connection's receive window grows to: the largest stream window the
@@ -213,7 +214,7 @@ fn limits(identities: usize, lanes: u32) -> Result<Limits, BusError> {
         acknowledgement: hyper_transport::Acknowledgement::Decimated,
         // A part's publishes, deliveries and replication are ordered streams, every message behind
         // a lost packet waiting a round trip for it: coded, a loss is rebuilt from the repairs after it
-        fec_window: Some(FEC_WINDOW),
+        fec_window: None,
     })
 }
 
