@@ -29,6 +29,9 @@ on:
       warmup:
         description: "Seconds sent and not measured, first"
         default: "15"
+      faults:
+        description: "What the cluster suffers while each load runs (run.sh FAULTS); a branch named ab/work-loss-<anything> defaults to 'netem=delay 80ms loss 3%'"
+        default: ""
 
 permissions:
   contents: read
@@ -167,12 +170,15 @@ jobs:
           FOCAL_LOAD_IMAGE: focal:bench-b
           MODE: ${{ startsWith(github.ref_name, 'ab/work') && 'work' || 'append' }}
           AGENTS: ${{ startsWith(github.ref_name, 'ab/work') && '500' || '' }}
+          # A branch named ab/work-loss-<anything> runs under the loss goal's path: 80 ms and 3%
+          # of every node's datagrams lost, at 20 claims a second, three rounds
+          FAULTS: ${{ github.event.inputs.faults || (startsWith(github.ref_name, 'ab/work-loss') && 'netem=delay 80ms loss 3%' || '') }}
         run: |
-          rounds=${{ github.event.inputs.rounds || '2' }}
+          rounds=${{ github.event.inputs.rounds || (startsWith(github.ref_name, 'ab/work-loss') && '3' || '2') }}
           for round in $(seq 1 "$rounds"); do
             order="a b"
             if [ $((round % 2)) -eq 0 ]; then order="b a"; fi
-            for rate in ${{ github.event.inputs.rates || (startsWith(github.ref_name, 'ab/work') && '50 100' || '100 1000 4000') }}; do
+            for rate in ${{ github.event.inputs.rates || (startsWith(github.ref_name, 'ab/work-loss') && '20' || (startsWith(github.ref_name, 'ab/work') && '50 100' || '100 1000 4000')) }}; do
               for side in $order; do
                 docker tag "focal:bench-$side" focal:bench
                 # A failed run is recorded and the rest still run.
