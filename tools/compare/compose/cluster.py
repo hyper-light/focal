@@ -30,6 +30,11 @@ of them (focal-nodes.sh writes the model; run.sh and focal-bootstrap.sh ask this
     cluster.py sessions TABLE < PLACEMENT
                                   every session the directory lists: TENANT SESSION FOUNDER, its
                                   founder the node that holds its first replica
+    cluster.py progress < PLACEMENT
+                                  how far the placement of every session has come, one line: each
+                                  session's voters and, for a plan under way, its phase and each
+                                  copy's step and log position. It differs from the last whenever
+                                  the placement moved
     cluster.py fleet TABLE < PLACEMENT
                                   whether the sessions sit across the whole fleet: as many as the
                                   largest zone has nodes, each placed (no plan pending) on three
@@ -178,6 +183,27 @@ def sessions_of(expected, document):
         print(session["tenant"], session["session"], founder)
 
 
+def progress(document):
+    placement = placement_of(document)
+    states = []
+    for session in listed(placement):
+        pending = session.get("pending")
+        steps = sorted(
+            (step["node"], step["phase"], step["attempt"], step["through"])
+            for step in (pending["progress"] if pending else [])
+        )
+        states.append((
+            session["session"],
+            sorted(session["voters"]),
+            pending["phase"] if pending else None,
+            sorted(pending["voters"]) if pending else None,
+            steps,
+            session.get("achieved_survive"),
+            session.get("achieved_max_failures"),
+        ))
+    print(json.dumps(sorted(states), separators=(",", ":")))
+
+
 def fleet(expected, document):
     placement = placement_of(document)
     names = by_address(expected, placement)
@@ -250,6 +276,9 @@ def main(argv):
         return 0
     if len(argv) == 2 and argv[0] == "sessions":
         sessions_of(table(argv[1]), json.load(sys.stdin))
+        return 0
+    if len(argv) == 1 and argv[0] == "progress":
+        progress(json.load(sys.stdin))
         return 0
     if len(argv) == 2 and argv[0] == "fleet":
         return 0 if fleet(table(argv[1]), json.load(sys.stdin)) else 1
