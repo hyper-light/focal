@@ -52,6 +52,10 @@
 #     isolate=NODES@S+D NODES (as kill's) each cut off from every peer and client (all its
 #                       datagrams lost) S seconds in, for D seconds
 #   The report's file names the run as faulted (`-faults`).
+#   REST (environment), focal: seconds the cluster is measured at rest before the load, founded,
+#   its clients enrolled and the generator idle (`<report>.rest.cpu.txt`, `.rest.io.txt`,
+#   `.rest.disk.txt`, as the load's are taken): what the load's counters hold that the cluster
+#   spends doing nothing. None where unset.
 #   INFLIGHT (environment): the generator's window, the requests out at most
 #   (focal-compare's own default, 4096, where unset); a run given one names it
 #   in its report's file.
@@ -75,6 +79,10 @@ case "$mode" in
     if [ "${AGENTS:-0}" -lt 3 ]; then echo "work goes among AGENTS agents, 3 at least" >&2; exit 2; fi
     suffix="-work-agents$AGENTS" ;;
   *) echo "unknown mode $mode" >&2; exit 2 ;;
+esac
+rest="${REST:-0}"
+case "$rest" in
+  '' | *[!0-9]*) echo "REST must be a whole number of seconds, not '$rest'" >&2; exit 2 ;;
 esac
 mkdir -p "$out"
 export NATS_SYNC=always KAFKA_FLUSH=1 REDIS_AOF=yes REDIS_FSYNC=always
@@ -455,6 +463,25 @@ cpu_stat() {
     fi
   done
 }
+# Each of the run's containers' disk as its cgroup (v2) counts it (io.stat, summed over its
+# devices): the bytes and the operations it wrote (wbytes, wios), read (rbytes, rios) and
+# discarded, each line `PHASE CONTAINER io.KEY VALUE`, read where cpu_stat reads its CPU: what
+# focal's nodes wrote themselves, where disk_stat's counters are the whole drive's, whoever else
+# writes to it. Prints nothing where the groups cannot be read.
+io_stat() {
+  local phase=$1 c pid group
+  for c in $(dc ps --format '{{.Name}}'); do
+    pid=$(docker inspect --format '{{.State.Pid}}' "$c" 2>/dev/null) || continue
+    group=$(awk -F: '$1 == "0" && $2 == "" { print $3 }' "/proc/$pid/cgroup" 2>/dev/null) || group=""
+    if [ -n "$group" ] && [ -r "/sys/fs/cgroup$group/io.stat" ]; then
+      cat "/sys/fs/cgroup$group/io.stat"
+    else
+      docker exec "$c" cat /sys/fs/cgroup/io.stat 2>/dev/null || true
+    fi | awk -v p="$phase" -v c="$c" '
+      { for (i = 2; i <= NF; i++) if (split($i, kv, "=") == 2) sum[kv[1]] += kv[2] }
+      END { for (k in sum) print p, c, "io." k, sum[k] }'
+  done
+}
 # Each of the run's containers' memory as its cgroup (v2) counts it, read where cpu_stat reads its
 # CPU: what it holds (memory.current), the most it held since it started (memory.peak, Linux 5.19
 # and later), its limit (memory.max), the times it reached that limit and the kernel killed in it
@@ -688,7 +715,18 @@ EOF
       # the settlement.
       bound=$(( bound + 4 * 120 ))
     fi
+    # The cluster at rest first, where REST asks: founded, its clients enrolled, the generator idle.
+    if [ "$rest" -gt 0 ]; then
+      cpu_stat before > "$out/$report.rest.cpu.txt"
+      io_stat before > "$out/$report.rest.io.txt"
+      disk_stat before > "$out/$report.rest.disk.txt"
+      sleep "$rest"
+      cpu_stat after >> "$out/$report.rest.cpu.txt"
+      io_stat after >> "$out/$report.rest.io.txt"
+      disk_stat after >> "$out/$report.rest.disk.txt"
+    fi
     cpu_stat before > "$out/$report.cpu.txt"
+    io_stat before > "$out/$report.io.txt"
     net_stat before > "$out/$report.net.txt"
     disk_stat before > "$out/$report.disk.txt"
     mem_stat before > "$out/$report.mem.txt"
@@ -708,6 +746,7 @@ EOF
     kill "$sampler" 2>/dev/null || true
     faults_end
     cpu_stat after >> "$out/$report.cpu.txt"
+    io_stat after >> "$out/$report.io.txt"
     net_stat after >> "$out/$report.net.txt"
     disk_stat after >> "$out/$report.disk.txt"
     mem_stat after >> "$out/$report.mem.txt"
