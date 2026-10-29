@@ -17932,11 +17932,18 @@ as before, and the same by session and by node with the nodes holding no replica
 the one the load drives) among the fleet's, where they had taken whichever session the placement
 listed first. The nodes take `FOCAL_IMAGE` as the generator and the bus do.
 
-| Bootstrap, box (Ryzen 9 9950X3D2), 33 nodes at 0.93 CPU | Sessions listed | On three voters in three zones | Nodes holding no replica | Most on one node |
+| Bootstrap | Sessions listed | On three voters in three zones | Nodes holding no replica | Most on one node |
 |---|---|---|---|---|
-| Before: ten plans from the founder in a burst (`focal:bench`, 9aded7cd) | 11 | 6 (5 refused `compare_failed`, not asked again) | 16 | 4 (`focal2`, `focal6`) |
-| After (`focal:s2`, this change), `run.sh focal 20 20 5 128`, NODES=33 | 11 | 11 | **0** | 1 |
-| After, NODES unset (3) | 1 | 1 | 0 | 1 |
+| Box (Ryzen 9 9950X3D2), 0.93 CPU a node, before: ten plans from the founder in a burst (`focal:bench`, 9aded7cd) | 11 | 6 (5 refused `compare_failed`, not asked again) | 16 | 4 (`focal2`, `focal6`) |
+| Box, 0.93 CPU, after (`focal:s2`, this change), `run.sh focal 20 20 5 128`, NODES=33 | 11 | 11 | **0** | 1 |
+| Box, 0.93 CPU, after, NODES unset (3) | 1 | 1 | 0 | 1 |
+| Box, 0.09 CPU a node (`HOST_CPUS=4`), after, the bootstrap alone: 427 s, and 389 s with the wait charged to progress | 11 | 11 | 0 | 1 |
+| GitHub runner (4 CPUs), 0.09 CPU a node, `compare.yml` nodes 33 (run 40884325974, f8db9f31) | 11 | 11 | **0** | 1 |
+
+On the runner the nodes joined in 76 s and the fleet was placed 15 min 44 s later, all 11 activated
+natively 16 s after that. The `inspect placement` it kept beside its report lists no plan pending
+and every session achieving survive zone with one failure. The run took 800 of 800 writes, none
+refused, unknown or abandoned.
 
 At 33 nodes each session is on one node of each zone. The 11 preferred leaders are the 11 zone-a
 founders, and each node holds one replica.
