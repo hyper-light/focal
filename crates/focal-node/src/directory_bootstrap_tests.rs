@@ -521,3 +521,23 @@ fn interrupted_activation_recovers_the_logged_request_before_selecting_a_success
 
 #[path = "directory_bootstrap_owner_tests.rs"]
 mod owner_tests;
+
+/// A group's replica proposes the root's authority snapshot only where its founder opens it alone
+/// (its one voter, no learner): a grown group's replica, the founder's among them, recovers from
+/// its log, and its permit is not refused for a snapshot it never proposes. With 500 agents
+/// enrolled the root's authority passed one command's bound, and the directory partition's two
+/// restarted voters were refused their permits until the end (2026-10-29).
+#[test]
+fn only_a_founder_alone_in_its_group_proposes_the_roots_authority() {
+    let one = BTreeMap::from([(1, 1)]);
+    let three = BTreeMap::from([(1, 1), (2, 1), (3, 1)]);
+    let none = BTreeMap::new();
+    assert!(founder_alone(1, 1, &one, &none));
+    // The group grew: no replica of it proposes the snapshot, the founder's included.
+    assert!(!founder_alone(1, 1, &three, &none));
+    assert!(!founder_alone(2, 1, &three, &none));
+    // A learner seated beside the founder, or another node as the one voter.
+    assert!(!founder_alone(1, 1, &one, &BTreeMap::from([(2, 1)])));
+    assert!(!founder_alone(1, 1, &BTreeMap::from([(2, 1)]), &none));
+    assert!(!founder_alone(2, 1, &one, &none));
+}

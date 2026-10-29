@@ -14,6 +14,8 @@ use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::{ContentHash, LedgerId, SessionId, TenantId};
 use std::collections::BTreeMap;
 
+/// The most of the root's enrollment registry the founder's first partition command carries: one
+/// control command's (`focal_control::ControlLimits::max_command_bytes`, 128 KiB by default).
 const MAX_ACTIVATION_BYTES: usize = 128 * 1024;
 const STARTUP_ROUNDS: usize = 16;
 
@@ -636,13 +638,24 @@ pub(crate) fn authorize_first_directory(
     else {
         return Err(DirectoryBootstrapError::Unauthorized);
     };
-    let encoded = postcard::experimental::serialized_size(&snapshot)
-        .map_err(|_| DirectoryBootstrapError::Capacity)?;
-    if encoded
-        .checked_add(4096)
-        .is_none_or(|bytes| bytes > MAX_ACTIVATION_BYTES)
-    {
-        return Err(DirectoryBootstrapError::Capacity);
+    // The snapshot is proposed, as the group's activation or an installation, only by a founder
+    // alone in its group (`PartitionBootstrapPermit::open`), and there it must fit one control
+    // command (the replica's `max_command_bytes`, its envelope and request beside it within 4 KiB).
+    // A group that grew past its founder is reopened from its own log, its leader sending
+    // what a replica lacks, and its permit is not refused for a snapshot it never proposes: the
+    // root's authority grows with every enrolled client (~175 B each), and with 500 agents
+    // enrolled it passed the bound, so two of the directory partition's three voters killed and
+    // started again were refused their permits ~690 times each and the partition never had a
+    // leader again (2026-10-29).
+    if founder_alone(plan.host, plan.founder_node, &group.voters, &group.learners) {
+        let encoded = postcard::experimental::serialized_size(&snapshot)
+            .map_err(|_| DirectoryBootstrapError::Capacity)?;
+        if encoded
+            .checked_add(4096)
+            .is_none_or(|bytes| bytes > owner.limits().max_command_bytes)
+        {
+            return Err(DirectoryBootstrapError::Capacity);
+        }
     }
     if snapshot.identity != owner.identity()
         || snapshot.source != owner.identity()
@@ -659,6 +672,17 @@ pub(crate) fn authorize_first_directory(
         expires_at,
         _allocation: allocation,
     })
+}
+
+/// Whether the replica `host` opens for a group proposes the root's authority snapshot: the
+/// group's founder, alone in it as the root's grant states it (its one voter, no learner).
+fn founder_alone(
+    host: u64,
+    founder: u64,
+    voters: &BTreeMap<u64, u64>,
+    learners: &BTreeMap<u64, u64>,
+) -> bool {
+    host == founder && voters.len() == 1 && voters.contains_key(&founder) && learners.is_empty()
 }
 
 /// Compute one small next intent from the control owner's opaque observation.
