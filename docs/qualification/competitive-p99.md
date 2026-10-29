@@ -48,6 +48,15 @@ not make replication strongly consistent (Jepsen; the Redis WAIT documentation).
 are run because they are what operators deploy; the claim is made against the
 durable rows.
 
+focal's node count is a parameter of the harness (`NODES`, `tools/compare/compose/focal-nodes.sh`):
+the comparison runs three, as each competitor does, on the same limits. A run of more measures
+focal alone at that size: node K in zone a, b or c as K-1 is 0, 1 or 2 modulo 3, each session on
+three of them, one a zone, and where the nodes and the generator would hold more CPUs than the
+host has, each node held to an equal share of what the generator leaves. Its report's file names
+the count (`-nodes33`). The host's kernel must hold every container's neighbours, (N+1)² entries in
+the one ARP table all its namespaces share; past 30 nodes that exceeds Linux's default of 1,024, so
+the bootstrap checks, and raises the limits only where `RAISE_HOST_LIMITS=1` allows it.
+
 ## Conditions
 
 Each system, at each durability, at offered rates of 1k, 4k, 16k and 64k records a

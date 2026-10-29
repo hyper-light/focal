@@ -3,7 +3,8 @@ name: Competitive tail latency
 # docs/qualification/competitive-p99.md: focal, Kafka, NATS JetStream and Redis
 # on equal terms, every acknowledged write on disk at a quorum, on a Linux
 # runner whose fsync reaches its disk (Docker Desktop's VM does not). Run by
-# hand: each system is three containers at one CPU each beside the generator.
+# hand: each system is three containers at one CPU each beside the generator
+# (focal's nodes as many as the nodes input asks, fit to the runner's CPUs).
 # Every system is measured on the same runner, one after another: the hosted
 # runners come with different disks (a network-attached virtual disk, or a
 # local NVMe), and a matrix gave each system a runner of its own — focal and
@@ -43,7 +44,10 @@ on:
         description: "deliver mode on focal: the messages go among this many enrolled agents, each a client of its own (focal-load's agents, 2..=4094); empty, one issuer and one consumer"
         default: ""
       faults:
-        description: "focal: what the cluster suffers while each load runs (run.sh FAULTS), e.g. 'netem=delay 80ms 30ms loss 3%;kill=focal2@40+30;isolate=focal3@100+20'; empty, none"
+        description: "focal: what the cluster suffers while each load runs (run.sh FAULTS), e.g. 'netem=delay 80ms 30ms loss 3%;kill=focal2@40+30;isolate=focal3@100+20', or nodes by list or count, 'kill=focal4,focal7@40+30;isolate=12@100+20'; empty, none"
+        default: ""
+      nodes:
+        description: "focal: the nodes its cluster runs (run.sh NODES, 3 to 203, over zones a, b and c; past three, fit to the runner's CPUs); empty, three, as each competitor runs"
         default: ""
 
 permissions:
@@ -134,6 +138,10 @@ jobs:
           MODE: ${{ github.event.inputs.mode || (startsWith(github.ref_name, 'compare/deliver') && 'deliver' || (startsWith(github.ref_name, 'compare/work') && 'work' || 'append')) }}
           AGENTS: ${{ github.event.inputs.agents || (startsWith(github.ref_name, 'compare/work') && '500' || '') }}
           FAULTS: ${{ github.event.inputs.faults || '' }}
+          NODES: ${{ github.event.inputs.nodes || '' }}
+          # The runner is the run's alone: the bootstrap may raise its kernel's neighbour table to
+          # hold every node's peers (focal-bootstrap.sh), which past three nodes the default may not.
+          RAISE_HOST_LIMITS: "1"
           # The competitors' images from the repository's registry where the image
           # job copied them (compose.yaml's defaults are the public sources).
           BENCH_LIBRARY: ${{ needs.image.outputs.registry || 'public.ecr.aws/docker/library' }}

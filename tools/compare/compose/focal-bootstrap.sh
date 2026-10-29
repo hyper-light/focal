@@ -1,13 +1,49 @@
 #!/bin/sh
 # Founds focal's arm of the comparison (docs/qualification/competitive-p99.md)
-# once `docker compose --profile focal up -d` has started it: the hosts join
-# by invitation, one session is placed on all three nodes (one zone each), it
-# is activated natively, and a client is enrolled in the generator's container
-# for focal-load. Every wait is bounded; every step may be run again.
+# once `docker compose -f compose.yaml -f focal-nodes.yaml --profile focal up -d`
+# has started it: the nodes focal-nodes.sh wrote (focal1 to focalN) join by
+# invitation, one session is placed on three of them (one zone each), it is
+# activated natively, and a client is enrolled in the generator's container for
+# focal-load. Every wait is bounded; every step may be run again.
 set -eu
 cd "$(dirname "$0")"
-DC="docker compose -f compose.yaml --profile focal"
+DC="docker compose -f compose.yaml -f focal-nodes.yaml --profile focal"
 f1() { $DC exec -T focal1 focal --data-dir /data "$@"; }
+# Every node as the model states it, in order (cluster.py nodes): NAME ADDRESS ZONE a line. focal1
+# founds the cluster; the others join it.
+table=$($DC config --format json | python3 cluster.py nodes)
+joiners=$(echo "$table" | awk '$1 != "focal1" { print $1 }')
+
+# The host's neighbour table holds every container's peers. Linux keeps one ARP table for every
+# network namespace on a host and, past its hard limit (net.ipv4.neigh.default.gc_thresh3, 1024 by
+# default), makes no entry; a node answers no ARP request from a sender it holds none for (the
+# kernel's arp_process replies once it holds the sender), so a container that must resolve a node
+# anew is never answered while nodes that hold their peers carry on. At 33 nodes the table refused
+# entries 105,155 times and the generator's client never reached the founder. Each container holds
+# at most an entry for every other container and the gateway: (N+1)^2 for N nodes and the generator,
+# beside what the host holds already. Past the soft limit (gc_thresh2) live entries are collected
+# and resolved again, so both limits must hold them. Read and raised in the Docker host's own
+# namespace (a container on the host's network: its kernel wherever Docker runs, a VM's included),
+# raised only where RAISE_HOST_LIMITS=1 allows it (a dedicated runner), refused otherwise.
+image=$($DC config --format json | python3 -c 'import json, sys; print(json.load(sys.stdin)["services"]["focal1"]["image"])')
+limits=$(docker run --rm --net host --entrypoint sh "$image" -c \
+  'cat /proc/sys/net/ipv4/neigh/default/gc_thresh2 /proc/sys/net/ipv4/neigh/default/gc_thresh3; awk "NR == 2 { print \$1 }" /proc/net/stat/arp_cache')
+soft=$(echo "$limits" | sed -n 1p)
+hard=$(echo "$limits" | sed -n 2p)
+held=$((0x$(echo "$limits" | sed -n 3p)))
+count=$(echo "$table" | wc -l)
+need=$((held + (count + 1) * (count + 1)))
+if [ "$soft" -lt "$need" ] || [ "$hard" -lt "$need" ]; then
+  if [ "${RAISE_HOST_LIMITS:-0}" != 1 ]; then
+    echo "the host's neighbour table holds $hard entries (gc_thresh3; gc_thresh2 $soft), $held of them held: $count nodes and the generator need $(((count + 1) * (count + 1))) more; set net.ipv4.neigh.default.gc_thresh2 and gc_thresh3 to $need at least, or let the run raise them (RAISE_HOST_LIMITS=1)" >&2
+    exit 2
+  fi
+  raised_soft=$need; [ "$soft" -gt "$need" ] && raised_soft=$soft
+  raised_hard=$need; [ "$hard" -gt "$need" ] && raised_hard=$hard
+  docker run --rm --privileged --net host --entrypoint sysctl "$image" -w \
+    "net.ipv4.neigh.default.gc_thresh2=$raised_soft" "net.ipv4.neigh.default.gc_thresh3=$raised_hard" >/dev/null
+  echo "the host's neighbour table raised for $count nodes and the generator: gc_thresh2 $soft -> $raised_soft, gc_thresh3 $hard -> $raised_hard ($held held already)"
+fi
 
 # A command retried until it succeeds, at most $1 times a second apart.
 retry() {
@@ -30,13 +66,23 @@ retry 300 authoritative focal1
 # typed `unavailable`, exit 6, retryable): each invitation is asked again,
 # bounded, until it is written.
 invite() { f1 invite node --node "$1" --output "/invite/$1.invite" >/dev/null; }
-for host in focal2 focal3; do
+for host in $joiners; do
   retry 120 invite "$host"
 done
-retry 300 serving focal2
-retry 300 serving focal3
+for host in $joiners; do
+  retry 300 serving "$host"
+done
+# Every node in the cluster's own view (cluster.py joined): its committed contact at its address,
+# and the directory seeing it alive in its zone. The work mode homes its agents on the contacts
+# listed, so a node not yet listed would be no agent's home.
+joined() {
+  contacts=$(f1 list nodes 2>/dev/null) || return 1
+  placement=$(f1 inspect placement 2>/dev/null) || return 1
+  printf '%s\n---\n%s\n' "$contacts" "$placement" | python3 cluster.py joined "$table"
+}
+retry 300 joined
 
-# Each session on all three nodes, surviving a zone: planned against the
+# Each session on three nodes, one in each zone, surviving a zone: planned against the
 # target, applied, then activated natively (whose first call may answer
 # `unavailable` while the session settles: the KIND campaign's D3).
 # A host that has joined is planned on once it has reported its load: until

@@ -1,0 +1,8 @@
+# A comparison node in zone a (focal-nodes.sh gives it nodes 1, 4, 7, ...): one region, three zones.
+version: 1
+topology:
+  region: "bench"
+  zone: "a"
+durability:
+  survive: node
+  max_failures: 0

@@ -17782,3 +17782,97 @@ no election ran in these rounds.
   repair due within each loss delay), so a lost answer waits for its retransmission.
 - **A client's leg.** A node's answers to its clients are sparse and uncoded; a lost one costs its
   write a probe timeout.
+
+### 2026-10-29 — The comparison harness runs any number of focal nodes
+
+Step 1 of the plan for a 30-node work flow: the compare harness ran exactly three focal nodes,
+`focal1` to `focal3`, written out in `compose.yaml`, and its faults named only those three.
+
+**The nodes, generated.** `tools/compare/compose/focal-nodes.sh` writes focal's nodes as a compose
+file beside `compose.yaml` for every run, `NODES` of them (3 where unset, as each competitor runs
+three). Node K is the service `focalK`: its data the volume `focalK`; its address 10.231.0.(20+K)
+on the bench network, which now hands addresses only from .224 up to containers given none (so
+`NODES` runs to 203); its configuration its zone's, zone a, b or c as K-1 is 0, 1 or 2 modulo 3
+(`focal-zone-a.yaml`, ..., the old per-node files renamed, their settings unchanged). `focal1`
+founds the cluster and every other node waits, a bounded wait, for its invitation. Each node holds
+`NODE_CPUS`, as the competitors' nodes do; past three nodes, where the nodes and the generator
+would hold more CPUs than the host has, each holds an equal share of what the generator leaves, in
+hundredths (a control group's least quota is 1 ms of Docker's 100 ms period): 0.09 CPU each for 33
+nodes on a 4-CPU runner, 3.97 CPUs held in all.
+
+**The join.** `focal-bootstrap.sh` reads the nodes from the compose model (`cluster.py nodes`),
+invites each after the founder, waits for each to serve, then waits until the cluster's own view
+holds every node and no other: each node's committed contact at its address (`list nodes`) and the
+directory seeing it alive in its zone (`inspect placement`). The work mode homes its agents on the
+contacts listed, so a node not yet listed would have been no agent's home. Every focal run keeps
+the generated nodes, the contacts and the placement beside its report (`<report>.cluster.yaml`,
+`.contacts.json`, `.placement.json`).
+
+**The faults.** `kill` and `isolate` name a node (`focalK`), a list (`focal4,focal7`), a count
+(`12`: any 12 of the nodes, drawn by a seed the log states, `FAULT_SEED` to draw the same again)
+or a role (`copy`, `leader`, mapped from the placement to its container by address). A set is
+killed in one `docker compose kill` and started in one call; each node's shaping, its 32 peer
+filters at 33 nodes included, is one call into it, and the nodes are shaped in parallel, as many at
+once as the host has CPUs (the three-node code's way, a call for each qdisc and each filter, would
+have made 34 calls a node, 1,122 one after another for 33). A directed shaping's peers are the
+model's addresses, so a node that is down keeps its filter. Every
+spec is checked before the cluster starts. A run of other than three nodes names them in its
+report's file (`-nodes33`). `run.sh` states that it needs bash 4.4 or later, which it already did
+(`mapfile`; empty arrays under `set -u`).
+
+**What 33 nodes on one host found: the host's neighbour table.** At 33 nodes every node joined,
+served and was listed alive in its zone, and then the generator's client could not enroll at the
+founder (`enrollment service is unavailable`), on the bare-metal box at 0.09 and at 0.93 of a CPU a
+node and on the GitHub runner alike. It was not focal's enrollment, the address plan or CPU. The
+generator could not even ping the founder, and with every address dynamic, as the three-node file
+had them, it lost every node within two minutes all the same (idle ping matrix: 0, then 2, then 33
+of 33 unreachable). A capture in both namespaces showed the generator's broadcast
+`who-has 10.231.0.21` reach the founder and get no reply, while in the same second the founder
+answered a unicast probe from a peer it already held. Linux keeps one neighbour table for every
+network namespace on a host. Past its hard limit (`net.ipv4.neigh.default.gc_thresh3`, 1024 by
+default; the box's `/proc/net/stat/arp_cache` counted 105,155 `table_fulls`) the kernel makes no
+entry, and `arp_process` answers a request only once it holds the sender. A mesh of N nodes and the
+generator holds up to (N+1)² entries, 1,156 at 33, so the bootstrap now checks the host's limits
+against what it already holds plus (N+1)². Where they fall short it refuses, naming the sysctls and
+values, or raises them where `RAISE_HOST_LIMITS=1` allows (`compare.yml` sets it for its dedicated
+runner). It reads and raises them from a container on the host's network, so the check holds on
+Docker Desktop's VM too.
+
+| Run (host, CPU a node) | All 33 serving | Joined, listed alive in their zones | Bootstrap |
+|---|---|---|---|
+| Box, Ryzen 9 9950X3D2, load 43–73; 0.09 | +42 s | +61 s, a 11, b 11, c 11 | client enrollment refused: neighbour limits at 512/1024 |
+| Box, 0.93 | by +68 s | yes | the same |
+| GitHub runner, EPYC 7763, 4 CPUs (run 40845098650); 0.09 | – | +89 s, a 11, b 11, c 11 | the same, at +224 s |
+| Box, 0.93, limits raised to 1,226 (test B) | – | a 11, b 11, c 11 | founded; 500 of 500 writes committed under faults |
+
+Test B's faults, from its `faults.txt`: netem on what each node sends its 32 peers, `any 3 of 33
+(seed 42, fault 2): focal1 focal16 focal21` killed in one call and started in one, `focal4 focal7`
+isolated and rejoined, and `leader is focal1` (read from a node still up) killed; every fault
+undone 26 s in. Idle at 33 nodes a node held 35–75 MiB, the 34 containers 1.8 GiB in all.
+
+**Three nodes as before.** The resolved model at three nodes differs from the old file only by the
+fixed addresses, the network's `ip_range` and the zone files' names (commands, image, CPUs, memory,
+capabilities and volumes the same). The comparison at three nodes (run 40845088093, work among 500
+agents) against the latest before it (run 40609035896): its report JSON has the same 134 keys at
+every rate, its files the same, with three beside them (`.cluster.yaml`, `.contacts.json`,
+`.placement.json`).
+
+| Claims a second | Run | Lifecycles | Writes | Refused, unknown, abandoned | Delivered, undelivered |
+|---|---|---|---|---|---|
+| 20 | before (40609035896) | 1,500 | 16,500 | 0, 0, 0 | 1,200, 0 |
+| 20 | NODES unset (40845088093) | 1,500 | 16,500 | 0, 0, 0 | 1,200, 0 |
+| 50 | before | 3,750 | 41,250 | 0, 0, 0 | 3,000, 0 |
+| 50 | NODES unset | 3,750 | 41,250 | 0, 0, 0 | 3,000, 0 |
+| 100 | before | 7,500 | 82,500 | 0, 0, 0 | 6,000, 0 |
+| 100 | NODES unset | 7,500 | 82,500 | 0, 0, 0 | 6,000, 0 |
+
+On the box the new harness also ran three nodes' work among 30 agents (500 lifecycles, every one
+written and judged) and NATS. Its focal-bus run failed: nodes 2 and 3 could not open the shared
+identity directory's keys, and the old harness's files failed the same way on the same image, so the
+failure predates this change. It is not fixed here.
+
+**For the plan's later steps.** Every node is a member of the root group (3 voters and 30 learners
+at 33 nodes). Idle, the founder, the root's leader, delivered 639 peer messages a second (a 100 ms
+tick to 32 followers, each way) and held 10.4% of a CPU against a node's 1.0%. At 0.09 of a CPU it
+is pinned at its quota (throttled in 74% of its periods). That is the CPU the sizing step has to
+fit.
