@@ -2,11 +2,15 @@
 # Founds focal's arm of the comparison (docs/qualification/competitive-p99.md)
 # once `docker compose -f compose.yaml -f focal-nodes.yaml --profile focal up -d`
 # has started it: the nodes focal-nodes.sh wrote (focal1 to focalN) join by
-# invitation, one session is placed on three of them (one zone each), it is
-# activated natively, and a client is enrolled in the generator's container for
-# focal-load. Every wait is bounded; every step may be run again.
+# invitation, the founder's session is placed on three of them (one zone each)
+# and activated natively, as many more sessions are placed and activated as it
+# takes for every node to hold a replica of one, and a client is enrolled in the
+# generator's container for focal-load. Every wait is bounded; every step may be
+# run again.
 set -eu
 cd "$(dirname "$0")"
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
 DC="docker compose -f compose.yaml -f focal-nodes.yaml --profile focal"
 f1() { $DC exec -T focal1 focal --data-dir /data "$@"; }
 # Every node as the model states it, in order (cluster.py nodes): NAME ADDRESS ZONE a line. focal1
@@ -98,6 +102,66 @@ applied() {
 }
 retry 60 applied
 retry 30 f1 activate native
+
+# Sessions across the whole fleet, the many groups of three that load every node: one session for
+# every node of the largest zone, each on three nodes in three zones, so that every node holds a
+# replica of one (cluster.py wanted: 11 at 33 nodes; one, the founder's, at three). Each of the
+# others is created on a node of the largest zone that no session seats yet, its first replica,
+# under the founder's tenant (the one an enrolled client's grant names), and planned from the
+# founder to the target's durability: the directory gives its other seats to the nodes of the other
+# zones that hold the fewest, counting the seats every plan before it committed. A plan is answered
+# `unavailable` until the founder's agent has seen the session registered, and `compare_failed`
+# where another commit moved the directory first: each is asked again, bounded. Once every session
+# is placed (cluster.py fleet), each is activated natively on the node it was created on, its
+# preferred leader.
+survive=$(sed -n 's/^ *survive: *"*\([a-z]*\)"*.*$/\1/p' focal-target.yaml)
+failures=$(sed -n 's/^ *max_failures: *\([0-9]*\).*$/\1/p' focal-target.yaml)
+tenant=$(f1 inspect identity | python3 -c '
+import json, sys
+identity = json.load(sys.stdin)
+tenant = identity.get("result", identity)["ledger"]["tenant"]
+print(tenant if isinstance(tenant, str) else bytes(tenant).hex())')
+wanted=$(python3 cluster.py wanted "$table")
+placement() { f1 inspect placement > "$tmp/placement.json"; }
+retry 60 placement
+for host in $(python3 cluster.py founders "$table" < "$tmp/placement.json"); do
+  retry 60 $DC exec -T "$host" focal --data-dir /data create session --tenant "$tenant" --name "fleet-$host" >/dev/null
+done
+# A session created is registered with the directory by its node's agent at its next pass: the
+# list is read once the directory lists every one.
+listed() {
+  placement 2>/dev/null && python3 cluster.py sessions "$table" < "$tmp/placement.json" > "$tmp/sessions" \
+    && [ "$(wc -l < "$tmp/sessions")" -ge "$wanted" ]
+}
+retry 120 listed
+planned() {
+  f1 plan session --tenant "$1" --session "$2" --survive "$survive" --max-failures "$failures" >/dev/null 2>&1
+}
+# The list is read on descriptor 3: `docker compose exec` reads its standard input.
+while read -r session_tenant session host <&3; do
+  retry 120 planned "$session_tenant" "$session"
+done 3< "$tmp/sessions"
+placed() {
+  placement 2>/dev/null && python3 cluster.py fleet "$table" < "$tmp/placement.json" > "$tmp/fleet.json" 2> "$tmp/fleet.txt"
+}
+if ! retry 300 placed; then
+  cat "$tmp/fleet.txt" >&2
+  exit 1
+fi
+cat "$tmp/fleet.txt"
+native() {
+  $DC exec -T "$1" focal --data-dir /data inspect replicas --replicas --session "$2" 2>/dev/null | python3 -c '
+import json, sys
+result = json.load(sys.stdin)["result"]
+sys.exit(0 if result.get("diagnostics", result)["native_active"] else 1)'
+}
+while read -r session_tenant session host <&3; do
+  if ! native "$host" "$session"; then
+    retry 30 $DC exec -T "$host" focal --data-dir /data activate native --session "$session" >/dev/null
+    retry 60 native "$host" "$session"
+  fi
+done 3< "$tmp/sessions"
+echo "$(wc -l < "$tmp/sessions" | tr -d ' ') sessions activated natively"
 
 # The generator's client, enrolled over QUIC like every competitor's client, and the
 # deliver mode's consumer, a client of its own that completes what the first issues.

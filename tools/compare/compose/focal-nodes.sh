@@ -16,6 +16,8 @@
 # focal1 founds the cluster; every other node waits for the invitation focal-bootstrap.sh writes
 # it, a bounded wait, then joins with it.
 #
+# The image: FOCAL_IMAGE where set, as for the generator and the bus (compose.yaml), else focal:bench.
+#
 # CPUs: each node holds NODE_CPUS (default 2), as each competitor's nodes and the generator do
 # (compose.yaml's limits). Past three nodes, where the nodes and the generator would hold more
 # CPUs than the host has (HOST_CPUS, else Docker's count), the nodes share what the generator
@@ -65,7 +67,7 @@ printf '%s\n' \
   "# focal's $nodes nodes in the comparison, written by focal-nodes.sh (NODES=$nodes, NODE_CPUS=$cpus):" \
   "# each node holds $node_cpus CPUs. Not kept in the repository: run.sh writes it for every run." \
   "x-focal-node: &focal-node" \
-  "  image: focal:bench" \
+  "  image: \${FOCAL_IMAGE:-focal:bench}" \
   "  profiles: [focal]" \
   "  cpus: \"$node_cpus\"" \
   "  mem_limit: 2g" \

@@ -53,7 +53,12 @@ the comparison runs three, as each competitor does, on the same limits. A run of
 focal alone at that size: node K in zone a, b or c as K-1 is 0, 1 or 2 modulo 3, each session on
 three of them, one a zone, and where the nodes and the generator would hold more CPUs than the
 host has, each node held to an equal share of what the generator leaves. Its report's file names
-the count (`-nodes33`). The host's kernel must hold every container's neighbours, (N+1)² entries in
+the count (`-nodes33`). The cluster holds a session for every node of the largest zone (11 at 33
+nodes, the founder's alone at three), so every node holds a replica of one: the bootstrap creates
+each on a node of that zone and plans it from the founder, and the directory seats the other two
+on the nodes of the other zones that hold the fewest. The run keeps `inspect placement` beside its
+report, and the same by session and by node with the nodes holding no replica counted
+(`<report>.sessions.json`, `cluster.py fleet`). The host's kernel must hold every container's neighbours, (N+1)² entries in
 the one ARP table all its namespaces share; past 30 nodes that exceeds Linux's default of 1,024, so
 the bootstrap checks, and raises the limits only where `RAISE_HOST_LIMITS=1` allows it.
 

@@ -84,7 +84,8 @@ impl PlacementAgent {
             self.leader_balancer.held_bytes(),
             self.home_balancer.held_bytes(),
             self.leading.as_ref().map_or(Some(0), |leading| {
-                map_bytes::<u64, u64>(leading.counts.len())
+                map_bytes::<u64, u64>(leading.counts.len())?
+                    .checked_add(map_bytes::<u64, u64>(leading.held.len())?)
             }),
         ];
         parts.extend(self.fences.values().map(|fence| fence.bytes().ok()));
@@ -135,8 +136,10 @@ impl PlacementAgent {
     /// table for each node they list, every session's rows
     /// (`session_rows`), and a row in every per-partition table for each.
     pub(super) fn pass_bytes(observed: &[Observed]) -> Option<usize> {
+        // A node's region, its facts, where sessions are led and where they
+        // are seated.
         let node_rows = map_entry_bytes::<u64, RegionId>()?
-            .checked_add(map_entry_bytes::<u64, u64>()?.checked_mul(2)?)?;
+            .checked_add(map_entry_bytes::<u64, u64>()?.checked_mul(3)?)?;
         let partition_rows = map_entry_bytes::<focal_directory::PartitionId, (i64, u64)>()?
             .checked_add(map_entry_bytes::<
                 focal_directory::PartitionId,

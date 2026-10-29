@@ -1297,6 +1297,7 @@ impl PlacementAgent {
                 counts: &leading.counts,
                 current: Some(descriptor.active.placement.preferred_leader),
             },
+            &leading.held,
             config.max_members,
             config.min_disk_available,
         );
@@ -1439,12 +1440,16 @@ impl PlacementAgent {
     ) -> Result<Option<AgentStep>, AgentError> {
         let config = self.partition_config();
         let proposal = if self.home_balancer.config().enabled {
-            focal_directory::home_move(
+            let leading = self.take_leading(directory);
+            let proposal = focal_directory::home_move(
                 descriptor,
                 &directory.nodes,
+                &leading.held,
                 config.max_members,
                 config.min_disk_available,
-            )
+            );
+            self.leading = Some(leading);
+            proposal
         } else {
             None
         };

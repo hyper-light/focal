@@ -25,7 +25,10 @@
 #   (focal-nodes.sh, written beside compose.yaml for every run: 3 to 203, 3 where unset, as every
 #   competitor runs three). Past three, nodes that would hold more CPUs than the host has beside
 #   the generator share what it leaves (fractions of a CPU). A run of other than three names them
-#   in its report's file (`-nodes33`).
+#   in its report's file (`-nodes33`). The bootstrap places a session for every node of the
+#   largest zone, each on three nodes in three zones, so every node holds a replica of one (11 at
+#   33 nodes, the founder's alone at three); the run keeps the placement beside its report
+#   (`<report>.placement.json`, and by session and node in `<report>.sessions.json`).
 #   FAULTS (environment), focal: what the cluster suffers while the load runs, `;`-separated,
 #   each timed from the load's start (its warm-up included), every one undone by the run's end
 #   and logged with its time (`<report>.faults.txt`):
@@ -248,14 +251,14 @@ fault_shape_to() {
   done
   dc exec -T "$node" sh -c "$script"
 }
-# The node that holds ROLE in the bench session's placement now, from the first node that answers,
-# and what it holds (cluster.py role): NAME SESSION COPIES LEADER. Nothing where no node answers or
-# none holds the role.
+# The node that holds ROLE in the bench session's placement now (the session the load drives, among
+# the fleet's), from the first node that answers, and what it holds (cluster.py role): NAME SESSION
+# COPIES LEADER. Nothing where no node answers or none holds the role.
 fault_node() {
   local role=$1 n placement
   for n in "${focal_nodes[@]}"; do
     placement=$(timeout 30 "${compose[@]}" --profile focal exec -T "$n" focal --data-dir /data inspect placement 2>/dev/null) || continue
-    python3 cluster.py role "$role" "$table" <<< "$placement"
+    python3 cluster.py role "$role" "$table" "$bench_session" <<< "$placement"
     return
   done
   return 1
@@ -492,16 +495,25 @@ case "$system" in
     fi
     bash focal-bootstrap.sh
     # The cluster the run measured: its nodes as written (their addresses, zones and limits), the
-    # contacts they committed and the directory's placement of them and of the bench session.
+    # contacts they committed and the directory's placement of them and of its sessions, the bench
+    # session's and the fleet's (`inspect placement`), and that placement by session and by node,
+    # with the nodes that hold no replica counted (cluster.py fleet: none, as the bootstrap left it).
     cp focal-nodes.yaml "$out/$report.cluster.yaml"
     timeout 30 "${compose[@]}" --profile focal exec -T focal1 focal --data-dir /data list nodes \
       > "$out/$report.contacts.json" 2>/dev/null || true
     timeout 30 "${compose[@]}" --profile focal exec -T focal1 focal --data-dir /data inspect placement \
       > "$out/$report.placement.json" 2>/dev/null || true
-    worker=$(dc exec -T focal1 focal --data-dir /data inspect identity | python3 -c '
+    python3 cluster.py fleet "$table" < "$out/$report.placement.json" > "$out/$report.sessions.json" || true
+    identity=$(dc exec -T focal1 focal --data-dir /data inspect identity)
+    worker=$(python3 -c '
 import json, sys
 w = json.load(sys.stdin)["worker"]
-print(w if isinstance(w, str) else bytes(w).hex())')
+print(w if isinstance(w, str) else bytes(w).hex())' <<< "$identity")
+    # The bench session: the founder's, the one the load drives and FAULTS' roles name.
+    bench_session=$(python3 -c '
+import json, sys
+s = json.load(sys.stdin)["ledger"]["session"]
+print(s if isinstance(s, str) else bytes(s).hex())' <<< "$identity")
     total=$(( rate * (seconds + warmup) ))
     # focal-load's most callers at every rate, each paced from its intended
     # start, so the offered rate is the same whatever the callers. One request

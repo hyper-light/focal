@@ -12,15 +12,34 @@ of them (focal-nodes.sh writes the model; run.sh and focal-bootstrap.sh ask this
                                   at its address, and the directory sees it alive in its zone.
                                   Prints the nodes by zone and exits 0 when it does; exits 1 when
                                   not yet
-    cluster.py role ROLE TABLE < PLACEMENT
-                                  the node holding ROLE in the bench session's placement:
-                                  `leader`, its preferred leader, or `copy`, a content copy other
-                                  than the preferred leader. Prints NAME SESSION COPIES LEADER;
-                                  exits 1 when no node of TABLE holds it
+    cluster.py role ROLE TABLE SESSION < PLACEMENT
+                                  the node holding ROLE in the placement of SESSION (the bench
+                                  session's, among the fleet's): `leader`, its preferred leader,
+                                  or `copy`, a content copy other than the preferred leader.
+                                  Prints NAME SESSION COPIES LEADER; exits 1 when no node of TABLE
+                                  holds it
     cluster.py pick SEED COUNT NAME...
                                   COUNT of the NAMEs, each as likely as any other, the same ones
                                   for the same SEED
+    cluster.py wanted TABLE      the sessions the fleet holds: one for every node of its largest
+                                  zone (11 at 33 nodes, 1 at three)
+    cluster.py founders TABLE < PLACEMENT
+                                  the nodes that found the fleet's sessions still to be made, one
+                                  a line: a session for every node of the largest zone (`wanted`),
+                                  so each is founded on a node of it that no session seats yet
+    cluster.py sessions TABLE < PLACEMENT
+                                  every session the directory lists: TENANT SESSION FOUNDER, its
+                                  founder the node that holds its first replica
+    cluster.py fleet TABLE < PLACEMENT
+                                  whether the sessions sit across the whole fleet: as many as the
+                                  largest zone has nodes, each placed (no plan pending) on three
+                                  voters in three zones, the directory holding each to survive a
+                                  zone, and every node of TABLE a voter of one at least. Writes the
+                                  placement by node and by session as JSON (the run keeps it beside
+                                  its report) and a line saying how it stands to stderr; exits 0
+                                  when it holds, 1 when not yet
 """
+import collections
 import json
 import random
 import re
@@ -80,7 +99,7 @@ def joined(expected, views):
     return True
 
 
-def role(name, expected, document):
+def role(name, expected, document, wanted_session):
     placement = placement_of(document)
     by_address = {f"{address}:7443": node for node, address, _ in expected}
     containers = {}
@@ -91,6 +110,8 @@ def role(name, expected, document):
                 containers[node["node"]] = container
     for partition in placement["partitions"]:
         for session in partition["sessions"]:
+            if session["session"] != wanted_session:
+                continue
             leader = session["preferred_leader"]
             held = [leader] if name == "leader" else sorted(c for c in session["content_copies"] if c != leader)
             for node in held:
@@ -100,14 +121,138 @@ def role(name, expected, document):
     return False
 
 
+def wanted(expected):
+    """The sessions the fleet holds: one for every node of the largest zone, each session on one
+    node of each zone, so that every node holds a replica of one (the smaller zones' nodes, where
+    the zones differ in size, of one or two)."""
+    return max(collections.Counter(zone for _, _, zone in expected).values())
+
+
+def by_address(expected, placement):
+    """Each node the directory lists, by its identity: its name in TABLE, found by the address it
+    advertises."""
+    names = {f"{address}:7443": name for name, address, _ in expected}
+    found = {}
+    for partition in placement["partitions"]:
+        for node in partition["nodes"]:
+            name = names.get(node.get("advertise"))
+            if name:
+                found[node["node"]] = name
+    return found
+
+
+def listed(placement):
+    """Every session the directory lists, refused where the view leaves sessions or nodes out."""
+    if any(partition.get("truncated") for partition in placement["partitions"]):
+        sys.exit("the placement view is truncated (it lists at most 48 sessions and 128 nodes a "
+                 "partition): the fleet cannot be read from it")
+    return [session for partition in placement["partitions"] for session in partition["sessions"]]
+
+
+def seated(session):
+    """The voters a session has, or will have once the plan under way is done."""
+    pending = session.get("pending")
+    return pending["voters"] if pending else session["voters"]
+
+
+def founders(expected, document):
+    placement = placement_of(document)
+    names = by_address(expected, placement)
+    sessions = listed(placement)
+    taken = {names.get(voter) for session in sessions for voter in seated(session)}
+    sizes = collections.Counter(zone for _, _, zone in expected)
+    # The largest zone, the first of the largest in TABLE's order where several are.
+    largest = next(zone for _, _, zone in expected if sizes[zone] == max(sizes.values()))
+    free = [name for name, _, zone in expected if zone == largest and name not in taken]
+    for name in free[:max(0, wanted(expected) - len(sessions))]:
+        print(name)
+
+
+def sessions_of(expected, document):
+    placement = placement_of(document)
+    names = by_address(expected, placement)
+    for session in listed(placement):
+        founder = names.get(session.get("founder"))
+        if not founder:
+            sys.exit(f"session {session['session']}'s founder {session.get('founder')} is no node of the table")
+        print(session["tenant"], session["session"], founder)
+
+
+def fleet(expected, document):
+    placement = placement_of(document)
+    names = by_address(expected, placement)
+    zone_of = {name: zone for name, _, zone in expected}
+    sessions = listed(placement)
+    record = {"sessions": [], "nodes": {name: [] for name, _, _ in expected}}
+    unplaced = []
+    for session in sessions:
+        voters = [names.get(voter, str(voter)) for voter in session["voters"]]
+        zones = sorted({zone_of.get(name) for name in voters if name in zone_of})
+        placed = (
+            session.get("pending") is None
+            and len(voters) == 3
+            and len(zones) == 3
+            and session.get("achieved_survive") == "Zone"
+            and (session.get("achieved_max_failures") or 0) >= 1
+        )
+        if not placed:
+            unplaced.append(session["session"])
+        record["sessions"].append({
+            "tenant": session["tenant"],
+            "session": session["session"],
+            "voters": voters,
+            "zones": zones,
+            "preferred_leader": names.get(session["preferred_leader"], str(session["preferred_leader"])),
+            "founder": names.get(session.get("founder"), str(session.get("founder"))),
+            "achieved_survive": session.get("achieved_survive"),
+            "achieved_max_failures": session.get("achieved_max_failures"),
+            "pending": session.get("pending") is not None,
+        })
+        for name in voters:
+            if name in record["nodes"]:
+                record["nodes"][name].append(session["session"])
+    holding_none = [name for name, held in record["nodes"].items() if not held]
+    record["count"] = {
+        "nodes": len(expected),
+        "sessions": len(sessions),
+        "sessions_wanted": wanted(expected),
+        "sessions_not_placed_in_three_zones": len(unplaced),
+        "nodes_holding_no_replica": len(holding_none),
+        "most_replicas_a_node": max((len(held) for held in record["nodes"].values()), default=0),
+    }
+    json.dump(record, sys.stdout, indent=1, sort_keys=True)
+    print()
+    holds = len(sessions) == wanted(expected) and not unplaced and not holding_none
+    print(
+        f"{len(sessions)} sessions of {wanted(expected)} over {len(expected)} nodes: "
+        f"{len(sessions) - len(unplaced)} placed on three voters in three zones; "
+        f"nodes holding no replica: {len(holding_none)}"
+        + (f" ({', '.join(holding_none)})" if holding_none else "")
+        + ("" if holds else "; not yet"),
+        file=sys.stderr,
+    )
+    return holds
+
+
 def main(argv):
     if len(argv) >= 1 and argv[0] == "nodes":
         nodes(json.load(sys.stdin))
         return 0
     if len(argv) == 2 and argv[0] == "joined":
         return 0 if joined(table(argv[1]), sys.stdin.read()) else 1
-    if len(argv) == 3 and argv[0] == "role" and argv[1] in ("leader", "copy"):
-        return 0 if role(argv[1], table(argv[2]), json.load(sys.stdin)) else 1
+    if len(argv) == 4 and argv[0] == "role" and argv[1] in ("leader", "copy"):
+        return 0 if role(argv[1], table(argv[2]), json.load(sys.stdin), argv[3]) else 1
+    if len(argv) == 2 and argv[0] == "wanted":
+        print(wanted(table(argv[1])))
+        return 0
+    if len(argv) == 2 and argv[0] == "founders":
+        founders(table(argv[1]), json.load(sys.stdin))
+        return 0
+    if len(argv) == 2 and argv[0] == "sessions":
+        sessions_of(table(argv[1]), json.load(sys.stdin))
+        return 0
+    if len(argv) == 2 and argv[0] == "fleet":
+        return 0 if fleet(table(argv[1]), json.load(sys.stdin)) else 1
     if len(argv) >= 3 and argv[0] == "pick":
         count, names = int(argv[2]), argv[3:]
         if not 1 <= count <= len(names):
