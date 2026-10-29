@@ -499,7 +499,15 @@ impl NativeSessionError {
                 | ConsensusError::PersistencePending
                 | ConsensusError::CheckpointIndex,
             ) => Retryable,
-            Self::Consensus(ConsensusError::NotLeader { .. }) | Self::NotReady { .. } => Authority,
+            // Authority moving: a member that does not lead, or a leader handing its leadership
+            // over or no member of what it leads (`LeaderLeaving`, focal-consensus
+            // `proposal_refused`). The proposal was dropped, nothing of it in the log, and what
+            // waits for it is kept or answered as authority moving is; classed fail-closed, a
+            // participant's write flushed during a transfer back to the restarted preferred
+            // leader stopped the new leader's replica, and its session kept no quorum until the
+            // old leader came back (twelve of 33 nodes killed, 2026-10-29).
+            Self::Consensus(ConsensusError::NotLeader { .. } | ConsensusError::LeaderLeaving)
+            | Self::NotReady { .. } => Authority,
             Self::Consensus(_)
             | Self::Codec(_)
             | Self::Checkpoint(_)

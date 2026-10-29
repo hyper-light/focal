@@ -710,6 +710,57 @@ fn a_batch_held_past_its_leaders_deposition_is_never_proposed() {
     cluster.assert_same_state(&[1, 2, 3, 4]);
 }
 
+/// A batch flushed while its leader hands its leadership over is dropped by the log, as Raft drops
+/// every proposal during a transfer: authority moving, not a failure. The leader keeps its
+/// candidates and its replica, the next term's barrier resolves them, and each, asked again of the
+/// new leader, commits once. A drop classed fail-closed stopped the replica of a new leader
+/// handing back to the restarted preferred leader, and its session kept no quorum (twelve of 33
+/// nodes killed, 2026-10-29).
+#[test]
+fn a_batch_flushed_while_its_leader_hands_over_is_kept_not_failed() {
+    let mut cluster = Cluster::new();
+    cluster.elect(1, &[]);
+    let first = cluster.creation(1);
+    cluster.commit(1, PARTIES.issuer, first, &[]);
+    cluster.node(1).engine.set_proposals_deferred(true);
+    let mut held = Vec::new();
+    for claim in 2..=4u128 {
+        let input = cluster.creation(claim);
+        held.push((input.request, claim));
+        let NativeSubmission::Pending { .. } = cluster.propose(1, PARTIES.issuer, input) else {
+            panic!("fresh candidates are pending");
+        };
+    }
+    let before = cluster.node(1).consensus.last_index().unwrap();
+    // The handover begins; nothing of it delivered yet, the leader still leads.
+    cluster.node(1).transfer_leader(2).unwrap();
+    assert!(cluster.node(1).is_authoritative());
+    let node = cluster.node(1);
+    assert!(
+        node.engine.flush_deferred(&mut node.consensus).is_none(),
+        "a dropped proposal is not a refusal that stops the session"
+    );
+    node.engine.set_proposals_deferred(false);
+    assert!(!cluster.node(1).engine.failed);
+    assert_eq!(cluster.node(1).consensus.last_index().unwrap(), before);
+    assert_eq!(cluster.node(1).pending_count(), 3);
+    cluster.settle(&[]);
+    assert!(cluster.failed.is_empty(), "{:?}", cluster.failed);
+    assert_eq!(cluster.authority(&[]), Some(2));
+    assert_eq!(
+        cluster.node(1).pending_count(),
+        0,
+        "resolved by the new term's barrier"
+    );
+    for (key, claim) in held {
+        assert_eq!(cluster.node(1).outcome(key).unwrap(), None);
+        let retried = cluster.commit(2, PARTIES.issuer, creation_for(key, claim), &[]);
+        assert_eq!(retried.invocation, NativeInvocation::Request(key));
+    }
+    cluster.settle(&[]);
+    cluster.assert_same_state(&[1, 2, 3, 4]);
+}
+
 /// A batch the leader's log has no room for whole, beside a write it holds
 /// uncommitted, is proposed a candidate at a time, as many as there is room
 /// for. The rest wait and owe no drain (each would propose nothing until room
