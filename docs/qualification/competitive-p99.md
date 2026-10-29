@@ -60,7 +60,19 @@ on the nodes of the other zones that hold the fewest. The run keeps `inspect pla
 report, and the same by session and by node with the nodes holding no replica counted
 (`<report>.sessions.json`, `cluster.py fleet`). The host's kernel must hold every container's neighbours, (N+1)² entries in
 the one ARP table all its namespaces share; past 30 nodes that exceeds Linux's default of 1,024, so
-the bootstrap checks, and raises the limits only where `RAISE_HOST_LIMITS=1` allows it.
+the bootstrap checks, and raises the limits only where `RAISE_HOST_LIMITS=1` allows it. Memory
+follows the CPUs' rule: each node holds `NODE_MEMORY` (2g, as the competitors' nodes), and where
+the nodes and the generator's limit would hold more than the host has available (its
+MemAvailable) each node holds an equal share of what the generator leaves, refused below the
+86 MiB whose three quarters is a node's least envelope. A run keeps its containers' memory beside
+its report (`<report>.mem.txt`: each one's current, peak, limit, OOM kills; `.mem-samples.txt`:
+the cluster's total a second) and `tools/compare/fit.py` tabulates how the cluster fit its host.
+Thirty-three nodes do not fit GitHub's 4-CPU runner: at 0.09 of a CPU each the founder, which
+leads the root, the directory and its own session, is held at its quota even at 2 claims a second
+(run 40876994584), and the fleet's eleven sessions take longer to place than the bootstrap waits
+(9 of 11, run 40876981991). The 30-node work flow runs on a larger host, fedora (Intel Core
+i9-14900HX, 32 threads, 62.5 GiB, NVMe): `NODES=33 NODE_MEMORY=512m` (0.90 of a CPU and 512 MiB a
+node), 500 agents, 220 claims a second (09, 2026-10-29).
 
 ## Conditions
 

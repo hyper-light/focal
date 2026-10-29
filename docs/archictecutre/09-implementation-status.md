@@ -17977,3 +17977,137 @@ identity, and the founder's is the least (locally: `sole 5407403133156177438 fou
 5407403133156177438`). The hosts had been kept only while their load reports, sent before their
 copies were installed, still counted none. The test reads from whichever node keeps the seat and
 passes (37 s).
+
+### 2026-10-29 — Thirty-three nodes and a host for them: what a node holds, and the rate
+
+Step 4 of the plan for a 30-node work flow: measure what a node holds at the least envelope and
+under the work load, choose the host, and size the offered rate so the run measures completion
+under load and not the host's saturation.
+
+**Each node pulled the directory from its leader four times a second.** Every node's placement
+agent observes every partition on each 250 ms pass (24 §7). Where another node leads the partition,
+it read the partition's checkpoint (`ControlRead::State`) and its installed authority
+(`ControlRead::Authority`) from that leader, both in full, every pass, whatever had changed. Seen in
+the founder's network namespace (a capture beside it, 33 idle nodes on fedora at 0.93 CPU a node):
+every ~262 ms each of the 30 other nodes sent a 135-byte read and was answered with 6.4 KB of
+checkpoint, then a 126-byte read answered with 42 KB of authority. The authority grows with every
+enrolled client (~175 B each: 130 KB a pull with 500 agents enrolled), so the founder, which leads
+the directory partition, sent 6.1 MB/s to nodes doing nothing, and 16.5 MB/s with the agents
+enrolled. From level 11 (`upgrade::OBSERVE_LEVEL`) a node names what it holds in each read
+(`ControlRead::StateUnless`, `AuthorityUnless`), and the leader answers an unchanged checkpoint or
+authority with the index it reached and, for the authority, its decision time (`StateHeld`,
+`AuthorityHeld`): every change to a checkpoint moves a revision, and a partition replaces its
+installed authority only with a copy taken from the root later (24 §7, §21). The node rebuilds the
+export the full read would have sent, byte for byte (the test below checks it), and keeps what it
+read charged with the agent's tables.
+
+| 33 idle nodes, 500 agents enrolled, fedora, 0.93 CPU a node | Before | After |
+|---|---|---|
+| Founder's CPU (it leads the root and the directory) | 0.344 | 0.127 |
+| Founder sends | 16.5 MB/s | 0.69 MB/s |
+| The three nodes beside it in the partition, each | 0.08 | 0.04 |
+| Any other node | 0.031–0.036 | 0.016–0.018 |
+| All 33 nodes' CPU | 1.51 | 0.71 |
+
+Bytes fell 24 times, the founder's CPU 2.7: what is left is the asking itself, 240 small
+linearizable reads a second at 33 nodes (each node twice a pass), each a read round at the
+partition's voters. A read the leader holds until something changes, answered without a round
+(Consul's blocking queries, Kafka's `fetch.max.wait.ms`, focal's own inbox waits), is the step
+after; it is not in this change.
+
+Tests: `focal-control` `authority_control::a_partition_held_by_its_reader_is_answered_by_index_until_it_changes`
+(held answers while nothing changed, each charged as the read it may answer in full; a command
+answers the checkpoint in full and the authority by index and decision time; an authority installed
+from a newer root is answered in full; what the reader rebuilds equals the full export each time)
+and `rpc::tests::peer_selector_preflight_never_decodes_submit_body_and_preserves_wire_ordinals`
+(the two reads are tags 15 and 16, open to the read-only ingress, their answers tags 14 and 15);
+`focal-node`'s placement agent tests (13, the three-host ones on the conditional reads); the upgrade
+journey (`deployment_upgrade`) recorded at level 11.
+
+**What a node holds at the least envelope.** A node takes three quarters of its container's limit
+as its envelope, never less than 64 MiB (`memory_envelope.rs`). The founder alone, before any node
+joined (fedora, `memory.current` and its budget's charges from `inspect node --metrics`):
+
+| Container limit (envelope) | Held (`memory.current`) | Charged to its budget | First `invite node` |
+|---|---|---|---|
+| 128 MiB (96 MiB) | 38.2 MB | 78.8 MB, 68.2 MB of it payload | refused `[capacity]` |
+| 192 MiB (144 MiB) | 38.8 MB | 78.8 MB | written |
+| 256 MiB (192 MiB) | 38.5 MB | 78.8 MB | written |
+
+A node charges ~75 MiB at rest whatever its envelope, twice what it holds: one 64 MiB reservation
+of payload, the same at every limit (and at 2 GiB on the runner), whose source is not yet found,
+and each enrollment call reserves four frames of 10 MiB besides, whatever it carries
+(`network_control.rs` `call_round`, even on the founder's local path). At 128 MiB the founder
+could not invite a node (GitHub run 40877007075 stopped there too: 120 invitations refused, the
+bootstrap gave up). In the fleet each node also funds one session copy of half the founder's
+envelope, so 256 MiB is the least container that holds the 30-node layout: at 256 MiB (below) every
+lifecycle was written and judged and no node reached its limit (`memory.events` max 0), the founder
+peaking at 224 MiB, 88% of it. Both reservations are worst-case accounting, open here.
+
+**GitHub's 4-CPU runner holds 33 nodes' memory, not their CPU.** Past three nodes each node holds
+an equal share of what the generator leaves: on the runner (4 vCPUs, 15,984 MiB) 0.09 of a CPU and
+392 MiB. The founder leads the root (32 members), the directory partition and its own session:
+
+| Run on the runner (all 33 nodes at 0.09 CPU) | Outcome |
+|---|---|
+| 40858083086 (step 1), append, 20 writes/s | 800 of 800; founder throttled in 100% of its periods |
+| 40870632050 (step 2), work, eleven sessions | 8 of 11 placed after 20 min; bootstrap gave up |
+| 40876981991, work, 45 agents | 9 of 11 placed at the bootstrap's bound; gave up |
+| 40876994584, work, 500 agents, 2 claims/s | 150 of 150 written and judged; founder 0.089 CPU, throttled in 100% of periods; write p50/p99 88.7/398.7 ms; 4,171 MiB held at once, the host's available memory never below 10,789 MiB |
+
+Even after the reads above, the founder at rest (500 agents enrolled) used 0.13 of a CPU on
+fedora: past the runner's 0.09 before any work. A run there measures the founder's quota, not completion.
+
+**The host: fedora** (kiln runner kiln-a094a12d.attlocal.net): Intel Core i9-14900HX, 8 performance
+and 16 efficiency cores, 32 threads, 62.5 GiB, Samsung 9100 PRO 8 TB NVMe under btrfs. Each node
+0.90 of a CPU (the harness's rule: (32 − 2) / 33, the generator holding 2) and 512 MiB
+(`NODE_MEMORY=512m`, against the 1.6 GiB the memory rule would give it: two and a half times the
+most a node held, so the host's memory stays the other tenants'). The generator 2 CPUs and 2 GiB
+(compose.yaml's limits). The nodes' limits come to 29.7 CPUs and 16.5 GiB, 31.7 and 18.5 with the
+generator's.
+
+**Under the work load.** `run.sh` drives one session (the founder's), so each run gave it one
+ledger's share of the 30-node run: 45 agents (500 / 11) at R / 11 claims a second. Every node holds
+one replica in the fleet (11 sessions × 3), so a node of a session at R / 11 holds what each node
+holds at R; the founder is that session's leader as it is in the fleet. Each 60 s measured after
+15 s, NODES=33, 11 sessions placed:
+
+| fedora run | Founder CPU (of 0.90) | Session's followers | Any other node, max | Most a node held | Held at once |
+|---|---|---|---|---|---|
+| 45 agents, 10/s (R = 110), 1.6 GiB nodes | 0.483 (54%) | 0.249 | 0.029 | 169 MiB | 3,417 MiB |
+| 45 agents, 20/s (R = 220), 1.6 GiB nodes | 0.573 (64%) | 0.315 | 0.059 | 213 MiB | 3,547 MiB |
+| 45 agents, 20/s (R = 220), **512 MiB nodes** | 0.589 (65%) | 0.306 | 0.060 | 209 MiB | 3,538 MiB |
+| 45 agents, 20/s (R = 220), 256 MiB nodes | 0.562 (62%) | 0.328 | 0.027 | 224 MiB | 3,576 MiB |
+| 500 agents, 5/s, 1.6 GiB nodes | 0.431 (48%) | 0.191 | 0.083 | 197 MiB | 4,190 MiB |
+
+Every run: every lifecycle written and judged (750, 1,500, 1,500, 1,500, 375), none refused,
+unknown, abandoned or undelivered; no container killed for memory; the most throttled node in at
+most 0.5% of its periods. Writes p50/p99 22.9/84.9, 27.9/65.5, 27.6/76.5, 26.7/80.4 and
+13.1/92.8 ms. The generator with 500 agents: 0.106 of a CPU and 656 MiB at most (0.083 and 652 MiB
+on the runner). The host's least available memory in any run: 51,665 MiB of 64,019.
+
+**The disk.** One session at R = 220's share flushed 309 times a second (4,061 writes, 52.7 MB/s);
+fitted over the two rates, the cluster flushes ~253 a second at rest and ~2.8 more for each claim a
+second. With 33 writers at once the drive took 4,707 synced 4 KiB writes a second (one writer: 326,
+3.1 ms each). The eleven sessions at 220 claims a second flush ~870 times a second: under a fifth of
+that.
+
+**The offered rate: 220 claims a second**, 20 for each of the 11 sessions. At it the busiest node,
+the founder, uses 65% of its CPU and is held back in under 1% of its periods; a session's followers
+a third of theirs; the drive's flushes stay under a fifth of what 33 writers get from it; the
+cluster holds under 6% of the host's memory; the generator, by its cost a claim here, ~0.75 of its
+2 CPUs. So a lifecycle that
+waits waits on focal, not on a quota, the drive or the host: completion under load. It is also the
+20 claims a second a session carried in the comparison's work runs at three nodes.
+
+**The harness.** `focal-nodes.sh` fits memory as it fits CPUs (`NODE_MEMORY`, the host's
+MemAvailable read in a container, refused below 86 MiB a node); `run.sh` keeps every container's
+memory before and after the load (`<report>.mem.txt`: current, peak, limit, `memory.events`, CPU
+quota, Docker's `OOMKilled`) and the cluster's total a second while it runs
+(`<report>.mem-samples.txt`); `tools/compare/fit.py` tabulates each run's fit (`compare.yml`
+prints it, and takes `node_memory`).
+
+**Open.** The asking itself (above); the 64 MiB payload a node charges at rest and the enrollment
+call's 40 MiB, which keep a node of 128 MB from founding a cluster; and the cluster writes ~35 MB/s
+and flushes ~250 times a second at rest (fitted above), which the 30-node run's own record should
+measure at rest before it is read as load.
