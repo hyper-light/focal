@@ -252,6 +252,10 @@ pub enum ReadRoute {
 struct CachedRoute {
     hint: RouteHint,
     used: u64,
+    /// The hint's node gave no answer, or no connection reached it: no request is sent there
+    /// until a node names a route again, and the hint's epoch stays the floor a newer one is
+    /// adopted above.
+    failed: bool,
 }
 struct Routes {
     entries: BTreeMap<LedgerId, CachedRoute>,
@@ -261,9 +265,23 @@ struct Routes {
 impl Routes {
     fn get(&mut self, ledger: LedgerId) -> Option<RouteHint> {
         self.clock = self.clock.saturating_add(1);
-        let entry = self.entries.get_mut(&ledger)?;
+        let entry = self
+            .entries
+            .get_mut(&ledger)
+            .filter(|entry| !entry.failed)?;
         entry.used = self.clock;
         Some(entry.hint.clone())
+    }
+    /// `failed`, a route to `ledger` a request was sent on, gave no answer: held failed where it
+    /// is still the route held, and the route held answered where another request learned a
+    /// newer one since.
+    fn fail(&mut self, ledger: LedgerId, failed: &RouteHint) -> Option<RouteHint> {
+        let entry = self.entries.get_mut(&ledger)?;
+        if entry.hint == *failed {
+            entry.failed = true;
+            return None;
+        }
+        (!entry.failed).then(|| entry.hint.clone())
     }
     /// Hold `hint` for `ledger`. A hint at the epoch held that names
     /// another endpoint replaces it: a route epoch names a placement, and
@@ -294,6 +312,7 @@ impl Routes {
             CachedRoute {
                 hint,
                 used: self.clock,
+                failed: false,
             },
         );
         Ok(())
@@ -812,6 +831,51 @@ impl<T: ClientTransport> Client<T> {
         let allowed = self.retries.refused();
         allowed && refusals < CAPACITY_RESENDS
     }
+    /// Where a request goes once the route it was sent on gave no answer (its connection failed
+    /// before a reply, or no connection reached it). A route a node named (a redirect) is held
+    /// failed, and the request goes where another request has learned since, else to the
+    /// transport's first route, whose node names the leader again; one of the transport's own
+    /// routes (`ClientTransport::routes`, the first where a request names none) is followed by
+    /// the next, in turn. A request resent elsewhere is the same request, its identity, epochs and
+    /// bytes, so its ledger answers it once whichever node it reaches: from the request's history
+    /// where it committed, by executing it where its leader never had it. Where every request kept
+    /// its route, a write in flight to a killed leader was resent to that leader until its clock
+    /// ran out and reported unknown, though the session had elected another leader within a
+    /// second (2026-10-29, twelve of 33 nodes killed: 1,709 writes unknown).
+    fn reroute(
+        &self,
+        homed: bool,
+        ledger: LedgerId,
+        route: &mut Option<RouteHint>,
+    ) -> Result<(), ClientError> {
+        let given = self.transport.routes();
+        let place = |hint: &RouteHint| {
+            given.iter().position(|route| {
+                route.endpoint == hint.endpoint && route.server_name == hint.server_name
+            })
+        };
+        match route.as_ref().map(|hint| (hint, place(hint))) {
+            Some((failed, None)) => {
+                *route = self
+                    .routes_for(homed)
+                    .lock()
+                    .map_err(|_| ClientError::Transport)?
+                    .fail(ledger, failed);
+            }
+            current => {
+                let at = current.and_then(|(_, place)| place).unwrap_or(0);
+                let next = at
+                    .checked_add(1)
+                    .and_then(|next| next.checked_rem(given.len()))
+                    .unwrap_or(0);
+                *route = match next {
+                    0 => None,
+                    next => given.get(next).cloned(),
+                };
+            }
+        }
+        Ok(())
+    }
     /// The routes a request follows: a homed read's, or every other request's.
     fn routes_for(&self, homed: bool) -> &Mutex<Routes> {
         if homed {
@@ -993,6 +1057,8 @@ impl<T: ClientTransport> Client<T> {
                     unavailable_refusals = unavailable_refusals.saturating_add(1);
                     last_refusal = Some(AccessError::Unavailable);
                     refused = true;
+                    // No connection reached the route: resent by another.
+                    self.reroute(homed, request.ledger, &mut route)?;
                 }
                 Ok(Err(WireError::Access(AccessError::Capacity)))
                     if self.resend_capacity(capacity_refusals) =>
@@ -1036,6 +1102,8 @@ impl<T: ClientTransport> Client<T> {
                 | Err(_) => {
                     uncertain = true;
                     *write_uncertain = request.operation.is_mutation();
+                    // No answer came on the route: resent by another.
+                    self.reroute(homed, request.ledger, &mut route)?;
                 }
             }
             if !refused {

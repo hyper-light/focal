@@ -1125,3 +1125,158 @@ async fn a_duplicate_domain_reply_traces_as_committed_on_a_shard() {
         }
     );
 }
+
+/// A session whose leader is killed, seen from a client homed on one of its followers (route
+/// `None`): the home names the leader 127.0.0.1:7777 until it is killed and its successor
+/// 127.0.0.1:8888 after; the killed leader answers nothing (its connection fails); the successor
+/// commits. A second route (`routes`), where `second` is set, is the session's other follower,
+/// which names the leader as the home does; `home_killed` kills the home with the leader.
+/// Each request a [`Killed`] session took: (endpoint, request id).
+type Sent = std::sync::Arc<Mutex<Vec<(Option<String>, u128)>>>;
+struct Killed {
+    seen: Sent,
+    killed: std::sync::atomic::AtomicBool,
+    home_killed: bool,
+    second: Vec<RouteHint>,
+}
+const KILLED_LEADER: &str = "127.0.0.1:7777";
+const NEW_LEADER: &str = "127.0.0.1:8888";
+fn route_to(endpoint: &str) -> RouteHint {
+    RouteHint {
+        epoch: RouteEpoch(1),
+        endpoint: endpoint.into(),
+        server_name: "localhost".into(),
+    }
+}
+impl ClientTransport for Killed {
+    fn request<'a>(
+        &'a self,
+        route: Option<&'a RouteHint>,
+        request: &'a RequestEnvelope,
+    ) -> TransportFuture<'a> {
+        Box::pin(async move {
+            let endpoint = route.map(|hint| hint.endpoint.clone());
+            self.seen
+                .lock()
+                .unwrap()
+                .push((endpoint.clone(), u128::from_be_bytes(request.request_id.0)));
+            let killed = self.killed.load(std::sync::atomic::Ordering::SeqCst);
+            let leader = if killed { NEW_LEADER } else { KILLED_LEADER };
+            match endpoint.as_deref() {
+                None if killed && self.home_killed => Err(WireError::Connection),
+                None | Some("127.0.0.1:7100") => {
+                    Ok(request.reply(Response::Error(AccessError::RouteChanged(route_to(leader)))))
+                }
+                Some(KILLED_LEADER) if killed => Err(WireError::Connection),
+                Some(_) => Ok(request.reply(Response::Submitted(MutationReply::Committed(
+                    receipt(request),
+                )))),
+            }
+        })
+    }
+    fn routes(&self) -> &[RouteHint] {
+        &self.second
+    }
+}
+
+/// A write whose leader was killed goes where the session leads now: the killed leader's route is
+/// held failed, the client's home names the successor, and the write, resent there as the same
+/// request, commits; the next write goes to the successor at once. Every request kept its route,
+/// so the write was resent to the killed leader until its attempts ran out and reported unknown
+/// though the session had another leader (twelve of 33 nodes killed, 2026-10-29).
+#[test]
+fn a_write_whose_leader_was_killed_is_resent_where_the_session_leads_now() {
+    focal_rt::block_on(
+        a_write_whose_leader_was_killed_is_resent_where_the_session_leads_now_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn a_write_whose_leader_was_killed_is_resent_where_the_session_leads_now_on_a_shard() {
+    let seen = std::sync::Arc::new(Mutex::new(vec![]));
+    let client = Client::new(
+        Killed {
+            seen: seen.clone(),
+            killed: std::sync::atomic::AtomicBool::new(false),
+            home_killed: false,
+            second: Vec::new(),
+        },
+        policy(),
+        WireLimits::default(),
+        1,
+    )
+    .unwrap();
+    assert!(matches!(
+        client.submit(request()).await.unwrap(),
+        MutationReply::Committed(_)
+    ));
+    client
+        .transport()
+        .killed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    seen.lock().unwrap().clear();
+    let killed = RequestEnvelope {
+        request_id: RequestId::from_u128(100),
+        ..request()
+    };
+    assert!(matches!(
+        client.submit(killed).await.unwrap(),
+        MutationReply::Committed(_)
+    ));
+    // Sent to the killed leader, then home, then to the successor: one request throughout.
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            (Some(KILLED_LEADER.to_owned()), 100),
+            (None, 100),
+            (Some(NEW_LEADER.to_owned()), 100)
+        ]
+    );
+    seen.lock().unwrap().clear();
+    assert!(matches!(
+        client.submit(request()).await.unwrap(),
+        MutationReply::Committed(_)
+    ));
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![(Some(NEW_LEADER.to_owned()), 99)]
+    );
+}
+
+/// A client whose home is killed with its session's leader is resent by the transport's next
+/// route, the session's other follower, which names the successor: given one route, the client
+/// could ask no node that knew where the session leads.
+#[test]
+fn a_write_whose_home_and_leader_were_killed_is_resent_by_the_next_route() {
+    focal_rt::block_on(
+        a_write_whose_home_and_leader_were_killed_is_resent_by_the_next_route_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn a_write_whose_home_and_leader_were_killed_is_resent_by_the_next_route_on_a_shard() {
+    let seen = std::sync::Arc::new(Mutex::new(vec![]));
+    let home = route_to("127.0.0.1:7000");
+    let client = Client::new(
+        Killed {
+            seen: seen.clone(),
+            killed: std::sync::atomic::AtomicBool::new(true),
+            home_killed: true,
+            second: vec![home, route_to("127.0.0.1:7100")],
+        },
+        policy(),
+        WireLimits::default(),
+        1,
+    )
+    .unwrap();
+    assert!(matches!(
+        client.submit(request()).await.unwrap(),
+        MutationReply::Committed(_)
+    ));
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            (None, 99),
+            (Some("127.0.0.1:7100".to_owned()), 99),
+            (Some(NEW_LEADER.to_owned()), 99)
+        ]
+    );
+}

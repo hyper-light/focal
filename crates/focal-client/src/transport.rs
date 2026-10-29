@@ -9,6 +9,14 @@ pub trait ClientTransport: Send + Sync {
         route: Option<&'a RouteHint>,
         request: &'a RequestEnvelope,
     ) -> TransportFuture<'a>;
+    /// The routes this transport was given to its cluster, its first route first (where a
+    /// request goes when the client knows no other): each asked in turn once the route a request
+    /// was sent on gave no answer, as a Kafka client's bootstrap servers or a NATS client's
+    /// server list are asked for the cluster when the server it held is gone. Empty for a
+    /// transport that reaches one node whatever the route.
+    fn routes(&self) -> &[RouteHint] {
+        &[]
+    }
 }
 
 pub struct EmbeddedTransport<H> {
@@ -93,7 +101,9 @@ impl ClientTransport for LocalTransport {
 /// however many calls arrive cold (`RouteConnections`, the audit's F60).
 pub struct QuicTransport {
     routes: RouteConnections,
-    initial: RouteHint,
+    /// The routes it was given, its first route first (`ClientTransport::routes`): one at
+    /// least, and no more than it holds connections.
+    given: Vec<RouteHint>,
 }
 impl QuicTransport {
     pub fn new(
@@ -101,12 +111,27 @@ impl QuicTransport {
         initial: RouteHint,
         max_connections: usize,
     ) -> Result<Self, WireError> {
-        if initial.endpoint.len() > 512 || initial.server_name.len() > 253 {
+        Self::with_routes(connector, vec![initial], max_connections)
+    }
+    /// A transport given several routes to its cluster, the first its first route: each a node
+    /// a request is sent to in turn once the route it was sent on gave no answer. One at least,
+    /// and no more than the connections it holds.
+    pub fn with_routes(
+        connector: QuicConnector,
+        given: Vec<RouteHint>,
+        max_connections: usize,
+    ) -> Result<Self, WireError> {
+        if given.is_empty()
+            || given.len() > max_connections
+            || given
+                .iter()
+                .any(|route| route.endpoint.len() > 512 || route.server_name.len() > 253)
+        {
             return Err(WireError::Limit);
         }
         Ok(Self {
             routes: RouteConnections::new(connector, max_connections)?,
-            initial,
+            given,
         })
     }
     /// Physical dials this transport has started.
@@ -121,7 +146,9 @@ impl ClientTransport for QuicTransport {
         request: &'a RequestEnvelope,
     ) -> TransportFuture<'a> {
         Box::pin(async move {
-            let route = route.unwrap_or(&self.initial);
+            let route = route
+                .or_else(|| self.given.first())
+                .ok_or(WireError::Limit)?;
             // A dial the listener refused at admission is its answer
             // (`Access(Capacity)`), resent as the refusal it is; the
             // connection is forgotten only when it is what failed.
@@ -129,5 +156,8 @@ impl ClientTransport for QuicTransport {
                 .request(&route.endpoint, &route.server_name, request)
                 .await
         })
+    }
+    fn routes(&self) -> &[RouteHint] {
+        &self.given
     }
 }
