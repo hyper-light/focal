@@ -17800,9 +17800,10 @@ group of three replicas, and focal-load drove one ledger a run. A run among agen
   principals for.
 - **Where.** On the embedded transport each ledger is a node the run opens. On the enrolled
   transport each names a session of the enrollment's tenant, addressed as `focal context add
-  --enrolled-as … --session …` addresses one: a participant's grant is its tenant's, and an
-  authored creation's root cause is not checked against the session's (`authored_check.rs`). Its
-  `homes` are the nodes holding its replica, its agents reading and waiting at them.
+  --enrolled-as … --session …` addresses one: an enrolled client is granted the founder's tenant
+  alone (`network_controller.rs`), so the sessions must be that tenant's, and an authored
+  creation's root cause is not checked against the session's (`authored_check.rs`). Its `homes`
+  are the nodes holding its replica, its agents reading and waiting at them.
 - **Counted apart and in total.** The report's `ledgers` names every ledger the run drove (tenant
   and session) with its callers and agents, and its lifecycles started, written, judged, refused
   by cause (the owner's memory, its other bounds, ingress capacity, unavailable, refused by name

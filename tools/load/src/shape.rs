@@ -258,9 +258,9 @@ pub struct Home {
 #[serde(deny_unknown_fields)]
 pub struct LedgerShape {
     /// `enrolled`: the ledger's session, 32 hex digits, in the enrollment's tenant, as `focal
-    /// context add --enrolled-as … --session …` addresses one (a principal's grant is its
-    /// tenant's). Not on `embedded`, where each ledger is a node the run opens, its session the
-    /// node's own.
+    /// context add --enrolled-as … --session …` addresses one: an enrolled client is granted the
+    /// founder's tenant alone, so the session must be one of that tenant's. Not on `embedded`,
+    /// where each ledger is a node the run opens, its session the node's own.
     #[serde(default)]
     pub session: Option<String>,
     /// `enrolled` agents: the nodes holding the ledger's replica, the ledger's agents homed over

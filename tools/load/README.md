@@ -150,8 +150,10 @@ places before the run's clock starts.
 
 On `embedded` each ledger is a node the run opens, a ledger of its own (`ledgers: [{}, {}]`
 drives two). On `enrolled` each names its session in the enrollment's tenant, as `focal
-context add --enrolled-as … --session …` addresses one: the agents' credentials are the
-tenant's, and a creation cites the root the enrollment names. A ledger's `homes` are the
+context add --enrolled-as … --session …` addresses one: an enrolled client is granted the
+founder's tenant alone, so each session must be one of that tenant's (`focal create session
+--tenant <the founder's> --name …`), and a creation cites the root the enrollment names. A
+ledger's `homes` are the
 nodes holding its replica, its agent `n` homed on its home `n mod homes` (reads and inbox
 waits at the home, writes at the ledger's leader); `homes` at the shape's top level are for
 a run of one ledger. Each ledger takes a caller at least, as many agents as its lifecycle
