@@ -12,14 +12,15 @@ use crate::authored;
 use crate::error::LoadError;
 use crate::generations::{Finished, Generations};
 use crate::measurements::{
-    self, Deliveries, Delivery, DeliveryMeasurements, RefusalCause, WriteMeasurements,
-    WriteOutcome, WriteSample, WriteSamples,
+    self, Deliveries, Delivery, DeliveryMeasurements, LifecycleCounts, RefusalCause,
+    WriteMeasurements, WriteOutcome, WriteSample, WriteSamples,
 };
 use crate::native;
 use crate::progress::{PROGRESS, Stage};
-use crate::report::{self, Latency, Report};
+use crate::report::{self, Latency, LedgerReport, Report};
+use crate::seats::{self, Seat, share};
 use crate::shape::{Home, Lifecycle, Profile, Transport, WorkloadShape};
-use crate::watch::{self, Side, Watch};
+use crate::watch::{self, Side, TailCounts, Watch};
 use focal_client::native_store::{NativeIdentity, NativeIdentityKind};
 use focal_client::operations::NativeAuthoredOperation;
 use focal_client::{
@@ -28,7 +29,7 @@ use focal_client::{
 use focal_ledger::NativeContentProfile;
 use focal_model::{
     ClaimId, LedgerId, ParticipantId, RequestEpoch, RequestId, RequestKey, RootCommandId,
-    RouteEpoch, SessionSeq,
+    RouteEpoch, SessionId, SessionSeq,
 };
 use focal_node::{config::Settings, embedded::EmbeddedNode, host::LocalHost};
 use focal_wire::{
@@ -207,8 +208,9 @@ struct Job {
     index: u16,
     /// Write phase: the most of this worker's writes under way at once.
     inflight: u16,
-    /// The callers of the phase, among which `index` is one.
-    callers: u16,
+    /// Where the caller sits among the phase's: the ledger it drives, and its seat among that
+    /// ledger's callers ([`Seat`]).
+    seat: Seat,
     /// Writes to submit, or reads to issue.
     count: u64,
     /// The first identity of this worker's space.
@@ -236,24 +238,18 @@ enum Phase {
 /// request, the counts, and the claims it created.
 #[derive(Default)]
 struct Outcome {
+    /// The ledger the worker drove.
+    ledger: u16,
     samples: Vec<(u128, u128)>,
     writes: WriteSamples,
-    committed: u64,
-    refused: u64,
-    unknown: u64,
+    /// What its lifecycles did, and its writes committed: a refused write, or one whose outcome
+    /// is unknown, ends its lifecycle, so each counts one write and one lifecycle.
+    counts: LifecycleCounts,
     hits: u64,
     created: Vec<u128>,
     refusals: Vec<(String, u64)>,
-    /// Claims whose every lifecycle step committed.
-    lifecycles: u64,
-    /// Lifecycle steps never sent: the read of the claim they bind to
-    /// failed.
-    abandoned: u64,
     /// `deliver`: the messages delivered end to end.
     deliveries: Deliveries,
-    /// `deliver`: messages whose other side never showed its step in the
-    /// events within the wait's bound.
-    undelivered: u64,
 }
 
 /// Counts one refusal of `reason`: a reason already seen counts once more,
@@ -497,7 +493,8 @@ struct Actor<'a> {
 /// outcome. Nothing is held across a wait.
 struct Shared<'a> {
     job: &'a Job,
-    issuer: Actor<'a>,
+    /// The run's issuer, in a run with no agents: it creates every claim.
+    issuer: Option<Actor<'a>>,
     /// A `deliver` run's consumer, and what both sides watch for.
     consumer: Option<(Actor<'a>, &'a Watch)>,
     /// A run among agents: lifecycle `n`'s issuer is the agent at `n` and its consumer the
@@ -513,20 +510,21 @@ type Sides<'s> = (&'s Actor<'s>, Option<(&'s Actor<'s>, &'s Watch)>);
 
 impl Shared<'_> {
     /// Lifecycle `i`'s issuer, and its consumer with what both watch: in a run among agents,
-    /// those of its place on the schedule, the callers' places interleaved (`n = i · callers +
-    /// index`), so every caller's lifecycles go round every agent.
+    /// those of its place among its ledger's lifecycles, the ledger's callers' places interleaved
+    /// (`n = i · seats + seat`, [`Seat::local`]), so every caller's lifecycles go round every
+    /// agent of its ledger.
     fn sides(&self, i: u64) -> Result<Sides<'_>, LoadError> {
         let Some((agents, watch)) = &self.agents else {
+            let issuer = self.issuer.as_ref().ok_or(LoadError::Shape(
+                "a run without agents writes as its issuer".into(),
+            ))?;
             return Ok((
-                &self.issuer,
+                issuer,
                 self.consumer.as_ref().map(|(actor, watch)| (actor, *watch)),
             ));
         };
         let count = u64::try_from(agents.len()).map_err(|_| LoadError::Bound("agents"))?;
-        let place = i
-            .checked_mul(u64::from(self.job.callers))
-            .and_then(|place| place.checked_add(u64::from(self.job.index)))
-            .ok_or(LoadError::Bound("lifecycle places"))?;
+        let place = self.job.seat.local(i)?;
         let at = |n: u64| -> Result<&Actor<'_>, LoadError> {
             let index = n
                 .checked_rem(count)
@@ -552,6 +550,37 @@ impl Shared<'_> {
     }
     fn note(&self, reason: String) {
         note(&mut self.outcome.borrow_mut().refusals, reason);
+    }
+    /// The worker's counts, as `change` makes them.
+    fn count(&self, change: impl FnOnce(&mut LifecycleCounts)) {
+        change(&mut self.outcome.borrow_mut().counts);
+    }
+    /// A lifecycle ended whole: every write committed.
+    fn written(&self) {
+        PROGRESS.lifecycle();
+        self.count(|counts| counts.written = counts.written.saturating_add(1));
+    }
+    /// A lifecycle ended at a step never sent: the read of what it binds to failed.
+    fn abandoned(&self) {
+        self.count(|counts| counts.abandoned = counts.abandoned.saturating_add(1));
+    }
+    /// A lifecycle's claim settled satisfied, at `satisfied`: delivered, its handing in at
+    /// `handled`, both measured from its place on the schedule at `started`.
+    fn judged(
+        &self,
+        started: Instant,
+        handled: Instant,
+        satisfied: Instant,
+    ) -> Result<(), LoadError> {
+        let mut outcome = self.outcome.borrow_mut();
+        outcome.counts.judged = outcome.counts.judged.saturating_add(1);
+        outcome.deliveries.push(Delivery {
+            start_ns: started.saturating_duration_since(self.run_start).as_nanos(),
+            handled_ns: handled.saturating_duration_since(self.run_start).as_nanos(),
+            satisfied_ns: satisfied
+                .saturating_duration_since(self.run_start)
+                .as_nanos(),
+        })
     }
     /// The owner's window for `actor`, read after a refusal by name: the run
     /// issues where the owner admits. `false` when the window could not be read.
@@ -614,13 +643,18 @@ impl Shared<'_> {
     async fn write(&self, i: u64, started: Instant) -> Result<(), LoadError> {
         let (issuer, _) = self.sides(i)?;
         PROGRESS.started();
+        self.count(|counts| counts.started = counts.started.saturating_add(1));
         let creating = PROGRESS.at(Stage::Create);
         let Some((claim, _, _)) = self.step(issuer, i, 0, started, None).await? else {
             return Ok(());
         };
         drop(creating);
         match self.job.lifecycle {
-            Lifecycle::Create => Ok(()),
+            // The creation is the lifecycle's one write.
+            Lifecycle::Create => {
+                self.written();
+                Ok(())
+            }
             Lifecycle::CancelRelease => self.cancel_release(i, claim).await,
             Lifecycle::Deliver => self.deliver(i, claim, started).await,
             Lifecycle::Work => self.work(i, claim, started).await,
@@ -642,9 +676,7 @@ impl Shared<'_> {
                 return Ok(());
             }
         }
-        PROGRESS.lifecycle();
-        let mut outcome = self.outcome.borrow_mut();
-        outcome.lifecycles = outcome.lifecycles.saturating_add(1);
+        self.written();
         Ok(())
     }
     /// The claim the issuer created, delivered: posted by the issuer, found by the
@@ -743,25 +775,16 @@ impl Shared<'_> {
             return Ok(());
         }
         drop(at);
-        let satisfied = Instant::now();
         // Delivered once satisfied, whether or not the release that ends its lifecycle commits:
         // a message delivered and a lifecycle completed are counted apart.
-        self.outcome.borrow_mut().deliveries.push(Delivery {
-            start_ns: started.saturating_duration_since(self.run_start).as_nanos(),
-            handled_ns: handled.saturating_duration_since(self.run_start).as_nanos(),
-            satisfied_ns: satisfied
-                .saturating_duration_since(self.run_start)
-                .as_nanos(),
-        })?;
+        self.judged(started, handled, Instant::now())?;
         let release = NativeAuthoredOperation::ClaimReleaseScope(authored::claim_target(claim));
         let at = PROGRESS.at(Stage::Release);
         if self.later(issuer, i, 7, &release, 0..0).await?.is_none() {
             return Ok(());
         }
         drop(at);
-        PROGRESS.lifecycle();
-        let mut outcome = self.outcome.borrow_mut();
-        outcome.lifecycles = outcome.lifecycles.saturating_add(1);
+        self.written();
         Ok(())
     }
 
@@ -838,8 +861,7 @@ impl Shared<'_> {
             .map(|identity| u128::from_be_bytes(identity.id))
             .ok_or_else(|| LoadError::Fixture("the work artifact minted no artifact".into()))?;
         let Some(reference) = self.work_reference(worker, artifact, written).await? else {
-            let mut outcome = self.outcome.borrow_mut();
-            outcome.abandoned = outcome.abandoned.saturating_add(1);
+            self.abandoned();
             return Ok(());
         };
         let submit =
@@ -928,23 +950,14 @@ impl Shared<'_> {
             ));
             return self.undelivered(claim, watch);
         }
-        let satisfied = Instant::now();
-        self.outcome.borrow_mut().deliveries.push(Delivery {
-            start_ns: started.saturating_duration_since(self.run_start).as_nanos(),
-            handled_ns: handled.saturating_duration_since(self.run_start).as_nanos(),
-            satisfied_ns: satisfied
-                .saturating_duration_since(self.run_start)
-                .as_nanos(),
-        })?;
+        self.judged(started, handled, Instant::now())?;
         let release = NativeAuthoredOperation::ClaimReleaseScope(authored::claim_target(claim));
         let at = PROGRESS.at(Stage::Release);
         if self.later(issuer, i, 10, &release, 0..0).await?.is_none() {
             return Ok(());
         }
         drop(at);
-        PROGRESS.lifecycle();
-        let mut outcome = self.outcome.borrow_mut();
-        outcome.lifecycles = outcome.lifecycles.saturating_add(1);
+        self.written();
         Ok(())
     }
 
@@ -953,8 +966,7 @@ impl Shared<'_> {
     fn undelivered(&self, claim: u128, watch: &Watch) -> Result<(), LoadError> {
         watch.forget(claim);
         PROGRESS.undelivered();
-        let mut outcome = self.outcome.borrow_mut();
-        outcome.undelivered = outcome.undelivered.saturating_add(1);
+        self.count(|counts| counts.undelivered = counts.undelivered.saturating_add(1));
         Ok(())
     }
     /// The identities lifecycle `i`'s creation mints from.
@@ -981,8 +993,7 @@ impl Shared<'_> {
         ids: std::ops::Range<u128>,
     ) -> Result<Option<(SessionSeq, Vec<NativeIdentity>)>, LoadError> {
         let Some(objects) = self.read_for(actor, operation).await? else {
-            let mut outcome = self.outcome.borrow_mut();
-            outcome.abandoned = outcome.abandoned.saturating_add(1);
+            self.abandoned();
             return Ok(None);
         };
         Ok(self
@@ -1133,10 +1144,11 @@ impl Shared<'_> {
             return Err(LoadError::Shape("work goes among agents".into()));
         };
         let count = u64::try_from(agents.len()).map_err(|_| LoadError::Bound("agents"))?;
-        let place = i
-            .checked_mul(u64::from(self.job.callers))
-            .and_then(|place| place.checked_add(u64::from(self.job.index)))
-            .and_then(|place| place.checked_add(2))
+        let place = self
+            .job
+            .seat
+            .local(i)?
+            .checked_add(2)
             .ok_or(LoadError::Bound("lifecycle places"))?;
         let index = place
             .checked_rem(count)
@@ -1240,7 +1252,7 @@ impl Shared<'_> {
                 Reply::Committed(sequence) => {
                     PROGRESS.committed();
                     let mut outcome = self.outcome.borrow_mut();
-                    outcome.committed = outcome.committed.saturating_add(1);
+                    outcome.counts.committed = outcome.counts.committed.saturating_add(1);
                     if later.is_none() {
                         outcome.created.push(claim);
                     }
@@ -1253,22 +1265,26 @@ impl Shared<'_> {
                     }
                     PROGRESS.refused();
                     let mut outcome = self.outcome.borrow_mut();
-                    outcome.refused = outcome.refused.saturating_add(1);
+                    let counts = &mut outcome.counts;
+                    counts.refused = counts.refused.saturating_add(1);
+                    counts.refused_by_cause.expired =
+                        counts.refused_by_cause.expired.saturating_add(1);
                     note(
                         &mut outcome.refusals,
                         "refused by name in the generation the owner named".into(),
                     );
                 }
-                Reply::Refused(reason, _) => {
+                Reply::Refused(reason, cause) => {
                     PROGRESS.refused();
                     let mut outcome = self.outcome.borrow_mut();
-                    outcome.refused = outcome.refused.saturating_add(1);
+                    outcome.counts.refused = outcome.counts.refused.saturating_add(1);
+                    outcome.counts.refused_by_cause.count(cause);
                     note(&mut outcome.refusals, reason);
                 }
                 Reply::Unknown(reason) => {
                     PROGRESS.unknown();
                     let mut outcome = self.outcome.borrow_mut();
-                    outcome.unknown = outcome.unknown.saturating_add(1);
+                    outcome.counts.unknown = outcome.counts.unknown.saturating_add(1);
                     note(&mut outcome.refusals, reason);
                 }
             }
@@ -1340,14 +1356,12 @@ async fn write_open_loop(shared: &Shared<'_>, inflight: u16) -> Result<(), LoadE
     }
 }
 
-/// Write `i`'s place in the aggregate schedule: caller `index` takes every `callers`th
-/// position. Divide only after scaling its global ordinal, so neither a remainder across
-/// callers nor rounding a recurring interval changes the aggregate offered rate.
+/// Write `i`'s place in the aggregate schedule: its seat's ([`Seat::global`]), every `seats`th
+/// of its ledger's places, the ledgers' interleaved. Divide only after scaling its global
+/// ordinal, so neither a remainder across callers nor rounding a recurring interval changes the
+/// aggregate offered rate.
 fn place(run_start: Instant, rate: u64, job: &Job, i: u64) -> Result<Instant, LoadError> {
-    let ordinal = i
-        .checked_mul(u64::from(job.callers))
-        .and_then(|ordinal| ordinal.checked_add(u64::from(job.index)))
-        .ok_or(LoadError::Bound("schedule"))?;
+    let ordinal = job.seat.global(i)?;
     let nanos = u128::from(ordinal)
         .checked_mul(1_000_000_000)
         .and_then(|scaled| scaled.checked_div(u128::from(rate)))
@@ -1376,11 +1390,12 @@ struct Agent {
     generations: Generations,
 }
 
-/// A run among agents, as its callers and tails share it: the agents, the watch every agent's
-/// tail tells, and how the tails read. Owned through `Rc`, so each caller and each tail runs as a
-/// task of its own ([`run_phase`]).
+/// One ledger of a run among agents, as its callers and tails share it: the ledger, its agents,
+/// the watch every one of their tails tells, and how the tails read. Owned through `Rc`, so each
+/// caller and each tail runs as a task of its own ([`run_phase`]).
 #[derive(Clone)]
 struct Agents {
+    ledger: LedgerId,
     agents: Rc<[Agent]>,
     watch: Rc<Watch>,
     poll: Duration,
@@ -1388,12 +1403,15 @@ struct Agents {
     seed: u64,
 }
 
+/// One caller's share of a phase: the write phase's lifecycles, as the run's issuer (`conn`,
+/// with a `deliver` run's consumer) or among its ledger's agents, or the read phase's reads on
+/// `conn`.
 async fn worker(
     job: Job,
     phase: Phase,
     run_start: Instant,
     generations: &Generations,
-    conn: &Conn,
+    conn: Option<&Conn>,
     (consumer, agents): (Option<ConsumerSide<'_>>, Option<&Agents>),
 ) -> Result<Outcome, LoadError> {
     let count = usize::try_from(job.count).map_err(|_| LoadError::Bound("worker count"))?;
@@ -1412,6 +1430,7 @@ async fn worker(
         _ => 0,
     };
     let mut outcome = Outcome {
+        ledger: job.seat.ledger,
         samples: Vec::with_capacity(match phase {
             Phase::Write => 0,
             Phase::Read => count,
@@ -1425,12 +1444,12 @@ async fn worker(
             outcome.created = Vec::with_capacity(count);
             let shared = Shared {
                 job: &job,
-                issuer: Actor {
+                issuer: conn.map(|conn| Actor {
                     principal: job.names.issuer,
                     conn,
                     generations,
                     protocol: std::cell::Cell::new(0),
-                },
+                }),
                 consumer: consumer.map(|side| {
                     (
                         Actor {
@@ -1468,6 +1487,7 @@ async fn worker(
             outcome = shared.outcome.into_inner();
         }
         Phase::Read => {
+            let conn = conn.ok_or(LoadError::Bound("read connections"))?;
             let mut cycle = job.created.iter().cycle();
             for i in 0..job.count {
                 let claim = *cycle
@@ -1494,16 +1514,6 @@ async fn worker(
     Ok(outcome)
 }
 
-/// Runs one phase on every job at once and waits for all of them; the wall
-/// time is the phase's, from the first caller's start to the last's end.
-///
-/// Each caller, and each agent's inbox tail, runs as a task of its own on this
-/// shard, with the run's connections and generations (`Rc`, one thread): a
-/// client's requests from several callers are carried on its one connection
-/// together, and a wake polls the task it was for. A caller's lifecycles share
-/// its task (`focal_rt::Concurrent`), so a wake of one polls the caller's
-/// others; more throughput than one shard drives comes from more processes,
-/// as the generations already model one participant's.
 /// A `deliver` run's consumer: how its connections are opened and as whom, its principal's
 /// generations, the watch both sides wait on, and how its tails poll.
 struct Consumer<'a> {
@@ -1533,23 +1543,43 @@ fn tail_ids(seed: u64, worker: u128) -> impl FnMut() -> Result<u128, LoadError> 
     }
 }
 
+/// Runs one phase on every job at once and waits for all of them; the wall
+/// time is the phase's, from the first caller's start to the last's end.
+///
+/// Each caller, and each agent's inbox tail, runs as a task of its own on this
+/// shard, with the run's connections and generations (`Rc`, one thread): a
+/// client's requests from several callers are carried on its one connection
+/// together, and a wake polls the task it was for. A caller's lifecycles share
+/// its task (`focal_rt::Concurrent`), so a wake of one polls the caller's
+/// others; more throughput than one shard drives comes from more processes,
+/// as the generations already model one participant's.
+///
+/// The run's issuer sends on `connections` connections of its own through `connector`, a
+/// `deliver` run's consumer on as many through its own; a run among agents opens none of them,
+/// each ledger's agents sending on their own (`agents`, one a ledger in the ledgers' order, each
+/// caller among its seat's ledger's).
 async fn run_phase(
     jobs: Vec<Job>,
     phase: Phase,
     generations: Rc<Generations>,
     connector: &Connector,
     connections: u16,
-    (consumer, agents): (Option<&Consumer<'_>>, Option<&Agents>),
+    (consumer, agents): (Option<&Consumer<'_>>, &[Agents]),
 ) -> Result<(Vec<Outcome>, u128, u128), LoadError> {
     let Some(first) = jobs.first() else {
         return Err(LoadError::Bound("zero workers"));
     };
     let names = first.names;
     let limits = first.limits.clone();
-    let conns: Rc<[Conn]> = (0..connections.max(1))
-        .map(|_| Conn::open(connector, names.issuer, &names, &limits))
-        .collect::<Result<Vec<_>, _>>()?
-        .into();
+    // The issuer's connections, where it writes: a run among agents writes as its agents alone.
+    let conns: Rc<[Conn]> = if agents.is_empty() {
+        (0..connections.max(1))
+            .map(|_| Conn::open(connector, names.issuer, &names, &limits))
+            .collect::<Result<Vec<_>, _>>()?
+            .into()
+    } else {
+        Rc::from(Vec::new())
+    };
     // A `deliver` run's consumer sends on connections of its own, as a second agent would, and
     // each side's tail reads on one more.
     let consumer_conns: Rc<[Conn]> = match consumer {
@@ -1566,33 +1596,38 @@ async fn run_phase(
         )),
         None => None,
     };
-    // The tails the run reads its sides' inboxes with, and the watch they take their places in.
-    let (positions, tails) = match (consumer, agents) {
-        (Some(side), _) => (Some(&*side.watch), 2),
-        (None, Some(run)) => (Some(&*run.watch), run.agents.len()),
-        (None, None) => (None, 0),
-    };
-    if let Some(watch) = positions {
-        watch.reserve_tails(tails)?;
+    // The tails the run reads its sides' inboxes with, by the watch they take their places in: a
+    // `deliver` run's two sides in its one, each ledger's agents in the ledger's.
+    let mut positions: Vec<(&Watch, usize)> = Vec::new();
+    positions
+        .try_reserve_exact(agents.len().max(1))
+        .map_err(|_| LoadError::Bound("watches"))?;
+    match consumer {
+        Some(side) => positions.push((&*side.watch, 2)),
+        None => {
+            for run in agents {
+                positions.push((&*run.watch, run.agents.len()));
+            }
+        }
+    }
+    for (watch, tails) in &positions {
+        watch.reserve_tails(*tails)?;
     }
     let stop = || {
-        if let Some(side) = consumer {
-            side.watch.stop();
-        }
-        if let Some(run) = agents {
-            run.watch.stop();
+        for (watch, _) in &positions {
+            watch.stop();
         }
     };
     // Every caller to its end, the first failure kept; the tails stopped either way, so none
     // outlives the callers it serves. The callers begin, and the run's clock with them, once
-    // every tail has taken its place: a claim posted before its recipient's tail had was posted
-    // behind where that tail reads from (`Watch::all_positioned`).
+    // every tail of every ledger has taken its place: a claim posted before its recipient's tail
+    // had was posted behind where that tail reads from (`Watch::all_positioned`).
     let collect = async {
-        if let Some(watch) = positions
-            && let Err(error) = watch.all_positioned(tails).await
-        {
-            stop();
-            return Err(error);
+        for (watch, tails) in &positions {
+            if let Err(error) = watch.all_positioned(*tails).await {
+                stop();
+                return Err(error);
+            }
         }
         let run_start_epoch_ns = match SystemTime::now().duration_since(UNIX_EPOCH) {
             Ok(since) => since.as_nanos(),
@@ -1613,12 +1648,21 @@ async fn run_phase(
         }
         for job in jobs {
             let index = job.index;
-            let slot = match usize::from(index).checked_rem(conns.len()) {
-                Some(slot) => slot,
+            // The issuer's connection the caller sends on, where the run opened them.
+            let slot = usize::from(index).checked_rem(conns.len());
+            if slot.is_none() && agents.is_empty() {
+                abort_all(&callers);
+                stop();
+                return Err(LoadError::Bound("connections"));
+            }
+            // The agents of the ledger the caller drives, in a run among agents.
+            let ledger = match agents.get(usize::from(job.seat.ledger)) {
+                Some(run) => Some(run.clone()),
+                None if agents.is_empty() => None,
                 None => {
                     abort_all(&callers);
                     stop();
-                    return Err(LoadError::Bound("connections"));
+                    return Err(LoadError::Bound("ledgers"));
                 }
             };
             let generations = Rc::clone(&generations);
@@ -1631,14 +1675,16 @@ async fn run_phase(
                     Rc::clone(&side.watch),
                 )
             });
-            let agents = agents.cloned();
             let spawned = focal_rt::spawn(async move {
-                let conn = conns.get(slot).ok_or(LoadError::Bound("connections"))?;
+                let conn = match slot {
+                    Some(slot) => Some(conns.get(slot).ok_or(LoadError::Bound("connections"))?),
+                    None => None,
+                };
                 let side = match &side {
                     Some((principal, generations, watch)) => Some(ConsumerSide {
                         principal: *principal,
-                        conn: consumer_conns
-                            .get(slot)
+                        conn: slot
+                            .and_then(|slot| consumer_conns.get(slot))
                             .ok_or(LoadError::Bound("consumer connections"))?,
                         generations,
                         watch,
@@ -1651,7 +1697,7 @@ async fn run_phase(
                     run_start,
                     &generations,
                     conn,
-                    (side, agents.as_ref()),
+                    (side, ledger.as_ref()),
                 )
                 .await
             });
@@ -1714,19 +1760,24 @@ async fn run_phase(
             issuer_tailed?;
             outcomes?
         }
-        _ => match agents {
-            // Every agent's inbox read beside the callers, each on the agent's one connection.
-            Some(run) => {
-                // Each agent's tail a task of its own, as each caller is: a delivery to one agent
-                // wakes its tail alone.
-                let mut tails = Vec::new();
-                if tails.try_reserve_exact(run.agents.len()).is_err() {
-                    stop();
-                    return Err(LoadError::Bound("agent tails"));
-                }
+        _ if agents.is_empty() => collect.await?,
+        // Every agent's inbox read beside the callers, each on the agent's one connection, in
+        // the agent's ledger.
+        _ => {
+            // Each agent's tail a task of its own, as each caller is: a delivery to one agent
+            // wakes its tail alone.
+            let count = agents
+                .iter()
+                .try_fold(0usize, |count, run| count.checked_add(run.agents.len()))
+                .ok_or(LoadError::Bound("agent tails"))?;
+            let mut tails = Vec::new();
+            if tails.try_reserve_exact(count).is_err() {
+                stop();
+                return Err(LoadError::Bound("agent tails"));
+            }
+            for run in agents {
                 for index in 0..run.agents.len() {
                     let run = run.clone();
-                    let ledger = names.ledger;
                     let spawned = focal_rt::spawn(async move {
                         let agent = run
                             .agents
@@ -1737,7 +1788,7 @@ async fn run_phase(
                             Side::Agent,
                             (run.poll, run.wait_ms),
                             &agent.conn,
-                            ledger,
+                            run.ledger,
                             agent.principal,
                             tail_ids(run.seed, AGENT_TAIL_WORKER),
                         )
@@ -1754,29 +1805,28 @@ async fn run_phase(
                         }
                     }
                 }
-                let tailed = async {
-                    let mut failed = None;
-                    for tail in tails {
-                        match tail.await {
-                            Ok(Ok(())) => {}
-                            Ok(Err(error)) => {
-                                failed.get_or_insert(error);
-                            }
-                            Err(_) => {
-                                failed.get_or_insert(LoadError::Worker(
-                                    "an agent's tail ended without its outcome",
-                                ));
-                            }
+            }
+            let tailed = async {
+                let mut failed = None;
+                for tail in tails {
+                    match tail.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            failed.get_or_insert(error);
+                        }
+                        Err(_) => {
+                            failed.get_or_insert(LoadError::Worker(
+                                "an agent's tail ended without its outcome",
+                            ));
                         }
                     }
-                    failed.map_or(Ok(()), Err)
-                };
-                let (outcomes, tailed) = hyper_rt::combine::join2(collect, tailed).await;
-                tailed?;
-                outcomes?
-            }
-            None => collect.await?,
-        },
+                }
+                failed.map_or(Ok(()), Err)
+            };
+            let (outcomes, tailed) = hyper_rt::combine::join2(collect, tailed).await;
+            tailed?;
+            outcomes?
+        }
     };
     // In the callers' order, whichever ended first.
     outcomes.sort_unstable_by_key(|(index, _)| *index);
@@ -1803,22 +1853,6 @@ fn unix_now() -> Result<i64, LoadError> {
             .as_secs(),
     )
     .map_err(|_| LoadError::Clock)
-}
-
-/// `total` split evenly over `parts`; the first `total % parts` parts get one more.
-fn share(total: u64, parts: u16, index: u16) -> Result<u64, LoadError> {
-    let parts = u64::from(parts);
-    let each = total
-        .checked_div(parts)
-        .ok_or(LoadError::Bound("zero workers"))?;
-    let extra = total
-        .checked_rem(parts)
-        .ok_or(LoadError::Bound("zero workers"))?;
-    Ok(if u64::from(index) < extra {
-        each.saturating_add(1)
-    } else {
-        each
-    })
 }
 
 /// The enrolled clients of `count` agents under `directory`: each agent a client data directory of
@@ -1963,9 +1997,9 @@ fn merged(outcomes: &[Outcome]) -> Merged {
                 .iter()
                 .map(|sample| (sample.start_ns, sample.latency_ns())),
         );
-        total.committed = total.committed.saturating_add(outcome.committed);
-        total.refused = total.refused.saturating_add(outcome.refused);
-        total.unknown = total.unknown.saturating_add(outcome.unknown);
+        total.committed = total.committed.saturating_add(outcome.counts.committed);
+        total.refused = total.refused.saturating_add(outcome.counts.refused);
+        total.unknown = total.unknown.saturating_add(outcome.counts.unknown);
         total.hits = total.hits.saturating_add(outcome.hits);
     }
     total
@@ -1989,120 +2023,231 @@ fn halves(samples: &mut [(u128, u128)]) -> Result<(Latency, Latency, Latency), L
     ))
 }
 
-/// The run on one shard of this thread, its root owning the node, the
+/// The run on one shard of this thread, its root owning the nodes, the
 /// connections and the generations every caller shares.
 pub fn run(shape: WorkloadShape) -> Result<Report, LoadError> {
     focal_rt::block_on(run_on_shard(shape)).map_err(LoadError::Runtime)?
 }
+
+/// An embedded node the run opened, a ledger of its own: the directory it keeps its data in (a
+/// temporary one the run removes, unless the shape named one), the settings it was opened with,
+/// and its host.
+struct Node {
+    root: PathBuf,
+    settings: Settings,
+    hosted: Hosted,
+    temporary: Option<tempfile::TempDir>,
+}
+impl Node {
+    /// A node on the shape's `data_dir`, or on a fresh temporary directory, activated natively
+    /// as `profile` on its first open; and the names its identity gives the ledger.
+    fn open(
+        shape: &WorkloadShape,
+        profile: NativeContentProfile,
+        limits: &WireLimits,
+    ) -> Result<(Self, Names), LoadError> {
+        let (root, temporary) = match &shape.data_dir {
+            Some(directory) => {
+                std::fs::create_dir_all(directory)?;
+                (directory.clone(), None)
+            }
+            None => {
+                let temporary = tempfile::tempdir()?;
+                (temporary.path().to_path_buf(), Some(temporary))
+            }
+        };
+        let mut settings = Settings::default();
+        settings.node.data_dir = Some(root.clone());
+        focal_node::native_activation::activate_local(&settings, profile)?;
+        let hosted = Hosted::open(&settings, limits)?;
+        let identity = focal_node::node_files::read_identity(&settings, &root)?;
+        let names = Names {
+            ledger: identity.ledger,
+            issuer: identity.issuer,
+            worker: identity.worker,
+            root: identity.root,
+            profile,
+        };
+        Ok((
+            Self {
+                root,
+                settings,
+                hosted,
+                temporary,
+            },
+            names,
+        ))
+    }
+}
+
+/// The ledgers a run drives, in the shape's order: each one's names, and what connections to it
+/// are opened through — on the embedded transport its own node, otherwise the run's one
+/// connector, which reaches every ledger the run drives (a running node's socket, the
+/// enrollment's cluster).
+struct Ledgers {
+    names: Vec<Names>,
+    connectors: Vec<Connector>,
+}
+impl Ledgers {
+    fn names(&self, ledger: u16) -> Result<&Names, LoadError> {
+        self.names
+            .get(usize::from(ledger))
+            .ok_or(LoadError::Bound("ledgers"))
+    }
+    fn connector(&self, ledger: u16) -> Result<&Connector, LoadError> {
+        match self.connectors.as_slice() {
+            [one] => Ok(one),
+            each => each
+                .get(usize::from(ledger))
+                .ok_or(LoadError::Bound("ledgers")),
+        }
+    }
+}
+
+/// Floors advanced and requests refused by name, summed over `journals`: every principal's.
+fn journal_counts<'a>(
+    journals: impl Iterator<Item = &'a Generations>,
+) -> Result<(u64, u64), LoadError> {
+    let (mut advanced, mut expired) = (0u64, 0u64);
+    for journal in journals {
+        let (floors, refused) = journal.counts()?;
+        advanced = advanced.saturating_add(floors);
+        expired = expired.saturating_add(refused);
+    }
+    Ok((advanced, expired))
+}
+
+/// What every tail `watch` tells read: a `deliver` run's two sides, or a ledger's agents.
+fn tail_totals(watch: &Watch) -> TailCounts {
+    let mut total = TailCounts::default();
+    for side in [Side::Consumer, Side::Issuer, Side::Agent] {
+        total.add(&watch.counts(side));
+    }
+    total
+}
+
 async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
     let limits = WireLimits::default();
     let profile = content_profile(shape.profile());
+    let ledger_count = shape.ledger_count().map_err(LoadError::Shape)?;
 
-    // The node: opened here, or already running behind its socket.
-    let mut kept_temp = None;
-    let mut settings = Settings::default();
-    let (connector, names, root) = match shape.transport {
-        Transport::Embedded => {
-            let root = match &shape.data_dir {
-                Some(directory) => {
-                    std::fs::create_dir_all(directory)?;
-                    directory.clone()
+    // The nodes: opened here, one a ledger, or already running behind a socket or a cluster.
+    let mut nodes = Vec::new();
+    // The enrolled issuer's founder ledger, which every enrolled principal of the run names.
+    let mut founder = None;
+    let mut ledgers =
+        match shape.transport {
+            Transport::Embedded => {
+                let mut ledgers = Ledgers {
+                    names: Vec::with_capacity(usize::from(ledger_count)),
+                    connectors: Vec::with_capacity(usize::from(ledger_count)),
+                };
+                nodes.reserve_exact(usize::from(ledger_count));
+                for _ in 0..ledger_count {
+                    let (node, names) = Node::open(&shape, profile, &limits)?;
+                    ledgers
+                        .connectors
+                        .push(Connector::Embedded(node.hosted.host.clone()));
+                    ledgers.names.push(names);
+                    nodes.push(node);
                 }
-                None => {
-                    let temporary = tempfile::tempdir()?;
-                    let path = temporary.path().to_path_buf();
-                    kept_temp = Some(temporary);
-                    path
+                ledgers
+            }
+            Transport::Unix => {
+                let root = shape
+                    .data_dir
+                    .clone()
+                    .ok_or_else(|| LoadError::Shape("transport unix needs data_dir".into()))?;
+                let settings = Settings::default();
+                let identity = focal_node::node_files::read_identity(&settings, &root)?;
+                let now = i64::try_from(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_err(|_| LoadError::Clock)?
+                        .as_secs(),
+                )
+                .map_err(|_| LoadError::Clock)?;
+                let keys = settings.found_data_keys(&root)?;
+                let actor = focal_node::network_join::local_unix_principal(
+                    &root,
+                    keys.as_ref(),
+                    &identity,
+                    now,
+                )?;
+                Ledgers {
+                    names: vec![Names {
+                        ledger: identity.ledger,
+                        issuer: actor,
+                        worker: identity.worker,
+                        root: identity.root,
+                        profile,
+                    }],
+                    connectors: vec![Connector::Unix(root.join("focal.sock"))],
                 }
-            };
-            settings.node.data_dir = Some(root.clone());
-            focal_node::native_activation::activate_local(&settings, profile)?;
-            let hosted = Hosted::open(&settings, &limits)?;
-            let identity = focal_node::node_files::read_identity(&settings, &root)?;
-            let names = Names {
-                ledger: identity.ledger,
-                issuer: identity.issuer,
-                worker: identity.worker,
-                root: identity.root,
-                profile,
-            };
-            (
-                Connector::Embedded(hosted.host.clone()),
-                names,
-                Some((root, hosted)),
-            )
-        }
-        Transport::Unix => {
-            let root = shape
-                .data_dir
-                .clone()
-                .ok_or_else(|| LoadError::Shape("transport unix needs data_dir".into()))?;
-            let identity = focal_node::node_files::read_identity(&settings, &root)?;
-            let now = i64::try_from(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_err(|_| LoadError::Clock)?
-                    .as_secs(),
-            )
-            .map_err(|_| LoadError::Clock)?;
-            let keys = settings.found_data_keys(&root)?;
-            let actor = focal_node::network_join::local_unix_principal(
-                &root,
-                keys.as_ref(),
-                &identity,
-                now,
-            )?;
-            let names = Names {
-                ledger: identity.ledger,
-                issuer: actor,
-                worker: identity.worker,
-                root: identity.root,
-                profile,
-            };
-            (Connector::Unix(root.join("focal.sock")), names, None)
-        }
-        Transport::Enrolled => {
-            let enrollment = shape
-                .enrollment
-                .clone()
-                .ok_or_else(|| LoadError::Shape("transport enrolled needs enrollment".into()))?;
-            // A `deliver` run's claims target its consumer, named below.
-            let worker = match shape.lifecycle {
-                Lifecycle::Deliver | Lifecycle::Work => [0; 16],
-                _ => shape
-                    .worker
-                    .as_deref()
-                    .ok_or_else(|| LoadError::Shape("transport enrolled needs worker".into()))
-                    .and_then(|text| {
-                        focal_client::input::parse_id(text)
-                            .map_err(|_| LoadError::Shape("worker is 32 hex digits".into()))
-                    })?,
-            };
-            let now = i64::try_from(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_err(|_| LoadError::Clock)?
-                    .as_secs(),
-            )
-            .map_err(|_| LoadError::Clock)?;
-            let pending = focal_node::network_join::PendingClientJoin::resume_shared(
-                &enrollment,
-                &client_keys(&enrollment)?,
-            )?;
-            let client = pending.remote_client(now, &limits)?;
-            let names = Names {
-                ledger: client.build.ledger,
-                issuer: client.build.actor,
-                worker: ParticipantId(worker),
-                root: client.build.root,
-                profile,
-            };
-            (Connector::Enrolled(Box::new(pending)), names, None)
-        }
-    };
+            }
+            Transport::Enrolled => {
+                let enrollment = shape.enrollment.clone().ok_or_else(|| {
+                    LoadError::Shape("transport enrolled needs enrollment".into())
+                })?;
+                // A `deliver` run's claims target its consumer, named below.
+                let worker = match shape.lifecycle {
+                    Lifecycle::Deliver | Lifecycle::Work => [0; 16],
+                    _ => shape
+                        .worker
+                        .as_deref()
+                        .ok_or_else(|| LoadError::Shape("transport enrolled needs worker".into()))
+                        .and_then(|text| {
+                            focal_client::input::parse_id(text)
+                                .map_err(|_| LoadError::Shape("worker is 32 hex digits".into()))
+                        })?,
+                };
+                let pending = focal_node::network_join::PendingClientJoin::resume_shared(
+                    &enrollment,
+                    &client_keys(&enrollment)?,
+                )?;
+                let client = pending.remote_client(unix_now()?, &limits)?;
+                let enrolled = Names {
+                    ledger: client.build.ledger,
+                    issuer: client.build.actor,
+                    worker: ParticipantId(worker),
+                    root: client.build.root,
+                    profile,
+                };
+                founder = Some(enrolled.ledger);
+                // Each ledger a session of the enrollment's tenant, addressed as an enrolled context
+                // addresses one (`focal context add --enrolled-as … --session …`): the tenant's grant
+                // reaches it, and its creations cite the root the enrollment names.
+                let names = match &shape.ledgers {
+                    Some(entries) => entries
+                        .iter()
+                        .map(|entry| {
+                            let session = entry
+                                .session_id()
+                                .map_err(LoadError::Shape)?
+                                .ok_or_else(|| {
+                                    LoadError::Shape(
+                                        "on enrolled each ledger names its session".into(),
+                                    )
+                                })?;
+                            Ok(Names {
+                                ledger: LedgerId {
+                                    tenant: enrolled.ledger.tenant,
+                                    session: SessionId(session),
+                                },
+                                ..enrolled
+                            })
+                        })
+                        .collect::<Result<Vec<_>, LoadError>>()?,
+                    None => vec![enrolled],
+                };
+                Ledgers {
+                    names,
+                    connectors: vec![Connector::Enrolled(Box::new(pending))],
+                }
+            }
+        };
     // A `deliver` run's consumer: a second enrolled client, or on the embedded node its worker
     // identity; every claim targets it.
-    let mut names = names;
     let consumer_connector = match (shape.lifecycle, shape.transport) {
         (Lifecycle::Deliver, Transport::Enrolled) if shape.agents.is_none() => {
             let directory = shape.consumer_enrollment.clone().ok_or_else(|| {
@@ -2113,6 +2258,10 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
                 &client_keys(&directory)?,
             )?;
             let client = pending.remote_client(unix_now()?, &limits)?;
+            let names = ledgers
+                .names
+                .first_mut()
+                .ok_or(LoadError::Bound("ledgers"))?;
             if client.build.ledger != names.ledger {
                 return Err(LoadError::Shape(
                     "the consumer is enrolled with another ledger".into(),
@@ -2122,38 +2271,62 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
             Some(Connector::Enrolled(Box::new(pending)))
         }
         // A run among agents has no consumer of its own: each agent is the next one's.
-        (Lifecycle::Deliver, Transport::Embedded) if shape.agents.is_none() => match &connector {
-            Connector::Embedded(host) => Some(Connector::Embedded(host.clone())),
-            _ => None,
-        },
+        (Lifecycle::Deliver, Transport::Embedded) if shape.agents.is_none() => {
+            match ledgers.connector(0)? {
+                Connector::Embedded(host) => Some(Connector::Embedded(host.clone())),
+                _ => None,
+            }
+        }
         _ => None,
     };
+    // The first ledger's names: a run of one ledger's, which a run without agents drives.
+    let names = *ledgers.names(0)?;
     if shape.lifecycle == Lifecycle::Deliver && names.worker == names.issuer {
         return Err(LoadError::Shape(
             "deliver's consumer must be a principal of its own".into(),
         ));
     }
     let consumer_generations = Rc::new(Generations::new());
-    let watch_bound = usize::from(shape.inflight)
-        .checked_mul(usize::from(shape.concurrency))
-        .ok_or(LoadError::Bound("messages under way"))?;
-    let watch = Rc::new(Watch::new(watch_bound));
-    // A run among agents: each agent a principal of its own on the embedded node, with its
-    // connection and its journal's generations.
+    // What each ledger's tails tell its lifecycles, at most its callers' writes under way.
+    let mut watches = Vec::with_capacity(usize::from(ledger_count));
+    for ledger in 0..ledger_count {
+        let bound = share(u64::from(shape.concurrency), ledger_count, ledger)?
+            .checked_mul(u64::from(shape.inflight))
+            .and_then(|bound| usize::try_from(bound).ok())
+            .ok_or(LoadError::Bound("messages under way"))?;
+        watches.push(Rc::new(Watch::new(bound)));
+    }
+    // A run among agents: each agent a principal of its own on its ledger (agent `a` on ledger
+    // `a mod ledgers`, `seats::agent_seat`), with its connection and its journal's generations.
     PROGRESS.agents(u64::from(shape.agents.unwrap_or(0)));
-    let agent_list = match (shape.agents, &shape.agent_enrollments) {
+    let mut groups: Vec<Vec<Agent>> = Vec::with_capacity(usize::from(ledger_count));
+    for ledger in 0..ledger_count {
+        let its = usize::try_from(share(
+            u64::from(shape.agents.unwrap_or(0)),
+            ledger_count,
+            ledger,
+        )?)
+        .map_err(|_| LoadError::Bound("agents"))?;
+        let mut group = Vec::new();
+        group
+            .try_reserve_exact(its)
+            .map_err(|_| LoadError::Bound("agents"))?;
+        groups.push(group);
+    }
+    match (shape.agents, &shape.agent_enrollments) {
         // Each an enrolled client of its own: the principal its credential names, on an
         // endpoint and a connection of its own.
-        (Some(count), Some(directory)) => enrolled_agents(directory, count)?
-            .into_iter()
-            .enumerate()
-            .map(|(agent, enrollment)| {
+        (Some(count), Some(directory)) => {
+            for (agent, enrollment) in (0..count).zip(enrolled_agents(directory, count)?) {
+                let seat = seats::agent_seat(agent, ledger_count)?;
                 let pending = focal_node::network_join::PendingClientJoin::resume_shared(
                     &enrollment,
                     &client_keys(&enrollment)?,
                 )?;
                 let client = pending.remote_client(unix_now()?, &limits)?;
-                if client.build.ledger != names.ledger {
+                // Enrolled in the run's cluster, as the run's enrollment is: what each invitation
+                // names is the founder's ledger, and its tenant the ledgers'.
+                if Some(client.build.ledger) != founder {
                     return Err(LoadError::Shape(format!(
                         "{} is enrolled with another ledger",
                         enrollment.display()
@@ -2161,49 +2334,80 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
                 }
                 let principal = client.build.actor;
                 let connector = Connector::Enrolled(Box::new(pending));
-                // Agent `n` on home `n mod homes`: the cluster's agents spread over its nodes.
-                let home = shape.homes.as_deref().and_then(|homes| {
-                    agent
+                // A ledger's agent `n` on its home `n mod homes`: the ledger's agents spread over
+                // the nodes holding its replica.
+                let home = shape.homes_of(seat.ledger).and_then(|homes| {
+                    usize::from(seat.index)
                         .checked_rem(homes.len())
                         .and_then(|place| homes.get(place))
                 });
-                let conn = Conn::open_homed(&connector, principal, &names, &limits, home)?;
-                PROGRESS.agent_opened();
-                Ok(Agent {
+                let conn = Conn::open_homed(
+                    &connector,
                     principal,
-                    conn,
-                    generations: Generations::new(),
-                })
-            })
-            .collect::<Result<Vec<_>, LoadError>>()?,
-        (Some(count), None) => (0..count)
-            .map(|agent| {
+                    ledgers.names(seat.ledger)?,
+                    &limits,
+                    home,
+                )?;
+                PROGRESS.agent_opened();
+                groups
+                    .get_mut(usize::from(seat.ledger))
+                    .ok_or(LoadError::Bound("ledgers"))?
+                    .push(Agent {
+                        principal,
+                        conn,
+                        generations: Generations::new(),
+                    });
+            }
+        }
+        (Some(count), None) => {
+            for agent in 0..count {
+                let seat = seats::agent_seat(agent, ledger_count)?;
                 let principal = agent_principal(shape.seed, agent)?;
-                let conn = Conn::open(&connector, principal, &names, &limits)?;
-                PROGRESS.agent_opened();
-                Ok(Agent {
+                let conn = Conn::open(
+                    ledgers.connector(seat.ledger)?,
                     principal,
-                    conn,
-                    generations: Generations::new(),
+                    ledgers.names(seat.ledger)?,
+                    &limits,
+                )?;
+                PROGRESS.agent_opened();
+                groups
+                    .get_mut(usize::from(seat.ledger))
+                    .ok_or(LoadError::Bound("ledgers"))?
+                    .push(Agent {
+                        principal,
+                        conn,
+                        generations: Generations::new(),
+                    });
+            }
+        }
+        (None, _) => {}
+    }
+    let agents: Vec<Agents> = match shape.agents {
+        Some(_) => (0..ledger_count)
+            .zip(groups)
+            .map(|(ledger, group)| {
+                Ok(Agents {
+                    ledger: ledgers.names(ledger)?.ledger,
+                    agents: Rc::from(group),
+                    watch: Rc::clone(
+                        watches
+                            .get(usize::from(ledger))
+                            .ok_or(LoadError::Bound("ledgers"))?,
+                    ),
+                    poll: Duration::from_millis(u64::from(shape.poll_ms)),
+                    wait_ms: shape.inbox_wait_ms,
+                    seed: shape.seed,
                 })
             })
-            .collect::<Result<Vec<_>, LoadError>>()?,
-        (None, _) => Vec::new(),
+            .collect::<Result<_, LoadError>>()?,
+        None => Vec::new(),
     };
-    let agent_list: Rc<[Agent]> = agent_list.into();
-    let agents = shape.agents.map(|_| Agents {
-        agents: Rc::clone(&agent_list),
-        watch: Rc::clone(&watch),
-        poll: Duration::from_millis(u64::from(shape.poll_ms)),
-        wait_ms: shape.inbox_wait_ms,
-        seed: shape.seed,
-    });
     let consumer = match &consumer_connector {
         Some(consumer_connector) => Some(Consumer {
             connector: consumer_connector,
             principal: names.worker,
             generations: Rc::clone(&consumer_generations),
-            watch: Rc::clone(&watch),
+            watch: Rc::clone(watches.first().ok_or(LoadError::Bound("ledgers"))?),
             poll: Duration::from_millis(u64::from(shape.poll_ms)),
             wait_ms: shape.inbox_wait_ms,
             seed: shape.seed,
@@ -2213,16 +2417,17 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
     let pace = shape.rate;
 
     let connections = shape.connections.unwrap_or(shape.concurrency);
-    // Writes: every worker its share of the claims, in its own id space.
+    // Writes: every caller its seat's share of its ledger's lifecycles, in its own id space.
     let mut jobs = Vec::with_capacity(usize::from(shape.concurrency));
     for index in 0..shape.concurrency {
+        let seat = Seat::of(index, shape.concurrency, ledger_count)?;
         jobs.push(Job {
             index,
             inflight: shape.inflight,
-            callers: shape.concurrency,
-            count: share(shape.claims, shape.concurrency, index)?,
+            seat,
+            count: seat.lifecycles(shape.claims)?,
             base: worker_base(shape.seed, u128::from(index))?,
-            names,
+            names: *ledgers.names(seat.ledger)?,
             limits: limits.clone(),
             created: Vec::new(),
             lifecycle: shape.lifecycle,
@@ -2240,9 +2445,9 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
             jobs,
             Phase::Write,
             Rc::clone(&generations),
-            &connector,
+            ledgers.connector(0)?,
             connections,
-            (consumer.as_ref(), agents.as_ref()),
+            (consumer.as_ref(), &agents),
         ),
         crate::progress::report(Instant::now()),
     )
@@ -2251,15 +2456,51 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
         Either::First(written) => written?,
         Either::Second(never) => match never {},
     };
-    let (floors_advanced, expired) = generations.counts()?;
+    // Every principal's journal: the issuer's, a consumer's, and each agent's.
+    let (floors_advanced, expired) = journal_counts(
+        [&*generations, &*consumer_generations].into_iter().chain(
+            agents
+                .iter()
+                .flat_map(|run| run.agents.iter().map(|agent| &agent.generations)),
+        ),
+    )?;
     let mut writes = merged(&write_outcomes);
     let (committed, refused, unknown) = (writes.committed, writes.refused, writes.unknown);
-    let lifecycles = write_outcomes.iter().fold(0u64, |total, outcome| {
-        total.saturating_add(outcome.lifecycles)
-    });
-    let abandoned = write_outcomes.iter().fold(0u64, |total, outcome| {
-        total.saturating_add(outcome.abandoned)
-    });
+    // Each ledger's lifecycles counted apart, its callers' outcomes together, and every ledger's
+    // summed.
+    let mut rows = Vec::with_capacity(usize::from(ledger_count));
+    let mut totals = LifecycleCounts::default();
+    for ledger in 0..ledger_count {
+        let mut counts = LifecycleCounts::default();
+        let mut refusals = Vec::new();
+        for outcome in write_outcomes
+            .iter()
+            .filter(|outcome| outcome.ledger == ledger)
+        {
+            counts.add(&outcome.counts);
+            for (reason, count) in &outcome.refusals {
+                note_count(&mut refusals, reason.clone(), *count);
+            }
+        }
+        totals.add(&counts);
+        let tails = watches
+            .get(usize::from(ledger))
+            .map(|watch| tail_totals(watch))
+            .unwrap_or_default();
+        rows.push(LedgerReport {
+            ledger: ledgers.names(ledger)?.ledger.into(),
+            callers: u16::try_from(share(u64::from(shape.concurrency), ledger_count, ledger)?)
+                .map_err(|_| LoadError::Bound("callers"))?,
+            agents: agents
+                .get(usize::from(ledger))
+                .map_or(Ok(0), |run| u16::try_from(run.agents.len()))
+                .map_err(|_| LoadError::Bound("agents"))?,
+            counts,
+            tail_events: tails.events,
+            tail_failures: tails.failed,
+            refusals,
+        });
+    }
     // Requests whose intended start falls in the warm-up are sent, never measured.
     let warmup = u128::from(shape.warmup_ms).saturating_mul(1_000_000);
     writes.samples.retain(|(start, _)| *start >= warmup);
@@ -2277,41 +2518,42 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
         warmup,
         write_phase_start_epoch_ns,
     )?;
-    let deliver = match consumer
-        .as_ref()
-        .map(|side| &*side.watch)
-        .or(agents.as_ref().map(|run| &*run.watch))
-    {
-        Some(watch) => {
-            let mut measured = DeliveryMeasurements::measure(
-                write_outcomes
-                    .iter()
-                    .flat_map(|outcome| outcome.deliveries.iter()),
-                warmup,
-            )?;
-            measured.undelivered = write_outcomes.iter().fold(0u64, |total, outcome| {
-                total.saturating_add(outcome.undelivered)
-            });
-            let consumer_tail = watch.counts(Side::Consumer);
-            let issuer_tail = watch.counts(Side::Issuer);
-            let agents_tail = watch.counts(Side::Agent);
-            measured.agents = shape.agents.unwrap_or(0);
-            measured.agent_polls = agents_tail.polls;
-            measured.agent_events = agents_tail.events;
-            measured.agent_waits = agents_tail.waited;
-            measured.consumer_polls = consumer_tail.polls;
-            measured.consumer_events = consumer_tail.events;
-            measured.consumer_waits = consumer_tail.waited;
-            measured.issuer_polls = issuer_tail.polls;
-            measured.issuer_events = issuer_tail.events;
-            measured.issuer_waits = issuer_tail.waited;
-            measured.tail_failures = consumer_tail
-                .failed
-                .saturating_add(issuer_tail.failed)
-                .saturating_add(agents_tail.failed);
-            Some(measured)
+    let deliver = if consumer.is_some() || !agents.is_empty() {
+        let mut measured = DeliveryMeasurements::measure(
+            write_outcomes
+                .iter()
+                .flat_map(|outcome| outcome.deliveries.iter()),
+            warmup,
+        )?;
+        measured.undelivered = totals.undelivered;
+        // Every ledger's tails together.
+        let (mut consumer_tail, mut issuer_tail, mut agents_tail) = (
+            TailCounts::default(),
+            TailCounts::default(),
+            TailCounts::default(),
+        );
+        for watch in &watches {
+            consumer_tail.add(&watch.counts(Side::Consumer));
+            issuer_tail.add(&watch.counts(Side::Issuer));
+            agents_tail.add(&watch.counts(Side::Agent));
         }
-        None => None,
+        measured.agents = shape.agents.unwrap_or(0);
+        measured.agent_polls = agents_tail.polls;
+        measured.agent_events = agents_tail.events;
+        measured.agent_waits = agents_tail.waited;
+        measured.consumer_polls = consumer_tail.polls;
+        measured.consumer_events = consumer_tail.events;
+        measured.consumer_waits = consumer_tail.waited;
+        measured.issuer_polls = issuer_tail.polls;
+        measured.issuer_events = issuer_tail.events;
+        measured.issuer_waits = issuer_tail.waited;
+        measured.tail_failures = consumer_tail
+            .failed
+            .saturating_add(issuer_tail.failed)
+            .saturating_add(agents_tail.failed);
+        Some(measured)
+    } else {
+        None
     };
     let mut refusals = Vec::new();
     for outcome in &write_outcomes {
@@ -2320,7 +2562,7 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
         }
     }
 
-    // Reads: the workers that created claims cycle through their own.
+    // Reads: the workers that created claims cycle through their own, in a run of one ledger.
     let readers: Vec<&Outcome> = write_outcomes
         .iter()
         .filter(|outcome| !outcome.created.is_empty())
@@ -2333,7 +2575,7 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
             jobs.push(Job {
                 index,
                 inflight: 1,
-                callers: reader_count,
+                seat: Seat::of(index, reader_count, 1)?,
                 count: share(shape.reads, reader_count, index)?,
                 base: worker_base(shape.seed, u128::from(index))?,
                 names,
@@ -2349,9 +2591,9 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
             jobs,
             Phase::Read,
             Rc::clone(&generations),
-            &connector,
+            ledgers.connector(0)?,
             reader_count.min(connections),
-            (None, None),
+            (None, &[]),
         )
         .await?;
         let reads = merged(&read_outcomes);
@@ -2366,23 +2608,25 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
     } else {
         (0, 0, 0, Latency::default())
     };
-    // Every handle to the embedded host goes before it closes: its owner joins once the last does,
-    // each agent's connection among them, held by the run's agents and the list alike (the
-    // phases' tasks, joined, hold none).
+    // Every handle to an embedded host goes before it closes: its owner joins once the last does,
+    // each agent's connection among them, held by the run's agents (the phases' tasks, joined,
+    // hold none), and each ledger's connector.
     drop(agents);
-    drop(agent_list);
+    drop(consumer);
     drop(consumer_connector);
-    drop(connector);
+    drop(ledgers);
 
-    // The embedded node: its size on disk, and its recovery when asked.
+    // The embedded nodes: their size on disk, and the node's recovery when asked.
     let mut data_dir_bytes = None;
     let (mut reopen_ms, mut first_read_after_reopen_ns, mut reopen_read_hit) = (None, None, None);
-    if let Some((root, hosted)) = root {
-        hosted.close()?;
-        data_dir_bytes = Some(directory_bytes(&root)?);
+    for node in nodes {
+        node.hosted.close()?;
+        let bytes = directory_bytes(&node.root)?;
+        data_dir_bytes = Some(data_dir_bytes.unwrap_or(0u64).saturating_add(bytes));
+        // A run of one ledger, one node (`reopen` is refused over ledgers).
         if shape.reopen {
             let started = Instant::now();
-            let hosted = Hosted::open(&settings, &limits)?;
+            let hosted = Hosted::open(&node.settings, &limits)?;
             reopen_ms = Some(started.elapsed().as_millis());
             if let Some(claim) = write_outcomes
                 .iter()
@@ -2404,16 +2648,16 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
             }
             hosted.close()?;
         }
+        drop(node.temporary);
     }
-    drop(kept_temp);
 
     Ok(Report {
         committed,
         refused,
         unknown,
         expired,
-        lifecycles,
-        abandoned,
+        lifecycles: totals.written,
+        abandoned: totals.abandoned,
         floors_advanced,
         wall_ms: write_nanos.checked_div(1_000_000).unwrap_or(0),
         throughput_ops_per_s: report::per_second(committed, write_nanos),
@@ -2434,6 +2678,8 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
         reopen_read_hit,
         data_dir_bytes,
         deliver,
+        ledgers: rows,
+        totals,
         shape,
     })
 }

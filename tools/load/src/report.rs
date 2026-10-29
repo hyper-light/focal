@@ -1,11 +1,13 @@
 //! The measured result (`--out` JSON): committed/refused/unknown counts, wall
 //! time, end-to-end committed throughput, request latency percentiles for the
 //! whole run and for its first and second half (by start time, so growth with
-//! session size shows), the read phase, and — when the shape asked for it —
-//! the reopen time of the node and its first read afterwards.
+//! session size shows), the read phase, every ledger the run drove with what its
+//! lifecycles did and their totals, and — when the shape asked for it — the
+//! reopen time of the node and its first read afterwards.
 use crate::error::LoadError;
-use crate::measurements::{DeliveryMeasurements, WriteMeasurements};
+use crate::measurements::{DeliveryMeasurements, LifecycleCounts, WriteMeasurements};
 use crate::shape::WorkloadShape;
+use focal_model::LedgerId;
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -17,15 +19,16 @@ pub struct Report {
     /// Writes the owner refused by name — their generation closed under
     /// pressure, or not admitted yet (the audit's F12) — and re-issued in
     /// the generation the owner admits; counted apart from `refused`, as
-    /// the protocol working, and in the samples twice.
+    /// the protocol working, and in the samples twice. Every principal's
+    /// journal's: the issuer's, a consumer's and every agent's.
     pub expired: u64,
     /// Claims whose every lifecycle step committed (the shape's `lifecycle`;
-    /// a `create` run counts none).
+    /// a `create` lifecycle's one step): `totals.written`.
     pub lifecycles: u64,
     /// Lifecycle steps never sent: the read of the claim they bind to failed.
     pub abandoned: u64,
     /// Generation floors this run advanced, as the journal does once the
-    /// generation below drained.
+    /// generation below drained: every principal's journal's.
     pub floors_advanced: u64,
     /// Wall time of the write phase, every worker included.
     pub wall_ms: u128,
@@ -66,6 +69,44 @@ pub struct Report {
     pub data_dir_bytes: Option<u64>,
     /// `deliver`: each message end to end, from its place on the schedule.
     pub deliver: Option<DeliveryMeasurements>,
+    /// Every ledger the run drove, in the shape's order (one where it names none): what its
+    /// lifecycles did over the whole write phase, counted apart.
+    pub ledgers: Vec<LedgerReport>,
+    /// The ledgers' counts summed.
+    pub totals: LifecycleCounts,
+}
+
+/// One ledger a run drove: which, the callers and agents that drove it, and what its lifecycles
+/// did.
+#[derive(Debug, Serialize)]
+pub struct LedgerReport {
+    pub ledger: LedgerName,
+    /// Its callers: its share of the run's.
+    pub callers: u16,
+    /// Its agents, in a run among agents: its share of the run's, each a principal on it.
+    pub agents: u16,
+    #[serde(flatten)]
+    pub counts: LifecycleCounts,
+    /// The events its inbox tails read, and their pages refused or failed.
+    pub tail_events: u64,
+    pub tail_failures: u64,
+    /// Its refusal reasons, counted as the run's `refusals` are.
+    pub refusals: Vec<(String, u64)>,
+}
+
+/// A ledger as the CLI names it: its tenant and its session, 32 hex digits each.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LedgerName {
+    pub tenant: String,
+    pub session: String,
+}
+impl From<LedgerId> for LedgerName {
+    fn from(ledger: LedgerId) -> Self {
+        Self {
+            tenant: ledger.tenant.to_string(),
+            session: ledger.session.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]

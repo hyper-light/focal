@@ -125,6 +125,39 @@ earlier would have been posted behind where its recipient reads from. The report
 satisfied as `delivered`; a claim that settled any other way, or whose next fact did
 not reach its agent within the run's bound, as `undelivered`.
 
+### Several ledgers at once
+
+```yaml
+lifecycle: work
+concurrency: 22
+agents: 66
+ledgers:              # optional; 1..=concurrency, each driven at once
+  - session: "<32 hex digits>"      # enrolled: a session of the enrollment's tenant
+    homes:                          # enrolled: the nodes holding its replica
+      - endpoint: "10.231.0.14:7443"
+        server_name: "<data server name>"
+  - session: "<32 hex digits>"
+```
+
+A run among agents (`deliver` or `work`) may drive several ledgers at once. Ledger `k`
+of `L` is driven by callers `k`, `k + L`, … among agents `k`, `k + L`, …, each agent a
+principal of its ledger alone, and takes every `L`th lifecycle of the run's one schedule
+(`src/seats.rs`): each ledger is offered the same share of the claims and of the rate
+whatever its callers, and the schedule is the same as one ledger's. Within a ledger its
+callers interleave as a run's always have, and a lifecycle's issuer, worker and evaluator
+are found around that ledger's own ring of agents; every ledger's agents' tails take their
+places before the run's clock starts.
+
+On `embedded` each ledger is a node the run opens, a ledger of its own (`ledgers: [{}, {}]`
+drives two). On `enrolled` each names its session in the enrollment's tenant, as `focal
+context add --enrolled-as … --session …` addresses one: the agents' credentials are the
+tenant's, and a creation cites the root the enrollment names. A ledger's `homes` are the
+nodes holding its replica, its agent `n` homed on its home `n mod homes` (reads and inbox
+waits at the home, writes at the ledger's leader); `homes` at the shape's top level are for
+a run of one ledger. Each ledger takes a caller at least, as many agents as its lifecycle
+goes among (`work` three, `deliver` two) and no more than a session keeps principals for,
+and a lifecycle at least. `reads`, `reopen` and `data_dir` apply to a run of one ledger.
+
 ## Report
 
 ```json
@@ -147,9 +180,37 @@ not reach its agent within the run's bound, as `undelivered`.
   "reopen_ms": 350,
   "first_read_after_reopen_ns": 210000,
   "reopen_read_hit": true,
-  "data_dir_bytes": 4194304
+  "data_dir_bytes": 4194304,
+  "ledgers": [
+    { "ledger": { "tenant": "<32 hex digits>", "session": "<32 hex digits>" },
+      "callers": 1, "agents": 0,
+      "started": 1000, "written": 1000, "judged": 0,
+      "refused": 0, "refused_by_cause": { "owner_memory": 0, "owner_bound": 0,
+        "ingress_capacity": 0, "unavailable": 0, "expired": 0, "other": 0 },
+      "unknown": 0, "abandoned": 0, "undelivered": 0, "committed": 1000,
+      "tail_events": 0, "tail_failures": 0, "refusals": [] }
+  ],
+  "totals": { "started": 1000, "written": 1000, "judged": 0, "refused": 0,
+              "refused_by_cause": { "owner_memory": 0, "owner_bound": 0, "ingress_capacity": 0,
+                                    "unavailable": 0, "expired": 0, "other": 0 },
+              "unknown": 0, "abandoned": 0, "undelivered": 0, "committed": 1000 }
 }
 ```
+
+`ledgers` names every ledger the run drove, in the shape's order (one, the node's or the
+enrollment's, where the shape names none), with the callers and agents that drove it and
+what its lifecycles did over the whole write phase; `totals` sums them. Each lifecycle
+begun (`started`) ends one way: `written`, every write committed (a `create` lifecycle's
+one); or ended early, `refused` (counted again under its cause in `refused_by_cause`, the
+causes `measured_writes` and the CSV name, `expired` for a write refused by name in the
+generation it was re-issued in too), `unknown`, `abandoned` (a step never sent: the read
+of what it binds to failed) or `undelivered` (a hand-off its agent never saw within the
+run's bound, or a claim settled other than satisfied). So `started` is the sum of those
+five. `judged` counts the claims settled satisfied — a work claim by its evaluator's
+verdict seen in its issuer's events, a message by its whole-work validation entered —
+whether or not the release after it committed. `committed` counts the ledger's writes,
+`tail_events` and `tail_failures` what its inbox tails read, and `refusals` its reasons.
+The run's own `lifecycles` is `totals.written`.
 
 The callers issue their writes in request generations as the CLI's journal
 does (the audit's F12): one generation for the run, shared by every worker as
@@ -161,7 +222,9 @@ closed under pressure on the owner's resident window, or not admitted yet —
 was never executed: the run reads the owner's window and issues the write
 once more in the generation the owner admits (`expired`, counted apart from
 `refused`; both attempts are in the samples). `FOCAL_NATIVE_OUTCOMES` on the
-node sets the resident window such a run presses on.
+node sets the resident window such a run presses on. In a run among agents
+each agent is a principal with a journal of its own; `floors_advanced` and
+`expired` count every principal's journal.
 
 Writes are `F_FULLFSYNC`-bound per commit (tens of ms; batching is the throughput
 lever — see `crates/focal-log/benches/append.rs`); linearizable reads take no

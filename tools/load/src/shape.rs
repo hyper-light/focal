@@ -199,6 +199,16 @@ pub struct WorkloadShape {
     /// invitation names and reads where it writes.
     #[serde(default)]
     pub homes: Option<Vec<Home>>,
+    /// A run among agents over several ledgers at once, each counted apart in the report's
+    /// `ledgers` rows and in total in its `totals`. Ledger `k` of `L` is driven by callers `k`,
+    /// `k + L`, … among agents `k`, `k + L`, …, and takes every `L`th lifecycle of the run's one
+    /// schedule, so each ledger is offered the same share of the claims and of the rate
+    /// (`seats`). On `embedded` each is a node the run opens, a ledger of its own; on `enrolled`
+    /// each names a session of the enrollment's tenant and the nodes holding its replica, which
+    /// its agents are homed over. Unset, the run drives one ledger: the embedded node's, or the
+    /// enrollment's.
+    #[serde(default)]
+    pub ledgers: Option<Vec<LedgerShape>>,
     /// Offered creations a second over all callers. Set, the writes are
     /// paced on a fixed schedule and each latency counts from its request's
     /// intended start (wrk2's constant-throughput method), so a stall is
@@ -241,6 +251,36 @@ pub struct Home {
     pub endpoint: String,
     /// The name its data certificate presents.
     pub server_name: String,
+}
+
+/// A ledger a run among agents drives ([`WorkloadShape::ledgers`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LedgerShape {
+    /// `enrolled`: the ledger's session, 32 hex digits, in the enrollment's tenant, as `focal
+    /// context add --enrolled-as … --session …` addresses one (a principal's grant is its
+    /// tenant's). Not on `embedded`, where each ledger is a node the run opens, its session the
+    /// node's own.
+    #[serde(default)]
+    pub session: Option<String>,
+    /// `enrolled` agents: the nodes holding the ledger's replica, the ledger's agents homed over
+    /// them as [`WorkloadShape::homes`] homes a run's: its agent `n` on home `n mod homes`, at most
+    /// one an agent. Unset, its agents dial the node their invitations name.
+    #[serde(default)]
+    pub homes: Option<Vec<Home>>,
+}
+
+impl LedgerShape {
+    /// The session the entry names, parsed.
+    pub fn session_id(&self) -> Result<Option<[u8; 16]>, String> {
+        self.session
+            .as_deref()
+            .map(|text| {
+                focal_client::input::parse_id(text)
+                    .map_err(|_| format!("ledger session {text:?} is not 32 hex digits"))
+            })
+            .transpose()
+    }
 }
 
 fn default_seed() -> u64 {
@@ -359,7 +399,8 @@ impl WorkloadShape {
                 return Err(format!("inbox_wait_ms must be 0..={MAX_INBOX_WAIT_MS}"));
             }
             if let Some(agents) = self.agents {
-                if agents < 2 || usize::from(agents) > max_agents() {
+                // Over several ledgers each ledger's share is bounded instead (`validate_ledgers`).
+                if self.ledgers.is_none() && (agents < 2 || usize::from(agents) > max_agents()) {
                     return Err(format!("agents must be 2..={}", max_agents()));
                 }
                 match (self.transport, &self.agent_enrollments) {
@@ -392,10 +433,102 @@ impl WorkloadShape {
         } else if self.homes.is_some() {
             return Err("homes apply to enrolled agents".into());
         }
+        if let Some(ledgers) = &self.ledgers {
+            self.validate_ledgers(ledgers)?;
+        }
         if self.rate == Some(0) {
             return Err("rate must be greater than zero".to_string());
         }
         Ok(())
+    }
+
+    /// A run over several ledgers: among agents, each ledger driven by a caller and a share of the
+    /// lifecycles of its own, among agents of its own, as many as its lifecycle goes among and no
+    /// more than a session keeps principals for; on `enrolled` each names a session of its own,
+    /// and the homes its agents take; on `embedded`, neither.
+    fn validate_ledgers(&self, ledgers: &[LedgerShape]) -> Result<(), String> {
+        let Some(agents) = self.agents.filter(|_| self.lifecycle.among_principals()) else {
+            return Err("ledgers apply to a run among agents".into());
+        };
+        let count = u16::try_from(ledgers.len())
+            .ok()
+            .filter(|count| (1..=self.concurrency).contains(count))
+            .ok_or("ledgers must be 1..=concurrency: each is driven by a caller of its own")?;
+        if self.claims < u64::from(count) {
+            return Err("claims must be at least the ledgers: each is driven".into());
+        }
+        if self.homes.is_some() {
+            return Err("over ledgers each ledger names the homes of its agents".into());
+        }
+        if self.reads > 0 || self.reopen || self.data_dir.is_some() {
+            return Err("reads, reopen and data_dir apply to a run of one ledger".into());
+        }
+        let least = if self.lifecycle == Lifecycle::Work {
+            3
+        } else {
+            2
+        };
+        let mut sessions = std::collections::BTreeSet::new();
+        for (index, ledger) in (0..count).zip(ledgers) {
+            // Ledger `index`'s agents: `agents / ledgers`, the first ledgers one more.
+            let its = crate::seats::share(u64::from(agents), count, index)
+                .map_err(|error| error.to_string())?;
+            if its < least || usize::try_from(its).map_or(true, |its| its > max_agents()) {
+                return Err(format!(
+                    "each ledger's agents must be {least}..={}: {agents} agents over {count} \
+                     ledgers give ledger {index} {its}",
+                    max_agents()
+                ));
+            }
+            match (self.transport, ledger.session_id()?) {
+                (Transport::Embedded, None) => {}
+                (Transport::Embedded, Some(_)) => {
+                    return Err(
+                        "on embedded each ledger is a node the run opens: it names no session"
+                            .into(),
+                    );
+                }
+                (Transport::Enrolled, Some(session)) => {
+                    if !sessions.insert(session) {
+                        return Err(format!("ledger {index} names a session named before it"));
+                    }
+                }
+                (Transport::Enrolled, None) => {
+                    return Err("on enrolled each ledger names its session".into());
+                }
+                (Transport::Unix, _) => {
+                    return Err("ledgers run on the embedded or the enrolled transport".into());
+                }
+            }
+            if let Some(homes) = &ledger.homes {
+                if self.transport != Transport::Enrolled {
+                    return Err("homes apply to enrolled agents".into());
+                }
+                if homes.is_empty() || u64::try_from(homes.len()).map_or(true, |homes| homes > its)
+                {
+                    return Err(format!(
+                        "ledger {index}'s homes must be 1..={its}, its agents"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The ledgers the run drives: the shape's, else the one its transport reaches.
+    pub fn ledger_count(&self) -> Result<u16, String> {
+        match &self.ledgers {
+            Some(ledgers) => u16::try_from(ledgers.len()).map_err(|_| "ledgers past u16".into()),
+            None => Ok(1),
+        }
+    }
+
+    /// The nodes ledger `ledger`'s agents are homed over: its entry's, or a run of one ledger's.
+    pub fn homes_of(&self, ledger: u16) -> Option<&[Home]> {
+        match &self.ledgers {
+            Some(ledgers) => ledgers.get(usize::from(ledger))?.homes.as_deref(),
+            None => self.homes.as_deref().filter(|_| ledger == 0),
+        }
     }
 
     /// The frame profile: the shape's, else the transport's own.

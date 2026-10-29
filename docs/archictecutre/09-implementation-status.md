@@ -17782,3 +17782,55 @@ no election ran in these rounds.
   repair due within each loss delay), so a lost answer waits for its retransmission.
 - **A client's leg.** A node's answers to its clients are sparse and uncoded; a lost one costs its
   write a probe timeout.
+
+### 2026-10-29 — focal-load drives a list of ledgers at once, each counted apart
+
+A cluster of thirty and more nodes loads every node only when its work spans a session for each
+group of three replicas, and focal-load drove one ledger a run. A run among agents (`deliver`,
+`work`) now takes `ledgers`, the ledgers it drives at once:
+
+- **Divided evenly.** Ledger `k` of `L` is driven by callers `k`, `k + L`, … among agents `k`,
+  `k + L`, …, each agent a principal of that ledger alone, and takes every `L`th lifecycle of the
+  run's one schedule (`tools/load/src/seats.rs`): each ledger is offered the same share of the
+  claims and of the rate whatever its callers, and the run's schedule is the same as one
+  ledger's. Within a ledger its callers interleave as a run's always have, a work claim's issuer,
+  worker and evaluator are found around that ledger's own ring of agents, and every ledger's
+  tails take their places before the run's clock starts. Each ledger takes a caller, a lifecycle
+  and as many agents as its lifecycle goes among at least, and no more agents than a session keeps
+  principals for.
+- **Where.** On the embedded transport each ledger is a node the run opens. On the enrolled
+  transport each names a session of the enrollment's tenant, addressed as `focal context add
+  --enrolled-as … --session …` addresses one: a participant's grant is its tenant's, and an
+  authored creation's root cause is not checked against the session's (`authored_check.rs`). Its
+  `homes` are the nodes holding its replica, its agents reading and waiting at them.
+- **Counted apart and in total.** The report's `ledgers` names every ledger the run drove (tenant
+  and session) with its callers and agents, and its lifecycles started, written, judged, refused
+  by cause (the owner's memory, its other bounds, ingress capacity, unavailable, refused by name
+  again after the re-issue, other), unknown, abandoned and undelivered, its writes committed, what
+  its tails read and its refusal reasons; `totals` sums the rows. A lifecycle begun ends one way,
+  so `started` is the sum of written, refused, unknown, abandoned and undelivered; `judged`
+  counts the claims settled satisfied, whether or not the release after it committed.
+
+Three things the change found on its way. A run among agents counted `expired` and
+`floors_advanced` from the run issuer's journal, which none of its writes went through, so every
+agents' run reported none: they sum every principal's journal now
+(`every_principals_journal_is_counted`). A run among agents opened `connections` connections as
+the issuer and never sent on them, sixteen idle QUIC connections to the founder in compare's work
+mode: it opens none. And a `create` lifecycle's one write now counts its lifecycle written, so the
+report's `lifecycles` is `totals.written` for every lifecycle (it counted none for `create`).
+
+Tests: `work_over_two_ledgers_on_embedded_nodes_is_driven_and_counted_apart` drives 33 work
+claims over two embedded nodes, four callers and eight agents: 17 and 16 lifecycles, each started,
+written and judged, 187 and 176 writes committed, each ledger's hand-offs read in its own agents'
+inboxes, none refused, unknown, abandoned or undelivered, and the totals the rows' sums. Opening
+the second ledger's agents on the first node fails it: the run ended without a report after 123 s,
+the tails' two-minute bound.
+`the_schedule_is_divided_among_the_ledgers_place_by_place`, `one_ledger_is_the_run_as_it_was`,
+`callers_and_agents_divide_among_the_ledgers`, `ledgers_divide_a_run_among_agents` and
+`refused_lifecycles_are_counted_by_their_cause` cover the division, the shape's refusals and the
+counts. `bash scripts/cargo.sh test -p focal-load --locked --offline -- --test-threads=4` on an
+Apple M5 Max (18 CPUs, 128 GiB, macOS 26.4.1): 30 passed, the two nightly tests ignored; the
+nightly campaign with `--ignored` (2 seeds, 60 claims, 120 reads) passed. By hand, `deliver` among
+seven agents over three embedded ledgers: 11, 10 and 10 messages, every one delivered. The
+enrolled transport's run over sessions is measured where the cluster has them (the 30-node plan's
+fifth step).
