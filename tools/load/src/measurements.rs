@@ -62,6 +62,81 @@ impl RefusalCause {
     }
 }
 
+/// Lifecycles a refused write ended, by what refused it ([`RefusalCause`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RefusedByCause {
+    pub owner_memory: u64,
+    pub owner_bound: u64,
+    pub ingress_capacity: u64,
+    pub unavailable: u64,
+    /// Refused by name, then again in the generation the owner named for its re-issue.
+    pub expired: u64,
+    pub other: u64,
+}
+impl RefusedByCause {
+    /// One lifecycle more that a write refused for `cause` ended.
+    pub fn count(&mut self, cause: RefusalCause) {
+        let count = match cause {
+            RefusalCause::OwnerMemory => &mut self.owner_memory,
+            RefusalCause::OwnerBound => &mut self.owner_bound,
+            RefusalCause::IngressCapacity => &mut self.ingress_capacity,
+            RefusalCause::Unavailable => &mut self.unavailable,
+            RefusalCause::None | RefusalCause::Other => &mut self.other,
+        };
+        *count = count.saturating_add(1);
+    }
+    fn add(&mut self, other: &Self) {
+        self.owner_memory = self.owner_memory.saturating_add(other.owner_memory);
+        self.owner_bound = self.owner_bound.saturating_add(other.owner_bound);
+        self.ingress_capacity = self.ingress_capacity.saturating_add(other.ingress_capacity);
+        self.unavailable = self.unavailable.saturating_add(other.unavailable);
+        self.expired = self.expired.saturating_add(other.expired);
+        self.other = self.other.saturating_add(other.other);
+    }
+}
+
+/// What lifecycles did: one caller's, one ledger's, or every ledger's together, over the whole
+/// write phase. Each lifecycle begun ends one way: written, or ended early by a refused write, a
+/// write whose outcome is unknown, a step never sent or a hand-off never seen; so `started` is
+/// the sum of those five. `judged` counts those whose claim settled satisfied, whether or not the
+/// release that follows committed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct LifecycleCounts {
+    /// Begun: the claim's creation sent.
+    pub started: u64,
+    /// Every write committed, a `create` lifecycle's one among them.
+    pub written: u64,
+    /// The claim settled satisfied: a work claim by its evaluator's verdict, seen in its issuer's
+    /// events; a message by its whole-work validation entered.
+    pub judged: u64,
+    /// Ended by a refused write, each counted under its cause in `refused_by_cause`.
+    pub refused: u64,
+    pub refused_by_cause: RefusedByCause,
+    /// Ended by a write whose outcome is unknown.
+    pub unknown: u64,
+    /// Ended by a step never sent: the read of what it binds to failed.
+    pub abandoned: u64,
+    /// Ended by a hand-off its agent never saw in its events within the wait's bound, or by a
+    /// claim settled other than satisfied.
+    pub undelivered: u64,
+    /// Writes committed, every step of every lifecycle.
+    pub committed: u64,
+}
+impl LifecycleCounts {
+    /// `other`'s counts added to these.
+    pub fn add(&mut self, other: &Self) {
+        self.started = self.started.saturating_add(other.started);
+        self.written = self.written.saturating_add(other.written);
+        self.judged = self.judged.saturating_add(other.judged);
+        self.refused = self.refused.saturating_add(other.refused);
+        self.refused_by_cause.add(&other.refused_by_cause);
+        self.unknown = self.unknown.saturating_add(other.unknown);
+        self.abandoned = self.abandoned.saturating_add(other.abandoned);
+        self.undelivered = self.undelivered.saturating_add(other.undelivered);
+        self.committed = self.committed.saturating_add(other.committed);
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct WriteSample {
     pub start_ns: u128,

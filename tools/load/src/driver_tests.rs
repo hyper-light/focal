@@ -171,3 +171,62 @@ fn enrolled_agents_are_each_their_own_client_data_directory() {
         "{refused}"
     );
 }
+
+/// A run among agents writes through each agent's journal, not the run issuer's: the floors
+/// advanced and the requests refused by name are every principal's, summed (an agents' run
+/// counted only its issuer's, which none of its writes went through, and reported none).
+#[test]
+fn every_principals_journal_is_counted() {
+    let issuer = Generations::new();
+    let agents = [Generations::new(), Generations::new()];
+    agents[0]
+        .learn(RequestEpoch(5), &[RequestEpoch(5)])
+        .unwrap();
+    agents[0].advanced(RequestEpoch(6)).unwrap();
+    agents[1]
+        .learn(RequestEpoch(2), &[RequestEpoch(2), RequestEpoch(3)])
+        .unwrap();
+    agents[1].learn(RequestEpoch(3), &[]).unwrap();
+    assert_eq!(journal_counts([&issuer].into_iter()).unwrap(), (0, 0));
+    assert_eq!(
+        journal_counts([&issuer].into_iter().chain(agents.iter())).unwrap(),
+        (1, 3)
+    );
+}
+
+/// A lifecycle a refused write ended is counted under the cause its reply named, and every
+/// cause's count adds up to the refused, ledger by ledger and in total.
+#[test]
+fn refused_lifecycles_are_counted_by_their_cause() {
+    let mut ledger = LifecycleCounts::default();
+    for cause in [
+        RefusalCause::OwnerMemory,
+        RefusalCause::OwnerMemory,
+        RefusalCause::IngressCapacity,
+        RefusalCause::Unavailable,
+        RefusalCause::Other,
+    ] {
+        ledger.refused += 1;
+        ledger.refused_by_cause.count(cause);
+    }
+    ledger.refused += 1;
+    ledger.refused_by_cause.expired += 1;
+    let causes = |counts: &LifecycleCounts| {
+        let by = counts.refused_by_cause;
+        by.owner_memory
+            + by.owner_bound
+            + by.ingress_capacity
+            + by.unavailable
+            + by.expired
+            + by.other
+    };
+    assert_eq!(ledger.refused_by_cause.owner_memory, 2);
+    assert_eq!(ledger.refused_by_cause.ingress_capacity, 1);
+    assert_eq!(causes(&ledger), ledger.refused);
+    let mut total = LifecycleCounts::default();
+    total.add(&ledger);
+    total.add(&ledger);
+    assert_eq!(total.refused, 12);
+    assert_eq!(total.refused_by_cause.owner_memory, 4);
+    assert_eq!(causes(&total), total.refused);
+}

@@ -56,6 +56,15 @@ pub struct TailCounts {
     /// Pages the node held until a delivery came or the wait ended (the waiting profile).
     pub waited: u64,
 }
+impl TailCounts {
+    /// `other`'s counts added to these: several tails' together.
+    pub fn add(&mut self, other: &Self) {
+        self.polls = self.polls.saturating_add(other.polls);
+        self.events = self.events.saturating_add(other.events);
+        self.failed = self.failed.saturating_add(other.failed);
+        self.waited = self.waited.saturating_add(other.waited);
+    }
+}
 
 /// The waiters of every message under way, by claim, at most `bound` of each kind.
 pub struct Watch {
