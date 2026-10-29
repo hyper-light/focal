@@ -234,6 +234,10 @@ node_report() {
   done
   timeout 30 "${compose[@]}" --profile focal exec -T "$n" focal --data-dir /data inspect node --metrics \
     > "$out/$report.$n.metrics.txt" 2>/dev/null || true
+  # Its health (the placement agent's last error among it) and its log's end, for what a fault left.
+  timeout 30 "${compose[@]}" --profile focal exec -T "$n" focal --data-dir /data inspect node --health \
+    > "$out/$report.$n.health.json" 2>/dev/null || true
+  timeout 30 "${compose[@]}" --profile focal logs --no-color --tail 300 "$n" > "$out/$report.$n.log" 2>&1 || true
 }
 cleanup() { dc down -v --remove-orphans >/dev/null 2>&1 || true; }
 # The FAULTS a run suffers, applied as its load starts: the shaping every node keeps, and each
@@ -247,7 +251,24 @@ fault_directed=""
 fault_started=0
 # What a count of nodes (`kill=12@...`) draws its nodes by: FAULT_SEED, else one drawn here, logged.
 fault_seed="${FAULT_SEED:-}"
-fault_log() { echo "$(( $(date +%s) - fault_started ))s $*" >> "$out/$report.faults.txt"; }
+# Each line the seconds since the load began and the Unix time in milliseconds, which the report's
+# CSV of writes is timed against (`run_start_epoch_ns`), so what a fault did is read write by write.
+fault_log() {
+  local now
+  now=$(perl -MTime::HiRes=time -e 'printf "%d", time() * 1e3')
+  echo "$(( now / 1000 - fault_started ))s ${now}ms $*" >> "$out/$report.faults.txt"
+}
+# NODE started again by a fault, waited on until it serves (the bootstrap's probe), and the log told
+# when: its time to serve. Bounded as the bootstrap's waits are, 300 probes a second apart.
+fault_serving() {
+  local node=$1 n=0
+  until timeout 10 "${compose[@]}" --profile focal exec -T "$node" focal --data-dir /data inspect node --probe serving >/dev/null 2>&1; do
+    n=$((n + 1))
+    if [ "$n" -ge 300 ]; then fault_log "$node not serving after $n probes"; return 1; fi
+    sleep 1
+  done
+  fault_log "$node serving"
+}
 fault_shape() {
   local node=$1 how=$2
   if [ -n "$how" ]; then
@@ -407,6 +428,7 @@ faults_start() {
           fi
           read -ra hit <<< "$found"
           if [ "$what" = kill ]; then
+            fault_log "${hit[*]} killing"
             if dc kill "${hit[@]}" >/dev/null 2>&1; then
               fault_log "${hit[*]} killed"
             else
@@ -414,8 +436,9 @@ faults_start() {
             fi
             sleep "$down"
             if dc start "${hit[@]}" >/dev/null 2>&1; then
-              each "${hit[@]}" -- fault_reshape || true
               fault_log "${hit[*]} started"
+              each "${hit[@]}" -- fault_reshape || true
+              each "${hit[@]}" -- fault_serving || true
             else
               fault_log "${hit[*]}: start refused"
             fi
