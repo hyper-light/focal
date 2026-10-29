@@ -187,7 +187,7 @@ node_evidence() {
   {
     echo "--- $n replicas"
     timeout 30 "${compose[@]}" --profile focal exec -T "$n" focal --data-dir /data inspect replicas --replicas || true
-    for session in $(held_sessions "$n"); do
+    for session in $(held_sessions "$n" other); do
       echo "--- $n replicas of $session"
       timeout 30 "${compose[@]}" --profile focal exec -T "$n" focal --data-dir /data inspect replicas --replicas \
         --session "$session" || true
@@ -200,28 +200,35 @@ node_evidence() {
     timeout 30 "${compose[@]}" --profile focal logs --no-color --tail 120 "$n" || true
   } > "$dir/$n" 2>&1
 }
-# The sessions other than the bench session that NODE holds a replica of, one a line, as the run's
-# placement by node records them (`<report>.sessions.json`); none before it is written.
+# The sessions NODE holds a replica of, one a line, as the run's placement by node records them
+# (`<report>.sessions.json`): `other`, those but the bench session; `bench`, the bench session where
+# it holds it, or where the record names none of its sessions (before it is written, or a node it
+# lists holding none).
 held_sessions() {
   python3 -c '
 import json, sys
 try:
-    held = json.load(open(sys.argv[1]))["nodes"].get(sys.argv[2], [])
+    held = json.load(open(sys.argv[1]))["nodes"].get(sys.argv[3], [])
 except (OSError, ValueError, KeyError):
     held = []
-print("\n".join(session for session in held if session != sys.argv[3]))' \
-    "$out/$report.sessions.json" "$1" "${bench_session:-}"
+if sys.argv[2] == "bench":
+    print(sys.argv[4] if not held or sys.argv[4] in held else "")
+else:
+    print("\n".join(session for session in held if session != sys.argv[4]))' \
+    "$out/$report.sessions.json" "$2" "$1" "${bench_session:-}"
 }
 # NODE's replicas as they report themselves, the cost of every checkpoint they wrote by stage among
-# them, for where the tail's time went: its original session's, the bench session's (empty where it
-# holds none of it), and each other session's it holds in a file of its own named by the session's
-# first eight digits; and its metrics: its log's flush and commit-wait quantiles and its owners'
-# longest periods, for whether a stall was the disk's.
+# them, for where the tail's time went: the bench session's (its original session, read without
+# `--session`) where it holds it, and each other session's it holds in a file of its own named by
+# the session's first eight digits; and its metrics: its log's flush and commit-wait quantiles and
+# its owners' longest periods, for whether a stall was the disk's.
 node_report() {
   local n=$1 session
-  timeout 30 "${compose[@]}" --profile focal exec -T "$n" focal --data-dir /data inspect replicas --replicas \
-    > "$out/$report.$n.replicas.json" 2>/dev/null || true
-  for session in $(held_sessions "$n"); do
+  if [ -n "$(held_sessions "$n" bench)" ]; then
+    timeout 30 "${compose[@]}" --profile focal exec -T "$n" focal --data-dir /data inspect replicas --replicas \
+      > "$out/$report.$n.replicas.json" 2>/dev/null || true
+  fi
+  for session in $(held_sessions "$n" other); do
     timeout 30 "${compose[@]}" --profile focal exec -T "$n" focal --data-dir /data inspect replicas --replicas \
       --session "$session" > "$out/$report.$n.${session:0:8}.replicas.json" 2>/dev/null || true
   done
