@@ -17844,6 +17844,7 @@ Docker Desktop's VM too.
 | Box, 0.93 | by +68 s | yes | the same |
 | GitHub runner, EPYC 7763, 4 CPUs (run 40845098650); 0.09 | – | +89 s, a 11, b 11, c 11 | the same, at +224 s |
 | Box, 0.93, limits raised to 1,226 (test B) | – | a 11, b 11, c 11 | founded; 500 of 500 writes committed under faults |
+| GitHub runner, 4 CPUs, limits raised to 1,161 (run 40858083086); 0.09 | – | +65 s, a 11, b 11, c 11 | founded; 800 of 800 writes, the measured 600 at p50 151 ms, p99 551 ms |
 
 Test B's faults, from its `faults.txt`: netem on what each node sends its 32 peers, `any 3 of 33
 (seed 42, fault 2): focal1 focal16 focal21` killed in one call and started in one, `focal4 focal7`
