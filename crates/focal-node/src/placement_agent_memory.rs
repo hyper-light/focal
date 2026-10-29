@@ -234,8 +234,11 @@ impl PlacementAgent {
         authority: &ControlAuthoritySnapshot,
     ) {
         let wanted = self.held_bytes().and_then(|held| {
-            held.checked_add(map_entry_bytes::<focal_directory::PartitionId, HeldObservation>()?)?
-                .checked_add(Self::held_heap_bytes(snapshot, authority)?)
+            held.checked_add(map_entry_bytes::<
+                focal_directory::PartitionId,
+                HeldObservation,
+            >()?)?
+            .checked_add(Self::held_heap_bytes(snapshot, authority)?)
         });
         match wanted.map(|wanted| self.charge_to(wanted)) {
             Some(Ok(())) => {

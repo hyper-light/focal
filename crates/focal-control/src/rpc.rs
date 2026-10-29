@@ -54,7 +54,9 @@ pub enum ControlRead {
     /// ([`ControlReadResult::StateHeld`]). What an observer that looks at a
     /// group again and again asks: it is sent the checkpoint once a change,
     /// not once a look. Open to enrolled nodes, as `State` is.
-    StateUnless { held: ControlRevisions },
+    StateUnless {
+        held: ControlRevisions,
+    },
     /// `Authority`, unless the reader holds it: a replica whose installed
     /// authority is the one it exports at `source_index` holds the reader's
     /// registry and enrollment (a partition replaces them only with a newer
@@ -62,7 +64,9 @@ pub enum ControlRead {
     /// it has reached and the time its last command was decided at
     /// ([`ControlReadResult::AuthorityHeld`]). Open to enrolled nodes, as
     /// `Authority` is.
-    AuthorityUnless { source_index: u64 },
+    AuthorityUnless {
+        source_index: u64,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(
@@ -172,11 +176,16 @@ pub enum ControlReadResult {
     },
     /// The checkpoint the reader holds (`ControlRead::StateUnless`) is this
     /// replica's at `applied_index`.
-    StateHeld { applied_index: u64 },
+    StateHeld {
+        applied_index: u64,
+    },
     /// The authority the reader holds (`ControlRead::AuthorityUnless`) is
     /// this replica's at `applied_index`, its last command decided at
     /// `decided_at`.
-    AuthorityHeld { applied_index: u64, decided_at: i64 },
+    AuthorityHeld {
+        applied_index: u64,
+        decided_at: i64,
+    },
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum ControlFailure {

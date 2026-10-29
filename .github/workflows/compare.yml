@@ -47,7 +47,10 @@ on:
         description: "focal: what the cluster suffers while each load runs (run.sh FAULTS), e.g. 'netem=delay 80ms 30ms loss 3%;kill=focal2@40+30;isolate=focal3@100+20', or nodes by list or count, 'kill=focal4,focal7@40+30;isolate=12@100+20'; empty, none"
         default: ""
       nodes:
-        description: "focal: the nodes its cluster runs (run.sh NODES, 3 to 203, over zones a, b and c; past three, fit to the runner's CPUs); empty, three, as each competitor runs"
+        description: "focal: the nodes its cluster runs (run.sh NODES, 3 to 203, over zones a, b and c; past three, fit to the runner's CPUs and memory); empty, three, as each competitor runs"
+        default: ""
+      node_memory:
+        description: "focal: each node's memory limit (focal-nodes.sh NODE_MEMORY, e.g. 256m; past three nodes, no more than the runner's share); empty, 2g, as each competitor's"
         default: ""
 
 permissions:
@@ -139,6 +142,7 @@ jobs:
           AGENTS: ${{ github.event.inputs.agents || (startsWith(github.ref_name, 'compare/work') && '500' || '') }}
           FAULTS: ${{ github.event.inputs.faults || '' }}
           NODES: ${{ github.event.inputs.nodes || '' }}
+          NODE_MEMORY: ${{ github.event.inputs.node_memory || '2g' }}
           # The runner is the run's alone: the bootstrap may raise its kernel's neighbour table to
           # hold every node's peers (focal-bootstrap.sh), which past three nodes the default may not.
           RAISE_HOST_LIMITS: "1"
