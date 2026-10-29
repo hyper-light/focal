@@ -3679,7 +3679,7 @@ impl PlacementAgent {
 /// the group last named (`learned`) while it is a voter the liveness view does not hold dead,
 /// else the founder while it is one, else the first such voter other than this `node`, else the
 /// founder. A voter asked that does not lead names who does (`NotLeader`), and is asked no more.
-fn partition_target_among(
+pub(crate) fn partition_target_among(
     founder: u64,
     node: u64,
     voters: &BTreeMap<u64, u64>,
@@ -3706,7 +3706,7 @@ fn partition_target_among(
 /// The voter of `voters` asked after `failed` gave no answer: the next after it in the grant's
 /// order, around to the first, that is neither `failed` nor this `node` and that the liveness
 /// view does not hold dead; none where no other voter is left.
-fn next_partition_target(
+pub(crate) fn next_partition_target(
     voters: &BTreeMap<u64, u64>,
     failed: u64,
     node: u64,
