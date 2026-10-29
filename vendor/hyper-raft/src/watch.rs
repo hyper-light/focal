@@ -160,7 +160,28 @@ pub(crate) struct Watch {
     /// The owner holds this member's campaigns: its log may lack what it acknowledged, or it is
     /// stalled for room (`docs/durable.md` §5, §8).
     pub(crate) held: bool,
+    /// The terms this member last stood in as a candidate and when it asked for their votes, on
+    /// the owner's clock as of its latest wake, the latest last: a grant that comes after the
+    /// member moved on still tells how long a grant takes.
+    stood: [(u64, u64); STOOD],
+    /// The term of a grant taken since the last wake, which times it (`Watch::time_grant`): a
+    /// message is stepped on the clock of the wake before it.
+    pub(crate) heard_grant: Option<u64>,
+    /// How long a grant took lately, from the asking to its arrival, nanoseconds; zero before
+    /// one. A voter grants once its vote is durable, on its own disk, which the round
+    /// (`Timing::round`) does not count: the owner's ballot counts this member's writes. An
+    /// unresolved candidacy waits at least this long before the member asks again, as a reset
+    /// waits at least a round (`Raft::wake`). Asking sooner, a candidate whose voter wrote slower
+    /// than itself moved on before every grant came, and spent a term each time it asked: 113
+    /// terms for one leader's kill, 70 % of the grants coming after their candidate had moved on
+    /// (Quiver's lab, a candidate on an NVMe disk and voters on a loaded btrfs one; kiln's
+    /// CP-T2.2 step 7). A grant that took longer raises it to that; a quicker one brings it
+    /// halfway down.
+    pub(crate) grant_wait: u64,
 }
+
+/// The candidacies a member remembers for timing late grants (`Watch::stood`).
+const STOOD: usize = 4;
 
 /// `duration` in nanoseconds, saturating at `u64::MAX` (584 years).
 pub(crate) fn nanos(duration: Duration) -> u64 {
@@ -168,6 +189,65 @@ pub(crate) fn nanos(duration: Duration) -> u64 {
 }
 
 impl Watch {
+    /// The member stands as a candidate in `term`, asking for its votes now.
+    pub(crate) fn stand(&mut self, term: u64) {
+        self.stood.rotate_left(1);
+        if let Some(last) = self.stood.last_mut() {
+            *last = (term, self.now);
+        }
+    }
+    /// Times the grant taken since the last wake, if it is of a term this member stood in lately
+    /// (`Watch::grant_wait`).
+    pub(crate) fn time_grant(&mut self) {
+        let Some(term) = self.heard_grant.take() else {
+            return;
+        };
+        let Some(&(_, asked)) = self
+            .stood
+            .iter()
+            .rev()
+            .find(|(stood, _)| *stood == term && term != 0)
+        else {
+            return;
+        };
+        let took = self.now.saturating_sub(asked);
+        self.grant_wait = if took >= self.grant_wait {
+            took
+        } else {
+            self.grant_wait
+                .saturating_sub(self.grant_wait.saturating_sub(took) / 2)
+        };
+    }
+    /// The earliest the candidacy of `term` may be given up, if this member stood in it lately and
+    /// a grant has been timed: when it asked, and as long as a grant takes and a round more
+    /// (`Watch::grant_wait`).
+    pub(crate) fn candidacy_floor(&self, term: u64) -> Option<u64> {
+        if self.grant_wait == 0 {
+            return None;
+        }
+        let &(_, asked) = self
+            .stood
+            .iter()
+            .rev()
+            .find(|(stood, _)| *stood == term && term != 0)?;
+        Some(
+            asked
+                .saturating_add(self.grant_wait)
+                .saturating_add(self.round().unwrap_or(0)),
+        )
+    }
+    /// The candidacy of `term` under way, if the member is a candidate, timed before a grant told
+    /// how long one takes, waits that long all the same and a round more from when it asked
+    /// (`Watch::candidacy_floor`): given up sooner, the grant it asked for comes to the next
+    /// candidacy, which drops it.
+    pub(crate) fn hold_candidacy(&mut self, term: Option<u64>) {
+        if let (Arm::At(at), Some(floor)) = (
+            self.campaign,
+            term.and_then(|term| self.candidacy_floor(term)),
+        ) {
+            self.campaign = Arm::At(at.max(floor));
+        }
+    }
     /// Whether the owner's detectors suspect `member`.
     pub(crate) fn suspects(&self, member: NodeId) -> bool {
         self.suspected.binary_search(&member).is_ok()

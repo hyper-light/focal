@@ -2814,6 +2814,7 @@ impl<S: Storage> Raft<S> {
             return Ok(false);
         };
         watch.now = watch.now.max(now);
+        watch.time_grant();
         if self.state == StateRole::Leader {
             return self.wake_leader(now);
         }
@@ -2927,6 +2928,7 @@ impl<S: Storage> Raft<S> {
             self.stop_asking()?;
         }
         let (promotable, local, term) = (self.promotable(), self.config.seed, self.term);
+        let candidate = self.state == StateRole::Candidate;
         let alone = self.tracker.is_singleton() && self.tracker.configuration().votes(self.id);
         // A sole voter's campaign in its term waits for its own vote to be durable (I9), which
         // alone elects it.
@@ -2958,16 +2960,20 @@ impl<S: Storage> Raft<S> {
             Arm::Off => Arm::Unset { round: true },
             armed => armed,
         };
+        // A round, and at least as long as a grant takes (`Watch::grant_wait`): a candidacy given
+        // up before its voters could grant spends a term and asks them again.
+        let grant_wait = watch.grant_wait;
         watch.campaign = match armed {
             Arm::Unset { round } => match (watch.round(), watch.draw(local)) {
                 (Some(tail), Some(delay)) => Arm::At(
-                    now.saturating_add(if round { tail } else { 0 })
+                    now.saturating_add(if round { tail.max(grant_wait) } else { 0 })
                         .saturating_add(delay),
                 ),
                 _ => armed,
             },
             armed => armed,
         };
+        watch.hold_candidacy(candidate.then_some(term));
         // A sole voter has no one to split a vote with, nor a leader to
         // suspect: it campaigns at once, timed or not.
         let due = (alone && promotable)
@@ -3051,6 +3057,9 @@ impl<S: Storage> Raft<S> {
         self.reset(term)?;
         self.vote = self.id;
         self.state = StateRole::Candidate;
+        if let Some(watch) = self.watch.as_mut() {
+            watch.stand(term);
+        }
         self.refresh_held_promise()
     }
     fn become_pre_candidate(&mut self) -> Result<()> {
@@ -3290,6 +3299,14 @@ impl<S: Storage> Raft<S> {
             return Err(Error::Violation(
                 "a term or an index beyond what is counted",
             ));
+        }
+        if kind == MessageType::MsgRequestVoteResponse
+            && !message.reject
+            && let Some(watch) = self.watch.as_mut()
+        {
+            // A grant, of whatever term and whatever this member is now: timed at the next wake,
+            // on its clock (`Watch::grant_wait`).
+            watch.heard_grant = Some(message.term);
         }
         if self.step_term(kind, &message)? == TermChecked::Done {
             return Ok(());
