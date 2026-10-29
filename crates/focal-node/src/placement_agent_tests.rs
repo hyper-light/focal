@@ -1666,6 +1666,80 @@ fn a_dead_voter_is_drained_and_replaced_without_waiting_it_out() {
     .unwrap()
 }
 
+/// A partition led on another node is asked where its group last named its leader, while that is
+/// a live voter of the grant: the 33-node kill (2026-10-29) moved the directory partition's
+/// leadership off its killed founder, and every agent whose fixed pick was a follower asked that
+/// follower ~100 times, each answer naming the leader, and observed nothing.
+#[test]
+fn a_partition_is_asked_where_its_group_last_named_its_leader() {
+    let founder = 1;
+    let node = 9;
+    let voters = BTreeMap::from([(1, 1), (5, 1), (30, 1)]);
+    let none_dead = |_: u64| false;
+    let founder_dead = |voter: u64| voter == founder;
+    let leader_dead = |voter: u64| voter == 30;
+    // Nothing named yet: the founder while it is a live voter, else the first live voter.
+    assert_eq!(
+        partition_target_among(founder, node, &voters, None, none_dead),
+        founder
+    );
+    assert_eq!(
+        partition_target_among(founder, node, &voters, None, founder_dead),
+        5
+    );
+    // Node 30 named the leader: asked there whether the founder lives or not.
+    assert_eq!(
+        partition_target_among(founder, node, &voters, Some(30), none_dead),
+        30
+    );
+    assert_eq!(
+        partition_target_among(founder, node, &voters, Some(30), founder_dead),
+        30
+    );
+    // A named leader held dead, no longer a voter, or this node itself is passed over.
+    assert_eq!(
+        partition_target_among(founder, node, &voters, Some(30), leader_dead),
+        founder
+    );
+    assert_eq!(
+        partition_target_among(founder, node, &voters, Some(77), none_dead),
+        founder
+    );
+    assert_eq!(
+        partition_target_among(founder, 30, &voters, Some(30), none_dead),
+        founder
+    );
+}
+
+/// A partition's target that gave no answer is followed by the next voter of the grant, around
+/// to the first, past this node and the voters held dead: a started node whose detector held no
+/// one dead asked the founder, started with it and not serving yet, every pass.
+#[test]
+fn a_partition_target_that_gave_no_answer_is_followed_by_the_next_voter() {
+    let voters = BTreeMap::from([(1, 1), (5, 1), (30, 1)]);
+    let none_dead = |_: u64| false;
+    assert_eq!(next_partition_target(&voters, 1, 9, none_dead), Some(5));
+    assert_eq!(next_partition_target(&voters, 5, 9, none_dead), Some(30));
+    // Around to the first, past this node and the dead.
+    assert_eq!(next_partition_target(&voters, 30, 9, none_dead), Some(1));
+    assert_eq!(next_partition_target(&voters, 1, 5, none_dead), Some(30));
+    assert_eq!(
+        next_partition_target(&voters, 1, 9, |voter| voter == 5),
+        Some(30)
+    );
+    // A target that is no voter is followed by the voter after it in order.
+    assert_eq!(next_partition_target(&voters, 7, 9, none_dead), Some(30));
+    // No other voter left: none.
+    assert_eq!(
+        next_partition_target(&voters, 1, 9, |voter| voter != 1),
+        None
+    );
+    assert_eq!(
+        next_partition_target(&BTreeMap::from([(1, 1)]), 1, 9, none_dead),
+        None
+    );
+}
+
 #[test]
 fn a_death_stands_for_one_election_window_of_the_group() {
     use crate::placement_agent::controller::retirement_hold;

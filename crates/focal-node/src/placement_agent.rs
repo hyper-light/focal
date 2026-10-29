@@ -504,11 +504,23 @@ pub struct PlacementAgent {
     /// Charged with the agent's tables; a partition leaves it as it leaves the root's delegations
     /// or comes to be read here.
     pub(super) held: BTreeMap<PartitionId, HeldObservation>,
+    /// Each partition led on another node, the leader its group last named to this agent (a
+    /// `NotLeader` answer's known leader): asked first while it is a voter of the group's grant
+    /// that the liveness view does not hold dead. A pass asked one fixed pick (the founder, else
+    /// the first live voter) whatever the group answered, so once the directory partition's
+    /// leadership moved (its founder killed with eleven other nodes of 33, 2026-10-29) every agent
+    /// whose pick was not the new leader asked that follower again each pass, ~100 times,
+    /// observed nothing and reported no liveness facts: neither it nor its restarted peers were
+    /// revived. Charged with the agent's tables; a partition leaves it as it leaves the root's
+    /// delegations.
+    pub(super) partition_leaders: BTreeMap<PartitionId, u64>,
     observed_at: i64,
-    /// The liveness member set derived from the last observation, shared so an
+    /// The liveness member set read from the root's authority, shared so an
     /// unchanged membership re-reports each tick without rebuilding the map.
     member_facts: std::sync::Arc<BTreeMap<u64, u64>>,
     member_generation: u64,
+    /// The root authority's revision the member set was read at: rebuilt only once it moves.
+    member_revision: Option<u64>,
     /// Per session, the (descriptor authority, directory revision) last seen to
     /// verify: the self-heal placement check is a pure function of those two, so
     /// an unchanged pair skips re-verifying against the whole node set each tick.
@@ -635,9 +647,11 @@ impl PlacementAgent {
             ticks: 0,
             last_observed: Vec::new(),
             held: BTreeMap::new(),
+            partition_leaders: BTreeMap::new(),
             observed_at: 0,
             member_facts: std::sync::Arc::new(BTreeMap::new()),
             member_generation: 0,
+            member_revision: None,
             verified_active: BTreeMap::new(),
             plan_requests: BTreeMap::new(),
             move_requests: Vec::new(),
@@ -884,6 +898,13 @@ impl PlacementAgent {
     ) -> Result<AgentStep, AgentError> {
         let node = self.state.node;
         let client = Self::local_client(self.state.genesis.founder.cluster, node);
+        // The root this node holds, observed first: the failure detector is told its members from
+        // it before anything this pass asks of another node (`report_liveness_members`), and the
+        // pass acts on it below as it did once its root intents were submitted.
+        let observed_root = handles.control.observe_root().await;
+        if let Ok(root) = &observed_root {
+            self.report_liveness_members(handles, root);
+        }
         if self.installs.is_none() {
             self.installs = Some(InstallJournal::open(&self.root, &self.keys, node)?);
         }
@@ -946,7 +967,7 @@ impl PlacementAgent {
             }
         }
         let now = unix_time()?;
-        let root = match handles.control.observe_root().await {
+        let root = match observed_root {
             Ok(observation) => observation,
             Err(ControlFailure::NotReady | ControlFailure::Capacity) => return Ok(AgentStep::Idle),
             Err(error) => return Err(error.into()),
@@ -959,8 +980,14 @@ impl PlacementAgent {
             return Err(AgentError::Identity);
         };
         let delegations: Vec<Delegation> = root_directory.delegations.values().copied().collect();
-        // A partition held for asking its leader again leaves with its delegation.
+        // A partition held for asking its leader again leaves with its delegation, as does the
+        // leader its group last named.
         self.held.retain(|partition, _| {
+            delegations
+                .iter()
+                .any(|delegation| delegation.partition == *partition)
+        });
+        self.partition_leaders.retain(|partition, _| {
             delegations
                 .iter()
                 .any(|delegation| delegation.partition == *partition)
@@ -1018,6 +1045,19 @@ impl PlacementAgent {
                 };
                 let outcome = journal.advance(&handles.control, submit).await?;
                 self.note_intent(IntentJournalKind::Partition, kind, sequence, &outcome);
+                // Asked again where the group says it leads, not of the node that said so, and of
+                // the next voter where the one asked gave no answer.
+                if let PartitionAccess::Remote { target, .. } = &access {
+                    match &outcome {
+                        crate::placement_journal::IntentOutcome::Retry(
+                            ControlFailure::NotLeader { leader },
+                        ) => self.learn_partition_leader(delegation.partition, *leader),
+                        crate::placement_journal::IntentOutcome::Retry(
+                            ControlFailure::OutcomeUnknown | ControlFailure::Unavailable,
+                        ) => self.rotate_partition_target(handles, &root, delegation, *target),
+                        _ => {}
+                    }
+                }
                 self.answer_plan_outcome(planned, &outcome);
                 note_load(
                     &mut self.last_load,
@@ -1028,7 +1068,7 @@ impl PlacementAgent {
                 );
                 return Ok(AgentStep::Advanced);
             }
-            if let Some((snapshot, installed)) = self
+            let observation = self
                 .observe_partition(
                     delegation.partition,
                     &access,
@@ -1037,8 +1077,19 @@ impl PlacementAgent {
                     partition_peer.clone(),
                     unless_held,
                 )
-                .await?
-            {
+                .await;
+            if let PartitionAccess::Remote { target, .. } = &access {
+                match &observation {
+                    Err(AgentError::Control(ControlFailure::NotLeader { leader })) => {
+                        self.learn_partition_leader(delegation.partition, *leader);
+                    }
+                    Err(
+                        AgentError::Transport(_) | AgentError::Control(ControlFailure::Unavailable),
+                    ) => self.rotate_partition_target(handles, &root, delegation, *target),
+                    _ => {}
+                }
+            }
+            if let Some((snapshot, installed)) = observation? {
                 observed.try_reserve(1).map_err(|_| AgentError::Capacity)?;
                 observed.push((*delegation, access, snapshot, installed));
             }
@@ -1081,7 +1132,8 @@ impl PlacementAgent {
             self.last_observed = next;
         }
         self.observed_at = now;
-        self.report_liveness_facts(handles, &observed, unchanged);
+        // A pass that observed the partitions is the progress a stuck host cannot make.
+        self.ticks = self.ticks.saturating_add(1);
         let root_leader = handles.control.progress().leader == node;
         for (delegation, access, snapshot, installed) in &observed {
             let ControlBootstrap::Partition { directory } = &snapshot.state else {
@@ -1303,15 +1355,41 @@ impl PlacementAgent {
                 .get(&node)
                 .is_some_and(|member| member.status == crate::liveness::MemberStatus::Dead)
         };
-        if grant.voters.contains_key(&founder) && !dead(founder) {
-            return founder;
+        partition_target_among(
+            founder,
+            self.state.node,
+            &grant.voters,
+            self.partition_leaders.get(&delegation.partition).copied(),
+            dead,
+        )
+    }
+    /// `failed`, asked for `delegation`'s partition, gave no answer or serves no such group: the
+    /// next pass asks the voter after it in the group's grant (`next_partition_target`), and from
+    /// there whoever that voter names as the leader. A started node whose detector holds no one
+    /// dead asked its fixed pick, the founder started with it whose copy did not serve yet, every
+    /// pass (twelve of 33 nodes killed, 2026-10-29).
+    fn rotate_partition_target(
+        &mut self,
+        handles: &NetworkHandles,
+        root: &RootObservation,
+        delegation: &Delegation,
+        failed: u64,
+    ) {
+        let Some(grant) = root
+            .authority()
+            .and_then(|authority| authority.groups.get(&delegation.log_group))
+        else {
+            return;
+        };
+        let view = handles.liveness.view();
+        let dead = |node: u64| {
+            view.members
+                .get(&node)
+                .is_some_and(|member| member.status == crate::liveness::MemberStatus::Dead)
+        };
+        if let Some(next) = next_partition_target(&grant.voters, failed, self.state.node, dead) {
+            self.learn_partition_leader(delegation.partition, next);
         }
-        grant
-            .voters
-            .keys()
-            .copied()
-            .find(|voter| *voter != self.state.node && !dead(*voter))
-            .unwrap_or(founder)
     }
     /// The root's grant for a partition group follows the group's log, as a
     /// session's does (`control`): once the log committed a configuration
@@ -1459,42 +1537,34 @@ impl PlacementAgent {
         journals.partitions.insert(delegation.partition, journal);
         Ok(())
     }
-    /// Tell the failure detector who its members are (every other eligible
-    /// enrolled node of every observed partition, at its highest generation),
-    /// how far this node has progressed, and whether admission is refusing
-    /// capacity.
-    fn report_liveness_facts(
-        &mut self,
-        handles: &NetworkHandles,
-        observed: &[Observed],
-        unchanged: bool,
-    ) {
-        self.ticks = self.ticks.saturating_add(1);
-        // The member set and generation derive only from the observed partition
-        // directories, so recompute them only when a directory actually moved;
-        // otherwise re-report the cached Arc (a refcount bump) with the advancing
-        // witness. Only `overloaded` and `witness` change every tick.
-        if !unchanged {
+    /// Tell the failure detector who its members are, every other node the root's installed
+    /// authority grants that is eligible, at its granted generation, and this node's own
+    /// generation; how many passes this agent completed (the progress witness); and whether
+    /// admission is refusing capacity. Read from the root this node holds, so a node knows its
+    /// members as soon as its own root replica opens, whatever the rest of a pass meets: the
+    /// members came from the partitions a pass observed at its end, so a node whose passes failed
+    /// earlier on (a peer not serving yet, a route not installed) probed no one and was never
+    /// revived (twelve of 33 nodes killed and started again, 2026-10-29: each started node's
+    /// detector held no member, and 21 of the survivors held the twelve dead to the end).
+    fn report_liveness_members(&mut self, handles: &NetworkHandles, root: &RootObservation) {
+        if let Some(authority) = root.authority()
+            && self.member_revision != Some(authority.revision)
+            && self.fund_members(authority.nodes.len())
+        {
             let node = self.state.node;
-            let mut generation = 0;
-            let mut members: BTreeMap<u64, u64> = BTreeMap::new();
-            for (_, _, snapshot, _) in observed {
-                let ControlBootstrap::Partition { directory } = &snapshot.state else {
-                    continue;
-                };
-                if let Some(record) = directory.nodes.get(&node) {
-                    generation = generation.max(record.enrollment.generation);
-                }
-                for (id, record) in directory.nodes.iter() {
-                    if *id == node || !record.enrollment.eligible {
-                        continue;
-                    }
-                    let known = members.entry(*id).or_insert(0);
-                    *known = (*known).max(record.enrollment.generation);
-                }
-            }
-            self.member_generation = generation;
+            self.member_generation = authority
+                .nodes
+                .get(&node)
+                .map_or(0, |grant| grant.enrollment.generation);
+            let members: BTreeMap<u64, u64> = authority
+                .nodes
+                .iter()
+                .filter(|(id, grant)| **id != node && grant.enrollment.eligible)
+                .map(|(id, grant)| (*id, grant.enrollment.generation))
+                .collect();
             self.member_facts = std::sync::Arc::new(members);
+            self.member_revision = Some(authority.revision);
+            self.settle();
         }
         let report = self
             .admission
@@ -3605,6 +3675,53 @@ impl PlacementAgent {
 }
 
 /// Submit one partition request locally or over the placement protocol.
+/// The node asked for a partition led on another node, among its group's `voters`: the leader
+/// the group last named (`learned`) while it is a voter the liveness view does not hold dead,
+/// else the founder while it is one, else the first such voter other than this `node`, else the
+/// founder. A voter asked that does not lead names who does (`NotLeader`), and is asked no more.
+fn partition_target_among(
+    founder: u64,
+    node: u64,
+    voters: &BTreeMap<u64, u64>,
+    learned: Option<u64>,
+    dead: impl Fn(u64) -> bool,
+) -> u64 {
+    if let Some(leader) = learned
+        && leader != node
+        && voters.contains_key(&leader)
+        && !dead(leader)
+    {
+        return leader;
+    }
+    if voters.contains_key(&founder) && !dead(founder) {
+        return founder;
+    }
+    voters
+        .keys()
+        .copied()
+        .find(|voter| *voter != node && !dead(*voter))
+        .unwrap_or(founder)
+}
+
+/// The voter of `voters` asked after `failed` gave no answer: the next after it in the grant's
+/// order, around to the first, that is neither `failed` nor this `node` and that the liveness
+/// view does not hold dead; none where no other voter is left.
+fn next_partition_target(
+    voters: &BTreeMap<u64, u64>,
+    failed: u64,
+    node: u64,
+    dead: impl Fn(u64) -> bool,
+) -> Option<u64> {
+    voters
+        .range((
+            std::ops::Bound::Excluded(failed),
+            std::ops::Bound::Unbounded,
+        ))
+        .chain(voters.range(..=failed))
+        .map(|(voter, _)| *voter)
+        .find(|voter| *voter != failed && *voter != node && !dead(*voter))
+}
+
 async fn submit_partition(
     access: &PartitionAccess,
     pool: &PeerConnectionPool,

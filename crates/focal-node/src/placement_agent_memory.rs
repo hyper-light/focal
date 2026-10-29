@@ -73,6 +73,7 @@ impl PlacementAgent {
                 .capacity()
                 .checked_mul(size_of::<(Delegation, PartitionCheckpoint)>()),
             map_bytes::<focal_directory::PartitionId, HeldObservation>(self.held.len()),
+            map_bytes::<focal_directory::PartitionId, u64>(self.partition_leaders.len()),
             map_bytes::<u64, u64>(self.member_facts.len()),
             map_bytes::<LedgerId, (ContentHash, u64)>(self.verified_active.len()),
             map_bytes::<LedgerId, (focal_directory::DurabilityIntent, Vec<(PlanReply, bool)>)>(
@@ -253,6 +254,40 @@ impl PlacementAgent {
             Some(Err(_)) | None => {
                 self.held.remove(&partition);
             }
+        }
+    }
+
+    /// A member set of `count` rows funded before it is built, on top of what the agent holds
+    /// (the set it replaces among it, given back once it is replaced, `settle`): a set the budget
+    /// cannot fund is not built, and the detector keeps the members it was told last.
+    pub(super) fn fund_members(&mut self, count: usize) -> bool {
+        let wanted = self
+            .held_bytes()
+            .and_then(|held| held.checked_add(map_entry_bytes::<u64, u64>()?.checked_mul(count)?));
+        matches!(wanted.map(|wanted| self.charge_to(wanted)), Some(Ok(())))
+    }
+
+    /// Remember `leader` as the leader `partition`'s group named, funded before the table grows
+    /// by its row as `hold` funds a copy. An unknown leader (0) changes nothing, and one the
+    /// budget cannot fund is not remembered: the next pass asks its fixed pick, which names the
+    /// leader again.
+    pub(super) fn learn_partition_leader(
+        &mut self,
+        partition: focal_directory::PartitionId,
+        leader: u64,
+    ) {
+        if leader == 0 {
+            return;
+        }
+        if let Some(known) = self.partition_leaders.get_mut(&partition) {
+            *known = leader;
+            return;
+        }
+        let wanted = self.held_bytes().and_then(|held| {
+            held.checked_add(map_entry_bytes::<focal_directory::PartitionId, u64>()?)
+        });
+        if let Some(Ok(())) = wanted.map(|wanted| self.charge_to(wanted)) {
+            self.partition_leaders.insert(partition, leader);
         }
     }
 
