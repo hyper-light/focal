@@ -17675,3 +17675,110 @@ What remains on the EPYC 7763:
   Platinum 8573C (run 40597298799), `memcpy` 9.8% of all of them and BLAKE3 6.2%, both spread over
   the record's encoding, the response's stamp checked at each encoding, artifact descriptors and
   intent fingerprints.
+
+### 2026-10-28 — A write under 80 ms and 3% loss: replication's head-of-line wait, rebuilt by forward erasure correction
+
+Under 80 ms one way and 3% of every node's datagrams lost, a write's median was 1.7 to 2.0 times
+the loss-free path's (compare CI's work mode, 500 agents, 20 claims a second, every leg: 244 to
+269 ms without loss, 429 to 681 ms with it). The goal was within 1.3 times. It is now 1.18 times
+(1.10 on the diag build), every lifecycle written in every round.
+
+**Where the time went.** A diag build (not merged) logged, every five seconds, each append's time
+from the leader's send to each follower's answer and to its first answer (the commit), in 10 ms
+buckets (DIAGR), and each connection's packets sent, lost, coded and rebuilt (DIAGQ). The leader
+sent each follower 640 to 830 packets a second, about 7.5 KB an append at about 110 appends a
+second, and lost 3% of them: about twenty losses a second on each follower's ordered lane, each
+holding every later append behind it until its retransmission arrived, a round trip and a loss
+delay later. Most appends waited on one. The followers rejected no append, and the excess was the
+same across the generator's 16 callers: the leader's replication, not its clients.
+
+**Batching rejected.** hyper-quic's replication harness (hyper-raft `tests/replication.rs`: two
+followers each sent 110 appends of 7.5 KB a second over 80 ms one way behind a 20 Mbit/s
+bottleneck, on hyper-sim's network) reproduced the wait: the commit's median 161 ms without loss
+and 292 to 300 ms at 3% each way, 1.84 times, as in focal. Fewer, larger appends carry the same
+bytes in as many packets and measured worse (55 a second of 15 KB: 307 to 310 ms; 28 of 30 KB:
+322 to 328). The loss sweep (0.25% 1.0 times, 0.5% 1.02 to 1.04, 1% 1.29, 2% 1.67, 3% 1.84) put what
+may stay unrepaired at about half a percent.
+
+**Forward erasure correction.** hyper-quic codes a connection's stream data while its path loses
+(`crates/hyper-quic/VENDORED.md` §47): each packet of stream data is a source of RFC 8681's
+sliding-window random linear code over GF(2^8), its coefficients from TinyMT32 (RFC 8682); repairs
+go at 3p/(1 − p) of the sources, three for each loss expected (measured), each over the sources not
+yet acknowledged and none older than the loss delay; and a receiver keeps the repairs' equations in
+reduced row echelon form, rebuilding a loss as soon as they are of full rank. The rebuilt packet
+stays lost to its sender's congestion control (RFC 9265 §6.3). hyper-transport charges what each
+connection's coding holds as it is held, and forgets it where the budget refuses
+(`docs/transport.md` §4al). focal-wire's transport and the bus set the window to 128 sources.
+
+Landing it in focal found what the harness had not, each fixed at its cause:
+
+- **A repair cut short was dropped** (hyper-raft 6c375d3). focal's datagrams grow with path MTU
+  discovery to 1,452 bytes, its pacer and window cut a datagram to 1,200, and a repair that did not
+  fit was dropped with the sources it covered, as for a path whose MTU fell: the leader repaired
+  4.9% of its sources where 9.6% were due, and its followers rebuilt 16 to 20% of their losses.
+  A datagram is now cut no shorter than the repair due.
+- **A repair after a smaller datagram in a batch was dropped** (hyper-raft 62f568d). focal's
+  driver makes 64 datagrams of a connection's at once (`UDP_MAX_SEGMENTS`), each after the first
+  that one's size, and a repair due after a smaller first one was dropped the same way: about 6,600
+  of the leader's 7,000 repairs a round, 22% of the losses rebuilt (diag A/B run 40699095320). The
+  harness had asked for one datagram at a time; asked for 64, it showed the same. A repair now
+  begins the next batch, and a packet begun for a repair alone is ack-eliciting, under the window
+  and the pacer, where it had been begun as one of acknowledgements.
+- **A segmented send is lost whole** (hyper-raft efc16f4). netem decides each socket buffer's loss
+  before it segments one (`net/sched/sch_netem.c`'s `netem_enqueue`), so the 3% of the compare
+  runs drops focal's segmented sends whole, a burst of the batch's datagrams: its followers rebuilt
+  77 to 82% of their losses, and the harness, losing each transmit whole, 78%. A repair now begins
+  a transmit of its own, never lost with the sources it was made after, and the sender measures
+  its bursts of loss and spans a burst of `b` so that it is in as many repairs' spans for each of
+  its packets as a single loss (`b` times a single loss's span and `b − 1` more): 83 to 84%.
+- **BBR's recovery window held a leader's bursts** (hyper-raft efc16f4, VENDORED.md §48). The
+  port leaves recovery only after a round trip with no loss and enters it again at the next,
+  conserved at what is then in flight: a leader had in flight, at a loss, what its last burst of
+  appends left, a few packets, and its next burst waited a round trip for acknowledgements. Its
+  recovery window is now never less than what the path delivered in its latest round trip, as
+  BBRv3 bounds its loss response (draft-ietf-ccwg-bbr-06 §5.5.10.3, `inflight_latest`). In the
+  harness, losing each transmit whole, the uncoded commit's median went from 182 to 208 ms to 166
+  to 172 (163 loss-free), the coded commit's 90th percentile from 229 to 246 ms to 196 to 197.
+
+**Per-follower append-to-answer timing.** The diag build on one runner, the 80 ms path without
+loss against itself with 3% (runs 40782718565 and 40795052327, three rounds a side each; each
+figure the median over the run's five-second windows of the bound of the 10 ms bucket a percentile
+fell in):
+
+| Path | Commit (first answer) p50 / p90 / p99 | Each follower's append to answer p50 / p99 | Write p50 |
+|---|---|---|---|
+| 80 ms | <170 / <170–200 / <190–230 ms | <170 / <190–230 ms | 247–282 ms |
+| 80 ms, 3% loss, coded (62f568d) | <200–220 / <280–370 / <360–510 ms | <230–260 / <500–710 ms | 313–429 ms |
+| 80 ms, 3% loss, coded (efc16f4) | <170–180 / <220–230 / <300–330 ms | <190–200 / <380–390 ms | 266–296 ms |
+
+**The evidence.** The landed build (efc16f4's crates) on one AMD EPYC 9V74 runner, the 80 ms path without
+loss (A) against itself with 3% (B), interleaved, three rounds a side (run 40795052431):
+
+| Round | A write p50 / p90 / p99 | B write p50 / p90 / p99 | B / A median | Lifecycles A, B |
+|---|---|---|---|---|
+| 1 | 268 / 423 / 574 ms | 294 / 560 / 937 ms | 1.10 | 1,500, 1,500 |
+| 2 | 248 / 406 / 462 ms | 284 / 509 / 753 ms | 1.15 | 1,500, 1,500 |
+| 3 | 249 / 409 / 491 ms | 293 / 554 / 2,244 ms | 1.18 | 1,500, 1,500 |
+
+The medians of the rounds' medians: 249 ms without loss, 293 ms with it, 1.18 times; none refused,
+unknown or abandoned. By step, the ordinary steps took 271 to 283 ms under loss against 243 to 255
+without (1.11 to 1.13 times), and steps 3 and 9 (ArtifactSubmit and Report) 534 to 535 ms against
+410 to 411 (1.30 times; 2.9 to 3.1 times before). A write's median is the other steps' 61st
+percentile: steps 3 and 9, 18% of the writes, take more than the median even without loss, so the
+median of all writes falls where the other steps' writes reach half of all of them (365 ms against
+their 61st percentile's 363 at 62f568d). The bus lands on 4d72e19, efc16f4 with main's d804110
+merged (a candidate gives each candidacy as long as its grants take): election timing alone, and
+no election ran in these rounds.
+
+**What remains.**
+
+- **The tail under loss.** B's p99 is 753 to 2,244 ms against 462 to 574. Steps 3 and 9 wait at
+  the leader's evidence door: it held 35 to 864 jobs a round under loss against 9 to 46 without. Its window
+  (`completion_window`, BBR's two bandwidth-delay products over the least time a job takes) counts
+  what completes within twice the least job, so where loss stretches a job's mean past twice its
+  least, the window holds fewer jobs than Little's law needs, and arrivals in a burst wait. And a
+  job waits on every copy (doc 26 §1's all-copies rule; the f+1 decision is pending).
+- **The followers' answers.** Each follower's answers are often too sparse for the code's rule (a
+  repair due within each loss delay), so a lost answer waits for its retransmission.
+- **A client's leg.** A node's answers to its clients are sparse and uncoded; a lost one costs its
+  write a probe timeout.
