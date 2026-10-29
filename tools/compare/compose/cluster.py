@@ -43,6 +43,14 @@ of them (focal-nodes.sh writes the model; run.sh and focal-bootstrap.sh ask this
                                   placement by node and by session as JSON (the run keeps it beside
                                   its report) and a line saying how it stands to stderr; exits 0
                                   when it holds, 1 when not yet
+    cluster.py ledgers TABLE CONTACTS < PLACEMENT
+                                  every session the directory lists as a ledger of focal-load's
+                                  (its shape's `ledgers`, YAML), the founder's first, then by the
+                                  node that founded each in TABLE's order: the session and its
+                                  homes, the contacts (CONTACTS, `focal list nodes`) of the nodes
+                                  holding its replica, its voters, in TABLE's order. Refused where
+                                  the sessions are of more than one tenant (an enrolled client is
+                                  granted one) or a voter has no contact
 """
 import collections
 import json
@@ -260,6 +268,38 @@ def fleet(expected, document):
     return holds
 
 
+def ledgers(expected, contacts_document, document):
+    placement = placement_of(document)
+    sessions = listed(placement)
+    if not sessions:
+        sys.exit("the directory lists no session")
+    tenants = sorted({session["tenant"] for session in sessions})
+    if len(tenants) != 1:
+        sys.exit(f"the sessions are of {len(tenants)} tenants ({', '.join(tenants)}): an enrolled "
+                 "client is granted one")
+    contacts = {contact["advertise"]: contact for contact in contacts_document["result"]["nodes"]}
+    advertised = {}
+    for partition in placement["partitions"]:
+        for node in partition["nodes"]:
+            advertised[node["node"]] = node.get("advertise")
+    order = {f"{address}:7443": place for place, (_, address, _) in enumerate(expected)}
+    founded = sorted(sessions, key=lambda session: order.get(advertised.get(session.get("founder")), len(order)))
+    print("ledgers:")
+    for session in founded:
+        homes = []
+        for voter in session["voters"]:
+            contact = contacts.get(advertised.get(voter))
+            if contact is None:
+                sys.exit(f"session {session['session']}'s voter {voter} has no contact")
+            homes.append(contact)
+        homes.sort(key=lambda contact: order.get(contact["advertise"], len(order)))
+        print("  - session: " + json.dumps(session["session"]))
+        print("    homes:")
+        for contact in homes:
+            print("      - endpoint: " + json.dumps(contact["advertise"]))
+            print("        server_name: " + json.dumps(contact["server_name"]))
+
+
 def main(argv):
     if len(argv) >= 1 and argv[0] == "nodes":
         nodes(json.load(sys.stdin))
@@ -282,6 +322,10 @@ def main(argv):
         return 0
     if len(argv) == 2 and argv[0] == "fleet":
         return 0 if fleet(table(argv[1]), json.load(sys.stdin)) else 1
+    if len(argv) == 3 and argv[0] == "ledgers":
+        with open(argv[2], encoding="utf-8") as contacts:
+            ledgers(table(argv[1]), json.load(contacts), json.load(sys.stdin))
+        return 0
     if len(argv) >= 3 and argv[0] == "pick":
         count, names = int(argv[2]), argv[3:]
         if not 1 <= count <= len(names):

@@ -18,9 +18,11 @@
 #   agents, each a client of its own (focal-load's `agents`), where unset one issuer and one
 #   consumer; the report's file names it.
 #   MODE work, focal alone (no other system has its lifecycle): each claim done among three of
-#   AGENTS enrolled agents, 3 at least, an issuer, a worker and an evaluator, its eleven writes
-#   each learned of from the next agent's inbox (focal-load's `lifecycle: work`); RATE is
-#   claims a second.
+#   AGENTS enrolled agents, an issuer, a worker and an evaluator, its eleven writes each learned
+#   of from the next agent's inbox (focal-load's `lifecycle: work`); RATE is claims a second.
+#   Every session the cluster holds is a ledger driven at once (focal-load's `ledgers`), each
+#   its share of the agents and the rate, so AGENTS is three a session at least (3 at three
+#   nodes, 33 at 33).
 #   NODES (environment), focal: the nodes its cluster runs, focal1 to focalN over zones a, b and c
 #   (focal-nodes.sh, written beside compose.yaml for every run: 3 to 203, 3 where unset, as every
 #   competitor runs three). Past three, nodes that would hold more CPUs than the host has beside
@@ -103,6 +105,20 @@ dc config --quiet
 # Each node as the model states it, in order (cluster.py nodes): NAME ADDRESS ZONE a line.
 table=$("${compose[@]}" --profile focal config --format json | python3 cluster.py nodes)
 mapfile -t focal_nodes < <(awk '{ print $1 }' <<< "$table")
+# The work mode drives every session the fleet will hold (cluster.py wanted), each claim among
+# three of its ledger's agents: refused before anything starts where the agents are too few.
+if [ "$mode" = work ]; then
+  ledgers_wanted=$(python3 cluster.py wanted "$table")
+  # A ledger takes a caller at least, of focal-load's 64 (tools/load/src/shape.rs MAX_CONCURRENCY).
+  if [ "$ledgers_wanted" -gt 64 ]; then
+    echo "work over ${#focal_nodes[@]} nodes drives $ledgers_wanted sessions, each a caller at least of focal-load's 64: 192 nodes at most" >&2
+    exit 2
+  fi
+  if [ "$AGENTS" -lt $(( 3 * ledgers_wanted )) ]; then
+    echo "work over ${#focal_nodes[@]} nodes drives $ledgers_wanted sessions, each among three agents at least: AGENTS must be $(( 3 * ledgers_wanted )) at least, not $AGENTS" >&2
+    exit 2
+  fi
+fi
 # CALL NODE ARGS... for each NODE before `--` (`each focal4 focal7 -- fault_shape "loss 100%"`),
 # as many at once as the host has CPUs, each a `docker compose` call of its own; fails when any
 # did. A subshell, so it waits on its own calls alone.
@@ -159,10 +175,15 @@ evidence() {
 }
 # NODE's replicas, metrics and log for the evidence, into DIR/NODE.
 node_evidence() {
-  local n=$1 dir=$2
+  local n=$1 dir=$2 session
   {
     echo "--- $n replicas"
     timeout 30 "${compose[@]}" --profile focal exec -T "$n" focal --data-dir /data inspect replicas --replicas || true
+    for session in $(held_sessions "$n"); do
+      echo "--- $n replicas of $session"
+      timeout 30 "${compose[@]}" --profile focal exec -T "$n" focal --data-dir /data inspect replicas --replicas \
+        --session "$session" || true
+    done
     # Its metrics: the listener's connections, refusals and stream pool among them.
     echo "--- $n metrics"
     timeout 30 "${compose[@]}" --profile focal exec -T "$n" focal --data-dir /data inspect node --metrics \
@@ -171,13 +192,31 @@ node_evidence() {
     timeout 30 "${compose[@]}" --profile focal logs --no-color --tail 120 "$n" || true
   } > "$dir/$n" 2>&1
 }
+# The sessions other than the bench session that NODE holds a replica of, one a line, as the run's
+# placement by node records them (`<report>.sessions.json`); none before it is written.
+held_sessions() {
+  python3 -c '
+import json, sys
+try:
+    held = json.load(open(sys.argv[1]))["nodes"].get(sys.argv[2], [])
+except (OSError, ValueError, KeyError):
+    held = []
+print("\n".join(session for session in held if session != sys.argv[3]))' \
+    "$out/$report.sessions.json" "$1" "${bench_session:-}"
+}
 # NODE's replicas as they report themselves, the cost of every checkpoint they wrote by stage among
-# them, for where the tail's time went; and its metrics: its log's flush and commit-wait quantiles
-# and its owners' longest periods, for whether a stall was the disk's.
+# them, for where the tail's time went: its original session's, the bench session's (empty where it
+# holds none of it), and each other session's it holds in a file of its own named by the session's
+# first eight digits; and its metrics: its log's flush and commit-wait quantiles and its owners'
+# longest periods, for whether a stall was the disk's.
 node_report() {
-  local n=$1
+  local n=$1 session
   timeout 30 "${compose[@]}" --profile focal exec -T "$n" focal --data-dir /data inspect replicas --replicas \
     > "$out/$report.$n.replicas.json" 2>/dev/null || true
+  for session in $(held_sessions "$n"); do
+    timeout 30 "${compose[@]}" --profile focal exec -T "$n" focal --data-dir /data inspect replicas --replicas \
+      --session "$session" > "$out/$report.$n.${session:0:8}.replicas.json" 2>/dev/null || true
+  done
   timeout 30 "${compose[@]}" --profile focal exec -T "$n" focal --data-dir /data inspect node --metrics \
     > "$out/$report.$n.metrics.txt" 2>/dev/null || true
 }
@@ -556,11 +595,13 @@ case "$system" in
     # contacts they committed and the directory's placement of them and of its sessions, the bench
     # session's and the fleet's (`inspect placement`), and that placement by session and by node,
     # with the nodes that hold no replica counted (cluster.py fleet: none, as the bootstrap left it).
+    # The work mode drives every session it lists, so both are read until they answer, bounded.
     cp focal-nodes.yaml "$out/$report.cluster.yaml"
-    timeout 30 "${compose[@]}" --profile focal exec -T focal1 focal --data-dir /data list nodes \
-      > "$out/$report.contacts.json" 2>/dev/null || true
-    timeout 30 "${compose[@]}" --profile focal exec -T focal1 focal --data-dir /data inspect placement \
-      > "$out/$report.placement.json" 2>/dev/null || true
+    founder_view() {
+      timeout 30 "${compose[@]}" --profile focal exec -T focal1 focal --data-dir /data "${@:2}" > "$1" 2>/dev/null
+    }
+    retry 15 founder_view "$out/$report.contacts.json" list nodes
+    retry 15 founder_view "$out/$report.placement.json" inspect placement
     python3 cluster.py fleet "$table" < "$out/$report.placement.json" > "$out/$report.sessions.json" || true
     identity=$(dc exec -T focal1 focal --data-dir /data inspect identity)
     worker=$(python3 -c '
@@ -589,24 +630,27 @@ print(s if isinstance(s, str) else bytes(s).hex())' <<< "$identity")
     # Append: every claim targets the node's worker. Deliver: every claim targets the
     # consumer, a client of its own that completes it.
     if [ "$mode" = work ]; then
-      # The agents are homed over the cluster's nodes, as its clients would be: each reads, and
-      # waits on its inbox, at its home and writes at the session's leader (focal-load's
-      # `homes`), where every agent dialed the founder its invitation names, and the leader
-      # served every read beside every write.
-      homes=$(dc exec -T focal1 focal --data-dir /data list nodes | python3 -c '
-import json, sys
-nodes = sorted(json.load(sys.stdin)["result"]["nodes"], key=lambda node: node["node"])
-if not nodes:
-    sys.exit("the cluster lists no nodes")
-print("homes:")
-for node in nodes:
-    print("  - endpoint: " + json.dumps(node["advertise"]))
-    print("    server_name: " + json.dumps(node["server_name"]))
-')
+      # Every session the fleet holds is a ledger the load drives at once (focal-load's
+      # `ledgers`, cluster.py ledgers: the founder's alone at three nodes), each among its share of
+      # the agents. A ledger's agents are homed over the nodes holding its replica, as its clients
+      # would be: each reads, and waits on its inbox, at its home and writes at the session's
+      # leader, where every agent dialed the founder its invitation names, and the leader served
+      # every read beside every write. Past three nodes the agents of the one session were homed
+      # over every node, most of them holding no replica of it. Each ledger is offered its share
+      # of the rate whatever its callers (focal-load's seats), and a caller holds at most
+      # `inflight` lifecycles under way, so each ledger is driven by as many callers as a run of
+      # one ledger is where focal-load's most callers (64, tools/load/src/shape.rs
+      # MAX_CONCURRENCY) hold that many for each, else by as many as they hold for each (5 at 11
+      # sessions: 320 lifecycles under way a ledger).
+      ledgers=$(python3 cluster.py ledgers "$table" "$out/$report.contacts.json" < "$out/$report.placement.json")
+      sessions=$(grep -c '^  - session: ' <<< "$ledgers")
+      each=$(( 64 / sessions ))
+      if [ "$each" -gt "$callers" ]; then each=$callers; fi
+      callers=$(( each * sessions ))
       lifecycle="lifecycle: work
 agents: $AGENTS
 agent_enrollments: /client/agents
-$homes"
+$ledgers"
     elif [ "$mode" = deliver ] && [ -n "${AGENTS:-}" ]; then
       lifecycle="lifecycle: deliver
 agents: $AGENTS
