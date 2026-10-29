@@ -192,6 +192,12 @@ type Observed = (
     ControlSnapshot,
     ControlAuthoritySnapshot,
 );
+/// A partition as the agent last read it from its leader on another node: what it holds so that
+/// it is sent each again only once it changed (`upgrade::OBSERVE_LEVEL`).
+pub(super) struct HeldObservation {
+    pub(super) snapshot: ControlSnapshot,
+    pub(super) authority: ControlAuthoritySnapshot,
+}
 fn observed_partition(
     observed: &[Observed],
     partition: PartitionId,
@@ -492,6 +498,12 @@ pub struct PlacementAgent {
     ticks: u64,
     /// The partitions as the last tick observed them, for the operator.
     last_observed: Vec<(Delegation, PartitionCheckpoint)>,
+    /// Each partition led on another node as the agent last read it, once the fence opens
+    /// `upgrade::OBSERVE_LEVEL`: a pass asks its leader for the checkpoint and the installed
+    /// authority unless it holds them, and is answered in full only where either changed.
+    /// Charged with the agent's tables; a partition leaves it as it leaves the root's delegations
+    /// or comes to be read here.
+    pub(super) held: BTreeMap<PartitionId, HeldObservation>,
     observed_at: i64,
     /// The liveness member set derived from the last observation, shared so an
     /// unchanged membership re-reports each tick without rebuilding the map.
@@ -618,6 +630,7 @@ impl PlacementAgent {
             session_leaders: BTreeMap::new(),
             ticks: 0,
             last_observed: Vec::new(),
+            held: BTreeMap::new(),
             observed_at: 0,
             member_facts: std::sync::Arc::new(BTreeMap::new()),
             member_generation: 0,
@@ -942,6 +955,16 @@ impl PlacementAgent {
             return Err(AgentError::Identity);
         };
         let delegations: Vec<Delegation> = root_directory.delegations.values().copied().collect();
+        // A partition held for asking its leader again leaves with its delegation.
+        self.held.retain(|partition, _| {
+            delegations
+                .iter()
+                .any(|delegation| delegation.partition == *partition)
+        });
+        // Every node reads the conditional reads once the fence opens their level.
+        let unless_held = root
+            .fence()
+            .is_some_and(|fence| crate::upgrade::opened(fence, crate::upgrade::OBSERVE_LEVEL));
         // Every partition this node can act on, observed at one prefix each.
         let mut observed: Vec<Observed> = Vec::new();
         for delegation in &delegations {
@@ -1002,7 +1025,14 @@ impl PlacementAgent {
                 return Ok(AgentStep::Advanced);
             }
             if let Some((snapshot, installed)) = self
-                .observe_partition(&access, pool, namespace, partition_peer.clone())
+                .observe_partition(
+                    delegation.partition,
+                    &access,
+                    pool,
+                    namespace,
+                    partition_peer.clone(),
+                    unless_held,
+                )
                 .await?
             {
                 observed.try_reserve(1).map_err(|_| AgentError::Capacity)?;
@@ -1617,15 +1647,23 @@ impl PlacementAgent {
             _ => Err(AgentError::Identity),
         }
     }
+    /// `partition` as its leader holds it now. Read on another node with `unless_held`, each of
+    /// the two reads names what the agent holds of the last, and an answer that it is current
+    /// (`StateHeld`, `AuthorityHeld`) brings only what moves without a change: the index reached
+    /// and the authority's decision time. The agent then holds what it read.
     async fn observe_partition(
         &mut self,
+        partition: PartitionId,
         access: &PartitionAccess,
         pool: &PeerConnectionPool,
         namespace: LedgerId,
         peer: AuthenticatedPeer,
+        unless_held: bool,
     ) -> Result<Option<(ControlSnapshot, ControlAuthoritySnapshot)>, AgentError> {
         match access {
             PartitionAccess::Local(host) => {
+                // Read here: nothing held is asked about again.
+                self.held.remove(&partition);
                 let id = self.next_request_id()?;
                 match host.read(peer, id, ControlRead::StateAndAuthority).await? {
                     ControlReadResult::StateAndAuthority {
@@ -1637,23 +1675,69 @@ impl PlacementAgent {
                 }
             }
             PartitionAccess::Remote { target, group } => {
-                let ControlReadResult::State(snapshot) = self
-                    .remote_read(pool, *target, *group, namespace, ControlRead::State)
-                    .await?
-                else {
-                    return Err(AgentError::Identity);
+                // What is held of this partition's group, named to its leader.
+                let held = self
+                    .held
+                    .get(&partition)
+                    .filter(|held| unless_held && held.snapshot.identity.group == *group)
+                    .map(|held| (held.snapshot.revisions, held.authority.source_index));
+                let state = match held {
+                    Some((revisions, _)) => ControlRead::StateUnless { held: revisions },
+                    None => ControlRead::State,
                 };
-                let ControlReadResult::Authority(authority) = self
-                    .remote_read(pool, *target, *group, namespace, ControlRead::Authority)
-                    .await?
-                else {
-                    return Err(AgentError::Identity);
+                // Whether either read came in full, a copy then to hold in place of the last.
+                let mut read_in_full = false;
+                let snapshot = match (
+                    self.remote_read(pool, *target, *group, namespace, state)
+                        .await?,
+                    held,
+                ) {
+                    (ControlReadResult::State(snapshot), _) => {
+                        read_in_full = true;
+                        snapshot
+                    }
+                    (ControlReadResult::StateHeld { applied_index }, Some(_)) => {
+                        let held = self.held.get_mut(&partition).ok_or(AgentError::Identity)?;
+                        held.snapshot.applied_index = applied_index;
+                        held.snapshot.clone()
+                    }
+                    _ => return Err(AgentError::Identity),
+                };
+                let authority = match held {
+                    Some((_, source_index)) => ControlRead::AuthorityUnless { source_index },
+                    None => ControlRead::Authority,
+                };
+                let authority = match (
+                    self.remote_read(pool, *target, *group, namespace, authority)
+                        .await?,
+                    held,
+                ) {
+                    (ControlReadResult::Authority(authority), _) => {
+                        read_in_full = true;
+                        authority
+                    }
+                    (
+                        ControlReadResult::AuthorityHeld {
+                            applied_index,
+                            decided_at,
+                        },
+                        Some(_),
+                    ) => {
+                        let held = self.held.get_mut(&partition).ok_or(AgentError::Identity)?;
+                        held.authority.applied_index = applied_index;
+                        held.authority.decided_at = decided_at;
+                        Some(held.authority.clone())
+                    }
+                    _ => return Err(AgentError::Identity),
                 };
                 // Two reads describe one prefix only when nothing was applied
                 // in between; a command built across a gap fails its compare
                 // and is replanned, so the gap is tolerated, not hidden.
                 match authority {
                     Some(authority) if authority.applied_index <= snapshot.applied_index => {
+                        if unless_held && read_in_full {
+                            self.hold(partition, &snapshot, &authority);
+                        }
                         Ok(Some((snapshot, authority)))
                     }
                     _ => Ok(None),

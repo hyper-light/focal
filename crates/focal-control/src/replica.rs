@@ -443,10 +443,15 @@ impl ControlReplica {
     /// Reserve this amount before retaining a read candidate or exporting state.
     pub fn read_charge(&self, query: &ControlRead) -> Result<usize, ControlError> {
         let bytes = match query {
-            ControlRead::State => self.machine.export_estimate()?,
+            // A conditional read is charged as the read it may answer in full.
+            ControlRead::State | ControlRead::StateUnless { .. } => {
+                self.machine.export_estimate()?
+            }
             ControlRead::Receipt(_) => 4096,
             ControlRead::Membership => 2048 * 16 + 4096,
-            ControlRead::Authority => self.machine.authority_estimate()?,
+            ControlRead::Authority | ControlRead::AuthorityUnless { .. } => {
+                self.machine.authority_estimate()?
+            }
             ControlRead::Configuration | ControlRead::MembershipRecord => 2048 * 16 + 4096,
             ControlRead::Contacts => self.machine.contact_charge(),
             ControlRead::InvitationPage { limit, .. } => {
@@ -470,6 +475,15 @@ impl ControlReplica {
             }
         };
         read_charged(bytes)
+    }
+    /// The checkpoint `ControlRead::State` exports, at the index applied here.
+    fn state_snapshot(&self) -> Result<ControlSnapshot, ControlError> {
+        Ok(ControlSnapshot {
+            identity: self.identity,
+            applied_index: self.applied_index,
+            revisions: self.machine.revisions(),
+            state: self.machine.export()?,
+        })
     }
     /// Local committed data only. A host claiming a linearizable result must
     /// first complete a matching ReadIndex. Every export retains its read
@@ -633,17 +647,36 @@ impl ControlReplica {
                     partition.route_changes(*after_revision),
                 ))
             }
-            ControlRead::State => Ok(ControlReadResult::State(ControlSnapshot {
-                identity: self.identity,
-                applied_index: self.applied_index,
-                revisions: self.machine.revisions(),
-                state: self.machine.export()?,
-            })),
+            ControlRead::State => Ok(ControlReadResult::State(self.state_snapshot()?)),
+            ControlRead::StateUnless { held } => {
+                if *held == self.machine.revisions() {
+                    Ok(ControlReadResult::StateHeld {
+                        applied_index: self.applied_index,
+                    })
+                } else {
+                    Ok(ControlReadResult::State(self.state_snapshot()?))
+                }
+            }
             ControlRead::Receipt(id) => Ok(ControlReadResult::Receipt(self.receipt(*id)?)),
             ControlRead::Authority => Ok(ControlReadResult::Authority(
                 self.machine
                     .export_authority(self.identity, self.applied_index)?,
             )),
+            ControlRead::AuthorityUnless { source_index } => {
+                match self
+                    .machine
+                    .authority_held(*source_index, self.applied_index)
+                {
+                    Some(decided_at) => Ok(ControlReadResult::AuthorityHeld {
+                        applied_index: self.applied_index,
+                        decided_at,
+                    }),
+                    None => Ok(ControlReadResult::Authority(
+                        self.machine
+                            .export_authority(self.identity, self.applied_index)?,
+                    )),
+                }
+            }
             ControlRead::StateAndAuthority => Ok(ControlReadResult::StateAndAuthority {
                 snapshot: Box::new(ControlSnapshot {
                     identity: self.identity,

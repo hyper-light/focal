@@ -48,6 +48,21 @@ pub enum ControlRead {
     /// here (`None` before any change): what a voter attests to the root
     /// for the grant to follow the log. Local or peer-control ingress.
     MembershipRecord,
+    /// `State`, unless the reader holds it: a replica whose revisions are
+    /// `held` exports what it exported at them (every change to a checkpoint
+    /// moves a revision), so it answers only the index it has reached
+    /// ([`ControlReadResult::StateHeld`]). What an observer that looks at a
+    /// group again and again asks: it is sent the checkpoint once a change,
+    /// not once a look. Open to enrolled nodes, as `State` is.
+    StateUnless { held: ControlRevisions },
+    /// `Authority`, unless the reader holds it: a replica whose installed
+    /// authority is the one it exports at `source_index` holds the reader's
+    /// registry and enrollment (a partition replaces them only with a newer
+    /// source index), so it answers only what moves without them, the index
+    /// it has reached and the time its last command was decided at
+    /// ([`ControlReadResult::AuthorityHeld`]). Open to enrolled nodes, as
+    /// `Authority` is.
+    AuthorityUnless { source_index: u64 },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(
@@ -155,6 +170,13 @@ pub enum ControlReadResult {
         eligible: bool,
         command: Option<Box<focal_directory::AuthorityCommand>>,
     },
+    /// The checkpoint the reader holds (`ControlRead::StateUnless`) is this
+    /// replica's at `applied_index`.
+    StateHeld { applied_index: u64 },
+    /// The authority the reader holds (`ControlRead::AuthorityUnless`) is
+    /// this replica's at `applied_index`, its last command decided at
+    /// `decided_at`.
+    AuthorityHeld { applied_index: u64, decided_at: i64 },
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum ControlFailure {
@@ -359,6 +381,42 @@ mod tests {
                 ControlRpc::decode_read_only(&bytes, 128),
                 Err(ControlError::Invalid)
             ));
+        }
+        // The reads that name what their reader holds append, open to the read-only ingress as
+        // `State` and `Authority` are; their held answers append to the results.
+        for (tag, query) in [
+            (
+                15,
+                ControlRead::StateUnless {
+                    held: ControlRevisions {
+                        root: 0,
+                        enrollment: 0,
+                        partition: 3,
+                    },
+                },
+            ),
+            (16, ControlRead::AuthorityUnless { source_index: 9 }),
+        ] {
+            let bytes = ControlRpc::Read(query.clone()).encode(128).unwrap();
+            assert_eq!(bytes.get(..2), Some([1, tag].as_slice()));
+            assert_eq!(ControlRpc::decode_read_only(&bytes, 128).unwrap(), query);
+        }
+        for (tag, answer) in [
+            (14, ControlReadResult::StateHeld { applied_index: 7 }),
+            (
+                15,
+                ControlReadResult::AuthorityHeld {
+                    applied_index: 7,
+                    decided_at: 1,
+                },
+            ),
+        ] {
+            let bytes = postcard::to_stdvec(&answer).unwrap();
+            assert_eq!(bytes.first(), Some(&tag));
+            assert_eq!(
+                postcard::from_bytes::<ControlReadResult>(&bytes).unwrap(),
+                answer
+            );
         }
     }
 }

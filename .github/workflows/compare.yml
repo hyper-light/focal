@@ -283,6 +283,9 @@ jobs:
               for row in delivered:
                   print("| " + " | ".join(f"{v:,.1f}" if isinstance(v, float) else str(v) for v in row) + " |")
           PY
+      - name: How focal's cluster fit the runner
+        if: always()
+        run: python3 tools/compare/fit.py tools/compare/compose/reports | tee -a "$GITHUB_STEP_SUMMARY"
       - name: What each faulted run suffered
         if: always()
         run: |

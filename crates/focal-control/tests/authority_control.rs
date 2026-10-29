@@ -312,6 +312,236 @@ fn compound_controller_read_preserves_exact_prefix_and_combined_allowance_after_
     assert_eq!(*snapshot, state);
 }
 
+/// What a reader holds of a partition rebuilt from a held answer: the export it read, at the
+/// index and decision time the answer names.
+fn rebuilt(
+    replica: &ControlReplica,
+    state: &ControlSnapshot,
+    authority: &ControlAuthoritySnapshot,
+) -> (ControlReadResult, ControlReadResult) {
+    let state = match replica
+        .read_local(&ControlRead::StateUnless {
+            held: state.revisions,
+        })
+        .unwrap()
+    {
+        ControlReadResult::StateHeld { applied_index } => {
+            ControlReadResult::State(ControlSnapshot {
+                applied_index,
+                ..state.clone()
+            })
+        }
+        full => full,
+    };
+    let authority = match replica
+        .read_local(&ControlRead::AuthorityUnless {
+            source_index: authority.source_index,
+        })
+        .unwrap()
+    {
+        ControlReadResult::AuthorityHeld {
+            applied_index,
+            decided_at,
+        } => ControlReadResult::Authority(Some(ControlAuthoritySnapshot {
+            applied_index,
+            decided_at,
+            ..authority.clone()
+        })),
+        full => full,
+    };
+    (state, authority)
+}
+
+#[test]
+fn a_partition_held_by_its_reader_is_answered_by_index_until_it_changes() {
+    let dirs = tempfile::tempdir().unwrap();
+    let mut roots = activated_roots(dirs.path());
+    let snapshot = roots.snapshot();
+    let delegation = Delegation {
+        namespace: NamespaceRange::all(),
+        partition: PartitionId([3; 16]),
+        region: RegionId::UNKNOWN,
+        log_group: LogGroupId(PART),
+        epoch: 1,
+        activation: None,
+    };
+    roots.commit(ControlCommand::VerifiedRoot(VerifiedRootCommand {
+        command: RootCommand {
+            expected_revision: 0,
+            operation: RootOperation::Delegate { delegation },
+        },
+        evidence: evidence(&snapshot, NOW),
+    }));
+    let snapshot = roots.snapshot();
+    let directory = DirectoryPartition::new(
+        ClusterId(CLUSTER),
+        delegation,
+        PartitionConfig::default(),
+        budget(),
+    )
+    .unwrap();
+    let mut parts = Group::open(
+        &dirs.path().join("partition"),
+        ControlBootstrap::partition(&directory),
+        PART,
+    );
+    parts.commit(ControlCommand::ActivateAuthority(
+        AuthorityActivation::Partition {
+            expected_partition_revision: 0,
+            snapshot: snapshot.clone(),
+        },
+    ));
+    let read = |parts: &Group| {
+        let replica = &parts.replicas[parts.leader];
+        let ControlReadResult::State(state) = replica.read_local(&ControlRead::State).unwrap()
+        else {
+            panic!("state")
+        };
+        let ControlReadResult::Authority(Some(authority)) =
+            replica.read_local(&ControlRead::Authority).unwrap()
+        else {
+            panic!("installed authority")
+        };
+        (state, authority)
+    };
+    let (state, authority) = read(&parts);
+    let replica = &parts.replicas[parts.leader];
+
+    // Nothing changed: each is answered by what moves without a change, and what the reader
+    // rebuilds is what it would have been sent in full.
+    assert_eq!(
+        replica
+            .read_local(&ControlRead::StateUnless {
+                held: state.revisions,
+            })
+            .unwrap(),
+        ControlReadResult::StateHeld {
+            applied_index: state.applied_index,
+        }
+    );
+    assert_eq!(
+        replica
+            .read_local(&ControlRead::AuthorityUnless {
+                source_index: authority.source_index,
+            })
+            .unwrap(),
+        ControlReadResult::AuthorityHeld {
+            applied_index: authority.applied_index,
+            decided_at: authority.decided_at,
+        }
+    );
+    // Held answers are charged as the reads they may answer in full.
+    for (unless, full) in [
+        (
+            ControlRead::StateUnless {
+                held: state.revisions,
+            },
+            ControlRead::State,
+        ),
+        (
+            ControlRead::AuthorityUnless {
+                source_index: authority.source_index,
+            },
+            ControlRead::Authority,
+        ),
+    ] {
+        assert_eq!(
+            replica.read_charge(&unless).unwrap(),
+            replica.read_charge(&full).unwrap()
+        );
+    }
+    // A reader that holds another revision or source is sent both in full.
+    let other = ControlRevisions {
+        partition: state.revisions.partition + 1,
+        ..state.revisions
+    };
+    assert_eq!(
+        replica
+            .read_local(&ControlRead::StateUnless { held: other })
+            .unwrap(),
+        ControlReadResult::State(state.clone())
+    );
+    assert_eq!(
+        replica
+            .read_local(&ControlRead::AuthorityUnless {
+                source_index: authority.source_index - 1,
+            })
+            .unwrap(),
+        ControlReadResult::Authority(Some(authority.clone()))
+    );
+
+    // A command changes the directory and decides the installed authority anew: the checkpoint
+    // is sent in full, the authority by its index and decision time, and the reader holds what it
+    // would have been sent.
+    parts.commit(ControlCommand::VerifiedPartition(
+        VerifiedPartitionCommand {
+            command: PartitionCommand {
+                expected_revision: state.revisions.partition,
+                delegation_epoch: 1,
+                operation: PartitionOperation::SealForTransfer {
+                    operation: OperationId([2; 16]),
+                    destination: PartitionId([5; 16]),
+                    next_epoch: 2,
+                },
+            },
+            evidence: evidence(&snapshot, NOW + 1),
+        },
+    ));
+    let (changed, decided) = read(&parts);
+    assert_ne!(changed.revisions, state.revisions);
+    assert_eq!(decided.source_index, authority.source_index);
+    assert_eq!(decided.decided_at, NOW + 1);
+    let replica = &parts.replicas[parts.leader];
+    assert!(matches!(
+        replica
+            .read_local(&ControlRead::AuthorityUnless {
+                source_index: authority.source_index,
+            })
+            .unwrap(),
+        ControlReadResult::AuthorityHeld { .. }
+    ));
+    assert_eq!(
+        rebuilt(replica, &state, &authority),
+        (
+            ControlReadResult::State(changed.clone()),
+            ControlReadResult::Authority(Some(decided.clone()))
+        )
+    );
+
+    // A newer authority from the root replaces the installed one: it is sent in full.
+    roots.commit(ControlCommand::Authority(AuthorityCommand {
+        expected_revision: snapshot.authority.revision,
+        enrollment_revision: 1,
+        decided_at: NOW + 2,
+        operation: AuthorityOperation::AdvanceClock,
+    }));
+    let newer = roots.snapshot();
+    assert!(newer.source_index > decided.source_index);
+    parts.commit(ControlCommand::InstallAuthority(AuthorityInstallation {
+        expected_source_index: decided.source_index,
+        decided_at: NOW + 3,
+        snapshot: newer,
+    }));
+    let (state_now, installed) = read(&parts);
+    assert!(installed.source_index > decided.source_index);
+    let replica = &parts.replicas[parts.leader];
+    assert_eq!(
+        replica
+            .read_local(&ControlRead::AuthorityUnless {
+                source_index: decided.source_index,
+            })
+            .unwrap(),
+        ControlReadResult::Authority(Some(installed.clone()))
+    );
+    assert_eq!(
+        rebuilt(replica, &changed, &decided),
+        (
+            ControlReadResult::State(state_now),
+            ControlReadResult::Authority(Some(installed))
+        )
+    );
+}
+
 #[test]
 fn saved_verified_root_compare_precedes_newer_committed_clock_after_restart() {
     let dirs = tempfile::tempdir().unwrap();

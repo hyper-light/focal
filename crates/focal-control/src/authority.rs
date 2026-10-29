@@ -204,22 +204,29 @@ impl InstalledAuthority {
         }
         Ok(())
     }
+    /// The source index an export at `applied_index` names: a root's own
+    /// authority is its state at every index it applies (each may change its
+    /// registry or enrollment), while an installed copy is its root's at the
+    /// index it was taken from, replaced only by a copy taken later
+    /// (`check_replacement`), so that index names its registry and enrollment.
+    pub(crate) fn exported_source_index(&self, applied_index: u64) -> u64 {
+        if self.remote.is_none() {
+            applied_index
+        } else {
+            self.source_index
+        }
+    }
     pub(crate) fn export(
         &self,
         identity: ControlIdentity,
         applied_index: u64,
         local: Option<&EnrollmentRegistry>,
     ) -> Result<ControlAuthoritySnapshot, ControlError> {
-        let source_index = if self.remote.is_none() {
-            applied_index
-        } else {
-            self.source_index
-        };
         Ok(ControlAuthoritySnapshot {
             identity,
             applied_index,
             source: self.source,
-            source_index,
+            source_index: self.exported_source_index(applied_index),
             authority: self.registry.checkpoint().clone(),
             enrollment: self.enrollment(local)?.checkpoint()?,
             decided_at: self.decided_at,

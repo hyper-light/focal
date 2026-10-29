@@ -56,6 +56,11 @@ pub struct AuthorityCheckpoint {
     pub groups: BTreeMap<LogGroupId, GroupAuthorityGrant>,
 }
 impl AuthorityCheckpoint {
+    /// What this checkpoint's tables hold, row by row, as a registry charges
+    /// its own state: what a holder of a copy charges for keeping it.
+    pub fn charged_bytes(&self) -> Result<usize, DirectoryError> {
+        state_charge(self)
+    }
     /// When a group's authorization ends: with the earliest of its members'
     /// grants. A member's grant is extended as its credential is renewed
     /// (24 §11), and the group follows it without a change of its own; the

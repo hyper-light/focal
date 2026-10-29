@@ -72,6 +72,7 @@ impl PlacementAgent {
             self.last_observed
                 .capacity()
                 .checked_mul(size_of::<(Delegation, PartitionCheckpoint)>()),
+            map_bytes::<focal_directory::PartitionId, HeldObservation>(self.held.len()),
             map_bytes::<u64, u64>(self.member_facts.len()),
             map_bytes::<LedgerId, (ContentHash, u64)>(self.verified_active.len()),
             map_bytes::<LedgerId, (focal_directory::DurabilityIntent, Vec<(PlanReply, bool)>)>(
@@ -92,6 +93,11 @@ impl PlacementAgent {
             self.last_observed
                 .iter()
                 .map(|(_, checkpoint)| checkpoint.charged_bytes().ok()),
+        );
+        parts.extend(
+            self.held
+                .values()
+                .map(|held| Self::held_heap_bytes(&held.snapshot, &held.authority)),
         );
         parts.extend(self.plan_requests.values().map(|(_, waiters)| {
             waiters
@@ -193,6 +199,55 @@ impl PlacementAgent {
         self.tables
             .absorb(&mut more)
             .map_err(|_| AgentError::Capacity)
+    }
+
+    /// What a partition held for asking its leader again keeps beyond its row
+    /// (`PlacementAgent::held`): its checkpoint, as the partition's owner
+    /// charges it, and its installed authority's registry, as the registry
+    /// charges it, and enrollment. Only a partition's checkpoint is held.
+    fn held_heap_bytes(
+        snapshot: &ControlSnapshot,
+        authority: &ControlAuthoritySnapshot,
+    ) -> Option<usize> {
+        let ControlBootstrap::Partition { directory } = &snapshot.state else {
+            return None;
+        };
+        directory
+            .charged_bytes()
+            .ok()?
+            .checked_add(authority.authority.charged_bytes().ok()?)?
+            .checked_add(authority.enrollment.capacity())
+    }
+
+    /// Hold `snapshot` and `authority` as what the agent last read of
+    /// `partition` from its leader, funded before it is held: the tables'
+    /// charge grows by a row and the copy first. A copy the budget cannot
+    /// fund, or one of a group that is not a partition, is not held, nor is
+    /// any earlier copy of it: the next pass reads that partition in full.
+    pub(super) fn hold(
+        &mut self,
+        partition: focal_directory::PartitionId,
+        snapshot: &ControlSnapshot,
+        authority: &ControlAuthoritySnapshot,
+    ) {
+        let wanted = self.held_bytes().and_then(|held| {
+            held.checked_add(map_entry_bytes::<focal_directory::PartitionId, HeldObservation>()?)?
+                .checked_add(Self::held_heap_bytes(snapshot, authority)?)
+        });
+        match wanted.map(|wanted| self.charge_to(wanted)) {
+            Some(Ok(())) => {
+                self.held.insert(
+                    partition,
+                    HeldObservation {
+                        snapshot: snapshot.clone(),
+                        authority: authority.clone(),
+                    },
+                );
+            }
+            Some(Err(_)) | None => {
+                self.held.remove(&partition);
+            }
+        }
     }
 
     /// The charge settled on what the agent's tables hold now, after a pass or

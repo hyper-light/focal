@@ -413,6 +413,64 @@ cpu_stat() {
     fi
   done
 }
+# Each of the run's containers' memory as its cgroup (v2) counts it, read where cpu_stat reads its
+# CPU: what it holds (memory.current), the most it held since it started (memory.peak, Linux 5.19
+# and later), its limit (memory.max), the times it reached that limit and the kernel killed in it
+# (memory.events: max, oom, oom_kill), and its CPU quota (cpu.max, microseconds of each period),
+# each line `PHASE CONTAINER KEY VALUE`, a limit of `max` (none) left out; whether Docker found it
+# killed for memory (`oom_killed`, 1 or 0, a container that stopped included); and the host's own
+# MemTotal and MemAvailable in kilobytes (proc(5)) as `PHASE - KEY VALUE`, read in a container so
+# Docker's VM is read where it runs in one.
+mem_stat() {
+  local phase=$1 c pid group dir killed
+  docker run --rm --net none --entrypoint awk focal:bench -v p="$phase" \
+    '$1 == "MemTotal:" || $1 == "MemAvailable:" { print p, "-", substr($1, 1, length($1) - 1) "_kb", $2 }' \
+    /proc/meminfo 2>/dev/null || true
+  for c in $(dc ps -a --format '{{.Name}}'); do
+    killed=$(docker inspect --format '{{.State.OOMKilled}}' "$c" 2>/dev/null) || continue
+    echo "$phase $c oom_killed $([ "$killed" = true ] && echo 1 || echo 0)"
+    pid=$(docker inspect --format '{{.State.Pid}}' "$c" 2>/dev/null) || pid=0
+    group=""
+    if [ "$pid" -gt 0 ]; then
+      group=$(awk -F: '$1 == "0" && $2 == "" { print $3 }' "/proc/$pid/cgroup" 2>/dev/null) || group=""
+    fi
+    dir="/sys/fs/cgroup$group"
+    {
+      if [ -n "$group" ] && [ -r "$dir/memory.current" ]; then
+        for f in memory.current memory.peak memory.max cpu.max; do
+          if [ -r "$dir/$f" ]; then echo "$f $(cat "$dir/$f")"; fi
+        done
+        sed 's/^/memory.events./' "$dir/memory.events"
+      elif [ "$pid" -gt 0 ]; then
+        docker exec "$c" sh -c 'cd /sys/fs/cgroup && for f in memory.current memory.peak memory.max cpu.max; do if [ -r "$f" ]; then echo "$f $(cat "$f")"; fi; done; sed "s/^/memory.events./" memory.events'
+      fi
+    } 2>/dev/null | awk -v p="$phase" -v c="$c" '
+      $1 == "cpu.max" { if ($2 ~ /^[0-9]+$/) print p, c, "cpu_quota_usec", $2; print p, c, "cpu_period_usec", $3; next }
+      $2 ~ /^[0-9]+$/ { key = $1; gsub(/\./, "_", key); print p, c, key, $2 }' || true
+  done
+}
+# The cluster's memory while the load runs, a line a second for at most SECONDS seconds: the
+# seconds since it began, what the run's containers held together then (each one's
+# memory.current, so their sum is the cluster's at that moment, the generator's included) and the
+# host's MemAvailable in kilobytes. Each container's group is found once, before the load (a group
+# is named for its container, which keeps it across a restart). Samples nothing where the host's
+# groups cannot be read (Docker Desktop's VM).
+mem_sampler() {
+  local seconds=$1 c pid group n started files=()
+  for c in $(dc ps --format '{{.Name}}'); do
+    pid=$(docker inspect --format '{{.State.Pid}}' "$c" 2>/dev/null) || continue
+    group=$(awk -F: '$1 == "0" && $2 == "" { print $3 }' "/proc/$pid/cgroup" 2>/dev/null) || group=""
+    if [ -n "$group" ] && [ -r "/sys/fs/cgroup$group/memory.current" ]; then
+      files+=("/sys/fs/cgroup$group/memory.current")
+    fi
+  done
+  [ "${#files[@]}" -gt 0 ] || return 0
+  started=$(date +%s)
+  for ((n = 0; n < seconds; n++)); do
+    echo "$(( $(date +%s) - started )) $(cat "${files[@]}" 2>/dev/null | awk '{ s += $1 } END { print s + 0 }') $(awk '$1 == "MemAvailable:" { print $2 }' /proc/meminfo)"
+    sleep 1
+  done
+}
 # Each of the run's containers' network as its own namespace counts it, read
 # on the host (`/proc/PID/net` is the namespace of PID): its UDP and TCP
 # counters and its interface's bytes and packets each way, before and after
@@ -577,18 +635,26 @@ EOF
     cpu_stat before > "$out/$report.cpu.txt"
     net_stat before > "$out/$report.net.txt"
     disk_stat before > "$out/$report.disk.txt"
+    mem_stat before > "$out/$report.mem.txt"
+    # The cluster's memory a second at a time while the load runs, as long as its bound at most.
+    mem_sampler "$bound" > "$out/$report.mem-samples.txt" &
+    sampler=$!
     faults_start
     if ! timeout "$bound" "${compose[@]}" --profile focal \
       exec -T -e "FOCAL_LOAD_WRITES_CSV=/reports/$report.csv" focal-load \
       focal-load --shape /reports/shape.yaml --out "/reports/$report"; then
+      kill "$sampler" 2>/dev/null || true
       faults_end
+      mem_stat after >> "$out/$report.mem.txt"
       evidence
       exit 1
     fi
+    kill "$sampler" 2>/dev/null || true
     faults_end
     cpu_stat after >> "$out/$report.cpu.txt"
     net_stat after >> "$out/$report.net.txt"
     disk_stat after >> "$out/$report.disk.txt"
+    mem_stat after >> "$out/$report.mem.txt"
     dc exec -T focal-load cat "/reports/$report" > "$out/$report"
     # Each write's intended start and latency, for where its tail falls in time.
     dc exec -T focal-load cat "/reports/$report.csv" > "$out/$report.csv" || true

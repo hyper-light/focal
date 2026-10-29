@@ -552,7 +552,14 @@ impl PlacementAgent {
         let namespace = handles.directory.namespace();
         let peer = self.peer(client, namespace)?;
         let Some((moved_snapshot, _)) = self
-            .observe_partition(&PartitionAccess::Local(source), pool, namespace, peer)
+            .observe_partition(
+                fence.source,
+                &PartitionAccess::Local(source),
+                pool,
+                namespace,
+                peer,
+                false,
+            )
             .await?
         else {
             return Ok(AgentStep::Idle);

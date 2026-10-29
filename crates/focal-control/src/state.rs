@@ -321,6 +321,16 @@ impl Machine {
             .transpose()
             .map(|value| value.unwrap_or(0))
     }
+    /// When the installed authority's last command was decided, where what it
+    /// exports at `index` is the export taken from its root at `source_index`:
+    /// all a reader holding that export lacks of this one
+    /// (`ControlRead::AuthorityUnless`). `None` where no authority is
+    /// installed, or another is.
+    pub(crate) fn authority_held(&self, source_index: u64, index: u64) -> Option<i64> {
+        self.authority()
+            .filter(|authority| authority.exported_source_index(index) == source_index)
+            .map(|authority| authority.decided_at)
+    }
     pub(crate) fn prepare(
         &self,
         command: &ControlCommand,
