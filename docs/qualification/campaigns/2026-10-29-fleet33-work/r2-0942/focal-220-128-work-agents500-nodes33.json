@@ -1,0 +1,657 @@
+{
+  "shape": {
+    "claims": 16500,
+    "seed": 1,
+    "reads": 0,
+    "transport": "enrolled",
+    "data_dir": null,
+    "profile": "authored_v1",
+    "concurrency": 55,
+    "connections": 16,
+    "inflight": 64,
+    "enrollment": "/client/CLIENT.contexts/enrollment-bench",
+    "worker": null,
+    "consumer_enrollment": null,
+    "poll_ms": 2,
+    "inbox_wait_ms": 20000,
+    "agents": 500,
+    "agent_enrollments": "/client/agents",
+    "homes": null,
+    "ledgers": [
+      {
+        "session": "149117f8c0776f5e96e1d59773836c63",
+        "homes": [
+          {
+            "endpoint": "10.231.0.21:7443",
+            "server_name": "node-14343898197083281865.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.26:7443",
+            "server_name": "node-14343898197083281870.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.28:7443",
+            "server_name": "node-14343898197083281873.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "2cdaf45da836f44fd29be43ce5c20901",
+        "homes": [
+          {
+            "endpoint": "10.231.0.24:7443",
+            "server_name": "node-14343898197083281868.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.25:7443",
+            "server_name": "node-14343898197083281869.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.29:7443",
+            "server_name": "node-14343898197083281872.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "3fa32035fa8b76fcea9798ee41b87104",
+        "homes": [
+          {
+            "endpoint": "10.231.0.27:7443",
+            "server_name": "node-14343898197083281871.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.37:7443",
+            "server_name": "node-14343898197083281880.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.41:7443",
+            "server_name": "node-14343898197083281885.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "5b300075bc1954a534e009cc3d01e181",
+        "homes": [
+          {
+            "endpoint": "10.231.0.30:7443",
+            "server_name": "node-14343898197083281874.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.38:7443",
+            "server_name": "node-14343898197083281882.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.49:7443",
+            "server_name": "node-14343898197083281893.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "406993a42a46d3ce57807b72cf3c2ee6",
+        "homes": [
+          {
+            "endpoint": "10.231.0.33:7443",
+            "server_name": "node-14343898197083281877.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.46:7443",
+            "server_name": "node-14343898197083281890.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.53:7443",
+            "server_name": "node-14343898197083281897.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "e9c1a3197a569fe8ed12c5338fca6cda",
+        "homes": [
+          {
+            "endpoint": "10.231.0.23:7443",
+            "server_name": "node-14343898197083281867.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.31:7443",
+            "server_name": "node-14343898197083281875.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.36:7443",
+            "server_name": "node-14343898197083281881.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "2d885323a73a21a7758b6455355e9b59",
+        "homes": [
+          {
+            "endpoint": "10.231.0.32:7443",
+            "server_name": "node-14343898197083281876.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.39:7443",
+            "server_name": "node-14343898197083281884.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.43:7443",
+            "server_name": "node-14343898197083281888.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "ddb0bb31552e0106e597ce453786c820",
+        "homes": [
+          {
+            "endpoint": "10.231.0.35:7443",
+            "server_name": "node-14343898197083281879.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.40:7443",
+            "server_name": "node-14343898197083281883.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.42:7443",
+            "server_name": "node-14343898197083281886.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "030f50bee75511f25956dd5818087194",
+        "homes": [
+          {
+            "endpoint": "10.231.0.22:7443",
+            "server_name": "node-14343898197083281866.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.45:7443",
+            "server_name": "node-14343898197083281889.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.50:7443",
+            "server_name": "node-14343898197083281894.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "c94c1d55a1db86d4035840a845447592",
+        "homes": [
+          {
+            "endpoint": "10.231.0.34:7443",
+            "server_name": "node-14343898197083281878.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.44:7443",
+            "server_name": "node-14343898197083281887.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.48:7443",
+            "server_name": "node-14343898197083281892.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "9acb1b577c17e8caeff8b1a1e811e1fa",
+        "homes": [
+          {
+            "endpoint": "10.231.0.47:7443",
+            "server_name": "node-14343898197083281891.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.51:7443",
+            "server_name": "node-14343898197083281895.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.52:7443",
+            "server_name": "node-14343898197083281896.1e8a217eb087597ccd795b179a2208dd.focal.internal"
+          }
+        ]
+      }
+    ],
+    "rate": 220,
+    "warmup_ms": 15000,
+    "lifecycle": "work",
+    "lifecycle_reads": null,
+    "reopen": false
+  },
+  "committed": 181500,
+  "refused": 0,
+  "unknown": 0,
+  "expired": 0,
+  "lifecycles": 16500,
+  "abandoned": 0,
+  "floors_advanced": 1000,
+  "wall_ms": 76166,
+  "throughput_ops_per_s": 2382.9410466316026,
+  "latency_ns": {
+    "p50": 42173717,
+    "p95": 81637798,
+    "p99": 108140848,
+    "p999": 144526956,
+    "max": 206915589
+  },
+  "latency_ns_first_half": {
+    "p50": 40699466,
+    "p95": 69234820,
+    "p99": 98362263,
+    "p999": 140051622,
+    "max": 179699951
+  },
+  "latency_ns_second_half": {
+    "p50": 44251871,
+    "p95": 88471750,
+    "p99": 111841193,
+    "p999": 147229123,
+    "max": 206915589
+  },
+  "measured_writes": {
+    "committed": 147545,
+    "refused": 0,
+    "unknown": 0,
+    "expired": 0,
+    "committed_latency_ns": {
+      "p50": 42173717,
+      "p95": 81637798,
+      "p99": 108140848,
+      "p999": 144526956,
+      "max": 206915589
+    },
+    "refused_latency_ns": {
+      "p50": 0,
+      "p95": 0,
+      "p99": 0,
+      "p999": 0,
+      "max": 0
+    },
+    "unknown_latency_ns": {
+      "p50": 0,
+      "p95": 0,
+      "p99": 0,
+      "p999": 0,
+      "max": 0
+    },
+    "expired_latency_ns": {
+      "p50": 0,
+      "p95": 0,
+      "p99": 0,
+      "p999": 0,
+      "max": 0
+    },
+    "schedule_delay_ns": {
+      "p50": 4405,
+      "p95": 378607,
+      "p99": 5217634,
+      "p999": 13646340,
+      "max": 27226512
+    },
+    "client_request_latency_ns": {
+      "p50": 42056721,
+      "p95": 81073002,
+      "p99": 107504796,
+      "p999": 143522941,
+      "max": 206881772
+    }
+  },
+  "write_phase_start_epoch_ns": 1793292808471818228,
+  "reads": 0,
+  "read_hits": 0,
+  "read_wall_ms": 0,
+  "read_throughput_ops_per_s": 0.0,
+  "read_latency_ns": {
+    "p50": 0,
+    "p95": 0,
+    "p99": 0,
+    "p999": 0,
+    "max": 0
+  },
+  "workers": 55,
+  "refusals": [],
+  "reopen_ms": null,
+  "first_read_after_reopen_ns": null,
+  "reopen_read_hit": null,
+  "data_dir_bytes": null,
+  "deliver": {
+    "delivered": 13200,
+    "handled_latency_ns": {
+      "p50": 567191987,
+      "p95": 951359998,
+      "p99": 1161236810,
+      "p999": 1284011433,
+      "max": 1446477972
+    },
+    "satisfied_latency_ns": {
+      "p50": 1127261421,
+      "p95": 1779063704,
+      "p99": 2054158789,
+      "p999": 2165855464,
+      "max": 2227332754
+    },
+    "undelivered": 0,
+    "consumer_polls": 0,
+    "consumer_events": 0,
+    "consumer_waits": 0,
+    "issuer_polls": 0,
+    "issuer_events": 0,
+    "issuer_waits": 0,
+    "agents": 500,
+    "agent_polls": 65130,
+    "agent_events": 66000,
+    "agent_waits": 64630,
+    "tail_failures": 0
+  },
+  "ledgers": [
+    {
+      "ledger": {
+        "tenant": "908ea5067acca049aca53bc910a03486",
+        "session": "149117f8c0776f5e96e1d59773836c63"
+      },
+      "callers": 5,
+      "agents": 46,
+      "started": 1500,
+      "written": 1500,
+      "judged": 1500,
+      "refused": 0,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 0,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 0,
+      "abandoned": 0,
+      "undelivered": 0,
+      "committed": 16500,
+      "tail_events": 6000,
+      "tail_failures": 0,
+      "refusals": []
+    },
+    {
+      "ledger": {
+        "tenant": "908ea5067acca049aca53bc910a03486",
+        "session": "2cdaf45da836f44fd29be43ce5c20901"
+      },
+      "callers": 5,
+      "agents": 46,
+      "started": 1500,
+      "written": 1500,
+      "judged": 1500,
+      "refused": 0,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 0,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 0,
+      "abandoned": 0,
+      "undelivered": 0,
+      "committed": 16500,
+      "tail_events": 6000,
+      "tail_failures": 0,
+      "refusals": []
+    },
+    {
+      "ledger": {
+        "tenant": "908ea5067acca049aca53bc910a03486",
+        "session": "3fa32035fa8b76fcea9798ee41b87104"
+      },
+      "callers": 5,
+      "agents": 46,
+      "started": 1500,
+      "written": 1500,
+      "judged": 1500,
+      "refused": 0,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 0,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 0,
+      "abandoned": 0,
+      "undelivered": 0,
+      "committed": 16500,
+      "tail_events": 6000,
+      "tail_failures": 0,
+      "refusals": []
+    },
+    {
+      "ledger": {
+        "tenant": "908ea5067acca049aca53bc910a03486",
+        "session": "5b300075bc1954a534e009cc3d01e181"
+      },
+      "callers": 5,
+      "agents": 46,
+      "started": 1500,
+      "written": 1500,
+      "judged": 1500,
+      "refused": 0,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 0,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 0,
+      "abandoned": 0,
+      "undelivered": 0,
+      "committed": 16500,
+      "tail_events": 6000,
+      "tail_failures": 0,
+      "refusals": []
+    },
+    {
+      "ledger": {
+        "tenant": "908ea5067acca049aca53bc910a03486",
+        "session": "406993a42a46d3ce57807b72cf3c2ee6"
+      },
+      "callers": 5,
+      "agents": 46,
+      "started": 1500,
+      "written": 1500,
+      "judged": 1500,
+      "refused": 0,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 0,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 0,
+      "abandoned": 0,
+      "undelivered": 0,
+      "committed": 16500,
+      "tail_events": 6000,
+      "tail_failures": 0,
+      "refusals": []
+    },
+    {
+      "ledger": {
+        "tenant": "908ea5067acca049aca53bc910a03486",
+        "session": "e9c1a3197a569fe8ed12c5338fca6cda"
+      },
+      "callers": 5,
+      "agents": 45,
+      "started": 1500,
+      "written": 1500,
+      "judged": 1500,
+      "refused": 0,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 0,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 0,
+      "abandoned": 0,
+      "undelivered": 0,
+      "committed": 16500,
+      "tail_events": 6000,
+      "tail_failures": 0,
+      "refusals": []
+    },
+    {
+      "ledger": {
+        "tenant": "908ea5067acca049aca53bc910a03486",
+        "session": "2d885323a73a21a7758b6455355e9b59"
+      },
+      "callers": 5,
+      "agents": 45,
+      "started": 1500,
+      "written": 1500,
+      "judged": 1500,
+      "refused": 0,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 0,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 0,
+      "abandoned": 0,
+      "undelivered": 0,
+      "committed": 16500,
+      "tail_events": 6000,
+      "tail_failures": 0,
+      "refusals": []
+    },
+    {
+      "ledger": {
+        "tenant": "908ea5067acca049aca53bc910a03486",
+        "session": "ddb0bb31552e0106e597ce453786c820"
+      },
+      "callers": 5,
+      "agents": 45,
+      "started": 1500,
+      "written": 1500,
+      "judged": 1500,
+      "refused": 0,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 0,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 0,
+      "abandoned": 0,
+      "undelivered": 0,
+      "committed": 16500,
+      "tail_events": 6000,
+      "tail_failures": 0,
+      "refusals": []
+    },
+    {
+      "ledger": {
+        "tenant": "908ea5067acca049aca53bc910a03486",
+        "session": "030f50bee75511f25956dd5818087194"
+      },
+      "callers": 5,
+      "agents": 45,
+      "started": 1500,
+      "written": 1500,
+      "judged": 1500,
+      "refused": 0,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 0,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 0,
+      "abandoned": 0,
+      "undelivered": 0,
+      "committed": 16500,
+      "tail_events": 6000,
+      "tail_failures": 0,
+      "refusals": []
+    },
+    {
+      "ledger": {
+        "tenant": "908ea5067acca049aca53bc910a03486",
+        "session": "c94c1d55a1db86d4035840a845447592"
+      },
+      "callers": 5,
+      "agents": 45,
+      "started": 1500,
+      "written": 1500,
+      "judged": 1500,
+      "refused": 0,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 0,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 0,
+      "abandoned": 0,
+      "undelivered": 0,
+      "committed": 16500,
+      "tail_events": 6000,
+      "tail_failures": 0,
+      "refusals": []
+    },
+    {
+      "ledger": {
+        "tenant": "908ea5067acca049aca53bc910a03486",
+        "session": "9acb1b577c17e8caeff8b1a1e811e1fa"
+      },
+      "callers": 5,
+      "agents": 45,
+      "started": 1500,
+      "written": 1500,
+      "judged": 1500,
+      "refused": 0,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 0,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 0,
+      "abandoned": 0,
+      "undelivered": 0,
+      "committed": 16500,
+      "tail_events": 6000,
+      "tail_failures": 0,
+      "refusals": []
+    }
+  ],
+  "totals": {
+    "started": 16500,
+    "written": 16500,
+    "judged": 16500,
+    "refused": 0,
+    "refused_by_cause": {
+      "owner_memory": 0,
+      "owner_bound": 0,
+      "ingress_capacity": 0,
+      "unavailable": 0,
+      "expired": 0,
+      "other": 0
+    },
+    "unknown": 0,
+    "abandoned": 0,
+    "undelivered": 0,
+    "committed": 181500
+  }
+}

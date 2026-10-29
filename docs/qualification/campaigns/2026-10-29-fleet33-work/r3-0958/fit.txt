@@ -1,0 +1,6 @@
+
+### focal's cluster on its host
+
+| run | nodes | each node's limit | busiest node, CPU over the load | most throttled node, periods | most a node held, MiB | every container's peak, MiB | most held at once, MiB | host MiB: total / least available | OOM kills |
+|---|---|---|---|---|---|---|---|---|---|
+| focal-220-128-work-agents500-nodes33 | 33 | 0.90 CPU; 512 MiB | s5-focal1 0.443 (49% of its limit) | s5-focal30 0.5% | s5-focal1 228 | 7,223 | 7,140 | 64,019 / 49,074 | 0 (0 stopped) |

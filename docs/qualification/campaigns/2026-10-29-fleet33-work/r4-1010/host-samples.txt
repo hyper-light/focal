@@ -1,0 +1,78 @@
+== 10:12:48 load 21.89 27.92 24.86
+ 372 clickhouse; 228 kiln-chbench; 100 ps;66.6 docker;55.5 bash;
+== 10:13:08 load 18.50 26.81 24.56
+ 350 clickhouse; 194 kiln-chbench;12.9 focal; 5.5 kiln; 4.0 kubelet;
+== 10:13:28 load 24.50 27.53 24.84
+ 388 clickhouse; 243 kiln-chbench; 132 git; 130 python3; 110 git;
+== 10:13:48 load 23.26 27.16 24.78
+ 377 clickhouse; 217 kiln-chbench;13.2 focal; 5.5 kiln; 4.0 kubelet;
+== 10:14:08 load 24.78 27.13 24.82
+ 403 clickhouse; 251 kiln-chbench;13.4 focal; 6.8 chbench; 5.5 kiln;
+== 10:14:28 load 21.31 26.26 24.58
+ 391 clickhouse; 228 kiln-chbench;13.4 focal; 5.5 kiln; 4.0 kubelet;
+== 10:14:48 load 21.26 25.84 24.48
+ 407 clickhouse; 245 kiln-chbench;13.6 focal; 8.7 chbench; 5.5 kiln;
+== 10:15:08 load 21.66 25.72 24.47
+ 397 clickhouse; 227 kiln-chbench;14.5 focal; 5.5 kiln; 4.1 focal;
+== 10:15:28 load 20.48 25.12 24.29
+ 409 clickhouse; 242 kiln-chbench;16.2 chbench;15.7 focal; 5.5 kiln;
+== 10:15:48 load 19.80 24.69 24.17
+ 400 clickhouse; 228 kiln-chbench;16.4 focal; 5.5 kiln; 4.6 focal;
+== 10:16:08 load 26.81 25.81 24.54
+ 409 clickhouse; 239 kiln-chbench; 100 ps;17.3 focal;16.1 chbench;
+== 10:16:28 load 24.88 25.54 24.49
+ 403 clickhouse; 227 kiln-chbench; 100 ps;17.9 focal; 5.5 kiln;
+== 10:16:48 load 24.44 25.34 24.44
+ 411 clickhouse; 243 kiln-chbench;18.7 focal;10.6 chbench; 5.5 kiln;
+== 10:17:08 load 28.13 26.26 24.77
+ 407 clickhouse; 232 kiln-chbench;19.1 focal;15.0 focal; 5.5 kiln;
+== 10:17:28 load 28.27 26.29 24.80
+ 415 clickhouse; 246 kiln-chbench;33.3 focal;19.5 focal; 7.1 chbench;
+== 10:17:48 load 25.83 25.95 24.73
+ 411 clickhouse; 236 kiln-chbench;19.8 focal;10.3 focal; 5.5 kiln;
+== 10:18:08 load 25.24 25.72 24.67
+ 415 clickhouse; 244 kiln-chbench;20.3 focal;20.0 focal; 8.7 chbench;
+== 10:18:28 load 22.36 25.10 24.50
+ 412 clickhouse; 234 kiln-chbench;20.7 focal;11.5 focal; 5.7 focal;
+== 10:18:48 load 23.88 25.16 24.52
+ 415 clickhouse; 242 kiln-chbench;21.4 focal;15.9 chbench;11.3 focal;
+== 10:19:08 load 26.92 25.83 24.76
+ 413 clickhouse; 234 kiln-chbench;21.8 focal;10.7 focal; 6.0 focal;
+== 10:19:28 load 25.71 25.57 24.69
+ 415 clickhouse; 241 kiln-chbench;22.5 focal;15.9 chbench; 9.2 focal;
+== 10:19:48 load 23.77 25.22 24.60
+ 413 clickhouse; 233 kiln-chbench; 100 ps;23.0 focal; 6.9 focal;
+== 10:20:08 load 26.18 25.56 24.72
+ 415 clickhouse; 243 kiln-chbench;33.3 focal;23.7 focal;10.3 chbench;
+== 10:20:28 load 22.31 24.77 24.48
+ 415 clickhouse; 236 kiln-chbench;24.2 focal; 6.5 focal; 6.5 focal;
+== 10:20:48 load 23.21 24.72 24.47
+ 418 clickhouse; 245 kiln-chbench; 200 git;31.2 focal;24.9 focal;
+== 10:21:08 load 24.08 24.90 24.53
+ 417 clickhouse; 238 kiln-chbench;25.5 focal;18.1 focal; 6.8 focal;
+== 10:21:28 load 26.24 25.25 24.65
+ 418 clickhouse; 244 kiln-chbench;26.2 focal;20.8 focal; 8.5 chbench;
+== 10:21:48 load 23.22 24.71 24.49
+26.3 focal; 7.0 focal; 7.0 focal; 5.5 kiln; 5.0 focal;
+== 10:22:08 load 17.38 23.29 24.03
+26.2 focal; 7.0 focal; 7.0 focal; 5.5 kiln; 5.0 focal;
+== 10:22:28 load 12.81 21.86 23.54
+26.2 focal; 7.1 focal; 7.1 focal; 5.5 kiln; 4.9 focal;
+== 10:22:49 load 10.38 20.72 23.13
+95.4 focal-load;26.0 focal; 7.1 focal; 7.0 focal; 5.5 kiln;
+== 10:23:09 load 18.79 21.95 23.48
+79.2 focal-load;26.9 focal; 7.9 focal; 7.9 focal; 5.9 focal;
+== 10:23:29 load 25.17 23.20 23.86
+77.9 focal-load;27.7 focal; 8.7 focal; 8.7 focal; 6.8 focal;
+== 10:23:49 load 29.60 24.35 24.23
+77.2 focal-load;28.5 focal; 9.5 focal; 9.4 focal; 7.7 focal;
+== 10:24:09 load 30.87 25.06 24.47
+ 100 ps;29.0 focal;10.0 focal;10.0 focal; 8.4 focal;
+== 10:24:29 load 22.32 23.48 23.96
+ 100 ps; 5.5 kiln; 4.0 kubelet; 3.5 kube-apiserver; 1.9 etcd;
+== 10:24:49 load 16.17 22.01 23.47
+ 5.5 kiln; 4.0 kubelet; 3.5 kube-apiserver; 1.9 etcd; 1.7 dockerd;
+== 10:25:09 load 11.80 20.63 22.98
+ 5.5 kiln; 4.0 kubelet; 3.5 kube-apiserver; 1.9 etcd; 1.7 dockerd;
+== 10:25:29 load 8.67 19.34 22.51
+ 5.5 kiln; 4.0 kubelet; 3.5 kube-apiserver; 1.9 etcd; 1.7 dockerd;

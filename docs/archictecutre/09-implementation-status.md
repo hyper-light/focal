@@ -18171,3 +18171,48 @@ nightly campaign with `--ignored` (2 seeds, 60 claims, 120 reads) passed. By han
 seven agents over three embedded ledgers: 11, 10 and 10 messages, every one delivered. The
 enrolled transport's run over sessions is measured where the cluster has them (the 30-node plan's
 fifth step).
+
+### 2026-10-29 — Thirty-three nodes run the work flow over eleven ledgers: every lifecycle written and judged
+
+Step 5 of the plan for a 30-node work flow: the work flow among agents on 33 nodes, every session
+the fleet holds driven at once, at the rate step 4 sized (220 claims a second, 20 a session), for
+the comparison's measured window (60 s after 15 s). On fedora (i9-14900HX, 32 threads, 62.5 GiB,
+btrfs on a Samsung 9100 PRO), 33 nodes of 0.90 CPU and 512 MiB, 11 sessions on three voters in
+three zones each, 500 agents: in each of three runs all 16,500 lifecycles started were written
+and judged, 1,500 in each of the 11 ledgers, none refused, unknown, abandoned or undelivered, and
+181,500 writes committed. The record, with each run's report, placement and host:
+[the work flow on 33 nodes](../qualification/campaigns/2026-10-29-fleet33-work.md).
+
+| fedora run | Started = written = judged | Refused, unknown, abandoned, undelivered | Write p50 / p99 / max (ms) | Nodes' CPU / generator's |
+|---|---|---|---|---|
+| r2-0942 | 16,500 | 0 | 42.2 / 108.1 / 206.9 | 9.43 / 0.69 |
+| r3-0958, beside a benchmark holding ~7 CPUs | 16,500 | 0 | 34.6 / 147.6 / 888.7 | 9.13 / 0.64 |
+| r4-1010 | 16,500 | 0 | 35.4 / 76.7 / 176.9 | 11.16 / 0.72 |
+
+**The harness drives every session** (`tools/compare/compose`). The work mode homed every agent
+over every listed node and drove the founder's session alone: at 33 nodes 30 of an agent's
+possible homes held no replica of what it wrote and ten sessions took no load. Each session is
+now a ledger of focal-load's (`cluster.py ledgers`: the founder's first, each homed on its own
+voters), driven by as many callers as a run of one ledger is (16) where focal-load's 64 hold that
+many for each, else as many as they hold (5 at 11 sessions; the first run gave 176 and was refused
+before any write). A ledger kept 20 to 25 lifecycles under way (a lifecycle 0.99 to 1.23 s on
+average) against the 320 its callers may hold. A run is refused before it starts where the
+agents are fewer than three a session or the sessions more than the callers. The record reads each
+node's replicas for every session it holds (`inspect replicas` without `--session` reads a node's
+original session: step 4's records held 30 empty files of 33), each container's own disk writes
+(`<report>.io.txt`, its cgroup's `io.stat`, where the drive's counters hold every tenant's), and
+the cluster at rest before the load where `REST` asks (`<report>.rest.*`).
+
+**What the nodes spent.** The founder (root leader, directory partition, its session's leader)
+used 0.44 to 0.53 of its 0.90, the other sessions' leaders 0.31 to 0.38, followers 0.25 to 0.35;
+no node was held back by its quota in more than 0.6% of its periods, the generator in none; the
+most a node held was 228 MiB of its 512, no container killed for memory. At rest (r4, 62.5 s, the
+agents enrolled) the nodes used 1.42 CPUs (the founder 0.236) and wrote 1.0 MB/s in 99 writes a
+second; under the load 11.16 CPUs and 149.7 MB/s in 12,841 writes a second, 69.3 KB a committed
+write over its three replicas. Step 4's ~35 MB/s at rest was the drive's, every tenant's.
+
+**Open.** What a replica writes for each write (~23 KB for a 128-byte payload's lifecycle step:
+records, sealed payloads, checkpoints, the content store) is not yet broken down; nor is the
+founder's 0.236 CPU at rest (it leads the root's 33 members, the directory partition, whose
+conditional reads still take a read round each, and its own session); enrolling 500 agents takes about 6 minutes, one at a time; focal-load's `MAX_CONCURRENCY` says each
+caller is an OS thread, which since e276fc49 it is not.
