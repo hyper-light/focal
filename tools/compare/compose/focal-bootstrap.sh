@@ -144,10 +144,31 @@ done 3< "$tmp/sessions"
 placed() {
   placement 2>/dev/null && python3 cluster.py fleet "$table" < "$tmp/placement.json" > "$tmp/fleet.json" 2> "$tmp/fleet.txt"
 }
-if ! retry 300 placed; then
-  cat "$tmp/fleet.txt" >&2
-  exit 1
-fi
+# The wait is charged to the placement's own progress (cluster.py progress): every observation that
+# finds it moved (a plan begun or a step further, a copy further through its log, a session placed)
+# begins the bound again, so a host whose nodes run slowly is waited on for as long as its
+# placement moves, and one that moved nothing in 300 observations, the bootstrap's bound for every
+# wait, is refused with where it stopped. A state that came back to one seen before is progress all
+# the same, so the observations are counted in all too, 300 for each session and one more.
+stalled=0
+observed=0
+last=""
+until placed; do
+  now=$(python3 cluster.py progress < "$tmp/placement.json" 2>/dev/null) || now=""
+  if [ -n "$now" ] && [ "$now" != "$last" ]; then
+    last=$now
+    stalled=0
+  else
+    stalled=$((stalled + 1))
+  fi
+  observed=$((observed + 1))
+  if [ "$stalled" -ge 300 ] || [ "$observed" -ge $((300 * (wanted + 1))) ]; then
+    cat "$tmp/fleet.txt" >&2
+    echo "the sessions' placement moved nothing in $stalled observations ($observed in all): $now" >&2
+    exit 1
+  fi
+  sleep 1
+done
 cat "$tmp/fleet.txt"
 native() {
   $DC exec -T "$1" focal --data-dir /data inspect replicas --replicas --session "$2" 2>/dev/null | python3 -c '

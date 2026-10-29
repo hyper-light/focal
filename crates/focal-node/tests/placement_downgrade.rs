@@ -72,9 +72,18 @@ fn lowering_max_failures_shrinks_the_voter_set_and_keeps_the_history() {
     let shrunk = ids(&session_row(&view, &ledger).unwrap()["voters"]);
     assert_eq!(shrunk.len(), 1, "one voter after the shrink: {view}");
     // The sole voter serves the session. Read the earlier claims from it
-    // directly (its own socket), retrying while leadership settles.
+    // directly (its own socket), retrying while leadership settles. Which of
+    // the three keeps its seat is the planner's: each holds one seat, and the
+    // tie goes by identity, so it may be the founder.
     let sole = shrunk[0];
-    let voter: &Node = if sole == node_a { &host_a } else { &host_b };
+    let voter: &Node = [
+        (founder_node, &founder),
+        (node_a, &host_a),
+        (node_b, &host_b),
+    ]
+    .into_iter()
+    .find_map(|(node, host)| (node == sole).then_some(host))
+    .unwrap_or_else(|| panic!("the sole voter {sole} is none of the three: {view}"));
     let read_from_voter = |claim: &str| -> String {
         let mut deadline = deadline::Deadline::after(Duration::from_secs(120));
         loop {
@@ -87,7 +96,7 @@ fn lowering_max_failures_shrinks_the_voter_set_and_keeps_the_history() {
             }
             assert!(
                 deadline.open(),
-                "the sole voter never served: {}",
+                "the sole voter {sole} (founder {founder_node}, host-a {node_a}, host-b {node_b}) never served: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
             std::thread::sleep(Duration::from_millis(500));

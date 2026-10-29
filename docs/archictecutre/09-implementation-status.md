@@ -17919,8 +17919,12 @@ lists every session (a created session is registered at its node's next pass), t
 the founder to the target's durability (`plan session` is answered by the partition leader's agent;
 on another node it is `unavailable`). It waits until every session is placed, three voters in three
 zones with the directory holding each to survive a zone and every node a voter of one
-(`cluster.py fleet`), then activates each natively on the node that created it, its preferred
-leader, and waits until that replica says `native_active`. Every wait is bounded and every step may
+(`cluster.py fleet`). That wait is charged to the placement's own progress (`cluster.py progress`):
+each observation that finds a plan begun or a step further, a copy further through its log or a
+session placed begins its bound again, so it refuses only a placement that moved nothing in 300
+observations, with where it stopped (and counts 300 for each session and one more in all). The
+bootstrap then activates each session natively on the node that created it, its preferred leader,
+and waits until that replica says `native_active`. Every wait is bounded and every step may
 be run again: a session of the same name is the same session, a plan already held is `satisfied`,
 and an active session is not activated again. `run.sh` keeps `inspect placement` beside the report,
 as before, and the same by session and by node with the nodes holding no replica counted
@@ -17935,7 +17939,23 @@ listed first. The nodes take `FOCAL_IMAGE` as the generator and the bus do.
 | After, NODES unset (3) | 1 | 1 | 0 | 1 |
 
 At 33 nodes each session is on one node of each zone. The 11 preferred leaders are the 11 zone-a
-founders, and each node holds one replica. Both runs took every write the load offered: 500 of 500
+founders, and each node holds one replica.
+
+**At a tenth of a CPU a node the plans run slowly, and do not stop.** The first CI run at 33 nodes
+(run 40870632050, the 4-CPU runner: 0.09 CPU a node beside the generator's one, every CPU of the
+host spoken for) joined the nodes in 88 s and placed the founder's session in 82 s more. Twenty
+minutes later 8 of the 11 sessions were placed, 6 nodes still held no replica, and the bootstrap
+gave up: it had waited 300 observations in all, a bound that measured the host. On the box at the
+same 0.09 CPU a node (`HOST_CPUS=4`), sampled every 15 s, no plan stalled. Each moved from
+`Planned` through preparation, catch-up, custody and promotion to its cut-over while the founder,
+which commits every step through the directory partition and leads the root, ran at its quota,
+throttled in 2,923 of 4,327 periods (68%). Sessions were placed at 1, 2, 4, 5, 6 and 9 in the
+first five minutes, all 11 at 06:32:41, and the bootstrap ended in 427 s. The CI runner's nodes
+competed for a host with no CPU to spare beside them, and the sizing step decides that host
+(step 4 found each agent's pass re-reading the partition's checkpoint and authority from its
+leader every 250 ms, 0.34 CPU and 16.5 MB/s on the founder at 33 idle nodes with 500 agents
+enrolled, and makes those reads conditional on its branch). The wait is now
+charged to the placement's progress, as above. Both runs took every write the load offered: 500 of 500
 committed, none refused or unknown. The three-node cluster is the one it was: the founder's session
 on `focal1`, `focal2` and `focal3`, the report's 27 keys, and one file more beside it
 (`.sessions.json`).
@@ -17949,3 +17969,11 @@ they go, each node once; a seat goes by the larger of report and directory), wit
 takes the seat of the voter the directory loads most. All three fail with the directory's count
 dropped from `occupancy` and pass with it. `focal-node`'s placement agent and controller tests and
 `home_balance`, `leader_balance`, `placement_binary` and `cli_zones` pass.
+
+`placement_downgrade::lowering_max_failures_shrinks_the_voter_set_and_keeps_the_history` failed on
+Linux and macOS CI (run 40870611616): it shrinks three voters to one and read the claims from
+`host-a` or else `host-b`, never the founder. Each of the three holds one seat, so the tie goes by
+identity, and the founder's is the least (locally: `sole 5407403133156177438 founder
+5407403133156177438`). The hosts had been kept only while their load reports, sent before their
+copies were installed, still counted none. The test reads from whichever node keeps the seat and
+passes (37 s).
