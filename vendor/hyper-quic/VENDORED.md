@@ -1684,7 +1684,18 @@ losses; `tests/replication.rs` had asked its connections for one datagram at a t
 a batch, and asked for focal's 64 (`UDP_MAX_SEGMENTS`) it showed the same, a repair for 5.2% of the
 sources and 40% of the losses rebuilt, the commit's median 259 ms against 163 loss-free. A packet
 begun for a repair alone is ack-eliciting, in flight and under the window and the pacer: begun as
-one of acknowledgements, the repair after a burst's last source had been none of them. A receiver keeps the sources it holds and the repairs' equations in reduced row
+one of acknowledgements, the repair after a burst's last source had been none of them. And a repair
+begins a transmit of its own: in the one that carried the sources it was made after, it shared
+their fate, and netem decides each socket buffer's loss before it segments one
+(`net/sched/sch_netem.c`'s `netem_enqueue`), so the 3% loss of focal's compare runs drops a
+segmented send whole. A path that loses its packets in bursts, consecutive packets lost together,
+spans them so that a burst is in as many repairs' spans for each of its packets as a single loss
+(`fec::Bursts`: the burst a lost packet is in, the last eight bursts' mean weighted by RFC 5348's
+weights and by size; a span of `b` times a single loss's and `b − 1` more, at most the window).
+With each transmit lost or kept whole at 3% (`tests/replication.rs`'s `batch_loss`), the followers
+rebuilt 78% of their losses with single losses' spans and repairs in their sources' transmits
+(focal's: 77 to 82%), now 83 to 84%, and the commit's 90th percentile is 196 to 197 ms where it
+was 229 to 246 (with §48). A receiver keeps the sources it holds and the repairs' equations in reduced row
 echelon form, and rebuilds a lost packet as soon as they are of full rank, taking its STREAM frames;
 a source missing when its window passes it is counted left to retransmission
 (`ConnectionStats::fec_unrebuilt`), which had counted the losses still to rebuild too and fell as
@@ -1711,5 +1722,25 @@ still draining, the code's repairs and retransmissions taking half as much of th
 Tests: `erasure::tests` (the field against shift-and-reduce, RFC 8682's
 outputs, the coefficients, rebuilds of one and of many losses, late sources, the decoder's bound),
 `connection::fec::tests` (the loss rate, the repair rate and span),
-`replication::the_code_repairs_what_replication_loses`, `a_path_that_loses_nothing_is_not_coded` and
-`a_coded_run_replays_from_its_seed_and_from_its_trace`.
+`replication::the_code_repairs_what_replication_loses`, `the_code_repairs_what_a_segmented_send_loses_whole`,
+`a_path_that_loses_nothing_is_not_coded` and `a_coded_run_replays_from_its_seed_and_from_its_trace`.
+
+## 48. A recovery window no less than the latest round's delivery (2026-10-28, found by focal)
+
+`congestion/bbr/mod.rs`'s `calculate_recovery_window`: loss recovery holds BBR to what it had in
+flight at the loss and what each acknowledgement frees (Chromium's `CalculateRecoveryWindow`:
+packet conservation for a round, growth by what is acknowledged after), and now never to less than
+what the path delivered in its latest round trip, as BBRv3 bounds its own loss response
+(draft-ietf-ccwg-bbr-06 §5.5.10.3, `LossLowerBounds`: "BBR.inflight_shortterm =
+max(BBR.inflight_latest, BBR.Beta * BBR.inflight_shortterm)", `inflight_latest` "a 1-round-trip max
+of delivered volume of data"). The port leaves recovery only after a round trip with no loss, rare
+at 3% and a hundred packets a round trip, and enters it again at the next loss, conserved at what
+is then in flight. A sender the application limits had in flight, at a loss, what its last burst
+left, a few packets, and its next burst waited a round trip for acknowledgements: focal's leader,
+its appends bursts of a few datagrams. A sender that keeps its window in flight, two products
+(BBR's cwnd gain), delivers about one a round, so conservation still cuts what it holds past that.
+Measured on hyper-sim at focal's replication load (`tests/replication.rs`, each transmit lost whole
+at 3%): the uncoded commit's median 182 to 208 ms where it now is 166 to 172 (163 loss-free); with
+each datagram lost on its own, the coded commit's 90th percentile 187 to 193 ms where it now is 173
+to 180 (with §47's spans). Test:
+`congestion::bbr::tests::a_loss_holds_an_app_limited_sender_to_no_less_than_its_latest_round_delivered`.

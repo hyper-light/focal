@@ -66,6 +66,11 @@ pub struct Bbr {
     cwnd: u64,
     current_round_trip_end_packet_number: u64,
     round_count: u64,
+    /// The bytes acknowledged since the round trip under way began, and over the last whole one:
+    /// what the path delivered in its latest round, the least a recovery window holds
+    /// (`calculate_recovery_window`)
+    delivered_in_round: u64,
+    delivered_last_round: u64,
     bw_at_last_round: u64,
     round_wo_bw_gain: u64,
     ack_aggregation: AckAggregationState,
@@ -120,6 +125,8 @@ impl Bbr {
             cwnd: window,
             current_round_trip_end_packet_number: 0,
             round_count: 0,
+            delivered_in_round: 0,
+            delivered_last_round: 0,
             bw_at_last_round: 0,
             round_wo_bw_gain: 0,
             ack_aggregation: AckAggregationState::default(),
@@ -409,13 +416,29 @@ impl Bbr {
         }
     }
 
+    /// The window loss recovery holds the sender to (Chromium's `CalculateRecoveryWindow`): what
+    /// it had in flight at the loss and what each acknowledgement frees, conserved for a round
+    /// and grown as acknowledged after, and never below what the path delivered in its latest
+    /// round trip. BBRv3 bounds its own loss response so (draft-ietf-ccwg-bbr-06 §5.5.10.3,
+    /// `LossLowerBounds`: "`BBR.inflight_shortterm = max(BBR.inflight_latest, BBR.Beta *
+    /// BBR.inflight_shortterm)`", `inflight_latest` "a 1-round-trip max of delivered volume of
+    /// data"): a sender that keeps its window in flight delivers about its product a round, which
+    /// conservation still cuts what it holds past toward; a sender the application limits had
+    /// in flight, at the loss, what its last burst left, and conserved at that, its next burst
+    /// waited for acknowledgements a round trip, every round trip a loss began recovery (focal's
+    /// leader under 3% loss: hyper-raft `tests/replication.rs`, the uncoded commit's median 182
+    /// to 208 ms where 166 to 172 floored, 163 loss-free).
     fn calculate_recovery_window(&mut self, bytes_acked: u64, bytes_lost: u64, in_flight: u64) {
         if !self.recovery_state.in_recovery() {
             return;
         }
+        let latest = self.delivered_last_round.max(self.delivered_in_round);
         // Set up the initial recovery window.
         if self.recovery_window == 0 {
-            self.recovery_window = self.min_cwnd.max(in_flight.saturating_add(bytes_acked));
+            self.recovery_window = self
+                .min_cwnd
+                .max(in_flight.saturating_add(bytes_acked))
+                .max(latest);
             return;
         }
 
@@ -438,7 +461,8 @@ impl Bbr {
         self.recovery_window = self
             .recovery_window
             .max(in_flight.saturating_add(bytes_acked))
-            .max(self.min_cwnd);
+            .max(self.min_cwnd)
+            .max(latest);
     }
 
     /// <https://datatracker.ietf.org/doc/html/draft-cardwell-iccrg-bbr-congestion-control#section-4.3.2.2>
@@ -508,7 +532,9 @@ impl Controller for Bbr {
             if is_round_start {
                 self.current_round_trip_end_packet_number = self.max_sent_packet_number;
                 self.round_count = self.round_count.saturating_add(1);
+                self.delivered_last_round = core::mem::take(&mut self.delivered_in_round);
             }
+            self.delivered_in_round = self.delivered_in_round.saturating_add(bytes_acked);
         }
         let min_rtt_expired = self
             .sample
@@ -1029,6 +1055,50 @@ mod tests {
         let paced = sender.bbr.pacing_rate();
         assert!(paced.is_some_and(|rate| rate > 0));
         assert_eq!(sender.bbr.metrics().pacing_rate, paced.map(|rate| rate * 8));
+    }
+
+    /// A sender the application limits, a burst of 20 packets every round trip, loses one when
+    /// what it has in flight is the last burst's tail: recovery holds it to what the path
+    /// delivered in its latest round trip, the 19 of that burst acknowledged, where conserved at
+    /// what was in flight, its window was the least BBR keeps, four packets, and each burst waited
+    /// for acknowledgements.
+    #[test]
+    fn a_loss_holds_an_app_limited_sender_to_no_less_than_its_latest_round_delivered() {
+        const BURST: u64 = 20;
+        let round_trip = Duration::from_millis(10);
+        let mut sender = Sender::new();
+        // Out of startup, its window well past what it sends
+        sender.bbr.mode = Mode::ProbeBw;
+        sender.bbr.is_at_full_bandwidth = true;
+        sender.bbr.cwnd = 1_000 * PACKET;
+        let start = start();
+        let mut due: VecDeque<Due> = VecDeque::new();
+        for burst in 0..10u32 {
+            let now = start + round_trip * burst;
+            while due.front().is_some_and(|(at, ..)| *at <= now) {
+                sender.ack(due.pop_front().unwrap());
+            }
+            for _ in 0..BURST {
+                let (snapshot, app_limited, number) = sender.send(now);
+                due.push_back((now + round_trip, now, snapshot, app_limited, number));
+            }
+            sender.delivery.on_app_limited(sender.in_flight);
+        }
+        // The last burst acknowledged but its last packet, and that one lost
+        let at = start + round_trip * 10;
+        while due.len() > 1 {
+            sender.ack(due.pop_front().unwrap());
+        }
+        let (_, sent, ..) = due.pop_front().unwrap();
+        sender.in_flight -= PACKET;
+        assert_eq!(sender.in_flight, 0);
+        sender.bbr.on_congestion_event(at, sent, false, PACKET);
+        // A packet sent and acknowledged after the loss: the acknowledgement that begins recovery
+        let (snapshot, app_limited, number) = sender.send(at);
+        sender.ack((at + round_trip, at, snapshot, app_limited, number));
+        assert!(sender.bbr.recovery_state.in_recovery());
+        assert_eq!(sender.bbr.min_cwnd, 4 * PACKET);
+        assert_eq!(sender.bbr.window(), (BURST - 1) * PACKET);
     }
 
     #[test]

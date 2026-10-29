@@ -109,10 +109,51 @@ impl LossRate {
     }
 }
 
+/// The bursts a connection's packets are lost in, the last eight: consecutive packets lost
+/// together, as a segmented send lost whole (netem decides each socket buffer's loss before it
+/// segments one, `net/sched/sch_netem.c`'s `netem_enqueue`) or a queue's overflow drops them. A
+/// span holds a burst in as many repairs' spans as a single loss (`Sending::span`).
+#[derive(Default)]
+pub(super) struct Bursts {
+    /// The packets of each of the last eight, the most recent first.
+    sizes: [u64; 8],
+    /// The bursts held, at most eight.
+    count: usize,
+}
+
+impl Bursts {
+    /// A burst of `size` consecutive packets was declared lost.
+    pub(super) fn lost(&mut self, size: u64) {
+        self.sizes.rotate_right(1);
+        if let Some(first) = self.sizes.first_mut() {
+            *first = size.max(1);
+        }
+        self.count = self.count.saturating_add(1).min(WEIGHTS.len());
+    }
+
+    /// The burst a lost packet is in, on average, as `(numerator, denominator)`: the sizes' mean
+    /// weighted by RFC 5348 §5.4's weights and by each size, a packet being in a burst in
+    /// proportion to its size; one before any.
+    fn per_loss(&self) -> (u64, u64) {
+        let (mut numerator, mut denominator) = (0u64, 0u64);
+        for (size, weight) in self.sizes.iter().zip(WEIGHTS).take(self.count) {
+            let weighted = size.saturating_mul(weight);
+            numerator = numerator.saturating_add(weighted.saturating_mul(*size));
+            denominator = denominator.saturating_add(weighted);
+        }
+        if denominator == 0 {
+            (1, 1)
+        } else {
+            (numerator, denominator)
+        }
+    }
+}
+
 /// The sending side: the encoder, the loss rate it codes against and the repair owed.
 pub(super) struct Sending {
     encoder: Encoder,
     losses: LossRate,
+    bursts: Bursts,
     /// Repairs owed, in millionths of one: each source sent adds the repair rate.
     credit: u64,
     /// The packets of stream data sent in the current loss delay and the last.
@@ -137,6 +178,7 @@ impl Sending {
         Self {
             encoder: Encoder::new(limit),
             losses: LossRate::default(),
+            bursts: Bursts::default(),
             credit: 0,
             meter: Meter::default(),
             limit: limit.max(1),
@@ -165,14 +207,38 @@ impl Sending {
     }
 
     /// The sources a repair combines at the repair rate: those over which `SPANS_PER_SOURCE`
-    /// repairs go, so that each source is in that many repairs' spans; `None` while the path
-    /// loses nothing, or more than the window holds.
+    /// repairs go, so that each source is in that many repairs' spans, and for a path that loses
+    /// its packets in bursts of `b`, `b` times that and `b − 1` more, so that a burst is in
+    /// `SPANS_PER_SOURCE` repairs' spans for each of its packets (a repair made `r` sources past a
+    /// burst's last spans the whole burst while `r` is under the span less `b − 1`), at most the
+    /// window; `None` while the path loses nothing, or a single loss's span is more than the
+    /// window holds. Under netem's 3% loss in focal's batches of up to 64 datagrams, its followers
+    /// rebuilt 77 to 82% of their losses with single losses' spans.
     fn span(&self) -> Option<usize> {
-        let span = SPANS_PER_SOURCE
-            .saturating_mul(PPM)
-            .div_ceil(self.repair_ppm().max(1));
-        let span = usize::try_from(span).ok()?;
-        (self.repair_ppm() > 0 && span <= self.limit).then_some(span.max(1))
+        let ppm = self.repair_ppm();
+        if ppm == 0 {
+            return None;
+        }
+        let single = SPANS_PER_SOURCE.saturating_mul(PPM).div_ceil(ppm);
+        if usize::try_from(single).is_ok_and(|single| single > self.limit) {
+            return None;
+        }
+        let (numerator, denominator) = self.bursts.per_loss();
+        let span = single
+            .saturating_mul(numerator)
+            .saturating_add(numerator)
+            .saturating_sub(denominator)
+            .div_ceil(denominator.max(1));
+        Some(
+            usize::try_from(span)
+                .unwrap_or(usize::MAX)
+                .clamp(1, self.limit),
+        )
+    }
+
+    /// A burst of `size` consecutive packets was declared lost (`Bursts`).
+    pub(super) fn burst(&mut self, size: u64) {
+        self.bursts.lost(size);
     }
 
     /// The rule a connection codes by: its path loses, and often enough that a span covering each
@@ -480,6 +546,47 @@ mod tests {
         assert!(sending.decide(at(499), delay));
         assert!(!sending.decide(at(500), delay));
         assert!(!sending.active());
+    }
+
+    #[test]
+    fn a_burst_is_in_as_many_repairs_spans_for_each_packet_as_a_single_loss() {
+        // 3% loss, a single loss's span 33 sources (`three_percent_loss_measures_as_three_percent`)
+        let mut losses = LossRate::default();
+        for _ in 0..40 {
+            for _ in 0..32 {
+                losses.delivered();
+            }
+            losses.lost();
+        }
+        let mut sending = Sending {
+            losses,
+            ..Sending::new(128)
+        };
+        assert_eq!(sending.span(), Some(33));
+        for _ in 0..8 {
+            sending.burst(1);
+        }
+        assert_eq!(sending.span(), Some(33), "single losses leave it so");
+        // Bursts of three: 3 · 33 + 2, so that a repair spans the whole burst for 99 sources past it
+        for _ in 0..8 {
+            sending.burst(3);
+        }
+        assert_eq!(sending.span(), Some(101));
+        // The most recent four of three, four before them single: a lost packet is in a burst of
+        // 380 / 140 on average (each burst weighted by RFC 5348's weight and by its size)
+        for _ in 0..4 {
+            sending.burst(1);
+        }
+        for _ in 0..4 {
+            sending.burst(3);
+        }
+        assert_eq!(sending.bursts.per_loss(), (380, 140));
+        assert_eq!(sending.span(), Some(92));
+        // Bursts of five: 169, more than the window holds
+        for _ in 0..8 {
+            sending.burst(5);
+        }
+        assert_eq!(sending.span(), Some(128));
     }
 
     #[test]

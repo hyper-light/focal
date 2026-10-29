@@ -960,6 +960,13 @@ impl Connection {
             // No more datagrams allowed
             return Some(Fill::Stop);
         }
+        // A repair falls due as the source it follows is sent, and begins a transmit of its own:
+        // in this one, it shared the fate of the sources it was made after, and a segmented send
+        // is lost whole where it is lost as one (netem decides each socket buffer's loss before
+        // it segments one, `net/sched/sch_netem.c`'s `netem_enqueue`; so drops a queue its burst)
+        if tx.num_datagrams > 0 && self.fec.repair_due() {
+            return Some(Fill::Stop);
+        }
 
         // RFC 9000 §8.1: before the peer's address is validated, the bytes sent stay within three
         // times those received. `total_sent` counts this transmit's datagrams only once it ends,
@@ -2843,6 +2850,30 @@ impl Connection {
     }
 
     /// OnPacketsLost
+    /// Each run of consecutive packet numbers among `packets` (ascending), lost together, is a
+    /// burst the coding sizes its spans by (`fec::Bursts`).
+    fn fec_bursts(&mut self, packets: &[u64]) {
+        let Some(sending) = &mut self.fec.sending else {
+            return;
+        };
+        let mut run = 0u64;
+        let mut last: Option<u64> = None;
+        for &packet in packets {
+            if last.and_then(|last| last.checked_add(1)) == Some(packet) {
+                run = run.saturating_add(1);
+            } else {
+                if run > 0 {
+                    sending.burst(run);
+                }
+                run = 1;
+            }
+            last = Some(packet);
+        }
+        if run > 0 {
+            sending.burst(run);
+        }
+    }
+
     fn on_packets_lost(
         &mut self,
         now: Instant,
@@ -2851,6 +2882,9 @@ impl Connection {
         largest_lost_sent: Instant,
         lost: &LostPackets,
     ) {
+        if pn_space == SpaceId::Data {
+            self.fec_bursts(&lost.packets);
+        }
         let old_bytes_in_flight = self.path.in_flight.bytes;
         self.stats.path.lost_packets = self
             .stats
