@@ -1,0 +1,2 @@
+run.sh exit=0 after 789 s
+gc_thresh restored to 512/1024: now 512/1024

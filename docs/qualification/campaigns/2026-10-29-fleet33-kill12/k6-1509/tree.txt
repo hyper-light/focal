@@ -1,0 +1,13 @@
+24770d5c AL: doc 09 and a qualification record for the 30-node plan's fifth step: the work flow among 500 agents on 33 nodes (fedora, i9-14900HX, 32 threads; each node 0.90 CPU and 512 MiB), the fleet's 11 sessions each a ledger driven at once at 220 claims a second for 60 s after 15 s. In each of three runs (r2-0942, r3-0958, r4-1010) all 16,500 lifecycles started were written and judged, 1,500 in each ledger, none refused, unknown, abandoned or undelivered, 181,500 writes committed; write p50/p99 42.2/108.1, 34.6/147.6 (beside another tenant's benchmark holding ~7 CPUs) and 35.4/76.7 ms. Each run's report, placement by session and node, host, summary and breakdown are kept beside the record with their SHA-256 sums as the host made them (docs/qualification/campaigns/2026-10-29-fleet33-work/), every file of each run on the host (fedora-2:~/s5/runs/). What the nodes spent by role, at rest and under the load (1.42 and 11.16 CPUs; 1.0 and 149.7 MB/s written, 69.3 KB a committed write over three replicas), and what is open
+ M crates/focal-client/src/client.rs
+ M crates/focal-client/src/tests.rs
+ M crates/focal-client/src/transport.rs
+ M crates/focal-node/src/directory_bootstrap.rs
+ M crates/focal-node/src/directory_bootstrap_tests.rs
+ M crates/focal-node/src/placement_agent.rs
+ M crates/focal-node/src/placement_agent_memory.rs
+ M crates/focal-node/src/placement_agent_tests.rs
+ M tools/compare/compose/run.sh
+ M tools/load/README.md
+ M tools/load/src/driver.rs
+ M tools/load/src/measurements.rs

@@ -1,0 +1,450 @@
+1793312493041 focal1 | health unreadable
+1793312493041 focal32 | health unreadable
+1793312493041 focal12 alive=31 suspect=1 dead=0 | err=peer transport: replication delivery was lost or has unknown outcome; Raft must retransmit | retry=- | root=0 part=26
+1793312493041 focal9 | health unreadable
+1793312493041 focal28 | health unreadable
+1793312493041 focal2 alive=25 suspect=7 dead=0 | err=peer transport: replication delivery was lost or has unknown outcome; Raft must retransmit | retry=- | root=0 part=26
+1793312499608 focal1 | health unreadable
+1793312499608 focal32 | health unreadable
+1793312499608 focal12 alive=21 suspect=11 dead=0 | err=- | retry=- | root=0 part=27
+1793312499608 focal9 | health unreadable
+1793312499608 focal28 | health unreadable
+1793312499608 focal2 alive=25 suspect=7 dead=0 | err=- | retry=- | root=0 part=26
+1793312502057 focal1 | health unreadable
+1793312502057 focal32 | health unreadable
+1793312502057 focal12 alive=21 suspect=11 dead=0 | err=- | retry=- | root=0 part=27
+1793312502057 focal9 | health unreadable
+1793312502057 focal28 | health unreadable
+1793312502057 focal2 alive=20 suspect=12 dead=0 | err=- | retry=- | root=0 part=27
+1793312504475 focal1 | health unreadable
+1793312504475 focal32 | health unreadable
+1793312504475 focal12 alive=21 suspect=11 dead=0 | err=- | retry=- | root=0 part=27
+1793312504475 focal9 | health unreadable
+1793312504475 focal28 | health unreadable
+1793312504475 focal2 alive=20 suspect=12 dead=0 | err=- | retry=- | root=0 part=27
+1793312506882 focal1 | health unreadable
+1793312506882 focal32 | health unreadable
+1793312506882 focal12 alive=20 suspect=11 dead=1 | err=- | retry=- | root=0 part=27
+1793312506882 focal9 | health unreadable
+1793312506882 focal28 | health unreadable
+1793312506882 focal2 alive=20 suspect=12 dead=0 | err=- | retry=- | root=0 part=27
+1793312509305 focal1 | health unreadable
+1793312509305 focal32 | health unreadable
+1793312509305 focal12 alive=20 suspect=11 dead=1 | err=- | retry=- | root=0 part=27
+1793312509305 focal9 | health unreadable
+1793312509305 focal28 | health unreadable
+1793312509305 focal2 alive=20 suspect=11 dead=1 | err=- | retry=- | root=0 part=27
+1793312511723 focal1 | health unreadable
+1793312511723 focal32 | health unreadable
+1793312511723 focal12 alive=20 suspect=10 dead=2 | err=- | retry=- | root=0 part=27
+1793312511723 focal9 | health unreadable
+1793312511723 focal28 | health unreadable
+1793312511723 focal2 alive=20 suspect=11 dead=1 | err=- | retry=- | root=0 part=27
+1793312514079 focal1 | health unreadable
+1793312514079 focal32 | health unreadable
+1793312514079 focal12 alive=20 suspect=10 dead=2 | err=- | retry=- | root=0 part=27
+1793312514079 focal9 | health unreadable
+1793312514079 focal28 | health unreadable
+1793312514079 focal2 alive=20 suspect=8 dead=4 | err=- | retry=- | root=0 part=27
+1793312516443 focal1 | health unreadable
+1793312516443 focal32 | health unreadable
+1793312516443 focal12 alive=20 suspect=6 dead=6 | err=- | retry=- | root=0 part=27
+1793312516443 focal9 | health unreadable
+1793312516443 focal28 | health unreadable
+1793312516443 focal2 alive=20 suspect=8 dead=4 | err=- | retry=- | root=0 part=27
+1793312518853 focal1 | health unreadable
+1793312518853 focal32 | health unreadable
+1793312518853 focal12 alive=20 suspect=6 dead=6 | err=- | retry=- | root=0 part=27
+1793312518853 focal9 | health unreadable
+1793312518853 focal28 | health unreadable
+1793312518853 focal2 alive=20 suspect=6 dead=6 | err=- | retry=- | root=0 part=27
+1793312521256 focal1 | health unreadable
+1793312521256 focal32 | health unreadable
+1793312521256 focal12 alive=20 suspect=6 dead=6 | err=- | retry=- | root=0 part=27
+1793312521256 focal9 | health unreadable
+1793312521256 focal28 | health unreadable
+1793312521256 focal2 alive=20 suspect=6 dead=6 | err=- | retry=- | root=0 part=27
+1793312523657 focal1 | health unreadable
+1793312523657 focal32 | health unreadable
+1793312523657 focal12 alive=20 suspect=6 dead=6 | err=- | retry=- | root=0 part=27
+1793312523657 focal9 | health unreadable
+1793312523657 focal28 alive=0 suspect=0 dead=0 | err=peer transport: peer ingress rejected replication: authoritative ledger service is unavail | retry=- | root=1 part=0
+1793312523657 focal2 alive=20 suspect=2 dead=10 | err=- | retry=- | root=0 part=27
+1793312527763 focal1 alive=0 suspect=0 dead=0 | err=- | retry=- | root=49 part=0
+1793312527763 focal32 alive=0 suspect=0 dead=0 | err=- | retry=- | root=0 part=27
+1793312527763 focal12 alive=20 suspect=2 dead=10 | err=- | retry=- | root=0 part=27
+1793312527763 focal9 alive=0 suspect=0 dead=0 | err=- | retry=- | root=0 part=27
+1793312527763 focal28 alive=0 suspect=0 dead=0 | err=- | retry=- | root=1 part=29
+1793312527763 focal2 alive=26 suspect=0 dead=6 | err=- | retry=- | root=0 part=27
+1793312530546 focal1 alive=32 suspect=0 dead=0 | err=- | retry=- | root=49 part=1
+1793312530546 focal32 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=27
+1793312530546 focal12 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312530546 focal9 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=27
+1793312530546 focal28 alive=32 suspect=0 dead=0 | err=- | retry=- | root=1 part=29
+1793312530546 focal2 alive=26 suspect=0 dead=6 | err=- | retry=- | root=0 part=27
+1793312533416 focal1 alive=32 suspect=0 dead=0 | err=- | retry=- | root=49 part=1
+1793312533416 focal32 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=27
+1793312533416 focal12 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312533416 focal9 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312533416 focal28 alive=32 suspect=0 dead=0 | err=- | retry=- | root=1 part=29
+1793312533416 focal2 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312536302 focal1 alive=32 suspect=0 dead=0 | err=- | retry=- | root=49 part=1
+1793312536302 focal32 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=27
+1793312536302 focal12 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312536302 focal9 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312536302 focal28 alive=32 suspect=0 dead=0 | err=- | retry=- | root=1 part=29
+1793312536302 focal2 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312539201 focal1 alive=32 suspect=0 dead=0 | err=- | retry=- | root=49 part=1
+1793312539201 focal32 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=27
+1793312539201 focal12 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312539201 focal9 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312539201 focal28 alive=32 suspect=0 dead=0 | err=- | retry=- | root=1 part=29
+1793312539201 focal2 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312542128 focal1 alive=32 suspect=0 dead=0 | err=- | retry=- | root=49 part=1
+1793312542128 focal32 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=27
+1793312542128 focal12 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312542128 focal9 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312542128 focal28 alive=32 suspect=0 dead=0 | err=- | retry=- | root=1 part=29
+1793312542128 focal2 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312545043 focal1 alive=32 suspect=0 dead=0 | err=- | retry=- | root=49 part=1
+1793312545043 focal32 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=27
+1793312545043 focal12 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312545043 focal9 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312545043 focal28 alive=32 suspect=0 dead=0 | err=- | retry=- | root=1 part=29
+1793312545043 focal2 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312547879 focal1 alive=32 suspect=0 dead=0 | err=- | retry=- | root=49 part=1
+1793312547879 focal32 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=27
+1793312547879 focal12 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312547879 focal9 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312547879 focal28 alive=32 suspect=0 dead=0 | err=- | retry=- | root=1 part=29
+1793312547879 focal2 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312550649 focal1 alive=32 suspect=0 dead=0 | err=- | retry=- | root=49 part=1
+1793312550649 focal32 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=27
+1793312550649 focal12 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312550649 focal9 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312550649 focal28 alive=32 suspect=0 dead=0 | err=- | retry=- | root=1 part=29
+1793312550649 focal2 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312553491 focal1 alive=32 suspect=0 dead=0 | err=- | retry=- | root=49 part=1
+1793312553491 focal32 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=27
+1793312553491 focal12 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312553491 focal9 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312553491 focal28 alive=32 suspect=0 dead=0 | err=- | retry=- | root=1 part=29
+1793312553491 focal2 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312556221 focal1 alive=32 suspect=0 dead=0 | err=- | retry=- | root=49 part=1
+1793312556221 focal32 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=27
+1793312556221 focal12 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312556221 focal9 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312556221 focal28 alive=32 suspect=0 dead=0 | err=- | retry=- | root=1 part=29
+1793312556221 focal2 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312559011 focal1 alive=32 suspect=0 dead=0 | err=- | retry=- | root=49 part=2
+1793312559011 focal32 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312559011 focal12 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312559011 focal9 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312559011 focal28 alive=32 suspect=0 dead=0 | err=- | retry=- | root=1 part=30
+1793312559011 focal2 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312561804 focal1 alive=32 suspect=0 dead=0 | err=- | retry=- | root=49 part=2
+1793312561804 focal32 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312561804 focal12 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312561804 focal9 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312561804 focal28 alive=32 suspect=0 dead=0 | err=- | retry=- | root=1 part=30
+1793312561804 focal2 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312564756 focal1 alive=32 suspect=0 dead=0 | err=- | retry=- | root=49 part=2
+1793312564756 focal32 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312564756 focal12 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312564756 focal9 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312564756 focal28 alive=32 suspect=0 dead=0 | err=- | retry=- | root=1 part=30
+1793312564756 focal2 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312567501 focal1 alive=32 suspect=0 dead=0 | err=- | retry=- | root=49 part=2
+1793312567501 focal32 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312567501 focal12 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312567501 focal9 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312567501 focal28 alive=32 suspect=0 dead=0 | err=- | retry=- | root=1 part=30
+1793312567501 focal2 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312570257 focal1 alive=32 suspect=0 dead=0 | err=- | retry=- | root=49 part=2
+1793312570257 focal32 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312570257 focal12 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312570257 focal9 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312570257 focal28 alive=32 suspect=0 dead=0 | err=- | retry=- | root=1 part=30
+1793312570257 focal2 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312573047 focal1 alive=32 suspect=0 dead=0 | err=- | retry=- | root=49 part=2
+1793312573047 focal32 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312573047 focal12 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312573047 focal9 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312573047 focal28 alive=32 suspect=0 dead=0 | err=- | retry=- | root=1 part=30
+1793312573047 focal2 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312575807 focal1 alive=32 suspect=0 dead=0 | err=- | retry=- | root=49 part=2
+1793312575807 focal32 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312575807 focal12 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312575807 focal9 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312575807 focal28 alive=32 suspect=0 dead=0 | err=- | retry=- | root=1 part=30
+1793312575807 focal2 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312578521 focal1 alive=32 suspect=0 dead=0 | err=- | retry=- | root=49 part=2
+1793312578521 focal32 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312578521 focal12 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312578521 focal9 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312578521 focal28 alive=32 suspect=0 dead=0 | err=- | retry=- | root=1 part=30
+1793312578521 focal2 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312581300 focal1 alive=32 suspect=0 dead=0 | err=- | retry=- | root=49 part=2
+1793312581300 focal32 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312581300 focal12 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312581300 focal9 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312581300 focal28 alive=32 suspect=0 dead=0 | err=- | retry=- | root=1 part=30
+1793312581300 focal2 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312584076 focal1 alive=32 suspect=0 dead=0 | err=- | retry=- | root=49 part=2
+1793312584076 focal32 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312584076 focal12 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312584076 focal9 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312584076 focal28 alive=32 suspect=0 dead=0 | err=- | retry=- | root=1 part=30
+1793312584076 focal2 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312586785 focal1 alive=32 suspect=0 dead=0 | err=- | retry=- | root=49 part=2
+1793312586785 focal32 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=28
+1793312586785 focal12 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312586785 focal9 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312586785 focal28 alive=32 suspect=0 dead=0 | err=- | retry=- | root=1 part=31
+1793312586785 focal2 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312589503 focal1 alive=32 suspect=0 dead=0 | err=- | retry=- | root=49 part=3
+1793312589503 focal32 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312589503 focal12 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312589503 focal9 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312589503 focal28 alive=32 suspect=0 dead=0 | err=- | retry=- | root=1 part=31
+1793312589503 focal2 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312592206 focal1 alive=32 suspect=0 dead=0 | err=- | retry=- | root=49 part=3
+1793312592206 focal32 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312592206 focal12 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=30
+1793312592206 focal9 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=30
+1793312592206 focal28 alive=32 suspect=0 dead=0 | err=- | retry=- | root=1 part=31
+1793312592206 focal2 alive=32 suspect=0 dead=0 | err=- | retry=- | root=0 part=29
+1793312594928 focal1 | health unreadable
+1793312594928 focal32 | health unreadable
+1793312594928 focal12 | health unreadable
+1793312594928 focal9 | health unreadable
+1793312594928 focal28 | health unreadable
+1793312594928 focal2 | health unreadable
+1793312598025 focal1 | health unreadable
+1793312598025 focal32 | health unreadable
+1793312598025 focal12 | health unreadable
+1793312598025 focal9 | health unreadable
+1793312598025 focal28 | health unreadable
+1793312598025 focal2 | health unreadable
+1793312600219 focal1 | health unreadable
+1793312600219 focal32 | health unreadable
+1793312600219 focal12 | health unreadable
+1793312600219 focal9 | health unreadable
+1793312600219 focal28 | health unreadable
+1793312600219 focal2 | health unreadable
+1793312602416 focal1 | health unreadable
+1793312602416 focal32 | health unreadable
+1793312602416 focal12 | health unreadable
+1793312602416 focal9 | health unreadable
+1793312602416 focal28 | health unreadable
+1793312602416 focal2 | health unreadable
+1793312604618 focal1 | health unreadable
+1793312604618 focal32 | health unreadable
+1793312604618 focal12 | health unreadable
+1793312604618 focal9 | health unreadable
+1793312604618 focal28 | health unreadable
+1793312604618 focal2 | health unreadable
+1793312606825 focal1 | health unreadable
+1793312606825 focal32 | health unreadable
+1793312606825 focal12 | health unreadable
+1793312606825 focal9 | health unreadable
+1793312606825 focal28 | health unreadable
+1793312606825 focal2 | health unreadable
+1793312609031 focal1 | health unreadable
+1793312609031 focal32 | health unreadable
+1793312609031 focal12 | health unreadable
+1793312609031 focal9 | health unreadable
+1793312609031 focal28 | health unreadable
+1793312609031 focal2 | health unreadable
+1793312611237 focal1 | health unreadable
+1793312611237 focal32 | health unreadable
+1793312611237 focal12 | health unreadable
+1793312611237 focal9 | health unreadable
+1793312611237 focal28 | health unreadable
+1793312611237 focal2 | health unreadable
+1793312613429 focal1 | health unreadable
+1793312613429 focal32 | health unreadable
+1793312613429 focal12 | health unreadable
+1793312613429 focal9 | health unreadable
+1793312613429 focal28 | health unreadable
+1793312613429 focal2 | health unreadable
+1793312615610 focal1 | health unreadable
+1793312615610 focal32 | health unreadable
+1793312615610 focal12 | health unreadable
+1793312615610 focal9 | health unreadable
+1793312615610 focal28 | health unreadable
+1793312615610 focal2 | health unreadable
+1793312617799 focal1 | health unreadable
+1793312617799 focal32 | health unreadable
+1793312617799 focal12 | health unreadable
+1793312617799 focal9 | health unreadable
+1793312617799 focal28 | health unreadable
+1793312617799 focal2 | health unreadable
+1793312619996 focal1 | health unreadable
+1793312619996 focal32 | health unreadable
+1793312619996 focal12 | health unreadable
+1793312619996 focal9 | health unreadable
+1793312619996 focal28 | health unreadable
+1793312619996 focal2 | health unreadable
+1793312622203 focal1 | health unreadable
+1793312622203 focal32 | health unreadable
+1793312622203 focal12 | health unreadable
+1793312622203 focal9 | health unreadable
+1793312622203 focal28 | health unreadable
+1793312622203 focal2 | health unreadable
+1793312624409 focal1 | health unreadable
+1793312624409 focal32 | health unreadable
+1793312624409 focal12 | health unreadable
+1793312624409 focal9 | health unreadable
+1793312624409 focal28 | health unreadable
+1793312624409 focal2 | health unreadable
+1793312626606 focal1 | health unreadable
+1793312626606 focal32 | health unreadable
+1793312626606 focal12 | health unreadable
+1793312626606 focal9 | health unreadable
+1793312626606 focal28 | health unreadable
+1793312626606 focal2 | health unreadable
+1793312628800 focal1 | health unreadable
+1793312628800 focal32 | health unreadable
+1793312628800 focal12 | health unreadable
+1793312628800 focal9 | health unreadable
+1793312628800 focal28 | health unreadable
+1793312628800 focal2 | health unreadable
+1793312630995 focal1 | health unreadable
+1793312630995 focal32 | health unreadable
+1793312630995 focal12 | health unreadable
+1793312630995 focal9 | health unreadable
+1793312630995 focal28 | health unreadable
+1793312630995 focal2 | health unreadable
+1793312633187 focal1 | health unreadable
+1793312633187 focal32 | health unreadable
+1793312633187 focal12 | health unreadable
+1793312633187 focal9 | health unreadable
+1793312633187 focal28 | health unreadable
+1793312633187 focal2 | health unreadable
+1793312635382 focal1 | health unreadable
+1793312635382 focal32 | health unreadable
+1793312635382 focal12 | health unreadable
+1793312635382 focal9 | health unreadable
+1793312635382 focal28 | health unreadable
+1793312635382 focal2 | health unreadable
+1793312637582 focal1 | health unreadable
+1793312637582 focal32 | health unreadable
+1793312637582 focal12 | health unreadable
+1793312637582 focal9 | health unreadable
+1793312637582 focal28 | health unreadable
+1793312637582 focal2 | health unreadable
+1793312639768 focal1 | health unreadable
+1793312639768 focal32 | health unreadable
+1793312639768 focal12 | health unreadable
+1793312639768 focal9 | health unreadable
+1793312639768 focal28 | health unreadable
+1793312639768 focal2 | health unreadable
+1793312641966 focal1 | health unreadable
+1793312641966 focal32 | health unreadable
+1793312641966 focal12 | health unreadable
+1793312641966 focal9 | health unreadable
+1793312641966 focal28 | health unreadable
+1793312641966 focal2 | health unreadable
+1793312644160 focal1 | health unreadable
+1793312644160 focal32 | health unreadable
+1793312644160 focal12 | health unreadable
+1793312644160 focal9 | health unreadable
+1793312644160 focal28 | health unreadable
+1793312644160 focal2 | health unreadable
+1793312646345 focal1 | health unreadable
+1793312646345 focal32 | health unreadable
+1793312646345 focal12 | health unreadable
+1793312646345 focal9 | health unreadable
+1793312646345 focal28 | health unreadable
+1793312646345 focal2 | health unreadable
+1793312648525 focal1 | health unreadable
+1793312648525 focal32 | health unreadable
+1793312648525 focal12 | health unreadable
+1793312648525 focal9 | health unreadable
+1793312648525 focal28 | health unreadable
+1793312648525 focal2 | health unreadable
+1793312650722 focal1 | health unreadable
+1793312650722 focal32 | health unreadable
+1793312650722 focal12 | health unreadable
+1793312650722 focal9 | health unreadable
+1793312650722 focal28 | health unreadable
+1793312650722 focal2 | health unreadable
+1793312652919 focal1 | health unreadable
+1793312652919 focal32 | health unreadable
+1793312652919 focal12 | health unreadable
+1793312652919 focal9 | health unreadable
+1793312652919 focal28 | health unreadable
+1793312652919 focal2 | health unreadable
+1793312655129 focal1 | health unreadable
+1793312655129 focal32 | health unreadable
+1793312655129 focal12 | health unreadable
+1793312655129 focal9 | health unreadable
+1793312655129 focal28 | health unreadable
+1793312655129 focal2 | health unreadable
+1793312657355 focal1 | health unreadable
+1793312657355 focal32 | health unreadable
+1793312657355 focal12 | health unreadable
+1793312657355 focal9 | health unreadable
+1793312657355 focal28 | health unreadable
+1793312657355 focal2 | health unreadable
+1793312659572 focal1 | health unreadable
+1793312659572 focal32 | health unreadable
+1793312659572 focal12 | health unreadable
+1793312659572 focal9 | health unreadable
+1793312659572 focal28 | health unreadable
+1793312659572 focal2 | health unreadable
+1793312661797 focal1 | health unreadable
+1793312661797 focal32 | health unreadable
+1793312661797 focal12 | health unreadable
+1793312661797 focal9 | health unreadable
+1793312661797 focal28 | health unreadable
+1793312661797 focal2 | health unreadable
+1793312664017 focal1 | health unreadable
+1793312664017 focal32 | health unreadable
+1793312664017 focal12 | health unreadable
+1793312664017 focal9 | health unreadable
+1793312664017 focal28 | health unreadable
+1793312664017 focal2 | health unreadable
+1793312666233 focal1 | health unreadable
+1793312666233 focal32 | health unreadable
+1793312666233 focal12 | health unreadable
+1793312666233 focal9 | health unreadable
+1793312666233 focal28 | health unreadable
+1793312666233 focal2 | health unreadable
+1793312668443 focal1 | health unreadable
+1793312668443 focal32 | health unreadable
+1793312668443 focal12 | health unreadable
+1793312668443 focal9 | health unreadable
+1793312668443 focal28 | health unreadable
+1793312668443 focal2 | health unreadable
+1793312670655 focal1 | health unreadable
+1793312670655 focal32 | health unreadable
+1793312670655 focal12 | health unreadable
+1793312670655 focal9 | health unreadable
+1793312670655 focal28 | health unreadable
+1793312670655 focal2 | health unreadable
+1793312672859 focal1 | health unreadable
+1793312672859 focal32 | health unreadable
+1793312672859 focal12 | health unreadable
+1793312672859 focal9 | health unreadable
+1793312672859 focal28 | health unreadable
+1793312672859 focal2 | health unreadable
+1793312675079 focal1 | health unreadable
+1793312675079 focal32 | health unreadable
+1793312675079 focal12 | health unreadable
+1793312675079 focal9 | health unreadable
+1793312675079 focal28 | health unreadable
+1793312675079 focal2 | health unreadable
+1793312677287 focal1 | health unreadable
+1793312677287 focal32 | health unreadable
+1793312677287 focal12 | health unreadable
+1793312677287 focal9 | health unreadable
+1793312677287 focal28 | health unreadable
+1793312677287 focal2 | health unreadable
+1793312679500 focal1 | health unreadable
+1793312679500 focal32 | health unreadable
+1793312679500 focal12 | health unreadable
+1793312679500 focal9 | health unreadable
+1793312679500 focal28 | health unreadable
+1793312679500 focal2 | health unreadable

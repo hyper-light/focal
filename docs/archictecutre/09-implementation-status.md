@@ -18216,3 +18216,38 @@ records, sealed payloads, checkpoints, the content store) is not yet broken down
 founder's 0.236 CPU at rest (it leads the root's 33 members, the directory partition, whose
 conditional reads still take a read round each, and its own session); enrolling 500 agents takes about 6 minutes, one at a time; focal-load's `MAX_CONCURRENCY` says each
 caller is an OS thread, which since e276fc49 it is not.
+
+### 2026-10-29 — A dozen of 33 nodes killed and started again under the work flow
+
+Condition 3 at scale, its first fault: twelve of the 33 nodes (the founder among them, the root's and
+the directory partition's leader) killed at once 45 s into the work flow (500 agents, 220 claims a
+second over 11 sessions) and started again 30 s later. On the final tree (fleet-run 476ee125, fedora,
+three CI jobs sharing the host) every lifecycle was written and judged (29,595 of 29,700) or refused
+with a typed error while nodes were down (105: `unavailable` 92 in the session that lost its quorum,
+`owner_bound` 13 where a custody check named the content copy missing); none unknown, abandoned or
+undelivered; every session's voters converged. A session that lost its leader wrote again in 10.0 to
+10.5 s, one that lost its quorum once its voters served (34.8 to 36.9 s), one that lost a follower
+within 2.8 to 6.7 s. The record, with each run's report and the report by ledger:
+[a dozen of 33 killed](../qualification/campaigns/2026-10-29-fleet33-kill12.md).
+
+| fedora run | Tree | Written and judged | Refused | Unknown | Abandoned | Undelivered |
+|---|---|---|---|---|---|---|
+| k1-1219 | 24770d5c | 24,327 | 3,496 | 1,709 | 101 | 76 |
+| k7-1551 | 476ee125 | 29,595 | 105 | 0 | 0 | 0 |
+
+**Found and fixed at the cause** (33667142 to 476ee125): a restarted node's failure detector held no
+member, its members read from a pass's partition observations that an earlier step's failure skipped,
+so the survivors held it dead to the end (members are read from the root the node holds, first); the
+placement agent asked a fixed node of a partition led elsewhere whatever the group answered (it follows
+`NotLeader`'s leader and moves past a node that gives no answer); a restarted directory partition voter
+was refused its permit for a root authority snapshot past one control command, which only a founder
+alone in its group proposes (with 500 agents enrolled the partition never had a leader again); a
+write the log dropped during a leadership transfer (`LeaderLeaving`) stopped its session, classed
+fail-closed; a client resent a write to a killed leader until its clock ran out (a route that gives no
+answer is held failed and the request resent by another); and focal-load's agents gave up at the
+client's clock where an agent asks again under the write's identity.
+
+**Open.** Ledger 9 lost its leader and kept its quorum, yet wrote nothing for 35.2 s, where ledger 10,
+killed alike, wrote in 10.5 s; failover waits on the QUIC idle timeout (10 s); the all-copies custody
+rule refuses artifact steps while a copy is down (the f+1 decision pending); the directory partition's
+authority refresh carries the whole enrollment registry in one 128 KiB command (~500 enrolled clients).

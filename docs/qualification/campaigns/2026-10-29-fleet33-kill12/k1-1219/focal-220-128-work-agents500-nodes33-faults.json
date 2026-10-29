@@ -1,0 +1,921 @@
+{
+  "shape": {
+    "claims": 29700,
+    "seed": 1,
+    "reads": 0,
+    "transport": "enrolled",
+    "data_dir": null,
+    "profile": "authored_v1",
+    "concurrency": 55,
+    "connections": 16,
+    "inflight": 64,
+    "enrollment": "/client/CLIENT.contexts/enrollment-bench",
+    "worker": null,
+    "consumer_enrollment": null,
+    "poll_ms": 2,
+    "inbox_wait_ms": 20000,
+    "agents": 500,
+    "agent_enrollments": "/client/agents",
+    "homes": null,
+    "ledgers": [
+      {
+        "session": "d9e4dd369f014429d3bcfb3b90ee785a",
+        "homes": [
+          {
+            "endpoint": "10.231.0.21:7443",
+            "server_name": "node-17625445699361855655.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.26:7443",
+            "server_name": "node-17625445699361855662.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.52:7443",
+            "server_name": "node-17625445699361855686.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "a079bed632a22a60c6e2bbee884e789a",
+        "homes": [
+          {
+            "endpoint": "10.231.0.23:7443",
+            "server_name": "node-17625445699361855656.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.24:7443",
+            "server_name": "node-17625445699361855658.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.25:7443",
+            "server_name": "node-17625445699361855660.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "31d5961dcfd101d28fd715e2c6ad3351",
+        "homes": [
+          {
+            "endpoint": "10.231.0.27:7443",
+            "server_name": "node-17625445699361855659.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.49:7443",
+            "server_name": "node-17625445699361855682.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.53:7443",
+            "server_name": "node-17625445699361855687.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "9a9095abcfd6a7f11c318330dcd3dacd",
+        "homes": [
+          {
+            "endpoint": "10.231.0.22:7443",
+            "server_name": "node-17625445699361855657.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.29:7443",
+            "server_name": "node-17625445699361855666.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.30:7443",
+            "server_name": "node-17625445699361855665.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "0f89aab4712080de39c4bdd5f35dde94",
+        "homes": [
+          {
+            "endpoint": "10.231.0.28:7443",
+            "server_name": "node-17625445699361855661.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.32:7443",
+            "server_name": "node-17625445699361855664.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.33:7443",
+            "server_name": "node-17625445699361855667.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "a8e0099d6201e4e32451785e46d5351f",
+        "homes": [
+          {
+            "endpoint": "10.231.0.35:7443",
+            "server_name": "node-17625445699361855669.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.36:7443",
+            "server_name": "node-17625445699361855672.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.40:7443",
+            "server_name": "node-17625445699361855675.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "6c0a72334254078768e839f4e8a0045d",
+        "homes": [
+          {
+            "endpoint": "10.231.0.39:7443",
+            "server_name": "node-17625445699361855673.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.43:7443",
+            "server_name": "node-17625445699361855677.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.50:7443",
+            "server_name": "node-17625445699361855684.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "6706bd59b29826f51929b02433d14314",
+        "homes": [
+          {
+            "endpoint": "10.231.0.31:7443",
+            "server_name": "node-17625445699361855663.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.38:7443",
+            "server_name": "node-17625445699361855671.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.42:7443",
+            "server_name": "node-17625445699361855678.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "5956c62f86dfc29d269dd9414fe5f873",
+        "homes": [
+          {
+            "endpoint": "10.231.0.37:7443",
+            "server_name": "node-17625445699361855670.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.45:7443",
+            "server_name": "node-17625445699361855681.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.47:7443",
+            "server_name": "node-17625445699361855679.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "f0fddd37cf1dc9e8ec2301e53761eadf",
+        "homes": [
+          {
+            "endpoint": "10.231.0.34:7443",
+            "server_name": "node-17625445699361855668.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.44:7443",
+            "server_name": "node-17625445699361855676.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.48:7443",
+            "server_name": "node-17625445699361855683.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "7e79aa93fd8eb0805874bc705a4a5fed",
+        "homes": [
+          {
+            "endpoint": "10.231.0.41:7443",
+            "server_name": "node-17625445699361855674.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.46:7443",
+            "server_name": "node-17625445699361855680.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.51:7443",
+            "server_name": "node-17625445699361855685.c28cc746e599f92873502e5d8f55c893.focal.internal"
+          }
+        ]
+      }
+    ],
+    "rate": 220,
+    "warmup_ms": 15000,
+    "lifecycle": "work",
+    "lifecycle_reads": null,
+    "reopen": false
+  },
+  "committed": 279970,
+  "refused": 3496,
+  "unknown": 1709,
+  "expired": 0,
+  "lifecycles": 24318,
+  "abandoned": 101,
+  "floors_advanced": 1922,
+  "wall_ms": 299955,
+  "throughput_ops_per_s": 933.3724000215827,
+  "latency_ns": {
+    "p50": 44464251,
+    "p95": 9279811879,
+    "p99": 43195596035,
+    "p999": 84971522685,
+    "max": 102156751248
+  },
+  "latency_ns_first_half": {
+    "p50": 38883286,
+    "p95": 11657526161,
+    "p99": 30005468774,
+    "p999": 48657056966,
+    "max": 58961767848
+  },
+  "latency_ns_second_half": {
+    "p50": 57859276,
+    "p95": 1358996686,
+    "p99": 63984768629,
+    "p999": 91306802543,
+    "max": 102156751248
+  },
+  "measured_writes": {
+    "committed": 244705,
+    "refused": 3496,
+    "unknown": 1709,
+    "expired": 0,
+    "committed_latency_ns": {
+      "p50": 43635818,
+      "p95": 593000210,
+      "p99": 36057238336,
+      "p999": 85145365583,
+      "max": 102156751248
+    },
+    "refused_latency_ns": {
+      "p50": 30000245562,
+      "p95": 46789773508,
+      "p99": 59103944251,
+      "p999": 72851406196,
+      "max": 74251003281
+    },
+    "unknown_latency_ns": {
+      "p50": 30000583177,
+      "p95": 46663603929,
+      "p99": 59319458699,
+      "p999": 64747018650,
+      "max": 66417861237
+    },
+    "expired_latency_ns": {
+      "p50": 0,
+      "p95": 0,
+      "p99": 0,
+      "p999": 0,
+      "max": 0
+    },
+    "schedule_delay_ns": {
+      "p50": 4671,
+      "p95": 2736948,
+      "p99": 35675236329,
+      "p999": 84845690996,
+      "max": 101864231428
+    },
+    "client_request_latency_ns": {
+      "p50": 43421011,
+      "p95": 571953561,
+      "p99": 30000191628,
+      "p999": 30006845096,
+      "max": 30032548532
+    }
+  },
+  "write_phase_start_epoch_ns": 1793302221796634725,
+  "reads": 0,
+  "read_hits": 0,
+  "read_wall_ms": 0,
+  "read_throughput_ops_per_s": 0.0,
+  "read_latency_ns": {
+    "p50": 0,
+    "p95": 0,
+    "p99": 0,
+    "p999": 0,
+    "max": 0
+  },
+  "workers": 55,
+  "refusals": [
+    [
+      "lifecycle read: client: transport unavailable",
+      64
+    ],
+    [
+      "client: outcome unknown for request #ecd; retry the same identity",
+      2
+    ],
+    [
+      "client: outcome unknown for request #edf; retry the same identity",
+      17
+    ],
+    [
+      "client: outcome unknown for request #ef#; retry the same identity",
+      18
+    ],
+    [
+      "client: outcome unknown for request #f#b; retry the same identity",
+      17
+    ],
+    [
+      "client: outcome unknown for request #f#; retry the same identity",
+      70
+    ],
+    [
+      "client: outcome unknown for request #f#d; retry the same identity",
+      10
+    ],
+    [
+      "(other reasons)",
+      5119
+    ]
+  ],
+  "reopen_ms": null,
+  "first_read_after_reopen_ns": null,
+  "reopen_read_hit": null,
+  "data_dir_bytes": null,
+  "deliver": {
+    "delivered": 21027,
+    "handled_latency_ns": {
+      "p50": 2732575646,
+      "p95": 25747385207,
+      "p99": 33744005815,
+      "p999": 43606493820,
+      "max": 44528870580
+    },
+    "satisfied_latency_ns": {
+      "p50": 5250525473,
+      "p95": 29851370938,
+      "p99": 36478601577,
+      "p999": 44697382570,
+      "max": 46023218059
+    },
+    "undelivered": 76,
+    "consumer_polls": 0,
+    "consumer_events": 0,
+    "consumer_waits": 0,
+    "issuer_polls": 0,
+    "issuer_events": 0,
+    "issuer_waits": 0,
+    "agents": 500,
+    "agent_polls": 92999,
+    "agent_events": 101453,
+    "agent_waits": 92499,
+    "tail_failures": 164
+  },
+  "ledgers": [
+    {
+      "ledger": {
+        "tenant": "ba592b653a6021fb8b92ccb4c291f1b5",
+        "session": "d9e4dd369f014429d3bcfb3b90ee785a"
+      },
+      "callers": 5,
+      "agents": 46,
+      "started": 2700,
+      "written": 2569,
+      "judged": 2570,
+      "refused": 0,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 0,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 119,
+      "abandoned": 12,
+      "undelivered": 0,
+      "committed": 28367,
+      "tail_events": 10316,
+      "tail_failures": 46,
+      "refusals": [
+        [
+          "lifecycle read: client: transport unavailable",
+          12
+        ],
+        [
+          "client: outcome unknown for request #ecd; retry the same identity",
+          1
+        ],
+        [
+          "client: outcome unknown for request #edf; retry the same identity",
+          3
+        ],
+        [
+          "client: outcome unknown for request #ef#; retry the same identity",
+          3
+        ],
+        [
+          "client: outcome unknown for request #f#b; retry the same identity",
+          3
+        ],
+        [
+          "client: outcome unknown for request #f#; retry the same identity",
+          8
+        ],
+        [
+          "client: outcome unknown for request #f#d; retry the same identity",
+          2
+        ],
+        [
+          "(other reasons)",
+          99
+        ]
+      ]
+    },
+    {
+      "ledger": {
+        "tenant": "ba592b653a6021fb8b92ccb4c291f1b5",
+        "session": "a079bed632a22a60c6e2bbee884e789a"
+      },
+      "callers": 5,
+      "agents": 46,
+      "started": 2700,
+      "written": 2700,
+      "judged": 2700,
+      "refused": 0,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 0,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 0,
+      "abandoned": 0,
+      "undelivered": 0,
+      "committed": 29700,
+      "tail_events": 10800,
+      "tail_failures": 0,
+      "refusals": []
+    },
+    {
+      "ledger": {
+        "tenant": "ba592b653a6021fb8b92ccb4c291f1b5",
+        "session": "31d5961dcfd101d28fd715e2c6ad3351"
+      },
+      "callers": 5,
+      "agents": 46,
+      "started": 2700,
+      "written": 2517,
+      "judged": 2519,
+      "refused": 0,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 0,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 167,
+      "abandoned": 16,
+      "undelivered": 0,
+      "committed": 27800,
+      "tail_events": 10108,
+      "tail_failures": 16,
+      "refusals": [
+        [
+          "lifecycle read: client: transport unavailable",
+          16
+        ],
+        [
+          "client: outcome unknown for request #ecd; retry the same identity",
+          1
+        ],
+        [
+          "client: outcome unknown for request #ebd; retry the same identity",
+          1
+        ],
+        [
+          "client: outcome unknown for request #edf; retry the same identity",
+          3
+        ],
+        [
+          "client: outcome unknown for request #ef#; retry the same identity",
+          3
+        ],
+        [
+          "client: outcome unknown for request #f#b; retry the same identity",
+          3
+        ],
+        [
+          "client: outcome unknown for request #f#; retry the same identity",
+          13
+        ],
+        [
+          "(other reasons)",
+          143
+        ]
+      ]
+    },
+    {
+      "ledger": {
+        "tenant": "ba592b653a6021fb8b92ccb4c291f1b5",
+        "session": "9a9095abcfd6a7f11c318330dcd3dacd"
+      },
+      "callers": 5,
+      "agents": 46,
+      "started": 2700,
+      "written": 847,
+      "judged": 847,
+      "refused": 1519,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 1519,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 334,
+      "abandoned": 0,
+      "undelivered": 0,
+      "committed": 14942,
+      "tail_events": 5263,
+      "tail_failures": 0,
+      "refusals": [
+        [
+          "access: Unavailable",
+          1519
+        ],
+        [
+          "client: outcome unknown for request #d; retry the same identity",
+          1
+        ],
+        [
+          "client: outcome unknown for request #; retry the same identity",
+          39
+        ],
+        [
+          "client: outcome unknown for request #f#; retry the same identity",
+          25
+        ],
+        [
+          "client: outcome unknown for request #a#; retry the same identity",
+          8
+        ],
+        [
+          "client: outcome unknown for request #b; retry the same identity",
+          8
+        ],
+        [
+          "client: outcome unknown for request #fd#; retry the same identity",
+          1
+        ],
+        [
+          "(other reasons)",
+          252
+        ]
+      ]
+    },
+    {
+      "ledger": {
+        "tenant": "ba592b653a6021fb8b92ccb4c291f1b5",
+        "session": "0f89aab4712080de39c4bdd5f35dde94"
+      },
+      "callers": 5,
+      "agents": 46,
+      "started": 2700,
+      "written": 2700,
+      "judged": 2700,
+      "refused": 0,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 0,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 0,
+      "abandoned": 0,
+      "undelivered": 0,
+      "committed": 29700,
+      "tail_events": 10800,
+      "tail_failures": 0,
+      "refusals": []
+    },
+    {
+      "ledger": {
+        "tenant": "ba592b653a6021fb8b92ccb4c291f1b5",
+        "session": "a8e0099d6201e4e32451785e46d5351f"
+      },
+      "callers": 5,
+      "agents": 45,
+      "started": 2700,
+      "written": 1708,
+      "judged": 1709,
+      "refused": 449,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 449,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 430,
+      "abandoned": 37,
+      "undelivered": 76,
+      "committed": 19950,
+      "tail_events": 7224,
+      "tail_failures": 43,
+      "refusals": [
+        [
+          "lifecycle read: client: transport unavailable",
+          13
+        ],
+        [
+          "client: outcome unknown for request #ebd; retry the same identity",
+          1
+        ],
+        [
+          "client: outcome unknown for request #e#; retry the same identity",
+          10
+        ],
+        [
+          "client: outcome unknown for request #edf; retry the same identity",
+          4
+        ],
+        [
+          "client: outcome unknown for request #ef#; retry the same identity",
+          4
+        ],
+        [
+          "client: outcome unknown for request #f#b; retry the same identity",
+          4
+        ],
+        [
+          "client: outcome unknown for request #f#; retry the same identity",
+          5
+        ],
+        [
+          "(other reasons)",
+          886
+        ]
+      ]
+    },
+    {
+      "ledger": {
+        "tenant": "ba592b653a6021fb8b92ccb4c291f1b5",
+        "session": "6c0a72334254078768e839f4e8a0045d"
+      },
+      "callers": 5,
+      "agents": 45,
+      "started": 2700,
+      "written": 2700,
+      "judged": 2700,
+      "refused": 0,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 0,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 0,
+      "abandoned": 0,
+      "undelivered": 0,
+      "committed": 29700,
+      "tail_events": 10800,
+      "tail_failures": 0,
+      "refusals": []
+    },
+    {
+      "ledger": {
+        "tenant": "ba592b653a6021fb8b92ccb4c291f1b5",
+        "session": "6706bd59b29826f51929b02433d14314"
+      },
+      "callers": 5,
+      "agents": 45,
+      "started": 2700,
+      "written": 2700,
+      "judged": 2700,
+      "refused": 0,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 0,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 0,
+      "abandoned": 0,
+      "undelivered": 0,
+      "committed": 29700,
+      "tail_events": 10800,
+      "tail_failures": 0,
+      "refusals": []
+    },
+    {
+      "ledger": {
+        "tenant": "ba592b653a6021fb8b92ccb4c291f1b5",
+        "session": "5956c62f86dfc29d269dd9414fe5f873"
+      },
+      "callers": 5,
+      "agents": 45,
+      "started": 2700,
+      "written": 844,
+      "judged": 844,
+      "refused": 1528,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 1528,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 315,
+      "abandoned": 13,
+      "undelivered": 0,
+      "committed": 14525,
+      "tail_events": 5126,
+      "tail_failures": 29,
+      "refusals": [
+        [
+          "client: outcome unknown for request #e#; retry the same identity",
+          22
+        ],
+        [
+          "lifecycle read: client: authoritative ledger service is unavailable",
+          13
+        ],
+        [
+          "access: Unavailable",
+          1528
+        ],
+        [
+          "client: outcome unknown for request #ef#; retry the same identity",
+          2
+        ],
+        [
+          "client: outcome unknown for request #; retry the same identity",
+          18
+        ],
+        [
+          "client: outcome unknown for request #d#; retry the same identity",
+          15
+        ],
+        [
+          "client: outcome unknown for request #b; retry the same identity",
+          9
+        ],
+        [
+          "(other reasons)",
+          249
+        ]
+      ]
+    },
+    {
+      "ledger": {
+        "tenant": "ba592b653a6021fb8b92ccb4c291f1b5",
+        "session": "f0fddd37cf1dc9e8ec2301e53761eadf"
+      },
+      "callers": 5,
+      "agents": 45,
+      "started": 2700,
+      "written": 2508,
+      "judged": 2511,
+      "refused": 0,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 0,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 184,
+      "abandoned": 8,
+      "undelivered": 0,
+      "committed": 27694,
+      "tail_events": 10073,
+      "tail_failures": 15,
+      "refusals": [
+        [
+          "client: outcome unknown for request #eab; retry the same identity",
+          1
+        ],
+        [
+          "client: outcome unknown for request #e#b; retry the same identity",
+          1
+        ],
+        [
+          "lifecycle read: client: transport unavailable",
+          8
+        ],
+        [
+          "client: outcome unknown for request #ebb; retry the same identity",
+          1
+        ],
+        [
+          "client: outcome unknown for request #edf; retry the same identity",
+          3
+        ],
+        [
+          "client: outcome unknown for request #ef#; retry the same identity",
+          3
+        ],
+        [
+          "client: outcome unknown for request #f#b; retry the same identity",
+          3
+        ],
+        [
+          "(other reasons)",
+          172
+        ]
+      ]
+    },
+    {
+      "ledger": {
+        "tenant": "ba592b653a6021fb8b92ccb4c291f1b5",
+        "session": "7e79aa93fd8eb0805874bc705a4a5fed"
+      },
+      "callers": 5,
+      "agents": 45,
+      "started": 2700,
+      "written": 2525,
+      "judged": 2527,
+      "refused": 0,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 0,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 160,
+      "abandoned": 15,
+      "undelivered": 0,
+      "committed": 27892,
+      "tail_events": 10143,
+      "tail_failures": 15,
+      "refusals": [
+        [
+          "lifecycle read: client: transport unavailable",
+          15
+        ],
+        [
+          "client: outcome unknown for request #a#ebb; retry the same identity",
+          1
+        ],
+        [
+          "client: outcome unknown for request #a#edf; retry the same identity",
+          1
+        ],
+        [
+          "client: outcome unknown for request #a#ef#; retry the same identity",
+          1
+        ],
+        [
+          "client: outcome unknown for request #a#f#b; retry the same identity",
+          1
+        ],
+        [
+          "client: outcome unknown for request #a#f#; retry the same identity",
+          4
+        ],
+        [
+          "client: outcome unknown for request #a#f#d; retry the same identity",
+          1
+        ],
+        [
+          "(other reasons)",
+          151
+        ]
+      ]
+    }
+  ],
+  "totals": {
+    "started": 29700,
+    "written": 24318,
+    "judged": 24327,
+    "refused": 3496,
+    "refused_by_cause": {
+      "owner_memory": 0,
+      "owner_bound": 0,
+      "ingress_capacity": 0,
+      "unavailable": 3496,
+      "expired": 0,
+      "other": 0
+    },
+    "unknown": 1709,
+    "abandoned": 101,
+    "undelivered": 76,
+    "committed": 279970
+  }
+}
