@@ -17877,3 +17877,75 @@ at 33 nodes). Idle, the founder, the root's leader, delivered 639 peer messages 
 tick to 32 followers, each way) and held 10.4% of a CPU against a node's 1.0%. At 0.09 of a CPU it
 is pinned at its quota (throttled in 74% of its periods). That is the CPU the sizing step has to
 fit.
+
+### 2026-10-29 — Sessions across the whole fleet, and seats given by what the directory holds
+
+Step 2 of the 30-node plan: the comparison's cluster holds a session for every node of its largest
+zone, each on three nodes in three zones, so every node holds a replica of one, the many groups of
+three that load every node (11 sessions at 33 nodes; the founder's alone at three, as before). The
+plan's count, floor(N/3), is the same wherever N is a multiple of three; elsewhere it would leave
+nodes of the largest zone with no replica, so the count is that zone's nodes (`cluster.py wanted`).
+
+**What placing them found: plans made faster than nodes report were seated on the same nodes.** The
+bootstrap first created ten sessions on the zone-a nodes and planned each from the founder, one after
+another. Four of the plans committed within two seconds (the others were refused `compare_failed`,
+the partition's revision having moved under them, and are asked again now). All four were seated on
+`focal2` and `focal6`, the same node of zone b and of zone c, while 18 nodes of those zones held
+nothing (16 of the 33 nodes held no replica, two held four each). The directory gives a vacant seat
+to the candidate that holds the fewest copies, and it read that from each node's load report
+(`active_weight`, its installed hosts), which a node sends once a load interval, 30 s. A plan's
+seats are committed the moment the plan is, so every plan inside one interval saw the same reports
+and made the same choice. Any burst of plans did this: an operator's script, or the controller
+healing many sessions after one node died.
+
+A node now holds what its report counted or what the partition's sessions seat on it, whichever is
+more (`focal_directory::seats_held`: where a session moves, else where it sits; each node once a
+session). This is the count a heal, an operator's plan and a move toward home seat by. It is the
+leaders' rule (27 §5) applied to seats: a fact of the directory, deterministic from committed state.
+With one partition the count is exact as soon as a plan commits, and a node that also holds other
+partitions' sessions holds at least what it reported. The placement agent counts it once a revision,
+beside the leaders, and charges it as held. A plan made on an observation that another commit moved
+is refused by the partition's compare and made again, so every plan is made on the seats of every
+plan committed before it. CockroachDB's allocator closes the same gap by updating its local copy of
+the store it chose at once, before gossip reports it (`StorePool.UpdateLocalStoreAfterRebalance`,
+`pkg/kv/kvserver/allocator/storepool/store_pool.go` at master d30c905fff79: an added voter is
+`RangeCount++`), and PD by counting each store's operators under way (`OpInfluence`,
+`pkg/schedule/operator/influence.go` at master 4ab9d1679ede).
+
+**The bootstrap** (`focal-bootstrap.sh`, after the founder's session is placed and activated) creates
+each other session under the founder's tenant (the one an enrolled client's grant names) on a node of
+the largest zone that no session seats yet (`cluster.py founders`). It waits until the directory
+lists every session (a created session is registered at its node's next pass), then plans each from
+the founder to the target's durability (`plan session` is answered by the partition leader's agent;
+on another node it is `unavailable`). It waits until every session is placed, three voters in three
+zones with the directory holding each to survive a zone and every node a voter of one
+(`cluster.py fleet`), then activates each natively on the node that created it, its preferred
+leader, and waits until that replica says `native_active`. Every wait is bounded and every step may
+be run again: a session of the same name is the same session, a plan already held is `satisfied`,
+and an active session is not activated again. `run.sh` keeps `inspect placement` beside the report,
+as before, and the same by session and by node with the nodes holding no replica counted
+(`<report>.sessions.json`). FAULTS' `leader` and `copy` name the bench session's (the founder's,
+the one the load drives) among the fleet's, where they had taken whichever session the placement
+listed first. The nodes take `FOCAL_IMAGE` as the generator and the bus do.
+
+| Bootstrap, box (Ryzen 9 9950X3D2), 33 nodes at 0.93 CPU | Sessions listed | On three voters in three zones | Nodes holding no replica | Most on one node |
+|---|---|---|---|---|
+| Before: ten plans from the founder in a burst (`focal:bench`, 9aded7cd) | 11 | 6 (5 refused `compare_failed`, not asked again) | 16 | 4 (`focal2`, `focal6`) |
+| After (`focal:s2`, this change), `run.sh focal 20 20 5 128`, NODES=33 | 11 | 11 | **0** | 1 |
+| After, NODES unset (3) | 1 | 1 | 0 | 1 |
+
+At 33 nodes each session is on one node of each zone. The 11 preferred leaders are the 11 zone-a
+founders, and each node holds one replica. Both runs took every write the load offered: 500 of 500
+committed, none refused or unknown. The three-node cluster is the one it was: the founder's session
+on `focal1`, `focal2` and `focal3`, the report's 27 keys, and one file more beside it
+(`.sessions.json`).
+
+Tests: `focal-directory` `seats::seats_planned_in_a_burst_go_to_the_nodes_holding_the_fewest`
+(33 nodes in three zones, every report counting no copies: eleven sessions planned one after
+another sit one on every node, each in three zones, with eleven distinct preferred leaders; by the
+reports alone every plan took the same two nodes) and
+`a_node_holds_what_it_reported_or_what_the_directory_seats_on_it` (moving sessions counted where
+they go, each node once; a seat goes by the larger of report and directory), with a home move that
+takes the seat of the voter the directory loads most. All three fail with the directory's count
+dropped from `occupancy` and pass with it. `focal-node`'s placement agent and controller tests and
+`home_balance`, `leader_balance`, `placement_binary` and `cli_zones` pass.

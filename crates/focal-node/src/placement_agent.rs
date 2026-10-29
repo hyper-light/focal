@@ -561,12 +561,16 @@ pub(super) fn near(
     };
     crate::fleet::Near { leader, voters }
 }
-/// Where the sessions of a partition are led at one revision of it.
+/// Where the sessions of a partition are led and seated at one revision of it.
 pub(super) struct Leading {
     partition: focal_directory::PartitionId,
     revision: u64,
     /// Sessions that prefer each node as their leader.
     pub(super) counts: BTreeMap<u64, u64>,
+    /// Seats the sessions hold on each node (`focal_directory::seats_held`):
+    /// what a seat is given by beside each node's load report, which counts
+    /// a plan's copies only at its next interval.
+    pub(super) held: BTreeMap<u64, u64>,
     /// A session is being balanced: it moves its preferred leader among
     /// the members it has, or one seat to another node, under the policy
     /// it has.
@@ -2358,10 +2362,9 @@ impl PlacementAgent {
         }
         OperationId(id)
     }
-    /// Answer an operator's plan request for this session from the committed
-    /// Where the sessions of `directory` are led, counted when its revision
-    /// was first seen. Taken out of the agent while it is read, and put
-    /// back by the caller.
+    /// Where the sessions of `directory` are led and seated, counted when its
+    /// revision was first seen. Taken out of the agent while it is read, and
+    /// put back by the caller.
     pub(super) fn take_leading(&mut self, directory: &PartitionCheckpoint) -> Leading {
         let partition = directory.delegation.partition;
         match self.leading.take() {
@@ -2389,6 +2392,7 @@ impl PlacementAgent {
                     } else {
                         BTreeMap::new()
                     },
+                    held: focal_directory::seats_held(&directory.sessions),
                     moving: directory.sessions.values().any(|session| {
                         session.pending.as_ref().is_some_and(|plan| {
                             let (now, next) = (&session.active.placement, &plan.desired.placement);
@@ -2407,6 +2411,7 @@ impl PlacementAgent {
             }
         }
     }
+    /// Answer an operator's plan request for this session from the committed
     /// directory: the pending plan if one exists, "satisfied" when the active
     /// placement already provides the durability, otherwise a plan under the
     /// active policy with the requested durability, journaled for the
@@ -2474,6 +2479,7 @@ impl PlacementAgent {
                         counts: &leading.counts,
                         current: Some(descriptor.active.placement.preferred_leader),
                     },
+                    &leading.held,
                     config.max_members,
                     config.min_disk_available,
                 );

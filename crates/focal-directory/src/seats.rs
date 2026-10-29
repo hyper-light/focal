@@ -22,8 +22,22 @@
 //! generation, memory, disk) is no condition of keeping one: a copy that
 //! is installed is not uninstalled for the room it would need to be
 //! installed.
+//!
+//! A seat goes to the node that holds the fewest. What a node holds is a
+//! fact of the directory before any report says it ([`seats_held`]): a
+//! node reports the copies it has installed once every load interval (30
+//! s in `focal-node`), and a plan's seats are committed the moment it is.
+//! Seats given by the reports alone went to the same nodes for every plan
+//! made within one interval: on 33 nodes in three zones, four sessions
+//! planned within two seconds were each seated on the same two nodes of
+//! the other zones, beside eighteen there that held none. So a node holds
+//! what its report counted or what the directory's sessions seat on it,
+//! whichever is more (`occupancy`): with one partition the directory's
+//! count is exact as soon as a plan commits, and a node that also holds
+//! the sessions of other partitions holds at least what it last reported.
 use crate::placement::failure_domain;
 use crate::*;
+use focal_model::LedgerId;
 use std::collections::{BTreeMap, BTreeSet};
 
 fn at_home(policy: &PlacementPolicy, node: &NodeRecord) -> bool {
@@ -44,11 +58,52 @@ fn sits<'a>(
             && (policy.residency.is_empty() || policy.residency.contains(&node.enrollment.region))
     })
 }
-/// The nodes that may be given a seat, the best first: at home, least
-/// loaded, with the most room, by identity.
+/// How many seats the directory's sessions hold on each node: by the
+/// placement a session moves to where it is moving, and by its active one
+/// otherwise (as [`leading`] counts leaders), each node a session places
+/// once whether it votes, materializes or keeps a content copy. One row per
+/// node seated, so no more rows than the nodes the sessions name.
+pub fn seats_held(sessions: &BTreeMap<LedgerId, SessionDescriptor>) -> BTreeMap<u64, u64> {
+    let mut held = BTreeMap::new();
+    for session in sessions.values() {
+        let placement = session
+            .pending
+            .as_ref()
+            .map_or(&session.active.placement, |plan| &plan.desired.placement);
+        let members = placement
+            .voters
+            .keys()
+            .chain(
+                placement
+                    .materializers
+                    .keys()
+                    .filter(|node| !placement.voters.contains_key(node)),
+            )
+            .chain(placement.content_copies.keys().filter(|node| {
+                !placement.voters.contains_key(node) && !placement.materializers.contains_key(node)
+            }));
+        for node in members {
+            let count: &mut u64 = held.entry(*node).or_insert(0);
+            *count = count.saturating_add(1);
+        }
+    }
+    held
+}
+/// What `node` holds when a seat is given: the copies its last load report
+/// counted, or the seats `held` says the directory's sessions give it,
+/// whichever is more. A node that has never reported holds the most there
+/// is, as every node without a report is last.
+fn occupancy(node: &NodeRecord, held: &BTreeMap<u64, u64>) -> u64 {
+    let seated = held.get(&node.enrollment.node).copied().unwrap_or(0);
+    node.load
+        .map_or(u64::MAX, |load| load.active_weight.max(seated))
+}
+/// The nodes that may be given a seat, the best first: at home, holding the
+/// fewest ([`occupancy`]), with the most room, by identity.
 fn admitted<'a>(
     nodes: &'a BTreeMap<u64, NodeRecord>,
     policy: &PlacementPolicy,
+    held: &BTreeMap<u64, u64>,
     min_disk_available: u64,
 ) -> Vec<(&'a NodeRecord, NodeLoad)> {
     let mut candidates: Vec<_> = nodes
@@ -71,16 +126,13 @@ fn admitted<'a>(
     candidates.sort_by_key(|(node, load)| {
         (
             !at_home(policy, node),
-            load.active_weight,
+            occupancy(node, held),
             std::cmp::Reverse(load.available_memory),
             std::cmp::Reverse(load.disk_available),
             node.enrollment.node,
         )
     });
     candidates
-}
-fn weight(node: &NodeRecord) -> u64 {
-    node.load.map_or(u64::MAX, |load| load.active_weight)
 }
 fn voters_needed(policy: &PlacementPolicy, max_members: usize) -> Result<usize, DirectoryError> {
     let needed = usize::from(policy.durability.max_failures)
@@ -102,12 +154,14 @@ fn observed(seats: &[&NodeRecord]) -> BTreeMap<u64, u64> {
 /// The placement of `policy` that keeps every seat of `sitting` that can be
 /// kept and fills the rest. `policy` is the session's own, or the one an
 /// operator asks for: more voters are added beside those that sit, and
-/// fewer keep the best of them.
+/// fewer keep the best of them. `held` is what the directory's sessions
+/// seat on each node ([`seats_held`]).
 pub fn heal_placement(
     nodes: &BTreeMap<u64, NodeRecord>,
     policy: &PlacementPolicy,
     sitting: &Placement,
     leading: Leading<'_>,
+    held: &BTreeMap<u64, u64>,
     max_members: usize,
     min_disk_available: u64,
 ) -> Result<PlacementProposal, DirectoryError> {
@@ -117,7 +171,13 @@ pub fn heal_placement(
         .iter()
         .filter_map(|(id, generation)| sits(nodes, policy, *id, *generation))
         .collect();
-    kept.sort_by_key(|node| (!at_home(policy, node), weight(node), node.enrollment.node));
+    kept.sort_by_key(|node| {
+        (
+            !at_home(policy, node),
+            occupancy(node, held),
+            node.enrollment.node,
+        )
+    });
     let mut domains = BTreeSet::new();
     let mut seats: Vec<&NodeRecord> = Vec::new();
     for node in kept {
@@ -129,7 +189,7 @@ pub fn heal_placement(
         }
     }
     let kept = seats.len();
-    let candidates = admitted(nodes, policy, min_disk_available);
+    let candidates = admitted(nodes, policy, held, min_disk_available);
     let seated = |seats: &[&NodeRecord], node: &NodeRecord| {
         seats
             .iter()
@@ -213,19 +273,21 @@ pub fn heal_placement(
         explanation: if kept == needed {
             "Every voter that sits keeps its seat."
         } else {
-            "Voters that sit keep their seats; vacant seats went to eligible nodes by home, measured load, free memory, and stable ID, in independent promised failure domains."
+            "Voters that sit keep their seats; vacant seats went to eligible nodes by home, the seats each holds (reported or committed, whichever is more), free memory, and stable ID, in independent promised failure domains."
         },
     })
 }
 
 /// The placement that gives one seat of `session` to a node at home: the
-/// seat of the voter that is not, and of those the most loaded. None where
-/// the session has no home regions, where every voter is at home, where no
-/// node at home could be seated beside the others, and while the session
-/// is moving, leaves copies behind or does not hold its placement.
+/// seat of the voter that is not, and of those the one holding the most
+/// (by its report or by `held`, [`seats_held`], whichever is more). None
+/// where the session has no home regions, where every voter is at home,
+/// where no node at home could be seated beside the others, and while the
+/// session is moving, leaves copies behind or does not hold its placement.
 pub fn home_move(
     session: &SessionDescriptor,
     nodes: &BTreeMap<u64, NodeRecord>,
+    held: &BTreeMap<u64, u64>,
     max_members: usize,
     min_disk_available: u64,
 ) -> Option<PlacementProposal> {
@@ -243,7 +305,7 @@ pub fn home_move(
         .keys()
         .filter_map(|id| nodes.get(id))
         .filter(|node| !at_home(policy, node))
-        .max_by_key(|node| (weight(node), node.enrollment.node))?;
+        .max_by_key(|node| (occupancy(node, held), node.enrollment.node))?;
     let mut domains = BTreeSet::new();
     for id in placement.voters.keys() {
         if *id != away.enrollment.node {
@@ -251,7 +313,7 @@ pub fn home_move(
             domains.insert(failure_domain(&node.enrollment, policy.durability.survive).ok()?);
         }
     }
-    let (newcomer, load) = admitted(nodes, policy, min_disk_available)
+    let (newcomer, load) = admitted(nodes, policy, held, min_disk_available)
         .into_iter()
         .find(|(node, _)| {
             at_home(policy, node)

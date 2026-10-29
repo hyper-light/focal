@@ -90,6 +90,7 @@ fn heal(
             counts: &nowhere(),
             current: Some(sits.preferred_leader),
         },
+        &nowhere(),
         MEMBERS,
         1 << 20,
     )
@@ -126,6 +127,7 @@ fn a_fleet_that_grew_moves_no_one() {
             counts: &nowhere(),
             current: Some(3),
         },
+        &nowhere(),
         MEMBERS,
         1 << 20,
     )
@@ -381,7 +383,7 @@ fn a_move_toward_home_is_one_seat_and_the_moves_end() {
     ]);
     let mut moving = session(&[1, 2, 3], 1, &[HOME]);
     let mut moves = Vec::new();
-    while let Some(proposal) = home_move(&moving, &nodes, MEMBERS, 1 << 20) {
+    while let Some(proposal) = home_move(&moving, &nodes, &nowhere(), MEMBERS, 1 << 20) {
         let before = &moving.active.placement;
         let after = &proposal.spec.placement;
         let left: Vec<u64> = voters(before)
@@ -408,22 +410,54 @@ fn a_move_toward_home_is_one_seat_and_the_moves_end() {
     // The most loaded first, to the least loaded at home.
     assert_eq!(moves, [(3, 5), (2, 4)]);
     assert_eq!(voters(&moving.active.placement), [1, 4, 5]);
+    // What the directory seats counts where it is more than a report says:
+    // node 2 holds ten seats its report does not count yet, so its seat
+    // moves first, and node 5, seated twice since it reported, is passed
+    // over for node 4.
+    let held = BTreeMap::from([(2, 10), (5, 2)]);
+    let first = home_move(
+        &session(&[1, 2, 3], 1, &[HOME]),
+        &nodes,
+        &held,
+        MEMBERS,
+        1 << 20,
+    )
+    .unwrap();
+    assert_eq!(voters(&first.spec.placement), [1, 3, 4]);
 
     // Nothing moves without home regions, while the session moves or
     // leaves copies behind, where its placement does not hold, or where
     // no node at home could be seated.
-    assert!(home_move(&session(&[1, 2, 3], 1, &[]), &nodes, MEMBERS, 1).is_none());
+    assert!(home_move(&session(&[1, 2, 3], 1, &[]), &nodes, &nowhere(), MEMBERS, 1).is_none());
     let mut pending = session(&[1, 2, 3], 1, &[HOME]);
     pending.retiring.insert(
         6,
         AssignmentProgress::assigned(6, 1, BTreeSet::from([AssignmentRole::Voter])),
     );
-    assert!(home_move(&pending, &nodes, MEMBERS, 1).is_none());
+    assert!(home_move(&pending, &nodes, &nowhere(), MEMBERS, 1).is_none());
     let mut broken = nodes.clone();
     dead(&mut broken, 2);
-    assert!(home_move(&session(&[1, 2, 3], 1, &[HOME]), &broken, MEMBERS, 1).is_none());
+    assert!(
+        home_move(
+            &session(&[1, 2, 3], 1, &[HOME]),
+            &broken,
+            &nowhere(),
+            MEMBERS,
+            1
+        )
+        .is_none()
+    );
     let none_home = fleet(&[(1, HOME, 3), (2, AWAY, 7), (3, AWAY, 9), (6, AWAY, 0)]);
-    assert!(home_move(&session(&[1, 2, 3], 1, &[HOME]), &none_home, MEMBERS, 1).is_none());
+    assert!(
+        home_move(
+            &session(&[1, 2, 3], 1, &[HOME]),
+            &none_home,
+            &nowhere(),
+            MEMBERS,
+            1
+        )
+        .is_none()
+    );
     let mut full = nodes.clone();
     for id in [4, 5] {
         full.get_mut(&id)
@@ -433,7 +467,195 @@ fn a_move_toward_home_is_one_seat_and_the_moves_end() {
             .unwrap()
             .disk_available = 0;
     }
-    assert!(home_move(&session(&[1, 2, 3], 1, &[HOME]), &full, MEMBERS, 1 << 20).is_none());
+    assert!(
+        home_move(
+            &session(&[1, 2, 3], 1, &[HOME]),
+            &full,
+            &nowhere(),
+            MEMBERS,
+            1 << 20
+        )
+        .is_none()
+    );
+}
+
+/// Nodes in three zones, one region, `per_zone` to a zone: node `k`,
+/// counted from one, in zone `(k - 1) % 3`, as the comparison's nodes are,
+/// every one reporting no copies.
+fn zoned_fleet(per_zone: u64) -> BTreeMap<u64, NodeRecord> {
+    (1..=3 * per_zone)
+        .map(|id| {
+            let mut record = node(id, HOME, 0);
+            record.enrollment.zone = ZoneId::from_u128(u128::from((id - 1) % 3 + 1));
+            (id, record)
+        })
+        .collect()
+}
+fn zone_policy() -> PlacementPolicy {
+    let mut zonal = policy(1, &[]);
+    zonal.durability.survive = FailureClass::Zone;
+    zonal
+}
+/// Session `k` founded on `founder` alone and planned to `desired`, its
+/// plan committed and not yet carried out.
+fn planned(k: u128, founder: u64, desired: &Placement) -> SessionDescriptor {
+    let mut planned = session(&[founder, founder, founder], founder, &[]);
+    planned.ledger.session = SessionId::from_u128(k);
+    planned.active.placement = sitting(&[founder], &[founder], founder);
+    planned.pending = Some(PendingPlacement {
+        operation: OperationId::from_u128(k),
+        next_route: RouteEpoch(2),
+        next_membership: 1,
+        next_placement: 2,
+        desired: PlacementSpec {
+            policy: zone_policy(),
+            placement: desired.clone(),
+        },
+        phase: PlacementPhase::Planned,
+        ready: BTreeMap::new(),
+        barrier: None,
+        observations: BTreeMap::new(),
+        progress: BTreeMap::new(),
+    });
+    planned
+}
+/// Plan sessions one after another within one load interval: each founded
+/// on its own node of the first zone and planned to survive a zone, every
+/// node's report still counting no copies. Each plan is made on the
+/// directory as the plans before it left it, by what it seats
+/// (`seats_held`), or, with `by_reports_alone`, by the reports and nothing
+/// else.
+fn plan_in_a_burst(nodes: &BTreeMap<u64, NodeRecord>, by_reports_alone: bool) -> Vec<Placement> {
+    let founders: Vec<u64> = nodes
+        .keys()
+        .copied()
+        .filter(|id| (id - 1) % 3 == 0)
+        .collect();
+    let mut sessions = BTreeMap::new();
+    let mut placements = Vec::new();
+    for (k, founder) in founders.into_iter().enumerate() {
+        let held = if by_reports_alone {
+            nowhere()
+        } else {
+            seats_held(&sessions)
+        };
+        let placement = heal_placement(
+            nodes,
+            &zone_policy(),
+            &sitting(&[founder], &[founder], founder),
+            Leading {
+                counts: &leading(&sessions),
+                current: Some(founder),
+            },
+            &held,
+            MEMBERS,
+            1 << 20,
+        )
+        .unwrap()
+        .spec
+        .placement;
+        let session = planned(k as u128 + 2, founder, &placement);
+        sessions.insert(session.ledger, session);
+        placements.push(placement);
+    }
+    placements
+}
+
+/// Plans made faster than nodes report (every 30 s in `focal-node`) take
+/// each seat by what the directory has seated: on 33 nodes in three zones,
+/// eleven sessions planned in a burst sit one on every node, each in three
+/// zones. By the reports alone every one of them took the same two nodes of
+/// the other zones (the comparison's 33 nodes, 2026-10-29: four sessions
+/// planned within two seconds were seated on the same two).
+#[test]
+fn seats_planned_in_a_burst_go_to_the_nodes_holding_the_fewest() {
+    let nodes = zoned_fleet(11);
+    let zone = |id: &u64| nodes[id].enrollment.zone;
+    let placements = plan_in_a_burst(&nodes, false);
+    assert_eq!(placements.len(), 11);
+    let mut seats = BTreeMap::new();
+    for placement in &placements {
+        let zones: BTreeSet<ZoneId> = placement.voters.keys().map(zone).collect();
+        assert_eq!(zones.len(), 3, "three voters in three zones: {placement:?}");
+        assert_eq!(placement.materializers, placement.voters);
+        for id in placement.voters.keys() {
+            *seats.entry(*id).or_insert(0) += 1;
+        }
+    }
+    assert_eq!(
+        seats,
+        nodes
+            .keys()
+            .map(|id| (*id, 1))
+            .collect::<BTreeMap<u64, u64>>(),
+        "every node seated once"
+    );
+    // The leaders spread too: each session is preferred where no other is.
+    let leaders: BTreeSet<u64> = placements.iter().map(|p| p.preferred_leader).collect();
+    assert_eq!(leaders.len(), 11);
+
+    // By the reports alone, the defect: the same two nodes for every plan.
+    let piled = plan_in_a_burst(&nodes, true);
+    let others: BTreeSet<Vec<u64>> = piled
+        .iter()
+        .map(|placement| {
+            placement
+                .voters
+                .keys()
+                .copied()
+                .filter(|id| (id - 1) % 3 != 0)
+                .collect()
+        })
+        .collect();
+    assert_eq!(others.len(), 1, "every plan took the same two: {others:?}");
+}
+
+/// What the directory seats on a node is counted from the placement its
+/// sessions move to, or hold where they do not move, each node once per
+/// session; and a seat goes to the node holding the fewest by its report or
+/// by the directory, whichever says more.
+#[test]
+fn a_node_holds_what_it_reported_or_what_the_directory_seats_on_it() {
+    let moving = planned(2, 4, &sitting(&[4, 5, 6], &[4, 5], 5));
+    let mut still = session(&[1, 2, 3], 1, &[]);
+    still.ledger.session = SessionId::from_u128(3);
+    // A copy that does not vote is a node the session places all the same.
+    still.active.placement.content_copies.insert(7, 1);
+    let sessions = BTreeMap::from([(moving.ledger, moving), (still.ledger, still)]);
+    assert_eq!(
+        seats_held(&sessions),
+        BTreeMap::from([(1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1)]),
+        "the moving session counted where it goes, every node once"
+    );
+    assert!(seats_held(&BTreeMap::new()).is_empty());
+
+    // Node 1 reported five copies and holds none here; node 2 reported none
+    // and holds two here; node 3 reported one and holds one; node 4 holds
+    // three here; node 5 founded the session and sits.
+    let nodes = fleet(&[
+        (1, HOME, 5),
+        (2, HOME, 0),
+        (3, HOME, 1),
+        (4, HOME, 0),
+        (5, HOME, 0),
+    ]);
+    let held = BTreeMap::from([(2, 2), (3, 1), (4, 3)]);
+    let placement = heal_placement(
+        &nodes,
+        &policy(1, &[]),
+        &sitting(&[5], &[5], 5),
+        Leading {
+            counts: &nowhere(),
+            current: Some(5),
+        },
+        &held,
+        MEMBERS,
+        1 << 20,
+    )
+    .unwrap()
+    .spec
+    .placement;
+    assert_eq!(voters(&placement), [2, 3, 5]);
 }
 
 #[test]

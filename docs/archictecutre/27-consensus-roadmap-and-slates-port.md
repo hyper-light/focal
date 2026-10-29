@@ -513,6 +513,19 @@ state that has lasted `FOCAL_HOME_BALANCE_HOLD_SECS` (30), one session of a part
 at a time, leaders and seats together, and not at all with `FOCAL_HOME_BALANCE=off`.
 Every move leaves one voter fewer away from home and none more, so the moves end.
 
+*Who holds the fewest* is what the directory has seated, not only what nodes last
+reported. A node reports the copies it has installed once a load interval (30 s), and a
+plan's seats are committed the moment it is: seats given by the reports alone went to the
+same nodes for every plan made inside one interval (on 33 nodes in three zones, four
+sessions planned within two seconds were each seated on the same two nodes of zones b
+and c, beside eighteen there that held none). A seat goes by what a node holds: its
+report, or the seats the partition's sessions give it where they move and where they sit
+(`focal_directory::seats_held`), whichever is more. With one partition that count is
+exact as soon as a plan commits, and a node that also holds the sessions of other
+partitions holds at least what it reported. A plan made on an observation another commit
+has since moved is refused by the partition's compare (24 §16) and made again, so every
+plan is made on the seats of every plan committed before it.
+
 On one node neither decides anything. Five real processes: a session placed while its
 home region had one node keeps its two voters elsewhere until two nodes join at home,
 and then moves one seat, and then the other, and rests (`tests/home_balance.rs`).
