@@ -189,13 +189,13 @@ and a lifecycle at least. `reads`, `reopen` and `data_dir` apply to a run of one
       "started": 1000, "written": 1000, "judged": 0,
       "refused": 0, "refused_by_cause": { "owner_memory": 0, "owner_bound": 0,
         "ingress_capacity": 0, "unavailable": 0, "expired": 0, "other": 0 },
-      "unknown": 0, "abandoned": 0, "undelivered": 0, "committed": 1000,
+      "unknown": 0, "abandoned": 0, "undelivered": 0, "committed": 1000, "resent": 0,
       "tail_events": 0, "tail_failures": 0, "refusals": [] }
   ],
   "totals": { "started": 1000, "written": 1000, "judged": 0, "refused": 0,
               "refused_by_cause": { "owner_memory": 0, "owner_bound": 0, "ingress_capacity": 0,
                                     "unavailable": 0, "expired": 0, "other": 0 },
-              "unknown": 0, "abandoned": 0, "undelivered": 0, "committed": 1000 }
+              "unknown": 0, "abandoned": 0, "undelivered": 0, "committed": 1000, "resent": 0 }
 }
 ```
 
@@ -212,6 +212,10 @@ five. `judged` counts the claims settled satisfied — a work claim by its evalu
 verdict seen in its issuer's events, a message by its whole-work validation entered —
 whether or not the release after it committed. `committed` counts the ledger's writes,
 `tail_events` and `tail_failures` what its inbox tails read, and `refusals` its reasons.
+`resent` counts writes whose client could not learn their outcome within its clock: an agent
+sends such a write again under its own identity, its generation held open, until its ledger
+answers it (each then counted as it was answered) or a hand-off's wait has passed since it was
+first sent (counted `unknown`), as the client's error says to.
 The run's own `lifecycles` is `totals.written`.
 
 The callers issue their writes in request generations as the CLI's journal

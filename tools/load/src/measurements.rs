@@ -121,6 +121,10 @@ pub struct LifecycleCounts {
     pub undelivered: u64,
     /// Writes committed, every step of every lifecycle.
     pub committed: u64,
+    /// Writes whose client could not learn their outcome within its clock, resent under their own
+    /// identity until their ledger answered them (each then counted as it was answered), or until a
+    /// hand-off's wait had passed (counted `unknown`).
+    pub resent: u64,
 }
 impl LifecycleCounts {
     /// `other`'s counts added to these.
@@ -134,6 +138,7 @@ impl LifecycleCounts {
         self.abandoned = self.abandoned.saturating_add(other.abandoned);
         self.undelivered = self.undelivered.saturating_add(other.undelivered);
         self.committed = self.committed.saturating_add(other.committed);
+        self.resent = self.resent.saturating_add(other.resent);
     }
 }
 

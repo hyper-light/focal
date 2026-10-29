@@ -121,16 +121,18 @@ impl Conn {
         names: &Names,
         limits: &WireLimits,
     ) -> Result<Self, LoadError> {
-        Self::open_homed(connector, principal, names, limits, None)
+        Self::open_homed(connector, principal, names, limits, &[])
     }
-    /// [`Conn::open`], an enrolled client homed on `home` where one is given: it dials its home
-    /// first, reads there and writes at the ledger's leader ([`ReadRoute::Home`]).
+    /// [`Conn::open`], an enrolled client homed on the first of `homes` where any are given: it
+    /// dials its home first, reads there and writes at the ledger's leader ([`ReadRoute::Home`]),
+    /// and sends a request to the next of `homes` in turn once the one it was sent on gave no
+    /// answer (`QuicTransport::with_routes`), as many as the transport holds connections.
     fn open_homed(
         connector: &Connector,
         principal: ParticipantId,
         names: &Names,
         limits: &WireLimits,
-        home: Option<&Home>,
+        homes: &[&Home],
     ) -> Result<Self, LoadError> {
         match connector {
             Connector::Embedded(host) => {
@@ -159,15 +161,25 @@ impl Conn {
             }
             Connector::Enrolled(pending) => {
                 let client = pending.remote_client(unix_now()?, limits)?;
-                let initial = match home {
-                    Some(home) => RouteHint {
+                let mut routes = Vec::new();
+                routes
+                    .try_reserve_exact(homes.len().max(1))
+                    .map_err(|_| LoadError::Bound("homes"))?;
+                for home in homes {
+                    routes.push(RouteHint {
                         epoch: client.initial.epoch,
                         endpoint: home.endpoint.clone(),
                         server_name: home.server_name.clone(),
-                    },
-                    None => client.initial,
+                    });
+                }
+                let reads = if routes.is_empty() {
+                    routes.push(client.initial);
+                    ReadRoute::Leader
+                } else {
+                    ReadRoute::Home
                 };
-                let address = if initial.endpoint.starts_with('[') {
+                let first = routes.first().ok_or(LoadError::Bound("homes"))?;
+                let address = if first.endpoint.starts_with('[') {
                     "[::]:0"
                 } else {
                     "0.0.0.0:0"
@@ -179,11 +191,7 @@ impl Conn {
                     QuicConnector::bind_standalone(address, client.tls, limits.clone())?;
                 // One route, one connection: the transport's bound is the
                 // routes a client may hold, as the CLI's enrolled context.
-                let transport = QuicTransport::new(connector, initial, 16)?;
-                let reads = match home {
-                    Some(_) => ReadRoute::Home,
-                    None => ReadRoute::Leader,
-                };
+                let transport = QuicTransport::with_routes(connector, routes, 16)?;
                 Ok(Self::Enrolled(
                     Client::new(transport, RetryPolicy::default(), limits.clone(), 1)?
                         .with_read_route(reads),
@@ -1063,7 +1071,13 @@ impl Shared<'_> {
         Ok(Some(objects))
     }
     /// One page of `query`, as `actor` reads it at `consistency`, at most `wanted` objects;
-    /// `None`, with the reason noted, when it could not be read or held nothing.
+    /// `None`, with the reason noted, when it could not be read or held nothing. A read its
+    /// client could not have answered, no node reached or none serving its ledger, is asked again
+    /// until its ledger answers it or a hand-off's wait has passed since it was first asked, as an
+    /// agent asks again: a linearizable read needs its session's leader, and one asked of a
+    /// session that lost its quorum failed at its client's 30 s clock however soon the voters
+    /// returned, its lifecycle abandoned (twelve of 33 nodes killed for 30 s, 2026-10-29). Each
+    /// pause between is the client's own longest pause between resends.
     async fn read_page(
         &self,
         actor: &Actor<'_>,
@@ -1074,31 +1088,44 @@ impl Shared<'_> {
         let Ok(_permit) = self.reads.acquire().await else {
             return Err(LoadError::Bound("lifecycle reads"));
         };
-        let request = self.protocol_request(actor)?;
-        let envelope = RequestEnvelope {
-            protocol: focal_wire::NATIVE_PROTOCOL_VERSION,
-            ledger: self.job.names.ledger,
-            route_epoch: RouteEpoch(1),
-            request_epoch: RequestEpoch(1),
-            request_id: RequestId::from_u128(request),
-            operation: Operation::NativeRead(NativeReadRequest {
-                consistency,
-                query,
-                max_items: wanted,
-            }),
-        };
-        match actor.conn.request(envelope).await {
-            Ok(envelope) => match envelope.result {
-                Response::NativeRead(page) if !page.objects.is_empty() => Ok(Some(page.objects)),
-                other => {
-                    self.note(format!("lifecycle read: unexpected reply {other:?}"));
+        let asked = Instant::now();
+        loop {
+            let request = self.protocol_request(actor)?;
+            let envelope = RequestEnvelope {
+                protocol: focal_wire::NATIVE_PROTOCOL_VERSION,
+                ledger: self.job.names.ledger,
+                route_epoch: RouteEpoch(1),
+                request_epoch: RequestEpoch(1),
+                request_id: RequestId::from_u128(request),
+                operation: Operation::NativeRead(NativeReadRequest {
+                    consistency: consistency.clone(),
+                    query: query.clone(),
+                    max_items: wanted,
+                }),
+            };
+            return match actor.conn.request(envelope).await {
+                Ok(envelope) => match envelope.result {
+                    Response::NativeRead(page) if !page.objects.is_empty() => {
+                        Ok(Some(page.objects))
+                    }
+                    other => {
+                        self.note(format!("lifecycle read: unexpected reply {other:?}"));
+                        Ok(None)
+                    }
+                },
+                Err(ClientError::Transport | ClientError::Access(AccessError::Unavailable))
+                    if asked.elapsed() < watch::WAIT =>
+                {
+                    focal_rt::time::sleep(RetryPolicy::default().max_backoff)
+                        .await
+                        .map_err(LoadError::Runtime)?;
+                    continue;
+                }
+                Err(error) => {
+                    self.note(format!("lifecycle read: client: {error}"));
                     Ok(None)
                 }
-            },
-            Err(error) => {
-                self.note(format!("lifecycle read: client: {error}"));
-                Ok(None)
-            }
+            };
         }
     }
     /// The work artifact `artifact` as `actor` reads it at least at `written`, the write that
@@ -1219,7 +1246,35 @@ impl Shared<'_> {
                 }
             };
             let sent = Instant::now();
-            let response = actor.conn.request(envelope).await;
+            let mut response = actor.conn.request(envelope).await;
+            // A write whose client could not learn its outcome within its clock is resent under its
+            // own identity, its bytes and its generation (held open, so the floor never passes
+            // it), until its ledger answers it or a hand-off's wait has passed since it was first
+            // sent, as the client says to (`retry the same identity`) and as an agent does: the
+            // ledger answers it once whichever time it reaches it, from the request's history
+            // where it committed. A session that lost its quorum decides nothing until its voters
+            // return, and a write sent into it was reported unknown at its client's 30 s clock
+            // however soon they returned after it (twelve of 33 nodes killed for 30 s,
+            // 2026-10-29). Each pause between is the client's own longest pause between resends.
+            let mut resent = false;
+            let response = loop {
+                match response {
+                    Err(ClientError::OutcomeUnknown { request })
+                        if sent.elapsed() < watch::WAIT =>
+                    {
+                        resent = true;
+                        focal_rt::time::sleep(RetryPolicy::default().max_backoff)
+                            .await
+                            .map_err(LoadError::Runtime)?;
+                        response = actor.conn.request(*request).await;
+                    }
+                    answered => break answered,
+                }
+            };
+            if resent {
+                let mut outcome = self.outcome.borrow_mut();
+                outcome.counts.resent = outcome.counts.resent.saturating_add(1);
+            }
             let finished = Instant::now();
             let reply = classify(response);
             self.outcome.borrow_mut().writes.record(WriteSample {
@@ -2334,19 +2389,24 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
                 }
                 let principal = client.build.actor;
                 let connector = Connector::Enrolled(Box::new(pending));
-                // A ledger's agent `n` on its home `n mod homes`: the ledger's agents spread over
-                // the nodes holding its replica.
-                let home = shape.homes_of(seat.ledger).and_then(|homes| {
-                    usize::from(seat.index)
-                        .checked_rem(homes.len())
-                        .and_then(|place| homes.get(place))
-                });
+                // A ledger's agent `n` on its home `n mod homes`, the ledger's agents spread over
+                // the nodes holding its replica, and the ledger's other homes after it in turn:
+                // the nodes it asks once its own gives no answer.
+                let homes = shape.homes_of(seat.ledger).unwrap_or(&[]);
+                let first = usize::from(seat.index)
+                    .checked_rem(homes.len())
+                    .unwrap_or(0);
+                let mut routes = Vec::new();
+                routes
+                    .try_reserve_exact(homes.len())
+                    .map_err(|_| LoadError::Bound("homes"))?;
+                routes.extend(homes.iter().cycle().skip(first).take(homes.len()));
                 let conn = Conn::open_homed(
                     &connector,
                     principal,
                     ledgers.names(seat.ledger)?,
                     &limits,
-                    home,
+                    &routes,
                 )?;
                 PROGRESS.agent_opened();
                 groups
