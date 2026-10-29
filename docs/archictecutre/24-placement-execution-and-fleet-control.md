@@ -248,6 +248,32 @@ does at most one thing:
 Custody under the old route is deliberately not readiness for the new one; the
 session log's cutover record is the first fact the agent waits for.
 
+**Observing a partition led elsewhere.** Each pass observes every partition at
+one prefix: where this node leads it, from its own owner; otherwise through the
+partition's leader, one read of its checkpoint (`ControlRead::State`) and one of
+its installed authority (`ControlRead::Authority`), each a linearizable read.
+Every node did both on every pass, four times a second, whatever had changed:
+at 33 idle nodes the leader sent each of the other 30 about 48 KB a pass (6 KB
+of checkpoint, 42 KB of authority, the authority growing by ~175 B with every
+enrolled client), 6 MB/s in all, and 16.5 MB/s with 500 agents enrolled, its
+owner 0.34 of a CPU (09, 2026-10-29). From level 11 (`upgrade::OBSERVE_LEVEL`,
+§21) the agent keeps what it last read of each such partition
+(`PlacementAgent::held`, charged with its tables, dropped as its delegation
+leaves the root or the node comes to lead it) and names it in each read:
+`StateUnless { held }` is answered `StateHeld { applied_index }` where the
+replica's revisions are the ones held, since every change to a checkpoint moves
+a revision; `AuthorityUnless { source_index }` is answered `AuthorityHeld {
+applied_index, decided_at }` where the installed authority is the one taken
+from the root at that index, since a partition replaces its registry and
+enrollment only with a copy taken later (`InstalledAuthority::check_replacement`)
+and its commands move only the decision time. What the agent rebuilds from a
+held answer is the export the full read would have sent, byte for byte; either
+read is charged as the read it may answer in full. The same 33 nodes with 500
+agents enrolled: the leader 0.13 of a CPU and 0.69 MB/s. Still open: each node
+still asks twice a pass, and each ask is a read round at the partition's
+voters, the leader's cost now (240 reads a second at 33 nodes, growing with the
+nodes); a read parked at the leader until something changes is the step after.
+
 ## 8. The placement protocol between nodes
 
 Implemented 2026-09-09 ("A joined host installs its assignment and signs
@@ -1787,7 +1813,11 @@ seal rule. A node's content store seals its object files from level 9
 level cannot open, so a node takes the form from the fence it last recorded
 (`storage_level::content_form`) as its store is opened at its start, keeps the
 clear layout below it, and from it seals what it installs and converts what it
-holds in the clear as it serves.
+holds in the clear as it serves. A placement agent asks a partition's leader on
+another node for its checkpoint and authority unless it holds them from level
+11 (`upgrade::OBSERVE_LEVEL`; §7): a binary below the level reads neither
+`StateUnless` nor `AuthorityUnless`, so the agent asks them only once the fence
+it observes from the root opens the level, and reads both in full below it.
 A cluster founded by a binary holds the fence at the level
 its founder *announces* from genesis (its one node runs it; a founder
 staging a rollout at a lower level founds at that level, never at one it
