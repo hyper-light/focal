@@ -4081,6 +4081,16 @@ mod admission {
         admission: AdmissionLimits,
         handler: Arc<dyn RequestHandler>,
     ) -> (Arc<QuicServer>, Spawned<Result<(), WireError>>) {
+        admitting_on(pki, registry, admission, handler, budget()).await
+    }
+    /// [`admitting_with`] on `budget`.
+    async fn admitting_on(
+        pki: &Pki,
+        registry: PeerRegistry,
+        admission: AdmissionLimits,
+        handler: Arc<dyn RequestHandler>,
+        budget: MemoryBudget,
+    ) -> (Arc<QuicServer>, Spawned<Result<(), WireError>>) {
         let (certificate, key) = pki.issue(true);
         let tls = server_tls(
             TlsIdentity::from_pkcs8(vec![certificate], key),
@@ -4095,7 +4105,7 @@ mod admission {
                 registry,
                 quick(),
                 admission,
-                budget(),
+                budget,
             )
             .unwrap(),
         );
@@ -4365,9 +4375,14 @@ mod admission {
     /// A thousand agents, each an identity and a process of its own, hold a connection each to one
     /// listener at once, and each is answered while the others are held: the listener admits what
     /// its budget funds of each connection's charge as it is made (`funded_connections`), where it
-    /// admitted 128 and the 129th agent took another's connection. Each connection holds its state's charge of the budget while it is up and gives
-    /// it back as it goes: once every agent has left, the listener holds what it held before any
-    /// came.
+    /// admitted 128 and the 129th agent took another's connection. Each connection holds its
+    /// state's charge of the budget while it is up and gives it back as it goes: once every agent
+    /// has left, the listener holds what it held before any came. The listener's budget is an
+    /// endpoint's allowance for the agents (`endpoint_budget`): `funded_connections` is a bound the
+    /// budget reaches first, so a budget that its count merely exceeds funds no thousand. Bound on
+    /// the shared 64 MiB, whose 48 MiB ordinary part held the agents' state with only the receive
+    /// ring's least growth to spare, agent 996 was refused for memory whenever load grew the ring
+    /// (50.2 MB charged, the ring 1.3 MiB: 3 runs in 20 on a loaded Linux host, once in CI).
     #[test]
     fn a_thousand_agents_each_hold_a_connection_to_one_listener() {
         const AGENTS: usize = 1_000;
@@ -4398,11 +4413,24 @@ mod admission {
                     (certificate, key)
                 })
                 .collect();
-            // As a node binds its listener: it admits what its budget funds.
-            let funded = funded_connections(&quick(), budget().limit()).unwrap();
+            // As a node binds its listener: it admits what its budget funds, the budget an
+            // endpoint's allowance for the agents, which funds them under the transport's own
+            // bounds (each connection at the most its windows hold, the receive pool and socket,
+            // and a body each way on each stream for the completion lane)
+            let budget = endpoint_budget(
+                &WireLimits {
+                    max_connections: AGENTS,
+                    ..quick()
+                },
+                None,
+            )
+            .unwrap();
+            let funded = funded_connections(&quick(), budget.limit()).unwrap();
             assert!(funded > AGENTS, "the budget funds {funded} connections");
             let admission = AdmissionLimits::for_connections(funded).replacing_after(QUIET);
-            let (server, task) = admitting(&pki, registry, admission).await;
+            let handler: Arc<dyn RequestHandler> =
+                Arc::new(|verified: VerifiedRequest| async move { response(verified.request()) });
+            let (server, task) = admitting_on(&pki, registry, admission, handler, budget).await;
             let address = server.local_addr().unwrap();
             // What the listener holds apart from its receive pool and its ring's growth, which it
             // keeps whether or not a connection is up: its socket's charge, before any agent comes.
