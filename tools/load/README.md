@@ -25,7 +25,7 @@ reads: 2000           # optional; claim reads after the creations (default 0; <=
 transport: embedded   # optional; `embedded` (default) or `unix`
 data_dir: /tmp/node   # `unix`: the running node's directory; `embedded`: keep the node here
 profile: authored_v1  # optional; the frame profile — the transport's own by default
-concurrency: 1        # optional; concurrent callers, 1..=64
+concurrency: 1        # optional; concurrent callers, at least 1
 rate: 100             # optional; fixed offered rate over all callers
 warmup_ms: 15000      # optional; intended starts before this time are not measured
 reopen: false         # optional, embedded only; reopen the node afterwards and time it
@@ -51,10 +51,11 @@ exact frame the CLI would send, with deterministic identities from the run's
 id space. A frame of the wrong profile is refused by the node and counted,
 with its reason, under `refusals`.
 
-`concurrency` runs that many callers at once, each an OS thread with its own
-client and runtime and its own identity space under the seed; the claims and
-then the reads are split evenly among them, so throughput separates from
-latency. `reopen` closes the embedded node after the reads, reopens the same
+`concurrency` runs that many callers at once, each a task on the run's one
+shard with its own identity space under the seed; the claims and then the reads
+are split evenly among them, so throughput separates from latency. A caller
+holds room for no more writes under way than it has lifecycles, so what a run
+holds follows its claims whatever its callers. `reopen` closes the embedded node after the reads, reopens the same
 directory and times that to the first linearizable read: single-node recovery
 at exactly this run's retained size.
 

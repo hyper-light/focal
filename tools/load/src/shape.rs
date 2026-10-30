@@ -10,9 +10,6 @@ use std::path::PathBuf;
 pub const MAX_CLAIMS: u64 = 1_000_000;
 /// The most reads one run issues.
 pub const MAX_READS: u64 = 10_000_000;
-/// The most concurrent callers one run drives (each is an OS thread with its
-/// own client and runtime).
-pub const MAX_CONCURRENCY: u16 = 64;
 /// The most of one caller's writes under way at once (`inflight`).
 pub const MAX_INFLIGHT: u16 = 256;
 /// The longest a side's inbox read is asked to wait at the node (`inbox_wait_ms`), and how long
@@ -129,8 +126,13 @@ pub struct WorkloadShape {
     /// The frame profile; by default the transport's own (see [`Profile`]).
     #[serde(default)]
     pub profile: Option<Profile>,
-    /// Concurrent callers (1..=MAX_CONCURRENCY, default 1). The claims and the
-    /// reads are split evenly among them.
+    /// Concurrent callers (1 to the field's 65,535, default 1). The claims and the reads are
+    /// split evenly among them. Each is a task on the run's one shard, holding
+    /// room for no more writes under way than it has lifecycles, so what a run
+    /// holds follows its claims whatever its callers, and a caller with none
+    /// holds its task alone. A fixed 64 said each was an OS thread with a
+    /// runtime of its own, which they stopped being (e276fc49), and held a run
+    /// over 11 sessions to 5 callers a ledger where a run of one has 16.
     #[serde(default = "default_concurrency")]
     pub concurrency: u16,
     /// The clients the callers share (1..=concurrency; by default one each),
@@ -323,8 +325,8 @@ impl WorkloadShape {
         if self.reads > MAX_READS {
             return Err(format!("reads must not exceed {MAX_READS}"));
         }
-        if self.concurrency == 0 || self.concurrency > MAX_CONCURRENCY {
-            return Err(format!("concurrency must be 1..={MAX_CONCURRENCY}"));
+        if self.concurrency == 0 {
+            return Err("concurrency must be at least 1".to_string());
         }
         if self
             .connections

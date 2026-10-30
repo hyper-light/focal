@@ -376,4 +376,18 @@ mod tests {
         let none = parse_shape("claims: 10\ninflight: 4\nlifecycle_reads: 0\n").unwrap();
         assert!(none.validate().is_err());
     }
+
+    /// A run's callers are not held to a fixed count: 176 callers over 11 sessions (16 a ledger,
+    /// as a run of one has) are a shape, where a fixed 64 refused them and held each ledger to 5.
+    #[test]
+    fn a_runs_callers_are_not_held_to_a_fixed_count() {
+        let shape = |text: &str| parse_shape(text).unwrap().validate();
+        assert!(shape("claims: 176\nconcurrency: 176\n").is_ok());
+        assert!(shape("claims: 1\nconcurrency: 0\n").is_err());
+        let ledgers = format!(
+            "claims: 4400\nlifecycle: work\nprofile: authored_v1\nconcurrency: 176\nagents: 33\nledgers: [{}]\n",
+            ["{}"; 11].join(", ")
+        );
+        assert!(shape(&ledgers).is_ok());
+    }
 }

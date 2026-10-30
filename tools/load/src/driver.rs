@@ -1355,7 +1355,10 @@ impl Shared<'_> {
 /// kept under way. At one, a caller waits for each answer, as it always has.
 async fn write_open_loop(shared: &Shared<'_>, inflight: u16) -> Result<(), LoadError> {
     let job = shared.job;
-    let inflight = usize::from(inflight.max(1));
+    // Room for the writes it has, `inflight` at most: a caller with fewer lifecycles holds no
+    // room it could not fill.
+    let inflight =
+        usize::from(inflight.max(1)).min(usize::try_from(job.count).unwrap_or(usize::MAX).max(1));
     // The writes under way, in this task: a wake polls each of them, at most
     // `inflight`.
     let mut flying =

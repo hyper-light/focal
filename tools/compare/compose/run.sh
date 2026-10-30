@@ -121,11 +121,6 @@ mapfile -t focal_nodes < <(awk '{ print $1 }' <<< "$table")
 # three of its ledger's agents: refused before anything starts where the agents are too few.
 if [ "$mode" = work ]; then
   ledgers_wanted=$(python3 cluster.py wanted "$table")
-  # A ledger takes a caller at least, of focal-load's 64 (tools/load/src/shape.rs MAX_CONCURRENCY).
-  if [ "$ledgers_wanted" -gt 64 ]; then
-    echo "work over ${#focal_nodes[@]} nodes drives $ledgers_wanted sessions, each a caller at least of focal-load's 64: 192 nodes at most" >&2
-    exit 2
-  fi
   if [ "$AGENTS" -lt $(( 3 * ledgers_wanted )) ]; then
     echo "work over ${#focal_nodes[@]} nodes drives $ledgers_wanted sessions, each among three agents at least: AGENTS must be $(( 3 * ledgers_wanted )) at least, not $AGENTS" >&2
     exit 2
@@ -715,14 +710,12 @@ print(s if isinstance(s, str) else bytes(s).hex())' <<< "$identity")
       # over every node, most of them holding no replica of it. Each ledger is offered its share
       # of the rate whatever its callers (focal-load's seats), and a caller holds at most
       # `inflight` lifecycles under way, so each ledger is driven by as many callers as a run of
-      # one ledger is where focal-load's most callers (64, tools/load/src/shape.rs
-      # MAX_CONCURRENCY) hold that many for each, else by as many as they hold for each (5 at 11
-      # sessions: 320 lifecycles under way a ledger).
+      # one ledger is. A fixed 64 callers in all held 11 sessions to 5 a ledger (320 lifecycles
+      # under way), which a session's stall filled: the lifecycles due after waited on the
+      # generator, not the cluster (schedule delay p99 9.8 s in fleet33-kill12 k11).
       ledgers=$(python3 cluster.py ledgers "$table" "$out/$report.contacts.json" < "$out/$report.placement.json")
       sessions=$(grep -c '^  - session: ' <<< "$ledgers")
-      each=$(( 64 / sessions ))
-      if [ "$each" -gt "$callers" ]; then each=$callers; fi
-      callers=$(( each * sessions ))
+      callers=$(( callers * sessions ))
       lifecycle="lifecycle: work
 agents: $AGENTS
 agent_enrollments: /client/agents
