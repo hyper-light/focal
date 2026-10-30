@@ -5093,14 +5093,21 @@ fn a_request_that_fails_alone_keeps_its_connection() {
         registry
             .register_certificate(&certificate, grant())
             .unwrap();
-        // Request 2 is answered after the client's deadline; the rest at once.
-        let handler: Arc<dyn RequestHandler> =
-            Arc::new(move |verified: VerifiedRequest| async move {
+        // Request 2 is answered once its client has given it up, a gate the test opens after the
+        // client's deadline; the rest at once. Answered after a pause of 1.5 s instead, it was
+        // answered first where the client's shard stalled past the pause: its wait polled the
+        // answer before its timer (Windows CI, and fedora at a load of 31, 2026-10-30).
+        let held = Arc::new(Gate::new());
+        let gate = held.clone();
+        let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| {
+            let gate = gate.clone();
+            async move {
                 if verified.request().request_id == RequestId::from_u128(2) {
-                    pause(Duration::from_millis(1500)).await;
+                    gate.pass().await;
                 }
                 response(verified.request())
-            });
+            }
+        });
         let (server, task) = server(&pki, registry, handler).await;
         let quick = WireLimits {
             request_timeout: Duration::from_millis(500),
@@ -5127,6 +5134,7 @@ fn a_request_that_fails_alone_keeps_its_connection() {
             routes.request(&address, "localhost", &request(2)).await,
             Err(WireError::Timeout)
         ));
+        held.open(1);
         assert!(
             routes
                 .request(&address, "localhost", &request(3))
