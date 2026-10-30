@@ -13,6 +13,8 @@ mod diagnostics;
 pub use diagnostics::ReplicaDiagnosticsReply;
 #[path = "fleet_registration.rs"]
 mod registration;
+#[path = "fleet_seeds.rs"]
+mod seeds;
 use focal_ledger::{
     LedgerError, ManagedSubmission, RequestStreamSubmission, Session, SessionEvents, Submission,
 };
@@ -24,6 +26,7 @@ use focal_rt::watch;
 use focal_wire::*;
 use hyper_rt::sync::{ChannelReceiver, OneshotSender};
 pub use registration::RegistrationFactsReply;
+pub(crate) use seeds::SeedRefusal;
 use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
@@ -449,6 +452,7 @@ impl Work {
             Self::ArtifactPointer(..) => "artifact pointer",
             Self::SeedChunks(..) => "seed chunks",
             Self::InstallSeed(..) => "install seed",
+            Self::SeedRefused(..) => "seed refused",
             Self::CustodyObjects(..) => "custody objects",
             Self::CustodyPulled(..) => "custody pulled",
             Self::Admit(..) => "admit",
@@ -524,6 +528,8 @@ enum Work {
         OneshotSender<Result<(), LedgerError>>,
         Allocation,
     ),
+    /// Why the chunks a pending seeded checkpoint lacks did not come, kept for its diagnostics.
+    SeedRefused(SeedRefusal, Allocation),
     /// The content objects a retained delivery lacks (24 §20).
     CustodyObjects(
         OneshotSender<Result<Vec<focal_model::ContentRef>, LedgerError>>,
@@ -1264,6 +1270,8 @@ struct Owner {
     pace: crate::pace::TickPeriod,
     /// When leadership goes back to the placement's preferred leader.
     leader_return: crate::leader_return::LeaderReturn,
+    /// Why a seeded checkpoint's chunks did not come or were refused here (`seeds`).
+    seed_refusals: seeds::SeedRefusals,
     nonblocking: bool,
     /// The owner takes its work in batches (27 §9): a request it admits
     /// leaves its drain to the batch's end, so the proposals and reads of a
@@ -1448,6 +1456,7 @@ impl ReplicaHost {
         let lane = session.inflight_window();
         let owner = Owner {
             leader_return: crate::leader_return::LeaderReturn::new(session.election_tick()),
+            seed_refusals: seeds::SeedRefusals::default(),
             pace: pace.clone(),
             session,
             config,
@@ -3091,10 +3100,19 @@ impl Owner {
             }
             Work::InstallSeed(hash, bytes, response, charge) => {
                 let result = self.session.install_seed_chunk(hash, &bytes);
+                if let Err(error) = &result {
+                    let pending = self.seed_at();
+                    self.seed_refusals.install_refused(pending, error);
+                }
                 drop(bytes);
                 drop(charge);
                 let _ = response.send(result);
                 self.drain()?;
+            }
+            Work::SeedRefused(refusal, charge) => {
+                let pending = self.seed_at();
+                self.seed_refusals.refused(pending, refusal);
+                drop(charge);
             }
             Work::CustodyObjects(response, charge) => {
                 let result = match self.session.pending_custody() {

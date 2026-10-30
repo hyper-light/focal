@@ -284,6 +284,7 @@ fn class(work: &Work) -> WorkClass {
         | Work::ArtifactPointer(..)
         | Work::SeedChunks(..)
         | Work::InstallSeed(..)
+        | Work::SeedRefused(..)
         | Work::CustodyObjects(..)
         | Work::CustodyPulled(..)
         | Work::Refence(..)

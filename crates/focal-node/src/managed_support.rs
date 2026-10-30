@@ -350,6 +350,9 @@ async fn service_seed(
         .await
         .map_err(|_| LedgerError::Capacity)?
     else {
+        // No peer to ask: the replica keeps why, as it keeps every refusal on the way (its
+        // diagnostics' `seed_refused`); refused the room, the next service says it again.
+        let _ = host.seed_refused(crate::fleet::SeedRefusal::Policy);
         return Ok(());
     };
     let scope = policy.scope();
@@ -357,10 +360,19 @@ async fn service_seed(
     let wanted = host.pending_seed_chunks().await?;
     let peers = &policy.peers;
     at_once(pool, peers, node, wanted, async |hash| {
+        let mut refused = None;
         for peer in peers.iter().filter(|peer| **peer != node) {
-            if let Ok(bytes) = crate::evidence_service::pull_seed(pool, *peer, scope, hash).await {
-                return host.install_seed_chunk(hash, bytes).await.is_ok();
+            match crate::evidence_service::pull_seed(pool, *peer, scope, hash).await {
+                // An install the replica refuses is kept by the replica itself.
+                Ok(bytes) => return host.install_seed_chunk(hash, bytes).await.is_ok(),
+                Err(error) => refused = Some((*peer, error)),
             }
+        }
+        if let Some((peer, error)) = refused {
+            let _ = host.seed_refused(crate::fleet::SeedRefusal::Pull {
+                peer,
+                error: error.to_string(),
+            });
         }
         false
     })

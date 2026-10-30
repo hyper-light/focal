@@ -207,6 +207,10 @@ pub struct AdminReplicaDiagnostics {
     /// The chunks of a seeded checkpoint this replica still lacks (25 §5),
     /// `None` when no seeded snapshot is waiting.
     pub seed_chunks_missing: Option<usize>,
+    /// Why those chunks are not here yet: the last refusal of a pull or an
+    /// install of one, for the checkpoint waiting. Absent while none was.
+    #[serde(default)]
+    pub seed_refused: Option<AdminSeedRefusal>,
     /// The content objects a retained delivery names that this replica does
     /// not hold yet (24 §20), `None` when none is waiting.
     pub custody_objects_missing: Option<usize>,
@@ -251,6 +255,18 @@ pub struct AdminReplicaDiagnostics {
     /// bound. Absent before the session has a native engine's share to report.
     #[serde(default)]
     pub memory: Option<AdminSessionMemory>,
+}
+/// The last refusal a replica's seeded checkpoint met on its way (25 §5), and how many it met.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminSeedRefusal {
+    pub refused: u64,
+    /// `policy`: the node holds no custody policy for the ledger, so it asked no peer; `pull`:
+    /// no peer of the policy gave a chunk (`peer` the last asked); `install`: the replica refused
+    /// a chunk it was given.
+    pub stage: String,
+    pub peer: Option<u64>,
+    pub error: String,
 }
 /// The kinds a session's native memory is told by ([`AdminSessionMemory::native_by_kind`]): the
 /// node's budget kinds, in their order (`focal_memory::BudgetKind::ALL`).

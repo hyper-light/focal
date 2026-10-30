@@ -72,6 +72,7 @@ impl Owner {
                 .session
                 .pending_seed()
                 .map(|pending| pending.missing.len()),
+            seed_refused: self.seed_refusals.current(self.seed_at()),
             custody_objects_missing: self
                 .session
                 .pending_custody()
