@@ -1,0 +1,38 @@
+focal16-1  | focal-diag: installing a snapshot at index 8224 term 1: prefix 8214
+focal16-1  | focal-diag: restore of 61140 rows (1481 artifacts, prefix 8214) validating: model allowed 123036357280 (shape 9665357056, custody term 113371000224, ceiling 171798630400), left 8411981030; parsing left 173307702, source left 1082224048, lookup left 3290665163
+focal16-1  | focal-diag: restore of 61140 rows validated: model left 6410245898
+focal17-1  | focal-diag: installing a snapshot at index 8214 term 1: prefix 8204
+focal17-1  | focal-diag: restore of 61054 rows (1477 artifacts, prefix 8204) validating: model allowed 122715654944 (shape 9650855936, custody term 113064799008, ceiling 171798630400), left 8401496779; parsing left 173017021, source left 1080456866, lookup left 3285557061
+focal17-1  | focal-diag: restore of 61054 rows validated: model left 6402824425
+focal1-1  | focal-diag: installing a snapshot at index 8215 term 1: prefix 8205
+focal1-1  | focal-diag: restore of 61056 rows (1477 artifacts, prefix 8205) validating: model allowed 122715978272 (shape 9651179264, custody term 113064799008, ceiling 171798630400), left 8404233471; parsing left 173021405, source left 1080494690, lookup left 3285688111
+focal1-1  | focal-diag: restore of 61056 rows validated: model left 6405520504
+focal23-1  | focal-diag: installing a snapshot at index 8233 term 1: prefix 8223
+focal23-1  | focal-diag: restore of 61186 rows (1480 artifacts, prefix 8223) validating: model allowed 122965682944 (shape 9671233024, custody term 113294449920, ceiling 171798630400), left 8417195670; parsing left 173367662, source left 1082667592, lookup left 3292641178
+focal23-1  | focal-diag: restore of 61186 rows validated: model left 6414623509
+focal27-1  | focal-diag: installing a snapshot at index 8223 term 1: prefix 8213
+focal27-1  | focal-diag: restore of 61126 rows (1480 artifacts, prefix 8213) validating: model allowed 122957025024 (shape 9662575104, custody term 113294449920, ceiling 171798630400), left 8414404846; parsing left 173236356, source left 1081820057, lookup left 3289362970
+focal27-1  | focal-diag: restore of 61126 rows validated: model left 6412776033
+focal28-1  | focal-diag: installing a snapshot at index 8218 term 1: prefix 8208
+focal28-1  | focal-diag: restore of 61091 rows (1479 artifacts, prefix 8208) validating: model allowed 122874282080 (shape 9656382464, custody term 113217899616, ceiling 171798630400), left 8404914720; parsing left 173096134, source left 1081030848, lookup left 3287448462
+focal28-1  | focal-diag: restore of 61091 rows validated: model left 6404901038
+focal31-1  | focal-diag: installing a snapshot at index 8229 term 1: prefix 8219
+focal31-1  | focal-diag: restore of 61191 rows (1480 artifacts, prefix 8219) validating: model allowed 122964751616 (shape 9670301696, custody term 113294449920, ceiling 171798630400), left 8416033761; parsing left 173281449, source left 1082313028, lookup left 3292615658
+focal31-1  | focal-diag: restore of 61191 rows validated: model left 6413780167
+focal32-1  | focal-diag: installing a snapshot at index 8234 term 1: prefix 8224
+focal32-1  | focal-diag: restore of 61167 rows (1483 artifacts, prefix 8224) validating: model allowed 123194189536 (shape 9670088704, custody term 113524100832, ceiling 171798630400), left 8417710277; parsing left 173384095, source left 1082829980, lookup left 3292245867
+focal32-1  | focal-diag: restore of 61167 rows validated: model left 6415151156
+focal6-1  | focal-diag: installing a snapshot at index 8224 term 1: prefix 8214
+focal6-1  | focal-diag: restore of 61140 rows (1481 artifacts, prefix 8214) validating: model allowed 123036357280 (shape 9665357056, custody term 113371000224, ceiling 171798630400), left 8411981030; parsing left 173307702, source left 1082224048, lookup left 3290665163
+focal6-1  | focal-diag: restore of 61140 rows validated: model left 6410245898
+focal7-1  | focal-diag: installing a snapshot at index 8233 term 1: prefix 8223
+focal7-1  | focal-diag: restore of 61192 rows (1480 artifacts, prefix 8223) validating: model allowed 122966207744 (shape 9671757824, custody term 113294449920, ceiling 171798630400), left 8417910445; parsing left 173359962, source left 1082662958, lookup left 3292800280
+focal7-1  | focal-diag: restore of 61192 rows validated: model left 6414833306
+focal8-1  | focal-diag: installing a snapshot at index 8235 term 1: prefix 8225
+focal8-1  | focal-diag: restore of 61194 rows (1481 artifacts, prefix 8225) validating: model allowed 123044333472 (shape 9673333248, custody term 113371000224, ceiling 171798630400), left 8418298400; parsing left 173410524, source left 1083039286, lookup left 3293492674
+focal8-1  | focal-diag: restore of 61194 rows validated: model left 6414892467
+focal8-1  | focal-diag: installing a snapshot at index 12368 term 1: prefix 12358
+focal8-1  | focal: session 320f482d8db7db1e0e585ca0e29c61e9 stopped: native: native lifecycle admission: a configured bound or counter would be exceeded (diag capacity sites ["crates/focal-core/src/native/record_codec/replay_validate.rs:48 on Some(\"main\")", "crates/focal-core/src/native/record_codec/replay_validate.rs:48 on Some(\"main\")", "crates/focal-core/src/native/record_codec/replay_validate.rs:48 on Some(\"main\")", "crates/focal-core/src/native/record_codec/replay_validate.rs:48 on Some(\"main\")", "crates/focal-core/src/native/record_codec/replay_index.rs:55 on Some(\"main\")", "crates/focal-core/src/native/record_codec/replay_index.rs:58 on Some(\"main\")", "crates/focal-core/src/native/record_codec/replay_index.rs:55 on Some(\"main\")", "crates/focal-core/src/native/record_codec/replay_index.rs:58 on Some(\"main\")", "crates/focal-core/src/native/record_codec/replay_index.rs:55 on Some(\"main\")", "crates/focal-core/src/native/record_codec/replay_validate.rs:48 on Some(\"main\")", "crates/focal-core/src/native/record_codec/replay_validate.rs:48 on Some(\"main\")", "crates/focal-core/src/native/record_codec/replay_validate.rs:48 on Some(\"main\")", "crates/focal-core/src/native/record_codec/replay_validate.rs:48 on Some(\"main\")", "crates/focal-core/src/native/record_codec/replay_validate.rs:48 on Some(\"main\")", "crates/focal-core/src/native/record_codec/replay_validate.rs:48 on Some(\"main\")", "crates/focal-core/src/native/record_codec/read_claim_build.rs:152 on Some(\"focal-node-sessions-14980483432396755493-0\")"])
+focal9-1  | focal-diag: installing a snapshot at index 8247 term 1: prefix 8237
+focal9-1  | focal-diag: restore of 61282 rows (1482 artifacts, prefix 8237) validating: model allowed 123133645120 (shape 9686094592, custody term 113447550528, ceiling 171798630400), left 8429625126; parsing left 173611506, source left 1084286642, lookup left 3297714185
+focal9-1  | focal-diag: restore of 61282 rows validated: model left 6423649241

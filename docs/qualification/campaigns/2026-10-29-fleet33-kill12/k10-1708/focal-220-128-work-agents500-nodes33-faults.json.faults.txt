@@ -1,0 +1,18 @@
+0s 1793319535772ms seed 1029 (FAULT_SEED)
+45s 1793319580817ms any 12 of 33 (seed 1029, fault 1): focal1 focal6 focal7 focal8 focal9 focal16 focal17 focal23 focal27 focal28 focal31 focal32
+45s 1793319580822ms focal1 focal6 focal7 focal8 focal9 focal16 focal17 focal23 focal27 focal28 focal31 focal32 killing
+46s 1793319581965ms focal1 focal6 focal7 focal8 focal9 focal16 focal17 focal23 focal27 focal28 focal31 focal32 killed
+79s 1793319614857ms focal1 focal6 focal7 focal8 focal9 focal16 focal17 focal23 focal27 focal28 focal31 focal32 started
+81s 1793319616337ms focal9 serving
+81s 1793319616622ms focal1 serving
+81s 1793319616674ms focal6 serving
+81s 1793319616994ms focal7 serving
+82s 1793319617379ms focal16 serving
+82s 1793319617458ms focal28 serving
+82s 1793319617471ms focal8 serving
+82s 1793319617472ms focal31 serving
+82s 1793319617490ms focal23 serving
+82s 1793319617497ms focal17 serving
+82s 1793319617608ms focal32 serving
+82s 1793319617712ms focal27 serving
+139s 1793319674638ms every fault undone

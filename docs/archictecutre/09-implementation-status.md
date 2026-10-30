@@ -18221,21 +18221,26 @@ caller is an OS thread, which since e276fc49 it is not.
 
 Condition 3 at scale, its first fault: twelve of the 33 nodes (the founder among them, the root's and
 the directory partition's leader) killed at once 45 s into the work flow (500 agents, 220 claims a
-second over 11 sessions) and started again 30 s later. On the final tree (fleet-run 476ee125, fedora,
-three CI jobs sharing the host) every lifecycle was written and judged (29,595 of 29,700) or refused
-with a typed error while nodes were down (105: `unavailable` 92 in the session that lost its quorum,
-`owner_bound` 13 where a custody check named the content copy missing); none unknown, abandoned or
-undelivered; every session's voters converged. A session that lost its leader wrote again in 10.0 to
-10.5 s, one that lost its quorum once its voters served (34.8 to 36.9 s), one that lost a follower
-within 2.8 to 6.7 s. The record, with each run's report and the report by ledger:
+second over 11 sessions) and started again 30 s later. On the final tree (fleet-run 5a7af464, fedora,
+a busy host) every lifecycle was written and judged or refused with a typed error, every refusal a
+write begun while the nodes were down: k14 29,579 and 121 (`unavailable` 97 in the session that lost its
+quorum, `owner_bound` 24 where a custody check named the content copy missing), k15 29,161 and 539 (the
+artifact steps of five sessions whose killed voter held a content copy among them, 208 answered within
+1.4 s after the last node served as their 30 s clocks ran out); none unknown, abandoned or undelivered;
+no replica stopped; every session's voters converged with nothing missing. Time to recover, each
+session's longest time without a commit: lost nothing or a follower holding no content copy, at most
+1.1 s; its leader, 10.0 to 10.1 s (the QUIC idle timeout; its new leader ready within 2.1 s), then its
+artifact steps until the copy on the killed leader was back; its quorum, until its voters served (35.0
+to 40.5 s). The record, with each run's report and the report by ledger:
 [a dozen of 33 killed](../qualification/campaigns/2026-10-29-fleet33-kill12.md).
 
-| fedora run | Tree | Written and judged | Refused | Unknown | Abandoned | Undelivered |
-|---|---|---|---|---|---|---|
-| k1-1219 | 24770d5c | 24,327 | 3,496 | 1,709 | 101 | 76 |
-| k7-1551 | 476ee125 | 29,595 | 105 | 0 | 0 | 0 |
+| fedora run | Tree | Written | Refused | Unknown | Abandoned | Undelivered | Replicas stopped |
+|---|---|---|---|---|---|---|---|
+| k1-1219 | 24770d5c | 24,318 | 3,496 | 1,709 | 101 | 76 | not recorded |
+| k14-2219 | 5a7af464 | 29,579 | 121 | 0 | 0 | 0 | 0 |
+| k15-2235 | 5a7af464 | 29,161 | 539 | 0 | 0 | 0 | 0 |
 
-**Found and fixed at the cause** (33667142 to 476ee125): a restarted node's failure detector held no
+**Found and fixed at the cause** (33667142 to 5a7af464): a restarted node's failure detector held no
 member, its members read from a pass's partition observations that an earlier step's failure skipped,
 so the survivors held it dead to the end (members are read from the root the node holds, first); the
 placement agent asked a fixed node of a partition led elsewhere whatever the group answered (it follows
@@ -18244,10 +18249,19 @@ was refused its permit for a root authority snapshot past one control command, w
 alone in its group proposes (with 500 agents enrolled the partition never had a leader again); a
 write the log dropped during a leadership transfer (`LeaderLeaving`) stopped its session, classed
 fail-closed; a client resent a write to a killed leader until its clock ran out (a route that gives no
-answer is held failed and the request resent by another); and focal-load's agents gave up at the
-client's clock where an agent asks again under the write's identity.
+answer is held failed and the request resent by another); focal-load's agents gave up at the client's
+clock where an agent asks again under the write's identity; a node's route cache read every partition
+at the founder (it reads each at the leader it has learned); a client sent every request to its home
+whatever the last one there found, waiting out the idle timeout at a killed home request after request
+(a given route that gave no answer is passed over and reached beside the requests sent elsewhere); no
+replica could restore a checkpoint past about 2,100 artifacts, the restore ceiling carrying none of the
+custody each artifact is prepaid (it does); and a replica behind its reader answered a list of events
+from its prefix, so agents homed on a follower stuck installing a snapshot lost thirteen hand-offs (it
+answers `Behind`, and a homed read asks the leader).
 
-**Open.** Ledger 9 lost its leader and kept its quorum, yet wrote nothing for 35.2 s, where ledger 10,
-killed alike, wrote in 10.5 s; failover waits on the QUIC idle timeout (10 s); the all-copies custody
-rule refuses artifact steps while a copy is down (the f+1 decision pending); the directory partition's
-authority refresh carries the whole enrollment registry in one 128 KiB command (~500 enrolled clients).
+**Open.** A restarted follower's snapshot install waited on a seed chunk to the end of one run in eleven,
+the reason its pulls failed unrecorded; failover waits on the QUIC idle timeout (10 s); the all-copies
+custody rule holds artifact steps while a copy is down (the f+1 decision pending); the evidence door
+refused 36 artifact jobs `ingress_capacity` under resends of jobs refused for a dead copy in one run; the
+directory partition's authority refresh carries the whole enrollment registry in one 128 KiB command
+(~500 enrolled clients).

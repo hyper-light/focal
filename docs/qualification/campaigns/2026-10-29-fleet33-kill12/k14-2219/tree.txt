@@ -1,0 +1,11 @@
+5a7af464 AL: a replica asked for events after a record it has not applied answers that it is behind, with the prefix it has published, where it answered from its prefix that nothing came after, and an inbox wait held until something did: a homed read asks the leader its writes found when its home is behind (`ReadRoute::Home`), but this home was never behind. Twelve of 33 nodes killed and started again under the work flow (fedora, 2026-10-29): a restarted follower whose snapshot install waited on a seed chunk stayed at index 12,374 while its leader reached 29,902, and the agents homed on it saw none of their hand-offs, so thirteen lifecycles ended undelivered and their ledger took no write for 60 s, the load long over. A deliveries or events list after a sequence past the replica's native sequence is refused `Behind { published }`, as a read at a token it has not reached is, before its page or its wait is begun. `a_list_of_events_after_a_record_this_replica_has_not_applied_is_refused_behind` fails without the change
+ M docs/qualification/campaigns/2026-10-29-fleet33-kill12.md
+ M docs/qualification/campaigns/2026-10-29-fleet33-kill12/k1-1219/killreport.md
+ M docs/qualification/campaigns/2026-10-29-fleet33-kill12/k1-1219/sha256.txt
+ M docs/qualification/campaigns/2026-10-29-fleet33-kill12/k6-1509/killreport.md
+ M docs/qualification/campaigns/2026-10-29-fleet33-kill12/k6-1509/sha256.txt
+ M docs/qualification/campaigns/2026-10-29-fleet33-kill12/k7-1551/killreport.md
+ M docs/qualification/campaigns/2026-10-29-fleet33-kill12/k7-1551/sha256.txt
+?? docs/qualification/campaigns/2026-10-29-fleet33-kill12/k10-1708/
+?? docs/qualification/campaigns/2026-10-29-fleet33-kill12/k8-1613/
+?? docs/qualification/campaigns/2026-10-29-fleet33-kill12/k9-1652/

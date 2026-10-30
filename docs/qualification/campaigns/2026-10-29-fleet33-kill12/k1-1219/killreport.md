@@ -2,19 +2,19 @@
 
 killed (12): focal1 focal6 focal7 focal8 focal9 focal16 focal17 focal23 focal27 focal28 focal31 focal32; all killed by 1.1 s, started again at 33.8 s; serving 34.1 to 36.4 s (12 of 12), 0.3 to 2.6 s after their start
 
-| ledger | session | voters (killed *) | lost | started | written | judged | refused (by cause) | unknown | abandoned | undelivered | resent | slowest before (ms) | longest without a commit (s) | recovered at (s from kill / from start) |
+| ledger | session | voters (killed *) | lost | started | written | judged | refused (by cause) | unknown | abandoned | undelivered | resent | slowest before (ms) | longest without a commit (s: from–to after the kill) | recovered at (s from kill / from start) |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 0 | d9e4dd36 | focal1* focal6* focal32* | quorum | 2,700 | 2,569 | 2,570 | 0  | 119 | 12 | 0 | - | 104 | 35.4 | 97 / 63.2 |
-| 1 | a079bed6 | focal3 focal4 focal5 | nothing | 2,700 | 2,700 | 2,700 | 0  | 0 | 0 | 0 | - | 141 | 0.5 | 102 / 68.2 |
-| 2 | 31d5961d | focal7* focal29 focal33 | leader | 2,700 | 2,517 | 2,519 | 0  | 167 | 16 | 0 | - | 89 | 37.1 | 102 / 68.2 |
-| 3 | 9a9095ab | focal2 focal10 focal9* | a follower | 2,700 | 847 | 847 | 1,519 {'unavailable': 1519} | 334 | 0 | 0 | - | 92 | 7.8 | 184 / 150.2 |
-| 4 | 0f89aab4 | focal8* focal12 focal13 | a follower | 2,700 | 2,700 | 2,700 | 0  | 0 | 0 | 0 | - | 108 | 4.3 | 102 / 68.2 |
-| 5 | a8e0099d | focal15 focal16* focal20 | leader | 2,700 | 1,708 | 1,709 | 449 {'unavailable': 449} | 430 | 37 | 76 | - | 110 | 36.8 | 136 / 102.2 |
-| 6 | 6c0a7233 | focal19 focal23* focal30 | a follower | 2,700 | 2,700 | 2,700 | 0  | 0 | 0 | 0 | - | 123 | 5.4 | 102 / 68.2 |
-| 7 | 6706bd59 | focal11 focal18 focal22 | nothing | 2,700 | 2,700 | 2,700 | 0  | 0 | 0 | 0 | - | 101 | 0.5 | 102 / 68.2 |
-| 8 | 5956c62f | focal17* focal27* focal25 | quorum | 2,700 | 844 | 844 | 1,528 {'unavailable': 1528} | 315 | 13 | 0 | - | 141 | 36.2 | 192 / 158.2 |
-| 9 | f0fddd37 | focal14 focal24 focal28* | leader | 2,700 | 2,508 | 2,511 | 0  | 184 | 8 | 0 | - | 121 | 37.2 | 102 / 68.2 |
-| 10 | 7e79aa93 | focal21 focal26 focal31* | leader | 2,700 | 2,525 | 2,527 | 0  | 160 | 15 | 0 | - | 119 | 37.6 | 102 / 68.2 |
+| 0 | d9e4dd36 | focal1* focal6* focal32* | quorum | 2,700 | 2,569 | 2,570 | 0  | 119 | 12 | 0 | - | 104 | 35.4 (0.2–35.6) | 97 / 63.2 |
+| 1 | a079bed6 | focal3 focal4 focal5 | nothing | 2,700 | 2,700 | 2,700 | 0  | 0 | 0 | 0 | - | 141 | 0.5 (15.3–15.8) | 102 / 68.2 |
+| 2 | 31d5961d | focal7* focal29 focal33 | leader | 2,700 | 2,517 | 2,519 | 0  | 167 | 16 | 0 | - | 89 | 37.1 (0.2–37.3) | 102 / 68.2 |
+| 3 | 9a9095ab | focal2 focal10 focal9* | a follower | 2,700 | 847 | 847 | 1,519 {'unavailable': 1519} | 334 | 0 | 0 | - | 92 | 7.8 (52.7–60.5) | 184 / 150.2 |
+| 4 | 0f89aab4 | focal8* focal12 focal13 | a follower | 2,700 | 2,700 | 2,700 | 0  | 0 | 0 | 0 | - | 108 | 4.3 (26.6–30.9) | 102 / 68.2 |
+| 5 | a8e0099d | focal15 focal16* focal20 | leader | 2,700 | 1,708 | 1,709 | 449 {'unavailable': 449} | 430 | 37 | 76 | - | 110 | 36.8 (0.2–37.0) | 136 / 102.2 |
+| 6 | 6c0a7233 | focal19 focal23* focal30 | a follower | 2,700 | 2,700 | 2,700 | 0  | 0 | 0 | 0 | - | 123 | 5.4 (26.4–31.8) | 102 / 68.2 |
+| 7 | 6706bd59 | focal11 focal18 focal22 | nothing | 2,700 | 2,700 | 2,700 | 0  | 0 | 0 | 0 | - | 101 | 0.5 (20.4–20.9) | 102 / 68.2 |
+| 8 | 5956c62f | focal17* focal27* focal25 | quorum | 2,700 | 844 | 844 | 1,528 {'unavailable': 1528} | 315 | 13 | 0 | - | 141 | 36.2 (0.2–36.4) | 192 / 158.2 |
+| 9 | f0fddd37 | focal14 focal24 focal28* | leader | 2,700 | 2,508 | 2,511 | 0  | 184 | 8 | 0 | - | 121 | 37.2 (0.2–37.4) | 102 / 68.2 |
+| 10 | 7e79aa93 | focal21 focal26 focal31* | leader | 2,700 | 2,525 | 2,527 | 0  | 160 | 15 | 0 | - | 119 | 37.6 (0.2–37.8) | 102 / 68.2 |
 
 totals: started 29,700, written 24,318, judged 24,327, refused 3,496 {'unavailable': 3496}, unknown 1709, abandoned 101, undelivered 76, resent -; judged/started 81.909%
 writes (measured window): committed 244,705, refused 3,496, unknown 1,709; committed p50/p99/p99.9/max 43.6/36057.2/85145.4/102156.8 ms; schedule delay p99 35675.2 ms; wall 300.0 s
@@ -63,3 +63,4 @@ not committed: 5205; started 0.2 to 192.0 s; latency 22.9 to 74.3 s; steps {10: 
 
 liveness at the end: nodes holding a member dead: 21 of 33 (most 12)
 placement agents retrying or failed at the end: 0
+sessions stopped on a node: 0

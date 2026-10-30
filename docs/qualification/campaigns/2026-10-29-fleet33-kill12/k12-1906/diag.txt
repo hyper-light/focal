@@ -1,0 +1,11 @@
+focal8-1  | focal: session 049a02f6f2a5916057999545549deed9 stopped: native: native lifecycle admission: a configured bound or counter would be exceeded (diag capacity sites ["crates/focal-core/src/native/record_codec/replay_valid …
+  capacity sites recorded: 16; the newest six:
+    crates/focal-core/src/native/record_codec/replay_validate.rs:48 on Some(\"focal-node-sessions-9495021603782004691-0\")
+    crates/focal-core/src/native/record_codec/replay_validate.rs:48 on Some(\"focal-node-sessions-9495021603782004691-0\")
+    crates/focal-core/src/native/record_codec/replay_validate.rs:48 on Some(\"focal-node-sessions-9495021603782004691-0\")
+    crates/focal-core/src/native/record_codec/replay_validate.rs:48 on Some(\"focal-node-sessions-9495021603782004691-0\")
+    crates/focal-core/src/native/record_codec/replay_validate.rs:48 on Some(\"focal-node-sessions-9495021603782004691-0\")
+    crates/focal-core/src/native/record_codec/read_validate.rs:624 on Some(\"focal-node-sessions-9495021603782004691-0\")
+focal4 d4bdaaf2: applied_index 29902, committed_index 29902, authoritative True, native_ready True, seed_chunks_missing None, custody_objects_missing None
+focal5 d4bdaaf2: applied_index 29902, committed_index 29902, authoritative False, native_ready True, seed_chunks_missing None, custody_objects_missing None
+focal9 d4bdaaf2: applied_index 12374, committed_index 12374, authoritative False, native_ready True, seed_chunks_missing 1, custody_objects_missing None
