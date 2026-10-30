@@ -634,10 +634,19 @@ pub(crate) fn authorize_first_directory(
         return Err(DirectoryBootstrapError::Unauthorized);
     }
     let expires_at = authority.checkpoint().group_expires_at(group);
-    let ControlReadResult::Authority(Some(snapshot)) = owner.read_local(&ControlRead::Authority)?
+    let ControlReadResult::Authority(Some(mut snapshot)) =
+        owner.read_local(&ControlRead::Authority)?
     else {
         return Err(DirectoryBootstrapError::Unauthorized);
     };
+    // A partition reads the root's enrollment for its nodes alone, and is given them alone from the
+    // level that opens it (`upgrade::NODES_AUTHORITY_LEVEL`).
+    if crate::upgrade::opened(enrollment.fence(), crate::upgrade::NODES_AUTHORITY_LEVEL) {
+        snapshot.enrollment = enrollment
+            .nodes_only()
+            .and_then(|nodes| nodes.checkpoint())
+            .map_err(ControlError::from)?;
+    }
     // The snapshot is proposed, as the group's activation or an installation, only by a founder
     // alone in its group (`PartitionBootstrapPermit::open`), and there it must fit one control
     // command (the replica's `max_command_bytes`, its envelope and request beside it within 4 KiB).

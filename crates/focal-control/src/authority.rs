@@ -264,13 +264,25 @@ impl InstalledAuthority {
             return Err(ControlError::WrongOwner);
         }
         if next.enrollment(None)?.revision() == self.enrollment(None)?.revision()
-            && hash("focal.control.enrollment-state.v1", next.enrollment(None)?)?
-                != hash("focal.control.enrollment-state.v1", self.enrollment(None)?)?
+            && !same_enrollment(next.enrollment(None)?, self.enrollment(None)?)?
         {
             return Err(ControlError::WrongOwner);
         }
         Ok(())
     }
+}
+/// Whether two copies of one revision of the root's enrollment are the same: byte for byte, or,
+/// where either holds the nodes alone (`EnrollmentRegistry::nodes_only`, the copy a partition is
+/// given from the projection's level on), the same nodes and all else the registry decides by.
+fn same_enrollment(a: &EnrollmentRegistry, b: &EnrollmentRegistry) -> Result<bool, ControlError> {
+    let state = |registry: &EnrollmentRegistry| hash("focal.control.enrollment-state.v1", registry);
+    if state(a)? == state(b)? {
+        return Ok(true);
+    }
+    if a.has_clients() && b.has_clients() {
+        return Ok(false);
+    }
+    Ok(state(&a.nodes_only()?)? == state(&b.nodes_only()?)?)
 }
 fn anchor(identity: ControlIdentity, enrollment: &EnrollmentRegistry) -> AuthorityAnchor {
     AuthorityAnchor {

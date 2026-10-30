@@ -9,7 +9,7 @@ use focal_enrollment::UpgradeFence;
 /// The capability level this binary implements. Raised by a release that
 /// activates behaviour older binaries cannot follow; the fence gates that
 /// behaviour until every node runs such a binary.
-pub const CAPABILITY_LEVEL: u32 = 11;
+pub const CAPABILITY_LEVEL: u32 = 12;
 /// The level at which the issuer succeeds itself (24 §11): a credential
 /// issued under a successor issuer is presented with the predecessor's
 /// endorsement, which a binary below this level cannot verify.
@@ -73,6 +73,14 @@ pub const AT_REST_LEVEL: u32 = 10;
 /// 500 agents, 16.5 MB/s from the leader of 33 idle nodes). A binary below this level reads
 /// neither, so the agent asks them only once the fence opens the level.
 pub const OBSERVE_LEVEL: u32 = 11;
+/// The level at which a directory partition is given the root's enrollment as its nodes alone
+/// (`EnrollmentRegistry::nodes_only`, 24 §7): what it verifies nodes' statements and authorizes
+/// node peers by, where it was given every client's record as well, ~175 B each, and one install
+/// of it fit a control command (128 KiB) up to about 500 enrolled clients (fleet33-kill12,
+/// 2026-10-29) though the registry admits `max_enrollments`. A binary below this level compares a
+/// partition's copies of one revision byte for byte and would refuse the nodes' copy its peers
+/// take, so the projection waits for the fence.
+pub const NODES_AUTHORITY_LEVEL: u32 = 12;
 /// The environment variable that lowers the announced level for a staged
 /// rollout or a rehearsal; it can never raise it.
 pub const ANNOUNCED_LEVEL_ENV: &str = "FOCAL_CAPABILITY_LEVEL";

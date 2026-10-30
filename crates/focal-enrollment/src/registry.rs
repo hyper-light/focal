@@ -2585,6 +2585,99 @@ impl EnrollmentRegistry {
         }
         Ok(receipt.identity.clone())
     }
+    /// This registry as a directory partition holds it (24 §7): the nodes' records alone, with
+    /// their certificates, keys and retired credentials, and all else the registry decides by (its
+    /// CA, issuers, tenants, fence, bootstrap server and counters) at the same revision and index.
+    /// A partition verifies nodes' statements and authorizes node peers by its copy and reads no
+    /// client's record; carried whole, its copy grew ~175 B with every enrolled client, and one
+    /// install of it fit a control command (128 KiB) up to about 500 of them (fleet33-kill12,
+    /// 2026-10-29), where the registry admits `max_enrollments`. It restores as any checkpoint
+    /// does, charged what it keeps as a restore counts it, and a projection's projection is itself.
+    pub fn nodes_only(&self) -> Result<Self, EnrollmentError> {
+        if !self.has_clients() {
+            let mut same = self.clone();
+            same.owner = Some(random()?);
+            return Ok(same);
+        }
+        let records: BTreeMap<InvitationId, InviteMetadata> = self
+            .records
+            .iter()
+            .filter(|(_, record)| record.role == EnrollmentRole::Node)
+            .map(|(id, record)| (*id, record.clone()))
+            .collect();
+        let kept = |id: &InvitationId| records.contains_key(id);
+        let certificates: BTreeMap<Fingerprint, InvitationId> = self
+            .certificates
+            .iter()
+            .filter(|(_, id)| kept(id))
+            .map(|(fingerprint, id)| (*fingerprint, *id))
+            .collect();
+        let enrolled_keys: BTreeMap<Fingerprint, InvitationId> = self
+            .enrolled_keys
+            .iter()
+            .filter(|(_, id)| kept(id))
+            .map(|(key, id)| (*key, *id))
+            .collect();
+        let retired: BTreeMap<Fingerprint, RetiredCredential> = self
+            .retired
+            .iter()
+            .filter(|(_, retired)| kept(&retired.invitation))
+            .map(|(fingerprint, retired)| (*fingerprint, retired.clone()))
+            .collect();
+        let mut charged_bytes = 8192usize;
+        for record in records.values() {
+            charged_bytes = charged_bytes
+                .checked_add(record_charge(record)?)
+                .ok_or(EnrollmentError::Capacity)?;
+        }
+        for retired in retired.values() {
+            charged_bytes = charged_bytes
+                .checked_add(retired_charge(retired)?)
+                .ok_or(EnrollmentError::Capacity)?;
+        }
+        charged_bytes = charged_bytes
+            .checked_add(
+                self.tenants
+                    .len()
+                    .checked_mul(64)
+                    .ok_or(EnrollmentError::Capacity)?,
+            )
+            .and_then(|bytes| bytes.checked_add(self.bootstrap.charge().ok()?))
+            .and_then(|bytes| bytes.checked_add(self.issuer.charge().ok()?))
+            .ok_or(EnrollmentError::Capacity)?;
+        let closing = records
+            .values()
+            .map(|record| (closed_at(record), record.id))
+            .collect();
+        Ok(Self {
+            owner: Some(random()?),
+            schema: self.schema,
+            cluster: self.cluster,
+            ca_certificate: self.ca_certificate.clone(),
+            limits: self.limits.clone(),
+            revision: self.revision,
+            applied_index: self.applied_index,
+            time_floor: self.time_floor,
+            next_node: self.next_node,
+            charged_bytes,
+            records,
+            certificates,
+            enrolled_keys,
+            retired,
+            tenants: self.tenants.clone(),
+            fence: self.fence,
+            bootstrap: self.bootstrap.clone(),
+            issuer: self.issuer.clone(),
+            compacted: self.compacted,
+            closing,
+        })
+    }
+    /// Whether any record is a client's: a registry holding none is its nodes' projection.
+    pub fn has_clients(&self) -> bool {
+        self.records
+            .values()
+            .any(|record| record.role != EnrollmentRole::Node)
+    }
     pub fn checkpoint(&self) -> Result<Vec<u8>, EnrollmentError> {
         let size = postcard::experimental::serialized_size(self)?;
         if size > self.limits.max_checkpoint_bytes {

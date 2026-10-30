@@ -274,6 +274,24 @@ still asks twice a pass, and each ask is a read round at the partition's
 voters, the leader's cost now (240 reads a second at 33 nodes, growing with the
 nodes); a read parked at the leader until something changes is the step after.
 
+**What a partition is given of the root's enrollment.** A partition verifies
+nodes' statements (`AuthorityRegistry::verifier`) and authorizes node peers
+(`ControlHost::authorize_placement_peer`) by its copy of the root's enrollment
+registry, and reads no client's record. It was given the registry whole, every
+client's record beside the nodes', ~175 B each, in one control command (128 KiB,
+`ControlLimits::max_command_bytes`): about 500 enrolled clients filled it
+(fleet33-kill12, 2026-10-29), where the registry itself admits
+`EnrollmentLimits::max_enrollments`, and every client enrolled sent every
+partition the whole registry again. From level 12 the root's permit carries the
+registry's nodes alone (`EnrollmentRegistry::nodes_only`): every node's record,
+certificate, key and retired credential, and all else the registry decides by
+(its CA, issuers, tenants, fence, bootstrap server and counters), at the same
+revision and index, so a partition's copy grows with the nodes, not the
+clients. Two copies of one revision are the same where they agree byte for
+byte, or, where either holds the nodes alone, where their nodes agree
+(`InstalledAuthority::check_replacement`), so a partition holding the whole
+registry takes the nodes' copy of the same revision.
+
 ## 8. The placement protocol between nodes
 
 Implemented 2026-09-09 ("A joined host installs its assignment and signs
@@ -1818,6 +1836,11 @@ another node for its checkpoint and authority unless it holds them from level
 11 (`upgrade::OBSERVE_LEVEL`; §7): a binary below the level reads neither
 `StateUnless` nor `AuthorityUnless`, so the agent asks them only once the fence
 it observes from the root opens the level, and reads both in full below it.
+A partition is given the root's enrollment as its nodes alone from level 12
+(`upgrade::NODES_AUTHORITY_LEVEL`; §7): a binary below the level compares a
+partition's copies of one revision byte for byte, and would refuse the nodes'
+copy its peers at the level take, so the root's permit projects the registry
+only once the fence opens the level, and carries it whole below it.
 A cluster founded by a binary holds the fence at the level
 its founder *announces* from genesis (its one node runs it; a founder
 staging a rollout at a lower level founds at that level, never at one it

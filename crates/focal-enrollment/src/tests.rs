@@ -1176,6 +1176,56 @@ fn node_statements_bind_payload_cluster_certificate_role_and_revocation() {
     ));
 }
 
+/// The registry as a directory partition holds it keeps every node's record and all the registry
+/// decides by, at the same revision and index, and no client's: a node's certificate is
+/// authorized by it and a client's is not, it restores as a checkpoint does, and its projection
+/// is itself. Carried whole, the copy grew with every enrolled client until one install of it no
+/// longer fit a control command (fleet33-kill12, 2026-10-29).
+#[test]
+fn a_registry_projected_to_its_nodes_keeps_them_and_nothing_of_its_clients() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = authority(&dir, [1; 16]);
+    let mut registry = registry(&authority);
+    let (_, node, _) = enroll_node(&dir, &mut registry, &authority, "node");
+    let invitation = invite(&mut registry, &authority, EnrollmentRole::Client);
+    let key = JoinKey::open_or_create(
+        dir.path().join("client"),
+        &focal_seal::test_keys_beside(dir.path().join("client")).unwrap(),
+        [1; 16],
+    )
+    .unwrap();
+    let request = invitation.request(&key, now()).unwrap();
+    let joined = registry.prepare_join(&authority, &request, now()).unwrap();
+    commit(&mut registry, joined);
+    let client = registry.release(&request, now()).unwrap();
+    let nodes = registry.nodes_only().unwrap();
+    assert_eq!(nodes.revision(), registry.revision());
+    assert_eq!(nodes.applied_index(), registry.applied_index());
+    assert_eq!(nodes.fence(), registry.fence());
+    assert!(
+        nodes
+            .authorize_certificate(&node.certificate, now())
+            .is_ok()
+    );
+    assert!(
+        registry
+            .authorize_certificate(&client.certificate, now())
+            .is_ok()
+    );
+    assert!(
+        nodes
+            .authorize_certificate(&client.certificate, now())
+            .is_err()
+    );
+    let projected = nodes.checkpoint().unwrap();
+    assert!(projected.len() < registry.checkpoint().unwrap().len());
+    let restored =
+        EnrollmentRegistry::restore(&projected, authority.cluster(), EnrollmentLimits::default())
+            .unwrap();
+    assert_eq!(restored.checkpoint().unwrap(), projected);
+    assert_eq!(nodes.nodes_only().unwrap().checkpoint().unwrap(), projected);
+}
+
 fn enroll_node(
     dir: &tempfile::TempDir,
     registry: &mut EnrollmentRegistry,

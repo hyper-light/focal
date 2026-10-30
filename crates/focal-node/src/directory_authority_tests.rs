@@ -67,7 +67,7 @@ fn live_directory_refresh_installs_revocation_retries_exactly_and_rejects_stale_
                 InviteOptions {
                     endpoint: "127.0.0.1:7443".into(),
                     server_name: network.state.sponsor.server_name.clone(),
-                    role: EnrollmentRole::Client,
+                    role: EnrollmentRole::Node,
                     expires_at: now + 60,
                 },
                 now,
@@ -81,6 +81,29 @@ fn live_directory_refresh_installs_revocation_retries_exactly_and_rejects_stale_
         let invitation = draft
             .release(network.control.enrollment().unwrap())
             .unwrap();
+        // A client's invitation: the root holds it, and a partition, which reads the root's
+        // enrollment for its nodes alone, is given none of it (`upgrade::NODES_AUTHORITY_LEVEL`).
+        let client = network
+            .control
+            .enrollment()
+            .unwrap()
+            .prepare_invitation(
+                &authority,
+                InviteOptions {
+                    endpoint: "127.0.0.1:7443".into(),
+                    server_name: network.state.sponsor.server_name.clone(),
+                    role: EnrollmentRole::Client,
+                    expires_at: now + 60,
+                },
+                now,
+            )
+            .unwrap();
+        commit(
+            &mut network.control,
+            6,
+            ControlCommand::Enrollment(client.command().clone()),
+        );
+        assert!(network.control.enrollment().unwrap().has_clients());
         let initial = authorize_first_directory(&network.control, plan, now, &budget).unwrap();
         let stale = authorize_first_directory(&network.control, plan, now, &budget).unwrap();
         let opened = initial
@@ -113,6 +136,7 @@ fn live_directory_refresh_installs_revocation_retries_exactly_and_rejects_stale_
         )
         .unwrap();
         assert!(!registry.invitation_revoked(invitation.id()).unwrap());
+        assert!(!registry.has_clients());
         host.submit(
             runtime(plan),
             ControlRequest {
@@ -149,7 +173,7 @@ fn live_directory_refresh_installs_revocation_retries_exactly_and_rejects_stale_
             .unwrap()
             .prepare_revoke(invitation.id(), now)
             .unwrap();
-        commit(&mut network.control, 6, ControlCommand::Enrollment(revoke));
+        commit(&mut network.control, 7, ControlCommand::Enrollment(revoke));
         let permit = authorize_first_directory(&network.control, plan, now, &budget).unwrap();
         let receipt = crate::test_waits::charged(
             || vec![host.periods()],
@@ -171,6 +195,7 @@ fn live_directory_refresh_installs_revocation_retries_exactly_and_rejects_stale_
         )
         .unwrap();
         assert!(registry.invitation_revoked(invitation.id()).unwrap());
+        assert!(!registry.has_clients());
         assert_eq!(installed.source_index, receipt.root_index);
         assert_eq!(host.progress().revisions.partition, 1);
         assert!(matches!(
