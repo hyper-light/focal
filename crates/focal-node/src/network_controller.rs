@@ -40,6 +40,10 @@ pub enum ControllerError {
     Capacity,
     #[error("root network owner stopped")]
     Stopped,
+    /// The root's owner stopped and said why (`ControlProgress::failure`): a node that exited on it
+    /// said only that it stopped, so what stopped it went with the process.
+    #[error("root network owner stopped: {0}")]
+    OwnerFailed(String),
     #[error("network controller runtime is unavailable")]
     Runtime,
     #[error("root metadata: {0}")]
@@ -1316,7 +1320,10 @@ impl NetworkController {
         loop {
             let progress = host.progress();
             if progress.stopped {
-                return Err(ControllerError::Stopped);
+                return Err(progress
+                    .failure
+                    .clone()
+                    .map_or(ControllerError::Stopped, ControllerError::OwnerFailed));
             }
             let mut now = unix_time()?;
             if observed

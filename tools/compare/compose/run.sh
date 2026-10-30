@@ -661,7 +661,17 @@ case "$system" in
       echo "focal-load runs on its own schedule and callers: no closed loop or window here" >&2
       exit 2
     fi
-    bash focal-bootstrap.sh
+    # A bootstrap that fails leaves each node's health and log's end beside the run's log, for why
+    # it failed: the containers go with the run.
+    bash focal-bootstrap.sh || {
+      status=$?
+      for n in "${focal_nodes[@]}"; do
+        timeout 30 "${compose[@]}" --profile focal exec -T "$n" focal --data-dir /data inspect node --health \
+          > "$out/bootstrap.$n.health.json" 2>/dev/null || true
+        timeout 30 "${compose[@]}" --profile focal logs --no-color --tail 300 "$n" > "$out/bootstrap.$n.log" 2>&1 || true
+      done
+      exit "$status"
+    }
     # The cluster the run measured: its nodes as written (their addresses, zones and limits), the
     # contacts they committed and the directory's placement of them and of its sessions, the bench
     # session's and the fleet's (`inspect placement`), and that placement by session and by node,
