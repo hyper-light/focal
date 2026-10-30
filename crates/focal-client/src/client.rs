@@ -1,6 +1,7 @@
 use crate::*;
 use focal_model::*;
 use focal_wire::{WireError, validate_response};
+use hyper_rt::combine::{Either, race2};
 use std::{collections::BTreeMap, sync::Mutex, time::Duration};
 
 #[derive(Debug, Clone)]
@@ -417,6 +418,76 @@ pub struct Client<T: ClientTransport> {
     calls: std::sync::atomic::AtomicU64,
     /// What this client may still resend after capacity refusals (`RetryBudget`).
     retries: RetryBudget,
+    /// How long a request goes unanswered before the next route is asked as well
+    /// ([`crate::rto::Rto`]).
+    rto: Mutex<crate::rto::Rto>,
+}
+
+/// What an attempt sent by more than one route came to ([`Client::hedged`]): the answer, the next
+/// route where it came from there, and whether an attempt was let go unanswered (one still under
+/// way when the other answered, or one that ended without an answer).
+struct Hedged {
+    response: Result<ResponseEnvelope, WireError>,
+    by: Option<Option<RouteHint>>,
+    let_go: bool,
+}
+impl Hedged {
+    fn alone(response: Result<ResponseEnvelope, WireError>) -> Self {
+        Self {
+            response,
+            by: None,
+            let_go: false,
+        }
+    }
+}
+/// Whether a request is sent by the next route as well once it goes unanswered: one answered as
+/// it is served. Never a wait the node holds by design (an inbox wait, a subscription, a monitor,
+/// a stream read), content (its time is its bytes'), nor the nodes' own control.
+fn hedges(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::Submit { .. }
+            | Operation::Read(_)
+            | Operation::OpenEpoch { .. }
+            | Operation::Stream(_)
+            | Operation::List(_)
+            | Operation::Reconcile(_)
+            | Operation::Managed { .. }
+            | Operation::RequestStreamControl { .. }
+            | Operation::Traverse(_)
+            | Operation::Validators(_)
+            | Operation::Summary
+            | Operation::Select(_)
+            | Operation::Native { .. }
+            | Operation::NativeRead(_)
+            | Operation::NativeList(_)
+            | Operation::Fence
+    )
+}
+/// A transport failure that leaves open whether the request reached its node.
+fn unanswered(error: &WireError) -> bool {
+    matches!(
+        error,
+        WireError::Io(_) | WireError::Allocation | WireError::Connection | WireError::Timeout
+    )
+}
+/// Whether the next route's answer to a hedged request admitted nothing the first route could not
+/// still answer: no answer, a refusal for its availability or its room, or a redirect to the first
+/// route itself.
+fn admitted_nothing_new(
+    answer: &Result<ResponseEnvelope, WireError>,
+    first: Option<&RouteHint>,
+) -> bool {
+    match answer {
+        Err(_) => true,
+        Ok(envelope) => match &envelope.result {
+            Response::Error(AccessError::Unavailable | AccessError::Capacity) => true,
+            Response::Error(AccessError::RouteChanged(hint)) => first.is_some_and(|first| {
+                first.endpoint == hint.endpoint && first.server_name == hint.server_name
+            }),
+            _ => false,
+        },
+    }
 }
 
 /// Single-host wall-clock nanoseconds for trace timestamps; a clock that runs
@@ -557,6 +628,7 @@ impl<T: ClientTransport> Client<T> {
             trace: None,
             calls: std::sync::atomic::AtomicU64::new(0),
             retries: RetryBudget::new(),
+            rto: Mutex::new(crate::rto::Rto::default()),
         })
     }
 
@@ -1083,6 +1155,119 @@ impl<T: ClientTransport> Client<T> {
         }
         Ok(())
     }
+    /// A request sent by `route`, and by the next route as well once it has gone unanswered for the
+    /// client's retransmission timeout ([`crate::rto::Rto`]): a hedged request (Dean and Barroso,
+    /// "The Tail at Scale", 2013), where it waited on its route until the connection's idle timeout
+    /// (10 s) said the node was gone though its session led elsewhere within 2.1 s (fleet33-kill12,
+    /// 2026-10-29). The first answer that says something is the request's: the first route's
+    /// whenever it comes, the next route's unless it admitted nothing new (no answer, a refusal for
+    /// its availability or room, a redirect to the first route), when the first is waited on again
+    /// and the next route asked again after the policy's pause, as a refused request is resent. A
+    /// request the node holds by design, or whose time is its bytes', is sent by its route alone
+    /// (`hedges`), and one with nowhere else to go waits on it alone.
+    async fn hedged(
+        &self,
+        homed: bool,
+        request: &RequestEnvelope,
+        route: Option<&RouteHint>,
+        clock: Duration,
+    ) -> Result<Hedged, ClientError> {
+        let began = crate::time::Instant::now();
+        let mut first = self.transport.request(route, request);
+        if !hedges(&request.operation) {
+            return Ok(Hedged::alone(first.await));
+        }
+        let mut wait = self
+            .rto
+            .lock()
+            .map_err(|_| ClientError::Transport)?
+            .timeout();
+        let mut next = route.cloned();
+        let mut let_go = false;
+        // The next routes are asked as often as a refused request is resent within the clock.
+        let hedges = self.policy.availability_resends();
+        let mut pauses = 0u32;
+        loop {
+            // A wait the clock ends first leaves the first route waited on alone.
+            if pauses >= hedges || wait >= clock.saturating_sub(began.elapsed()) {
+                let answer = first.await;
+                self.sampled(&answer, began)?;
+                return Ok(Hedged {
+                    response: answer,
+                    by: None,
+                    let_go,
+                });
+            }
+            let timer = std::pin::pin!(crate::time::sleep(wait));
+            match race2(&mut first, timer).await {
+                Either::First(answer) => {
+                    self.sampled(&answer, began)?;
+                    return Ok(Hedged {
+                        response: answer,
+                        by: None,
+                        let_go,
+                    });
+                }
+                Either::Second(slept) => slept?,
+            }
+            if pauses == 0 {
+                self.rto
+                    .lock()
+                    .map_err(|_| ClientError::Transport)?
+                    .expired();
+            }
+            self.reroute(homed, request.ledger, &mut next)?;
+            if next.as_ref() == route {
+                let answer = first.await;
+                self.sampled(&answer, began)?;
+                return Ok(Hedged {
+                    response: answer,
+                    by: None,
+                    let_go,
+                });
+            }
+            let hedged_at = crate::time::Instant::now();
+            let mut second = self.transport.request(next.as_ref(), request);
+            match race2(&mut first, &mut second).await {
+                Either::First(answer) => {
+                    self.sampled(&answer, began)?;
+                    return Ok(Hedged {
+                        response: answer,
+                        by: None,
+                        let_go: true,
+                    });
+                }
+                Either::Second(answer) => {
+                    self.sampled(&answer, hedged_at)?;
+                    if !admitted_nothing_new(&answer, route) {
+                        return Ok(Hedged {
+                            response: answer,
+                            by: Some(next.clone()),
+                            let_go: true,
+                        });
+                    }
+                    // An attempt that ended unanswered may have reached its node.
+                    let_go |= matches!(&answer, Err(error) if unanswered(error));
+                }
+            }
+            wait = jittered(&self.policy, pauses, clock, entropy());
+            pauses = pauses.saturating_add(1);
+        }
+    }
+    /// A round trip an answer took, from `sent`: what the retransmission timeout is learned from.
+    fn sampled(
+        &self,
+        answer: &Result<ResponseEnvelope, WireError>,
+        sent: crate::time::Instant,
+    ) -> Result<(), ClientError> {
+        if answer.is_ok() {
+            self.rto
+                .lock()
+                .map_err(|_| ClientError::Transport)?
+                .sample(sent.elapsed());
+        }
+        Ok(())
+    }
     /// The routes a request follows: a homed read's, or every other request's.
     fn routes_for(&self, homed: bool) -> &Mutex<Routes> {
         if homed {
@@ -1157,18 +1342,41 @@ impl<T: ClientTransport> Client<T> {
             }
             let mut refused = false;
             // The answer is what is waited for: a reach not over by then is let go, its dial
-            // going on where the transport keeps its connections.
-            let response = {
-                let exchange =
-                    crate::time::within(remaining, self.transport.request(route.as_ref(), request));
+            // going on where the transport keeps its connections. A request unanswered for the
+            // client's retransmission timeout is sent by the next route as well ([`Self::hedged`]).
+            let (response, hedge) = {
+                let exchange = crate::time::within(
+                    remaining,
+                    self.hedged(homed, request, route.as_ref(), remaining),
+                );
                 let mut exchange = std::pin::pin!(exchange);
-                std::future::poll_fn(|context| {
+                match std::future::poll_fn(|context| {
                     self.poll_reach(&mut reach, context);
                     std::future::Future::poll(exchange.as_mut(), context)
                 })
                 .await?
-                .ok_or(())
+                {
+                    Some(hedged) => {
+                        let hedged = hedged?;
+                        (Ok(hedged.response), Some((hedged.by, hedged.let_go)))
+                    }
+                    None => (Err(()), None),
+                }
             };
+            if let Some((by, let_go)) = hedge {
+                // An attempt let go unanswered may have reached its node: a write's outcome is the
+                // next definite answer's, as after any attempt that went unanswered.
+                if let_go && request.operation.is_mutation() {
+                    uncertain = true;
+                    *write_uncertain = true;
+                }
+                // The next route answered: the first gave none in its time, and the request goes
+                // on from where the answer came.
+                if let Some(by) = by {
+                    self.found(route.as_ref(), &Err(()))?;
+                    route = by;
+                }
+            }
             self.found(route.as_ref(), &response)?;
             // A homed read its home could not answer (no answer, unavailable, or behind its
             // token) is asked of the ledger's leader, as the writes found it, once and at once:

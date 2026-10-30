@@ -1281,6 +1281,100 @@ async fn a_write_whose_home_and_leader_were_killed_is_resent_by_the_next_route_o
     );
 }
 
+/// A session whose leader stops answering without a word, as a node killed or cut off does over
+/// QUIC, which has no reset to send: once `silent` is set its requests there are never answered,
+/// and the client's home (route `None`) names the successor, which commits.
+struct Silenced {
+    seen: Sent,
+    silent: std::sync::atomic::AtomicBool,
+}
+impl ClientTransport for Silenced {
+    fn request<'a>(
+        &'a self,
+        route: Option<&'a RouteHint>,
+        request: &'a RequestEnvelope,
+    ) -> TransportFuture<'a> {
+        Box::pin(async move {
+            let endpoint = route.map(|hint| hint.endpoint.clone());
+            self.seen
+                .lock()
+                .unwrap()
+                .push((endpoint.clone(), u128::from_be_bytes(request.request_id.0)));
+            let silent = self.silent.load(std::sync::atomic::Ordering::SeqCst);
+            let leader = if silent { NEW_LEADER } else { KILLED_LEADER };
+            match endpoint.as_deref() {
+                Some(KILLED_LEADER) if silent => std::future::pending().await,
+                None => {
+                    Ok(request.reply(Response::Error(AccessError::RouteChanged(route_to(leader)))))
+                }
+                Some(_) => Ok(request.reply(Response::Submitted(MutationReply::Committed(
+                    receipt(request),
+                )))),
+            }
+        })
+    }
+}
+
+/// A write whose leader stopped answering is sent by the next route as well once it has gone
+/// unanswered for the client's retransmission timeout (a second before any slower answer), and
+/// commits where the session leads now. It waited on the silent leader until the connection's idle
+/// timeout (10 s) said the node was gone, so a session whose leader was killed wrote again 10 s
+/// after the kill though its new leader was ready within 2.1 s (fleet33-kill12, 2026-10-29). Here
+/// the clock is five seconds: waited on alone, the silent leader takes all of it and the write
+/// ends unknown.
+#[test]
+fn a_write_whose_leader_stopped_answering_is_sent_by_the_next_route_once_its_time_is_up() {
+    focal_rt::block_on(
+        a_write_whose_leader_stopped_answering_is_sent_by_the_next_route_once_its_time_is_up_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn a_write_whose_leader_stopped_answering_is_sent_by_the_next_route_once_its_time_is_up_on_a_shard()
+ {
+    let seen = std::sync::Arc::new(Mutex::new(vec![]));
+    let client = Client::new(
+        Silenced {
+            seen: seen.clone(),
+            silent: std::sync::atomic::AtomicBool::new(false),
+        },
+        RetryPolicy {
+            max_elapsed: Duration::from_secs(5),
+            ..policy()
+        },
+        WireLimits::default(),
+        1,
+    )
+    .unwrap();
+    // The home names the leader, which commits: the client follows the session's leader.
+    assert!(matches!(
+        client.submit(request()).await.unwrap(),
+        MutationReply::Committed(_)
+    ));
+    client
+        .transport()
+        .silent
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    seen.lock().unwrap().clear();
+    let unanswered = RequestEnvelope {
+        request_id: RequestId::from_u128(100),
+        ..request()
+    };
+    assert!(matches!(
+        client.submit(unanswered).await.unwrap(),
+        MutationReply::Committed(_)
+    ));
+    // Sent to the silent leader, then by the home, which names the successor, and there: one
+    // request throughout.
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            (Some(KILLED_LEADER.to_owned()), 100),
+            (None, 100),
+            (Some(NEW_LEADER.to_owned()), 100)
+        ]
+    );
+}
+
 /// A client homed on a node that is gone, its transport given that home and the session's other
 /// voter: the home answers nothing while `home_up` is unset, the other voter answers every read. A
 /// reach of the home waits on a dial that never ends while it is down, as a dial to a killed node
