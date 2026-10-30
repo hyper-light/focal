@@ -245,7 +245,10 @@ pub enum ReadRoute {
     /// fetches from the replica in its rack (KIP-392). A read its home sends elsewhere at the
     /// epoch it knows goes there for that ledger until it learns a newer epoch; one its home
     /// cannot answer (no answer, unavailable, behind the token) is asked again of the ledger's
-    /// leader once a write has found it.
+    /// leader once a write has found it. A home that gave no answer is passed over for the next
+    /// given route until a reach of it is answered ([`GivenRoutes`]), as a Kafka consumer whose
+    /// fetch from its preferred replica failed fetches from the leader (KIP-392:
+    /// `AbstractFetch::handleFetchFailure` clears the preferred replica).
     Home,
 }
 
@@ -319,6 +322,83 @@ impl Routes {
     }
 }
 
+/// The routes a client's transport was given ([`ClientTransport::routes`]) that gave no answer,
+/// by their place among them, one place for each, fixed when the client is made. A request that
+/// would go to one goes to the next that has not, and each is reached again beside a request sent
+/// elsewhere ([`ClientTransport::reach`]), never by one, a drawn step of the policy's backoff
+/// after its last reach began (`jittered`, doubling from the base to the cap while its reaches go
+/// unanswered); it is a route again once a reach of it, or a request to it, is answered. Every
+/// request went to its route whatever the last one sent there found, so a client homed on a
+/// killed node sent each read there first and waited out its connection's idle timeout (10 s)
+/// before the next route answered, read after read until its home was back: twelve of 33 nodes
+/// killed (2026-10-29), each session that lost a follower went 7.3 to 7.9 s without a commit 22
+/// to 30 s after the kill, its lifecycles held on the reads of agents homed on the follower.
+struct GivenRoutes {
+    held: Vec<Option<Held>>,
+}
+/// A given route that gave no answer.
+#[derive(Clone, Copy)]
+struct Held {
+    /// When its next reach may begin.
+    due: crate::time::Instant,
+    /// Its reaches begun since it gave no answer: the doublings of the step its next pause is
+    /// drawn over.
+    reaches: u32,
+}
+impl GivenRoutes {
+    fn held(&self, place: usize) -> bool {
+        self.held.get(place).is_some_and(Option::is_some)
+    }
+    /// Where a request whose route is at `place` goes: there unless it is held, else the next in
+    /// turn that is not, else there.
+    fn start(&self, place: usize) -> usize {
+        let count = self.held.len();
+        (0..count)
+            .filter_map(|offset| place.checked_add(offset)?.checked_rem(count))
+            .find(|at| !self.held(*at))
+            .unwrap_or(place)
+    }
+    /// The route at `place` gave no answer: held, its first reach a drawn step away.
+    fn failed(&mut self, place: usize, policy: &RetryPolicy) {
+        if let Some(slot @ None) = self.held.get_mut(place) {
+            *slot = Some(Held {
+                due: step_after(crate::time::Instant::now(), policy, 0),
+                reaches: 0,
+            });
+        }
+    }
+    /// The route at `place` answered.
+    fn answered(&mut self, place: usize) {
+        if let Some(slot) = self.held.get_mut(place) {
+            *slot = None;
+        }
+    }
+    /// The first held route other than `asked`'s whose reach is due, its next reach a doubled step
+    /// later. A request that goes to a held route, every route being held, reaches it itself: a
+    /// reach beside it would wait on the same dial, and take a place among its waiters.
+    fn due(&mut self, policy: &RetryPolicy, asked: Option<usize>) -> Option<usize> {
+        let now = crate::time::Instant::now();
+        let (place, held) = self.held.iter_mut().enumerate().find_map(|(place, held)| {
+            if Some(place) == asked {
+                return None;
+            }
+            Some((place, held.as_mut().filter(|held| held.due <= now)?))
+        })?;
+        held.reaches = held.reaches.saturating_add(1);
+        held.due = step_after(now, policy, held.reaches);
+        Some(place)
+    }
+}
+/// `now` and a pause drawn over `policy`'s backoff step after `doublings` (`jittered`).
+fn step_after(
+    now: crate::time::Instant,
+    policy: &RetryPolicy,
+    doublings: u32,
+) -> crate::time::Instant {
+    let pause = jittered(policy, doublings, Duration::MAX, entropy());
+    now.checked_add(pause).unwrap_or(now)
+}
+
 pub struct Client<T: ClientTransport> {
     transport: T,
     policy: RetryPolicy,
@@ -327,6 +407,8 @@ pub struct Client<T: ClientTransport> {
     /// Where reads go ([`ReadRoute`]), and, homed, the routes its home sent a ledger's reads to.
     reads: ReadRoute,
     read_routes: Mutex<Routes>,
+    /// The transport's given routes that gave no answer ([`GivenRoutes`]).
+    given: Mutex<GivenRoutes>,
     /// Optional offline-history trace (R11 §1). Absent by default; when absent,
     /// `request` does no per-call trace work.
     trace: Option<Box<dyn crate::TraceSink>>,
@@ -450,6 +532,12 @@ impl<T: ClientTransport> Client<T> {
         {
             return Err(ClientError::Configuration);
         }
+        // One place for each route the transport was given, as many as it holds.
+        let given = transport.routes().len();
+        let mut held = Vec::new();
+        held.try_reserve_exact(given)
+            .map_err(|_| ClientError::Access(AccessError::Capacity))?;
+        held.resize(given, None);
         Ok(Self {
             transport,
             policy,
@@ -465,6 +553,7 @@ impl<T: ClientTransport> Client<T> {
                 clock: 0,
                 capacity: route_capacity,
             }),
+            given: Mutex::new(GivenRoutes { held }),
             trace: None,
             calls: std::sync::atomic::AtomicU64::new(0),
             retries: RetryBudget::new(),
@@ -836,43 +925,161 @@ impl<T: ClientTransport> Client<T> {
     /// failed, and the request goes where another request has learned since, else to the
     /// transport's first route, whose node names the leader again; one of the transport's own
     /// routes (`ClientTransport::routes`, the first where a request names none) is followed by
-    /// the next, in turn. A request resent elsewhere is the same request, its identity, epochs and
-    /// bytes, so its ledger answers it once whichever node it reaches: from the request's history
-    /// where it committed, by executing it where its leader never had it. Where every request kept
-    /// its route, a write in flight to a killed leader was resent to that leader until its clock
-    /// ran out and reported unknown, though the session had elected another leader within a
-    /// second (2026-10-29, twelve of 33 nodes killed: 1,709 writes unknown).
+    /// the next in turn that has not gone unanswered ([`GivenRoutes`]). A request resent elsewhere
+    /// is the same request, its identity, epochs and bytes, so its ledger answers it once
+    /// whichever node it reaches: from the request's history where it committed, by executing it
+    /// where its leader never had it. Where every request kept its route, a write in flight to a
+    /// killed leader was resent to that leader until its clock ran out and reported unknown,
+    /// though the session had elected another leader within a second (2026-10-29, twelve of 33
+    /// nodes killed: 1,709 writes unknown).
     fn reroute(
         &self,
         homed: bool,
         ledger: LedgerId,
         route: &mut Option<RouteHint>,
     ) -> Result<(), ClientError> {
-        let given = self.transport.routes();
-        let place = |hint: &RouteHint| {
-            given.iter().position(|route| {
-                route.endpoint == hint.endpoint && route.server_name == hint.server_name
-            })
-        };
-        match route.as_ref().map(|hint| (hint, place(hint))) {
-            Some((failed, None)) => {
+        match (route.as_ref(), self.given_place(route.as_ref())) {
+            (Some(failed), None) => {
                 *route = self
                     .routes_for(homed)
                     .lock()
                     .map_err(|_| ClientError::Transport)?
                     .fail(ledger, failed);
             }
-            current => {
-                let at = current.and_then(|(_, place)| place).unwrap_or(0);
+            (_, at) => {
+                let given = self.transport.routes();
                 let next = at
+                    .unwrap_or(0)
                     .checked_add(1)
                     .and_then(|next| next.checked_rem(given.len()))
                     .unwrap_or(0);
-                *route = match next {
-                    0 => None,
-                    next => given.get(next).cloned(),
-                };
+                let next = self
+                    .given
+                    .lock()
+                    .map_err(|_| ClientError::Transport)?
+                    .start(next);
+                *route = self.given_at(next);
             }
+        }
+        Ok(())
+    }
+    /// The place of `route` among the transport's given routes, the first where it names none:
+    /// none where the transport was given none, or the route is not one of them.
+    fn given_place(&self, route: Option<&RouteHint>) -> Option<usize> {
+        let given = self.transport.routes();
+        match route {
+            _ if given.is_empty() => None,
+            None => Some(0),
+            Some(hint) => given.iter().position(|route| {
+                route.endpoint == hint.endpoint && route.server_name == hint.server_name
+            }),
+        }
+    }
+    /// The given route at `place` as a request names it: none for the first, where the transport
+    /// sends a request that names none.
+    fn given_at(&self, place: usize) -> Option<RouteHint> {
+        match place {
+            0 => None,
+            place => self.transport.routes().get(place).cloned(),
+        }
+    }
+    /// Where a request whose route is `route` begins: there, unless it is a given route that gave
+    /// no answer, which is passed over for the next that has not ([`GivenRoutes`]).
+    fn begin_at(&self, route: Option<RouteHint>) -> Result<Option<RouteHint>, ClientError> {
+        let Some(place) = self.given_place(route.as_ref()) else {
+            return Ok(route);
+        };
+        let begin = self
+            .given
+            .lock()
+            .map_err(|_| ClientError::Transport)?
+            .start(place);
+        Ok(if begin == place {
+            route
+        } else {
+            self.given_at(begin)
+        })
+    }
+    /// Whether `route` is a given route that gave no answer.
+    fn passed_over(&self, route: &RouteHint) -> Result<bool, ClientError> {
+        let Some(place) = self.given_place(Some(route)) else {
+            return Ok(false);
+        };
+        Ok(self
+            .given
+            .lock()
+            .map_err(|_| ClientError::Transport)?
+            .held(place))
+    }
+    /// A given route that gave no answer whose reach is due, other than the one a request asked
+    /// at `route` goes to, and the reach of it begun ([`GivenRoutes`]).
+    fn due_reach(
+        &self,
+        route: Option<&RouteHint>,
+    ) -> Result<Option<(usize, ReachFuture<'_>)>, ClientError> {
+        let given = self.transport.routes();
+        if given.is_empty() {
+            return Ok(None);
+        }
+        let place = self
+            .given
+            .lock()
+            .map_err(|_| ClientError::Transport)?
+            .due(&self.policy, self.given_place(route));
+        Ok(place.and_then(|place| Some((place, self.transport.reach(given.get(place)?)))))
+    }
+    /// Polls `reach` where one is under way, and notes its route a route again where it reached
+    /// it: a reach that did not is due again at its step ([`GivenRoutes`]).
+    fn poll_reach(
+        &self,
+        reach: &mut Option<(usize, ReachFuture<'_>)>,
+        context: &mut std::task::Context<'_>,
+    ) {
+        let Some((place, dial)) = reach.as_mut() else {
+            return;
+        };
+        let std::task::Poll::Ready(reached) = std::future::Future::poll(dial.as_mut(), context)
+        else {
+            return;
+        };
+        let place = *place;
+        *reach = None;
+        // A poisoned table is refused by the next request that takes it.
+        if reached.is_ok()
+            && let Ok(mut given) = self.given.lock()
+        {
+            given.answered(place);
+        }
+    }
+    /// Notes what an attempt found of its route where it is a given route: any answer, a route;
+    /// no answer, or no connection reaching it, passed over until a reach of it is answered
+    /// ([`GivenRoutes`]).
+    fn found(
+        &self,
+        route: Option<&RouteHint>,
+        response: &Result<Result<ResponseEnvelope, WireError>, ()>,
+    ) -> Result<(), ClientError> {
+        let Some(place) = self.given_place(route) else {
+            return Ok(());
+        };
+        let mut given = self.given.lock().map_err(|_| ClientError::Transport)?;
+        match response {
+            Ok(Err(
+                WireError::Access(AccessError::Unavailable)
+                | WireError::Io(_)
+                | WireError::Allocation
+                | WireError::Connection
+                | WireError::Timeout,
+            ))
+            | Err(()) => given.failed(place, &self.policy),
+            Ok(Ok(_))
+            | Ok(Err(
+                WireError::Access(AccessError::Capacity)
+                | WireError::Authentication
+                | WireError::Unpinned
+                | WireError::InvalidFrame,
+            )) => given.answered(place),
+            Ok(Err(_)) => {}
         }
         Ok(())
     }
@@ -924,6 +1131,10 @@ impl<T: ClientTransport> Client<T> {
                 route = None;
             }
         }
+        // A given route that gave no answer is passed over, and one whose reach is due is reached
+        // beside this request, never by it ([`GivenRoutes`]).
+        let mut route = self.begin_at(route)?;
+        let mut reach = self.due_reach(route.as_ref())?;
         // Whether a homed read its home could not answer was asked of the leader: once.
         let mut left_home = false;
         let start = crate::time::Instant::now();
@@ -945,10 +1156,20 @@ impl<T: ClientTransport> Client<T> {
                 break;
             }
             let mut refused = false;
-            let response =
-                crate::time::within(remaining, self.transport.request(route.as_ref(), request))
-                    .await?
-                    .ok_or(());
+            // The answer is what is waited for: a reach not over by then is let go, its dial
+            // going on where the transport keeps its connections.
+            let response = {
+                let exchange =
+                    crate::time::within(remaining, self.transport.request(route.as_ref(), request));
+                let mut exchange = std::pin::pin!(exchange);
+                std::future::poll_fn(|context| {
+                    self.poll_reach(&mut reach, context);
+                    std::future::Future::poll(exchange.as_mut(), context)
+                })
+                .await?
+                .ok_or(())
+            };
+            self.found(route.as_ref(), &response)?;
             // A homed read its home could not answer (no answer, unavailable, or behind its
             // token) is asked of the ledger's leader, as the writes found it, once and at once:
             // another node, not a resend after a backoff.
@@ -962,6 +1183,7 @@ impl<T: ClientTransport> Client<T> {
                     .get(request.ledger)
                 && route.as_ref() != Some(&leader)
                 && leader.epoch >= request.route_epoch
+                && !self.passed_over(&leader)?
             {
                 left_home = true;
                 request.route_epoch = leader.epoch;

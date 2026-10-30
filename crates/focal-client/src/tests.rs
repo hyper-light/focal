@@ -1280,3 +1280,157 @@ async fn a_write_whose_home_and_leader_were_killed_is_resent_by_the_next_route_o
         ]
     );
 }
+
+/// A client homed on a node that is gone, its transport given that home and the session's other
+/// voter: the home answers nothing while `home_up` is unset, the other voter answers every read. A
+/// reach of the home waits on a dial that never ends while it is down, as a dial to a killed node
+/// waits out its idle timeout, and is answered once it is up.
+struct Downed {
+    seen: Sent,
+    reaches: Mutex<Vec<String>>,
+    home_up: std::sync::atomic::AtomicBool,
+    given: Vec<RouteHint>,
+}
+const DOWNED_HOME: &str = "127.0.0.1:7000";
+const OTHER_VOTER: &str = "127.0.0.1:7100";
+impl ClientTransport for Downed {
+    fn request<'a>(
+        &'a self,
+        route: Option<&'a RouteHint>,
+        request: &'a RequestEnvelope,
+    ) -> TransportFuture<'a> {
+        Box::pin(async move {
+            let endpoint = route.map(|hint| hint.endpoint.clone());
+            self.seen
+                .lock()
+                .unwrap()
+                .push((endpoint.clone(), u128::from_be_bytes(request.request_id.0)));
+            let up = self.home_up.load(std::sync::atomic::Ordering::SeqCst);
+            match endpoint.as_deref() {
+                None | Some(DOWNED_HOME) if !up => Err(WireError::Connection),
+                _ => Ok(page(request)),
+            }
+        })
+    }
+    fn routes(&self) -> &[RouteHint] {
+        &self.given
+    }
+    fn reach<'a>(&'a self, route: &'a RouteHint) -> ReachFuture<'a> {
+        Box::pin(async move {
+            self.reaches.lock().unwrap().push(route.endpoint.clone());
+            if route.endpoint == DOWNED_HOME
+                && !self.home_up.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        })
+    }
+}
+
+/// A read whose home gave no answer is resent by the session's other voter, and every read after
+/// it goes there first until a reach of the home is answered, no read waiting on that reach;
+/// then reads go home again. Every request went to its route whatever the last one sent there
+/// found, so a client homed on a killed node sent each read there first and waited out its
+/// connection's idle timeout before the next route answered (twelve of 33 nodes killed,
+/// 2026-10-29: sessions that lost a follower went 7.3 to 7.9 s without a commit).
+#[test]
+fn a_read_whose_home_gave_no_answer_goes_to_the_next_route_until_its_home_is_reached() {
+    focal_rt::block_on(
+        a_read_whose_home_gave_no_answer_goes_to_the_next_route_until_its_home_is_reached_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn a_read_whose_home_gave_no_answer_goes_to_the_next_route_until_its_home_is_reached_on_a_shard()
+ {
+    let seen = std::sync::Arc::new(Mutex::new(vec![]));
+    let client = Client::new(
+        Downed {
+            seen: seen.clone(),
+            reaches: Mutex::new(Vec::new()),
+            home_up: std::sync::atomic::AtomicBool::new(false),
+            given: vec![route_to(DOWNED_HOME), route_to(OTHER_VOTER)],
+        },
+        policy(),
+        WireLimits::default(),
+        1,
+    )
+    .unwrap()
+    .with_read_route(ReadRoute::Home);
+    let read = |id| RequestEnvelope {
+        request_id: RequestId::from_u128(id),
+        ..native_read()
+    };
+    // The home gives no answer: the read is resent by the other voter.
+    client.request(read(1)).await.unwrap();
+    // The home is passed over and reached beside the next read, which does not wait on it.
+    client.request(read(2)).await.unwrap();
+    client
+        .transport()
+        .home_up
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    // A reach of the home is answered beside the third read, and the fourth goes home.
+    client.request(read(3)).await.unwrap();
+    client.request(read(4)).await.unwrap();
+    let other = || Some(OTHER_VOTER.to_owned());
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            (None, 1),
+            (other(), 1),
+            (other(), 2),
+            (other(), 3),
+            (None, 4)
+        ]
+    );
+    assert_eq!(
+        *client.transport().reaches.lock().unwrap(),
+        vec![DOWNED_HOME.to_owned(), DOWNED_HOME.to_owned()]
+    );
+}
+
+/// A client given one route that gave no answer sends its next request there, with no reach beside
+/// it: the request reaches it itself, where a reach would wait on the same dial and take a place
+/// among its waiters (a transport of one connection refused the request `Capacity`). Once the
+/// route answers, it is no longer passed over.
+#[test]
+fn a_request_to_its_only_route_that_gave_no_answer_reaches_it_itself() {
+    focal_rt::block_on(
+        a_request_to_its_only_route_that_gave_no_answer_reaches_it_itself_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn a_request_to_its_only_route_that_gave_no_answer_reaches_it_itself_on_a_shard() {
+    let seen = std::sync::Arc::new(Mutex::new(vec![]));
+    let client = Client::new(
+        Downed {
+            seen: seen.clone(),
+            reaches: Mutex::new(Vec::new()),
+            home_up: std::sync::atomic::AtomicBool::new(false),
+            given: vec![route_to(DOWNED_HOME)],
+        },
+        policy(),
+        WireLimits::default(),
+        1,
+    )
+    .unwrap()
+    .with_read_route(ReadRoute::Home);
+    let read = |id| RequestEnvelope {
+        request_id: RequestId::from_u128(id),
+        ..native_read()
+    };
+    assert!(client.request(read(1)).await.is_err());
+    assert!(client.request(read(2)).await.is_err());
+    client
+        .transport()
+        .home_up
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    client.request(read(3)).await.unwrap();
+    client.request(read(4)).await.unwrap();
+    let attempts = usize::try_from(policy().max_attempts).unwrap();
+    let mut sent = vec![(None, 1); attempts];
+    sent.extend(vec![(None, 2); attempts]);
+    sent.extend([(None, 3), (None, 4)]);
+    assert_eq!(*seen.lock().unwrap(), sent);
+    assert!(client.transport().reaches.lock().unwrap().is_empty());
+}

@@ -3,6 +3,7 @@ use std::{future::Future, pin::Pin};
 
 pub type TransportFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ResponseEnvelope, WireError>> + Send + 'a>>;
+pub type ReachFuture<'a> = Pin<Box<dyn Future<Output = Result<(), WireError>> + Send + 'a>>;
 pub trait ClientTransport: Send + Sync {
     fn request<'a>(
         &'a self,
@@ -16,6 +17,15 @@ pub trait ClientTransport: Send + Sync {
     /// transport that reaches one node whatever the route.
     fn routes(&self) -> &[RouteHint] {
         &[]
+    }
+    /// Reaches `route` with no request: its connection up now, else dialed. A dial left before
+    /// it ends goes on where the transport keeps its connections, so a later reach finds the
+    /// connection it made. The client reaches one of its routes that gave no answer this way,
+    /// beside the requests it sends elsewhere meanwhile ([`Client`](crate::Client)). Reached at
+    /// once by a transport that reaches one node whatever the route.
+    fn reach<'a>(&'a self, route: &'a RouteHint) -> ReachFuture<'a> {
+        let _ = route;
+        Box::pin(std::future::ready(Ok(())))
     }
 }
 
@@ -159,5 +169,15 @@ impl ClientTransport for QuicTransport {
     }
     fn routes(&self) -> &[RouteHint] {
         &self.given
+    }
+    /// The route's connection, dialed if none is up: the endpoint's owner runs the dial and keeps
+    /// the connection it makes for the route's next call, whether or not this one still waits.
+    fn reach<'a>(&'a self, route: &'a RouteHint) -> ReachFuture<'a> {
+        Box::pin(async move {
+            self.routes
+                .connect(&route.endpoint, &route.server_name)
+                .await
+                .map(|_| ())
+        })
     }
 }

@@ -945,7 +945,10 @@ impl Owner {
 
     /// A call for a route dialed before: the greeted connection, or a wait on its dial (the
     /// audit's F60: concurrent cold calls dial once). A route's waiters are bounded by the
-    /// endpoint's connections, each its own caller's.
+    /// endpoint's connections, each its own caller's, and a caller that stopped waiting holds no
+    /// place: a client reaches a route that gave no answer beside its requests and lets the reach
+    /// go when the request is answered, the dial going on here, so a dial to a node that is gone
+    /// would otherwise fill with the waits of reaches no one holds and refuse the next.
     fn rejoin(
         &mut self,
         peer: PeerId,
@@ -970,6 +973,7 @@ impl Owner {
             let _ = reply.send(Err(WireError::Connection));
             return;
         };
+        dial.waiting.retain(|waiter| !waiter.is_closed());
         if dial.waiting.len() >= most {
             let _ = reply.send(Err(WireError::Access(AccessError::Capacity)));
             return;

@@ -5027,6 +5027,57 @@ fn cold_calls_to_one_route_share_one_dial_and_a_stale_failure_forgets_nothing() 
     .unwrap()
 }
 
+/// A caller that stopped waiting for a route's dial holds no place among its waiters: a client
+/// reaches a route that gave no answer beside its requests and lets the reach go once a request
+/// is answered, so a dial to a node that is gone, which waits out its idle timeout, filled with
+/// the waits of reaches no one held and refused the next caller `Capacity` at once.
+#[test]
+fn callers_that_stopped_waiting_for_a_dial_hold_no_place_among_its_waiters() {
+    focal_rt::block_on(async move {
+        let pki = Pki::new();
+        let (certificate, key) = pki.issue(false);
+        // A node that is gone: its address holds a socket that answers nothing.
+        let gone = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = gone.local_addr().unwrap().to_string();
+        let most = 2;
+        let limits = WireLimits {
+            max_connections: most,
+            ..limits()
+        };
+        let connector = QuicConnector::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            client_identity(&pki, certificate, key),
+            limits,
+            budget(),
+        )
+        .unwrap();
+        let routes = RouteConnections::new(connector, most).unwrap();
+        // As many callers as the route's waiters are bounded by give up on its dial.
+        for _ in 0..most {
+            let gave_up = timeout(
+                Duration::from_micros(10),
+                routes.connect(&address, "localhost"),
+            )
+            .await;
+            assert!(gave_up.is_none(), "a dial to a silent address answered");
+        }
+        // The next waits on the one dial, where it was refused at once.
+        let waited = timeout(
+            Duration::from_millis(100),
+            routes.connect(&address, "localhost"),
+        )
+        .await;
+        assert!(
+            waited.is_none(),
+            "refused: {:?}",
+            waited.map(|got| got.err())
+        );
+        assert_eq!(routes.dials().await, 1, "one dial for every caller");
+        drop(gone);
+    })
+    .unwrap()
+}
+
 /// A request that fails alone keeps its connection: one that timed out on a
 /// connection answering the caller's other requests is not the connection's
 /// failure, so the route is not dialed again (a caller that dialed again
