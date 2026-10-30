@@ -387,6 +387,23 @@ impl Rig {
     async fn state(&self, index: usize) -> ControlSnapshot {
         self.state_on_leader(index).await.1
     }
+    /// Waits until host `index` has applied its log through `at`, charged to the hosts' periods:
+    /// a replica answers an exact request from what it applied, and one that has not applied the
+    /// request's entry yet takes it for a new one, which a follower refuses `NotLeader`.
+    async fn applied(&self, index: usize, at: u64) {
+        let mut wait = self.deadline();
+        while self.hosts[index].progress().applied_index < at {
+            if let Err(spent) = wait.check(&self.periods()) {
+                panic!(
+                    "host {index} never applied {at}: {spent}; {:?}",
+                    self.hosts[index].progress()
+                );
+            }
+            focal_rt::time::sleep(Duration::from_millis(1))
+                .await
+                .unwrap();
+        }
+    }
     /// The definite answer of host `index` to `request`, asked by `role`:
     /// an outcome unknown, a host without the room or one not ready is
     /// asked again, charged to the hosts' periods, and the exact request
@@ -1382,8 +1399,11 @@ fn membership_requires_runtime_and_returns_only_committed_configuration_receipts
         assert_eq!(record.term, added.committed_term);
         assert_eq!(record.request_hash, added.request_hash);
         assert_eq!(record.configuration, after.configuration);
-        // A follower answers the exact request from what was committed.
+        // A follower answers the exact request from what was committed, once it has applied it:
+        // asked before, a lagging follower took it for a new request and refused `NotLeader`
+        // (macOS CI, 2026-10-30).
         let mut follower = (leader + 1) % 3;
+        rig.applied(follower, added.committed_index).await;
         assert_eq!(
             rig.definite(&mut follower, PeerRole::Runtime, &add, None)
                 .await
