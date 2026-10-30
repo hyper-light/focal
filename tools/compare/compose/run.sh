@@ -49,8 +49,12 @@
 #                       (`focal inspect placement`): `copy`, a node holding one of its content
 #                       copies other than its preferred leader, or `leader`, its preferred leader.
 #                       A role makes a run hit what it names whichever node the run seated there.
-#     isolate=NODES@S+D NODES (as kill's) each cut off from every peer and client (all its
-#                       datagrams lost) S seconds in, for D seconds
+#     isolate=NODES@S+D NODES (as kill's) each cut off from every peer and client S seconds in,
+#                       for D seconds: every datagram it sends lost (netem on its root) and every
+#                       one sent it dropped as it arrives (an ingress filter), its process and
+#                       state going on, then joined again. focal's transport is QUIC over UDP,
+#                       which has no reset to send: a D past the transport's idle timeout (10 s)
+#                       drops every connection the nodes hold, at both ends, as a lost path does
 #   The report's file names the run as faulted (`-faults`).
 #   REST (environment), focal: seconds the cluster is measured at rest before the load, founded,
 #   its clients enrolled and the generator idle (`<report>.rest.cpu.txt`, `.rest.io.txt`,
@@ -274,8 +278,21 @@ fault_shape() {
   if [ -n "$how" ]; then
     dc exec -T "$node" tc qdisc replace dev eth0 root netem $how
   else
-    dc exec -T "$node" tc qdisc del dev eth0 root 2>/dev/null || true
+    dc exec -T "$node" sh -c "tc qdisc del dev eth0 root 2>/dev/null; tc qdisc del dev eth0 ingress 2>/dev/null; true" || true
   fi
+}
+# NODE cut off from every peer and client: every datagram it sends lost, netem on its root, and
+# every one sent it dropped as it arrives, an ingress qdisc whose filter matches all. With its root
+# alone it went on hearing every peer and client while none heard it; a partition cuts both ways.
+fault_isolate() {
+  local node=$1
+  dc exec -T "$node" sh -c "tc qdisc del dev eth0 ingress 2>/dev/null; tc qdisc replace dev eth0 root netem loss 100% && tc qdisc add dev eth0 handle ffff: ingress && tc filter add dev eth0 parent ffff: protocol all prio 1 matchall action drop"
+}
+# NODE joined again: its ingress filter gone and the run's shaping, if any, on its root again.
+fault_rejoin() {
+  local node=$1
+  dc exec -T "$node" tc qdisc del dev eth0 ingress 2>/dev/null || true
+  fault_reshape "$node"
 }
 # The addresses a directed shaping takes NODE's datagrams to, one a line: the other nodes', as the
 # model gives them (a node down has its address still), or the load's.
@@ -443,10 +460,12 @@ faults_start() {
               fault_log "${hit[*]}: start refused"
             fi
           else
-            each "${hit[@]}" -- fault_shape "loss 100%" || true
+            fault_log "${hit[*]} isolating"
+            each "${hit[@]}" -- fault_isolate || fault_log "${hit[*]}: an isolation refused"
             fault_log "${hit[*]} isolated"
             sleep "$down"
-            each "${hit[@]}" -- fault_reshape || true
+            fault_log "${hit[*]} rejoining"
+            each "${hit[@]}" -- fault_rejoin || true
             fault_log "${hit[*]} rejoined"
           fi
         ) &
