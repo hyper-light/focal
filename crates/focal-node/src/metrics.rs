@@ -1033,12 +1033,12 @@ impl MetricsSnapshot {
         }
         text.counter(
             "focal_evidence_copies_unavailable_total",
-            "Required copies an artifact job did not ask, the liveness view holding them suspect or dead; each refused its job at once.",
+            "Required copies an artifact job did not ask, the liveness view holding them suspect or dead; each refused its job at once, or was missing from the custody obligation it reported.",
             self.evidence.copies_unavailable,
         );
         text.counter(
             "focal_evidence_copies_given_up_total",
-            "Required copies whose wait an artifact job ended, the liveness view coming to hold them suspect or dead; each refused its job.",
+            "Required copies whose wait an artifact job ended, the liveness view coming to hold them suspect or dead; each refused its job, or was missing from the custody obligation it reported.",
             self.evidence.copies_given_up,
         );
         text.header(

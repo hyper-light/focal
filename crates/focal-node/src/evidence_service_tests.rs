@@ -978,6 +978,83 @@ fn a_job_held_past_its_request_time_is_refused_and_counted() {
     .unwrap()
 }
 
+/// What `future` gives polled once: ready or not.
+async fn polled<F: Future + ?Sized>(
+    mut future: std::pin::Pin<&mut F>,
+) -> std::task::Poll<F::Output> {
+    std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx))).await
+}
+/// A job that comes while others are held at the door waits behind them: the place the driver
+/// frees goes to the oldest held, never to a job that came after it. One that came later took the
+/// place while the oldest was woken to it, and the oldest, finding the queue full, was held again:
+/// under a stream of resends the jobs held longest were the ones whose time ran out. The driver
+/// is not run: the test takes from its queue and wakes the door as the driver does.
+#[test]
+fn a_job_that_comes_while_others_are_held_waits_behind_them() {
+    focal_rt::block_on(async move {
+        let fixture = Fixture::new();
+        let (coordinator, mut driver) = EvidenceCoordinator::channel(
+            fixture.host.clone(),
+            1,
+            vec![],
+            fixture.budget.clone(),
+            1,
+        )
+        .unwrap();
+        let sealed = |id: u128| {
+            let (send, _receive) = hyper_rt::sync::oneshot().unwrap();
+            (
+                request(
+                    id,
+                    Operation::Upload(UploadRequest::Seal { upload: [7; 16] }),
+                ),
+                JobKind::Seal(send),
+            )
+        };
+        // The queue's one place, taken.
+        let (first, kind) = sealed(1);
+        coordinator.admit(first, kind, far()).await.unwrap();
+        // The admissions borrow the coordinator: they end with this block, before it goes.
+        {
+            let (oldest, kind) = sealed(2);
+            let mut oldest = std::pin::pin!(coordinator.admit(oldest, kind, far()));
+            let (next, kind) = sealed(3);
+            let mut next = std::pin::pin!(coordinator.admit(next, kind, far()));
+            assert!(polled(oldest.as_mut()).await.is_pending());
+            assert!(polled(next.as_mut()).await.is_pending());
+            // Woken by the job held behind it, the oldest finds the queue full and is held first.
+            assert!(polled(oldest.as_mut()).await.is_pending());
+            assert_eq!(coordinator.door_stats().held, 2);
+            // The driver takes the first job and wakes the oldest held.
+            let taken = driver.receiver.try_recv().unwrap().unwrap();
+            assert_eq!(
+                taken.request.as_ref().unwrap().request().request_id,
+                RequestId::from_u128(1)
+            );
+            driver.door.door.wake_one();
+            // A job that comes before the oldest takes its place waits behind the one still held.
+            let (later, kind) = sealed(4);
+            let mut later = std::pin::pin!(coordinator.admit(later, kind, far()));
+            assert!(polled(later.as_mut()).await.is_pending());
+            assert_eq!(coordinator.door_stats().held, 3);
+            assert!(matches!(
+                polled(oldest.as_mut()).await,
+                std::task::Poll::Ready(Ok(()))
+            ));
+            let queued = driver.receiver.try_recv().unwrap().unwrap();
+            assert_eq!(
+                queued.request.as_ref().unwrap().request().request_id,
+                RequestId::from_u128(2)
+            );
+            drop((taken, queued));
+        }
+        drop(driver);
+        drop(coordinator);
+        fixture.close().await;
+    })
+    .unwrap()
+}
+
 /// More calls at once than the content owner's queue holds are each served: those past it wait at
 /// its door for the owner to take one before them, where they were refused for capacity (1,612
 /// artifact jobs refused so in a work run with a content copy isolated; compare/work-faults on
@@ -1140,6 +1217,146 @@ fn a_copy_the_liveness_view_holds_dead_is_not_asked_and_its_job_is_refused_at_on
                 assert_eq!((stats.copies_unavailable, stats.copies_given_up), (1, 1));
                 // Both jobs' participants were answered `Unavailable`, and counted so.
                 assert_eq!((stats.jobs_unavailable, stats.jobs_capacity), (2, 0));
+            }
+            drop(coordinator);
+        };
+        let (result, ()) =
+            hyper_rt::combine::join2(driver.run(&pool, Some(&liveness)), exercise).await;
+        result.unwrap();
+        drop(liveness);
+        drop(publisher);
+        fixture.close().await;
+    })
+    .unwrap()
+}
+
+/// A custody obligation asks no copy the liveness view holds dead and waits for none it comes to
+/// hold so: the copy is missing from it at once, with no dial to the copy and nothing waiting out
+/// the pool's request time. Each such ask held its job's place in the driver's window while the
+/// jobs behind it waited at the door; a leader new to its session holds none of the receipts its
+/// predecessor recorded, so every phase that evaluated an artifact asked the dead copy again (a
+/// run of 33 nodes with 12 killed: 271 jobs ran out of time at one leader's door, and 36 writes
+/// were refused `ingress_capacity`; fleet33-kill12 k11, 2026-10-29).
+#[test]
+fn an_obligation_asks_no_copy_the_liveness_view_holds_dead_and_waits_for_none_it_comes_to() {
+    focal_rt::block_on(async move {
+        let fixture = Fixture::new();
+        let held = placement(1, &[1, 2]);
+        fixture
+            .host
+            .install_policy(held.custody_policy())
+            .await
+            .unwrap();
+        let (coordinator, driver) = EvidenceCoordinator::channel(
+            fixture.host.clone(),
+            1,
+            vec![held],
+            fixture.budget.clone(),
+            1,
+        )
+        .unwrap();
+        let pool = pool();
+        let blackhole =
+            hyper_rt::udp::UdpSocket::bind("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+                .unwrap();
+        pool.replace_routes(
+            1,
+            BTreeMap::from([(
+                2,
+                PeerEndpoint {
+                    address: blackhole.local_addr().unwrap(),
+                    server_name: "localhost".into(),
+                    name: None,
+                },
+            )]),
+        )
+        .unwrap();
+        let (liveness, publisher) = crate::liveness::LivenessHandle::channel(
+            &fixture.budget,
+            crate::liveness::LivenessConfig::default(),
+            1,
+            ledger(),
+        )
+        .unwrap();
+        let held_as = |status| {
+            let mut view = liveness.view();
+            view.members.insert(
+                2,
+                crate::liveness::MemberView {
+                    generation: 1,
+                    status,
+                    incarnation: 1,
+                    confirmed: true,
+                    decided_at_ms: 0,
+                    suspected_by: None,
+                    confirmations: 0,
+                    extensions: 0,
+                    extended_ms: 0,
+                    timeout_ms: 0,
+                    rtt_ms: None,
+                },
+            );
+            view
+        };
+        publisher.publish_view(held_as(crate::liveness::MemberStatus::Dead));
+        let exercise = async {
+            let (obligation, _) = coordinator
+                .obligation(seal_request(), fixture.reference.clone(), far())
+                .await
+                .unwrap();
+            assert_eq!(obligation.held, BTreeSet::from([1]));
+            assert_eq!(obligation.missing().collect::<Vec<_>>(), vec![2]);
+            let stats = coordinator.door_stats();
+            assert_eq!((stats.copies_unavailable, stats.copies_given_up), (1, 0));
+            assert_eq!(pool.stats().dials, 0);
+            publisher.publish_view(held_as(crate::liveness::MemberStatus::Alive));
+            {
+                let asked =
+                    coordinator.obligation(seal_request(), fixture.reference.clone(), far());
+                let mut asked = std::pin::pin!(asked);
+                let mut datagram = [0; 2048];
+                // The copy's address hears the job's dial, or the wait is wedged: bounded by the
+                // frozen window alone (`crate::test_waits`).
+                crate::test_waits::charged(
+                    Vec::new,
+                    Duration::from_secs(2),
+                    Duration::from_millis(10),
+                    async {
+                        match hyper_rt::combine::race2(
+                            blackhole.recv_from(&mut datagram),
+                            asked.as_mut(),
+                        )
+                        .await
+                        {
+                            hyper_rt::combine::Either::First(received) => {
+                                assert!(received.unwrap().0 > 0);
+                            }
+                            hyper_rt::combine::Either::Second(_) => {
+                                panic!("the obligation was answered without asking the copy")
+                            }
+                        }
+                    },
+                )
+                .await
+                .unwrap();
+                // The copy dies while it is asked: the obligation is answered once the view says
+                // so, the copy missing, its wait bounded by the frozen window alone.
+                publisher.publish_view(held_as(crate::liveness::MemberStatus::Dead));
+                let (obligation, _) = crate::test_waits::charged(
+                    Vec::new,
+                    Duration::from_secs(2),
+                    Duration::from_millis(10),
+                    asked.as_mut(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(obligation.held, BTreeSet::from([1]));
+                assert_eq!(obligation.missing().collect::<Vec<_>>(), vec![2]);
+                let stats = coordinator.door_stats();
+                assert_eq!((stats.copies_unavailable, stats.copies_given_up), (1, 1));
+                // An obligation short of a copy is an answer, not a refusal of its job.
+                assert_eq!((stats.jobs_unavailable, stats.jobs_capacity), (0, 0));
             }
             drop(coordinator);
         };

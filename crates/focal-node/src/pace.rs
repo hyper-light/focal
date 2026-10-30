@@ -297,6 +297,10 @@ impl Door {
         self.settle(&held);
         Ok(())
     }
+    /// Whether a request is held: one that comes while any is waits behind it.
+    pub(crate) fn holds_any(&self) -> bool {
+        self.count.load(Ordering::Acquire) != 0
+    }
     /// Wakes the oldest request still held, if any is: the words of those that stopped waiting
     /// (their deadlines passed, their exchanges gone) are let go on the way, each once. A
     /// poisoned lock wakes none, and those held end at their deadlines.

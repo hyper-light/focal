@@ -806,11 +806,18 @@ impl EvidenceCoordinator {
         let mut held = false;
         // Each turn is a wake: the loop ends when the queue takes the job or its deadline passes.
         loop {
-            job = match self.sender.try_send(job) {
-                Ok(()) => return Ok(()),
-                Err(SyncError::Full(job)) => job,
-                Err(_) => return Err(AccessError::Unavailable),
-            };
+            // Jobs come to the queue in the order they came, as at a session's door
+            // ([`crate::pace::Door`]): at once while none is held, the oldest held as it is woken,
+            // and one that finds others held behind them. One that came later could take the place
+            // the driver freed for the oldest, which woke to a full queue and was held again: under
+            // a stream of resends the jobs held longest were the ones whose time ran out.
+            if first || !self.door.door.holds_any() {
+                job = match self.sender.try_send(job) {
+                    Ok(()) => return Ok(()),
+                    Err(SyncError::Full(job)) => job,
+                    Err(_) => return Err(AccessError::Unavailable),
+                };
+            }
             if deadline.remaining().is_zero() {
                 self.door.timed_out.fetch_add(1, Ordering::Relaxed);
                 return Err(AccessError::Capacity);
@@ -830,14 +837,20 @@ impl EvidenceCoordinator {
                     }
                     _ => AccessError::Unavailable,
                 })?;
-            // The driver may have taken a job between the queue found full and the word held,
-            // and woken none: the job is offered once more, and a word left held is let go by
-            // the wake that finds it unwaited.
-            job = match self.sender.try_send(job) {
-                Ok(()) => return Ok(()),
-                Err(SyncError::Full(job)) => job,
-                Err(_) => return Err(AccessError::Unavailable),
-            };
+            if first {
+                // The driver may have taken a job between the queue found full and the word held,
+                // and woken none: the oldest offers its job once more, and a word left held is let
+                // go by the wake that finds it unwaited.
+                job = match self.sender.try_send(job) {
+                    Ok(()) => return Ok(()),
+                    Err(SyncError::Full(job)) => job,
+                    Err(_) => return Err(AccessError::Unavailable),
+                };
+            } else {
+                // Held last, it may find room the driver left as those before it were taken, with
+                // none left to wake: the oldest held is woken to take it, or to be held first again.
+                self.door.door.wake_one();
+            }
             match focal_rt::time::timeout_at(deadline, woken).await {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => return Err(AccessError::Unavailable),
@@ -1386,7 +1399,7 @@ async fn process(
         JobKind::Obligation(reference, response) => {
             let result = match (&placement, job.request) {
                 (Ok(row), Some(request)) => {
-                    obligation(content, pool, node, &row.placement, &reference)
+                    obligation(content, pool, health, node, &row.placement, &reference)
                         .await
                         .map(|obligation| (obligation, request))
                 }
@@ -2001,7 +2014,7 @@ async fn archive(
             .ok_or(AccessError::InvalidRequest)?,
     );
     replicate(content, pool, health, node, placement, request, &reference).await?;
-    let obligation = obligation(content, pool, node, placement, &reference).await?;
+    let obligation = obligation(content, pool, health, node, placement, &reference).await?;
     Ok(ArchiveOutcome {
         reference,
         obligation,
@@ -2011,10 +2024,21 @@ async fn archive(
 /// copy without one is asked to verify the object now (this node through
 /// its own store) and its `Durable` answer is recorded as its receipt. A
 /// copy that cannot answer is simply not held; nothing is ever inferred
-/// from a request or an intent.
+/// from a request or an intent. A copy the liveness view holds suspect or dead
+/// is not asked, and one it comes to hold so while asked is waited for no longer
+/// ([`CopyHealth`]): its answer would not come, and the job would hold its place
+/// in the driver's window for the pool's two attempts of 5 s while every job
+/// behind it waited at the door. A leader new to its session holds none of the
+/// receipts its predecessor recorded, so each phase that evaluated an artifact
+/// asked the dead copy again: in a run of 33 nodes with 12 killed, the window of
+/// the leader that took over from a killed one filled with these asks, the
+/// artifact jobs behind them (each refused at once for that copy) waited at the
+/// door, and 271 there and 218 at another leader ran out of time
+/// (`ingress_capacity` to 36 writes; fleet33-kill12 k11, 2026-10-29).
 async fn obligation(
     content: &ContentHost,
     pool: &PeerConnectionPool,
+    health: &CopyHealth<'_>,
     node: u64,
     placement: &EvidencePlacement,
     reference: &ContentRef,
@@ -2051,8 +2075,24 @@ async fn obligation(
                     .export_manifest(scope, reference.clone())
                     .await
                     .is_ok()
+            } else if health.held_down(peer) {
+                health.not_asked.fetch_add(1, Ordering::Relaxed);
+                false
             } else {
-                holds(pool, peer, scope, transfer, reference).await
+                let asked = holds(pool, peer, scope, transfer, reference);
+                let mut asked = pin!(asked);
+                // Polled on each of the driver's wakes, a change of the view among them.
+                let answered = std::future::poll_fn(|cx| {
+                    if health.held_down(peer) {
+                        return Poll::Ready(None);
+                    }
+                    asked.as_mut().poll(cx).map(Some)
+                })
+                .await;
+                answered.unwrap_or_else(|| {
+                    health.given_up.fetch_add(1, Ordering::Relaxed);
+                    false
+                })
             };
             if durable {
                 content
