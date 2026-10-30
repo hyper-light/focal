@@ -18265,3 +18265,32 @@ custody rule holds artifact steps while a copy is down (the f+1 decision pending
 refused 36 artifact jobs `ingress_capacity` under resends of jobs refused for a dead copy in one run; the
 directory partition's authority refresh carries the whole enrollment registry in one 128 KiB command
 (~500 enrolled clients).
+
+### 2026-10-30 — A dozen of 33 nodes partitioned, and their connections dropped, under the work flow
+
+Condition 3 at scale, its second fault: the kill campaign's twelve nodes (the founder, the root's and
+the directory partition's leader, among them) cut off from every peer and client at once 45 s into the
+work flow, both ways (every datagram a node sends lost and every one sent it dropped as it arrives;
+the harness's isolation took only what it sent before dcf3a798), their processes and state going on:
+for 30 s, a partition, and for 12 s, just past the QUIC idle timeout, which drops every connection they
+hold at both ends (focal's transport is QUIC over UDP, which has no reset to send). On fleet-run
+5a7af464 every lifecycle was written and judged, or refused with a typed error while the twelve were
+cut off; none unknown, abandoned or undelivered; no replica stopped; every session's voters converged
+with nothing missing, both sides reviving each other after the heal without a restart. A cut-off
+leader gave up its authority 1.5 to 2.9 s into the cut and a voter of the other side led from 1.5 to
+2.6 s; a session left without its quorum wrote again 0.2 to 3.7 s after the heal, its cut-off voters
+caught up within 0.4 s, and a cut-off leader of a session that went on without it within 1.2 to 4.7 s.
+The record, with each run's report, report by ledger and sampler:
+[a dozen of 33 partitioned](../qualification/campaigns/2026-10-30-fleet33-partition12.md).
+
+| fedora run | Fault | Written | Refused | Unknown | Abandoned | Undelivered | Replicas stopped |
+|---|---|---|---|---|---|---|---|
+| p1-0227 | cut off 30 s | 29,668 | 32 | 0 | 0 | 0 | 0 |
+| p2-0256 | cut off 30 s | 29,656 | 44 | 0 | 0 | 0 | 0 |
+| c1-0241 | cut off 12 s | 29,700 | 0 | 0 | 0 | 0 | 0 |
+| c2-0310 | cut off 12 s | 29,700 | 0 | 0 | 0 | 0 | 0 |
+
+The refusals were artifact steps whose content copy was cut off (`owner_bound` at `validation.begin`,
+`unavailable` at `artifact.submit` and `validation.report`, the evidence door's `ingress_capacity` at
+`artifact.submit`) and, in p2, writes of a session without its quorum (`unavailable` at
+`claim.create`). Nothing new was found; what is open is the kill campaign's.
