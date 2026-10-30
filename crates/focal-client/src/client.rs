@@ -1320,11 +1320,20 @@ impl<T: ClientTransport> Client<T> {
                     | WireError::Allocation
                     | WireError::Connection
                     | WireError::Timeout,
-                ))
-                | Err(_) => {
+                )) => {
                     uncertain = true;
                     *write_uncertain = request.operation.is_mutation();
                     // No answer came on the route: resent by another.
+                    self.reroute(homed, request.ledger, &mut route)?;
+                }
+                // The request's own clock ran out with its attempt out. A write may have reached
+                // the node, so its outcome is unknown; a read changed nothing, and the answers it
+                // was given stand.
+                Err(_) => {
+                    if request.operation.is_mutation() {
+                        uncertain = true;
+                        *write_uncertain = true;
+                    }
                     self.reroute(homed, request.ledger, &mut route)?;
                 }
             }
@@ -1334,12 +1343,15 @@ impl<T: ClientTransport> Client<T> {
                     break;
                 }
             }
-            let backoff = jittered(
-                &self.policy,
-                backoffs,
-                self.policy.max_elapsed.saturating_sub(start.elapsed()),
-                entropy(),
-            );
+            let remaining = self.policy.max_elapsed.saturating_sub(start.elapsed());
+            let backoff = jittered(&self.policy, backoffs, remaining, entropy());
+            // A pause that takes what is left of the clock leaves the attempt after it no time to
+            // be answered: the request ends with the answers it was given. Resent into the clock's
+            // last instant, that attempt was cut off unanswered, and a read its node had refused
+            // `Unavailable` for 30 s ended `Transport` (cli_archive, Linux CI, 2026-10-30).
+            if backoff >= remaining {
+                break;
+            }
             backoffs = backoffs.saturating_add(1);
             crate::time::sleep(backoff).await?;
         }

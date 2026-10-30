@@ -1434,3 +1434,66 @@ async fn a_request_to_its_only_route_that_gave_no_answer_reaches_it_itself_on_a_
     assert_eq!(*seen.lock().unwrap(), sent);
     assert!(client.transport().reaches.lock().unwrap().is_empty());
 }
+
+/// A node that refuses its first request `Unavailable` and leaves every later one unanswered, as
+/// one whose answer outlasts the request's clock does.
+struct RefusedThenHeld {
+    calls: std::sync::atomic::AtomicUsize,
+}
+impl ClientTransport for RefusedThenHeld {
+    fn request<'a>(
+        &'a self,
+        _route: Option<&'a RouteHint>,
+        request: &'a RequestEnvelope,
+    ) -> TransportFuture<'a> {
+        Box::pin(async move {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Ok(request.reply(Response::Error(AccessError::Unavailable)));
+            }
+            std::future::pending::<()>().await;
+            Err(WireError::Timeout)
+        })
+    }
+}
+
+/// A read whose last attempt its own clock cut off keeps the answer it was given: its node refused
+/// it `Unavailable`, and a read changes nothing, so that refusal is how it ends, where it ended
+/// `Transport` (cli_archive, Linux CI, 2026-10-30). A write so cut off may have reached its node,
+/// and its outcome stays unknown.
+#[test]
+fn a_read_its_own_clock_cut_off_keeps_its_refusal_and_a_write_stays_unknown() {
+    focal_rt::block_on(
+        a_read_its_own_clock_cut_off_keeps_its_refusal_and_a_write_stays_unknown_on_a_shard(),
+    )
+    .unwrap();
+}
+async fn a_read_its_own_clock_cut_off_keeps_its_refusal_and_a_write_stays_unknown_on_a_shard() {
+    let short = RetryPolicy {
+        max_attempts: 3,
+        max_elapsed: Duration::from_millis(200),
+        base_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+    };
+    let held = || RefusedThenHeld {
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    };
+    let client = Client::new(held(), short.clone(), WireLimits::default(), 1).unwrap();
+    let read = client.request(native_read()).await.unwrap_err();
+    assert!(
+        matches!(read, ClientError::Access(AccessError::Unavailable)),
+        "{read:?}"
+    );
+    assert_eq!(
+        client
+            .transport()
+            .calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+    let client = Client::new(held(), short, WireLimits::default(), 1).unwrap();
+    let write = client.request(request()).await.unwrap_err();
+    assert!(
+        matches!(write, ClientError::OutcomeUnknown { .. }),
+        "{write:?}"
+    );
+}
