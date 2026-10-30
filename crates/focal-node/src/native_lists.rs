@@ -805,6 +805,24 @@ pub(crate) fn serve(
     request: &NativeListRequest,
     charge: &mut focal_memory::Allocation,
 ) -> Result<NativeListPage, AccessError> {
+    // Events after a record this replica has not applied are not in its prefix yet: it is behind
+    // its reader, who asks elsewhere (a homed read asks the leader its writes found), as a read at
+    // a token it has not reached is refused. Answered from the prefix, the page said nothing came
+    // after, and a wait held until something did: a replica whose install waited on a seed chunk
+    // no peer still held answered its homed agents so until their hand-offs were given up (twelve
+    // of 33 nodes killed, 2026-10-29: thirteen lifecycles undelivered).
+    let published = reader.core.native_sequence();
+    if let NativeListFilter::Deliveries {
+        after: Some((sequence, _)),
+        ..
+    }
+    | NativeListFilter::Events {
+        after: Some((sequence, _)),
+    } = &request.filter
+        && *sequence > published
+    {
+        return Err(AccessError::Behind { published });
+    }
     let filter = filter_bytes(&request.filter)?;
     let after = request
         .cursor

@@ -149,6 +149,46 @@ fn delivery_pages_resume_exclusively_and_bind_the_recipient_and_principal() {
     assert_eq!(page.objects.len(), 1);
 }
 
+/// A replica asked for events after a record it has not applied is behind its reader and says
+/// so, with the prefix it has published, so the reader asks elsewhere: answered from its prefix,
+/// it said nothing came after, and its homed agents waited on it while it waited on a seed no
+/// peer held (twelve of 33 nodes killed, 2026-10-29: thirteen lifecycles undelivered). A list at
+/// or before its prefix is answered.
+#[test]
+fn a_list_of_events_after_a_record_this_replica_has_not_applied_is_refused_behind() {
+    let mut h = Harness::new();
+    let (_, posted) = post(&mut h, SUBJECT);
+    let after = |sequence: SessionSeq| NativeListRequest {
+        filter: NativeListFilter::Deliveries {
+            recipient: SUBJECT,
+            after: Some((sequence, u32::MAX)),
+        },
+        cursor: None,
+        max_items: 256,
+        max_visits: 256,
+    };
+    let ahead = SessionSeq(posted.0 + 1);
+    assert!(
+        matches!(
+            h.list(&after(ahead)),
+            Err(AccessError::Behind { published }) if published == posted
+        ),
+        "a deliveries list past the prefix"
+    );
+    assert!(matches!(
+        h.list(&NativeListRequest {
+            filter: NativeListFilter::Events {
+                after: Some((ahead, 0)),
+            },
+            ..after(ahead)
+        }),
+        Err(AccessError::Behind { published }) if published == posted
+    ));
+    let page = h.list(&after(posted)).unwrap();
+    assert!(page.objects.is_empty());
+    assert_eq!(page.native_sequence, posted);
+}
+
 #[test]
 fn a_posted_testament_is_delivered_to_its_claimant_once() {
     let mut h = Harness::new();
