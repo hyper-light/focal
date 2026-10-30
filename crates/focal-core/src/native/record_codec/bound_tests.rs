@@ -999,3 +999,55 @@ fn a_restore_s_work_stays_within_the_envelope_its_checkpoint_declares() {
         assert_eq!(under.used, used);
     }
 }
+
+/// A checkpoint restores under the ceiling of a configuration whose bounds are its own shape,
+/// artifacts and all: the ceiling holds the custody its artifact rows extend the envelope by.
+/// Without that term the ceiling cut each restore's custody short (every artifact prepaid its
+/// verifier's declared maximum), here at the first artifact and in a 33-node cluster past about
+/// 2,100 artifacts in some 60,000 rows, where no replica could restore the session's checkpoint
+/// (twelve nodes killed, 2026-10-29: restarted voters stopped installing its snapshot).
+#[test]
+fn a_checkpoint_restores_under_the_ceiling_of_a_configuration_shaped_to_it() {
+    use super::recovery::{self, Work, tests as checkpoint};
+    let mut projection = Lab::new(NativeContentProfile::ProjectionOnly);
+    projection_workflow(&mut projection);
+    let mut authored = Lab::new(NativeContentProfile::AuthoredV1);
+    authored_workflow(&mut authored);
+    let mut with_artifacts = 0;
+    for (name, lab) in [("projection", &projection), ("authored", &authored)] {
+        let core = lab.owner.committed_core();
+        let bytes = checkpoint::encode(core);
+        let structural = checkpoint::inspect(&bytes);
+        let quote = structural.quote();
+        let artifacts = structural
+            .rows(usize::MAX)
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|row| matches!(row.key, Key::Artifact(_)))
+            .count();
+        if artifacts > 0 {
+            with_artifacts += 1;
+        }
+        let mut limits = checkpoint::limits(core.limits);
+        limits.work = Work::for_limits(quote.visits, quote.bytes, quote.rows);
+        let (restored, measured) = recovery::restore_measured(
+            &structural,
+            RangeId(11),
+            limits,
+            checkpoint::budget(),
+            &lab.store,
+            &BuiltinNativeSchemas,
+            focal_memory::BudgetLane::Completion,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "{name}: {artifacts} artifacts in {} rows: {error:?}",
+                quote.rows
+            )
+        });
+        checkpoint::compare(core, &restored);
+        assert!(measured.allowed.within(limits.work));
+        assert!(measured.used.within(measured.allowed));
+    }
+    assert!(with_artifacts > 0, "a workflow holds artifacts");
+}

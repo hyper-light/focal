@@ -92,10 +92,18 @@ impl Work {
             lookup: rows.saturating_mul(LOOKUP_PER_ROW),
         }
     }
-    /// The ceiling for the largest checkpoint a configuration admits:
-    /// `for_shape` at the inspection's visits, bytes and rows.
+    /// The ceiling for the largest checkpoint a configuration admits: `for_shape` at the
+    /// inspection's visits, bytes and rows, extended by the custody term of the most artifact rows
+    /// such a checkpoint holds, every row of it (`custody_per_artifact`), as a restore extends its
+    /// envelope for the artifacts it counts. Without that term the ceiling cut a restore's custody
+    /// short of what its rows declared: each artifact is prepaid its verifier's declared maximum
+    /// (76.6 M units of model work under the built-in schemas), so a checkpoint of some 60,000
+    /// rows past about 2,100 artifacts ran out of work before its rows were rebuilt and could be
+    /// restored by no replica, its own on restart included (twelve of 33 nodes killed, 2026-10-29:
+    /// restarted voters and a session's new member stopped installing a snapshot past it).
     pub fn for_limits(visits: usize, bytes: usize, rows: usize) -> Self {
         Self::for_shape(visits, bytes, rows)
+            .extended(rows.saturating_mul(Self::custody_per_artifact()))
     }
     pub(super) fn min(self, other: Self) -> Self {
         Self {
