@@ -479,12 +479,20 @@ pub struct PlacementAgent {
     last_ready: Option<(LedgerId, OperationId, i64)>,
     /// The most recent failed tick, kept for diagnostics.
     last_error: Option<AgentError>,
+    /// The step and session a pass is at, and those of the failed tick: a pass ends at the first
+    /// session whose step fails, and its error alone does not say which.
+    step: Option<(&'static str, LedgerId)>,
+    last_error_at: Option<(&'static str, LedgerId)>,
     /// The last intent the owner refused before admission, by kind and
     /// failure, cleared by the next intent that commits (24 §7).
     last_refusal: Option<String>,
     /// The kind of intent `last_refusal` is about: a commit of another kind
     /// does not clear it.
     last_refusal_kind: Option<&'static str>,
+    /// How many intents of that kind were refused since one of it last committed.
+    last_refusals: u64,
+    /// The partition intents the owner refused before admission, for the operator's view.
+    partition_refused: u64,
     /// The pending intent the owner has not decided yet, asked again each
     /// pass: which journal, its kind and sequence, how many times it was
     /// asked and the last answer. A pass that resolves it clears it; an
@@ -640,8 +648,12 @@ impl PlacementAgent {
             last_load: BTreeMap::new(),
             last_ready: None,
             last_error: None,
+            step: None,
+            last_error_at: None,
             last_refusal: None,
             last_refusal_kind: None,
+            last_refusals: 0,
+            partition_refused: 0,
             retrying: None,
             session_leaders: BTreeMap::new(),
             ticks: 0,
@@ -785,14 +797,17 @@ impl PlacementAgent {
                         // Each job's future, and the tick's, is built in a frame of its own
                         // and boxed: this loop's poll frame holds a pointer to whichever
                         // runs, not room for every one of them.
+                        self.step = None;
                         let pause = match focal_rt::boxed(|| self.tick(handles, pool)).await {
                             Ok(_) => {
                                 self.last_error = None;
+                                self.last_error_at = None;
                                 TICK
                             }
                             Err(error) => {
                                 let retry = error.retryable();
                                 self.last_error = Some(error);
+                                self.last_error_at = self.step;
                                 if retry { TICK } else { BACKOFF }
                             }
                         };
@@ -1218,20 +1233,26 @@ impl PlacementAgent {
                 return Ok(step);
             }
             for descriptor in directory.sessions.values() {
+                let ledger = descriptor.ledger;
+                self.step = Some(("members", ledger));
                 Self::sync_members(handles, descriptor, directory).await?;
+                self.step = Some(("custody", ledger));
                 self.sync_custody(handles, descriptor, directory).await?;
+                self.step = Some(("plan request", ledger));
                 if let Some(step) = self
                     .answer_plan_request(handles, descriptor, directory, snapshot, installed, now)
                     .await?
                 {
                     return Ok(step);
                 }
+                self.step = Some(("install", ledger));
                 if let Some(step) = self
                     .install_assignment(handles, access, pool, descriptor, snapshot, installed, now)
                     .await?
                 {
                     return Ok(step);
                 }
+                self.step = Some(("readiness", ledger));
                 if let Some(step) = self
                     .report_ready(handles, access, pool, descriptor, snapshot, installed, now)
                     .await?
@@ -1239,6 +1260,7 @@ impl PlacementAgent {
                     return Ok(step);
                 }
             }
+            self.step = None;
             if let PartitionAccess::Local(host) = access {
                 let progress = host.progress();
                 if progress.leader == progress.node
@@ -1256,6 +1278,7 @@ impl PlacementAgent {
                     return Ok(step);
                 }
                 for descriptor in directory.sessions.values() {
+                    self.step = Some(("control", descriptor.ledger));
                     if let Some(step) = self
                         .control(
                             handles, pool, descriptor, directory, snapshot, installed, &root, now,
@@ -1265,6 +1288,7 @@ impl PlacementAgent {
                         return Ok(step);
                     }
                 }
+                self.step = None;
             }
         }
         Ok(AgentStep::Idle)
@@ -3446,14 +3470,28 @@ impl PlacementAgent {
             return Ok(None);
         }
         let expected = self.custody.get(&descriptor.ledger).copied();
+        let began = focal_rt::time::Instant::now();
         let custody = handles.content.verify_prefix(evidence, expected).await?;
+        // What a readiness verification read, and how long the closed session waited on it.
+        let manifest = custody.manifest();
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "focal: readiness of {}/{} verified {} artifacts, {} objects of {} bytes, in {} ms",
+            descriptor.ledger.tenant,
+            descriptor.ledger.session,
+            manifest.verified_artifacts,
+            manifest.verified_content_references,
+            manifest.verified_content_bytes,
+            began.elapsed().as_millis(),
+        );
         let mut ready = ReplicaReady {
             ledger: descriptor.ledger,
             operation: plan.operation,
             route_epoch: plan.next_route,
             node,
             node_generation: progress.node_generation,
-            through: custody.manifest().prefix.sequence,
+            through: manifest.prefix.sequence,
             custody: custody.digest(),
             attestation: ContentHash([0; 32]),
         };
@@ -3572,13 +3610,28 @@ impl PlacementAgent {
                     sum.saturating_add(journal.completed())
                 })
             }),
+            partition_refused: self.partition_refused,
             installed: self
                 .installs
                 .as_ref()
                 .map(|installs| installs.record.installed.keys().copied().collect())
                 .unwrap_or_default(),
-            last_error: self.last_error.as_ref().map(|error| error.to_string()),
-            last_refusal: self.last_refusal.clone(),
+            last_error: self
+                .last_error
+                .as_ref()
+                .map(|error| match self.last_error_at {
+                    Some((step, ledger)) => {
+                        format!("{step} of {}/{}: {error}", ledger.tenant, ledger.session)
+                    }
+                    None => error.to_string(),
+                }),
+            last_refusal: self.last_refusal.as_ref().map(|refusal| {
+                if self.last_refusals > 1 {
+                    format!("{refusal} ({} in a row)", self.last_refusals)
+                } else {
+                    refusal.clone()
+                }
+            }),
             retrying: self.retrying.as_ref().map(Retrying::describe),
         }
     }
@@ -3624,9 +3677,18 @@ impl PlacementAgent {
             IntentOutcome::Committed(_) if self.last_refusal_kind == Some(kind) => {
                 self.last_refusal = None;
                 self.last_refusal_kind = None;
+                self.last_refusals = 0;
             }
             IntentOutcome::Committed(_) | IntentOutcome::Retry(_) => {}
             IntentOutcome::Refused(failure) => {
+                if journal == IntentJournalKind::Partition {
+                    self.partition_refused = self.partition_refused.saturating_add(1);
+                }
+                self.last_refusals = if self.last_refusal_kind == Some(kind) {
+                    self.last_refusals.saturating_add(1)
+                } else {
+                    1
+                };
                 self.last_refusal = Some(format!("{kind}: {failure}"));
                 self.last_refusal_kind = Some(kind);
             }

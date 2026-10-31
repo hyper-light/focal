@@ -220,6 +220,8 @@ pub struct AgentStatus {
     pub node: u64,
     pub root_intents: u64,
     pub partition_intents: u64,
+    /// The partition intents the owner refused before admission.
+    pub partition_refused: u64,
     pub installed: Vec<focal_model::LedgerId>,
     pub last_error: Option<String>,
     /// The last intent the owner refused before admission (24 §7).

@@ -153,6 +153,7 @@ impl LocalNetworkAdmin {
                         focal_client::admin::AdminPlacementAgent {
                             root_intents: status.root_intents,
                             partition_intents: status.partition_intents,
+                            partition_refused: status.partition_refused,
                             installed: status
                                 .installed
                                 .iter()

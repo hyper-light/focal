@@ -122,6 +122,42 @@ enum Command {
     #[cfg(test)]
     Hold(mpsc::Receiver<()>),
 }
+impl Command {
+    /// The call's name in a line about it.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Request(_) => "request",
+            Self::Install(_) => "install",
+            Self::Replace(..) => "replace",
+            Self::Check(_) => "check",
+            Self::Export(..) => "export",
+            Self::Chunk(..) => "chunk",
+            Self::Read(..) => "read",
+            Self::Seal(..) => "seal",
+            Self::SealImport(..) => "seal import",
+            Self::SealBundle(..) => "seal bundle",
+            Self::Policy(_) => "policy",
+            Self::AnnouncePending(..) => "announce pending",
+            Self::Verify(_) => "verify",
+            Self::VerifyNative(_) => "verify native",
+            Self::RecordReceipt(..) => "record receipt",
+            Self::Receipt(..) => "receipt",
+            Self::Policies => "policies",
+            Self::Protect(_) => "protect",
+            Self::Collect(..) => "collect",
+            Self::Restore(..) => "restore",
+            Self::RestoreContent(..) => "restore content",
+            Self::DiskStats => "disk stats",
+            Self::ConversionStatus => "conversion status",
+            Self::CustodyStats => "custody stats",
+            Self::Advance(_) => "advance",
+            Self::RestoreAdvance(..) => "restore advance",
+            Self::Stop => "stop",
+            #[cfg(test)]
+            Self::Hold(_) => "hold",
+        }
+    }
+}
 /// A custody request whose answer waits on a pass over a whole object (the
 /// audit's F51): the pass, which the store keeps, and the reply it answers
 /// under once the pass is done.
@@ -163,6 +199,8 @@ enum Output {
 struct Work {
     command: Command,
     result: OneshotSender<Result<Output, AccessError>>,
+    /// When the call began: its caller waits for the answer until a timeout past it.
+    asked: Instant,
     _allocation: Allocation,
 }
 impl ContentHost {
@@ -278,11 +316,27 @@ impl ContentHost {
                             let Work {
                                 command,
                                 result,
+                                asked,
                                 _allocation: allocation,
                             } = work;
                             let stop = matches!(command, Command::Stop);
+                            let (name, taken) = (command.name(), Instant::now());
                             let outcome =
                                 execute(&mut owner, command, &limits, &worker_budget, &mut scratch);
+                            // An answer its caller stopped waiting for (the caller says the
+                            // outcome is unknown) is said here: the call, how long it waited for
+                            // the owner and how long the owner took over it.
+                            let done = Instant::now();
+                            if done.saturating_duration_since(asked) >= timeout {
+                                use std::io::Write as _;
+                                let _ = writeln!(
+                                    std::io::stderr().lock(),
+                                    "focal: the content owner answered a {name} call after its caller's {} ms: {} ms waiting, {} ms taken",
+                                    timeout.as_millis(),
+                                    taken.saturating_duration_since(asked).as_millis(),
+                                    done.saturating_duration_since(taken).as_millis(),
+                                );
+                            }
                             // Requests and decode staging are gone before the
                             // caller observes completion. Output carries its
                             // separate owned permit through the handoff.
@@ -358,6 +412,7 @@ impl ContentHost {
         let mut work = Work {
             command,
             result: send,
+            asked: Instant::now(),
             _allocation: allocation,
         };
         let mut first = false;
@@ -427,6 +482,7 @@ impl ContentHost {
             .try_send(Work {
                 command: Command::Hold(held),
                 result,
+                asked: Instant::now(),
                 _allocation: allocation,
             })
             .map_err(|_| AccessError::Capacity)?;

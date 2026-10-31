@@ -236,6 +236,21 @@ node_report() {
   # Its health (the placement agent's last error among it) and its log's end, for what a fault left.
   timeout 30 "${compose[@]}" --profile focal exec -T "$n" focal --data-dir /data inspect node --health \
     > "$out/$report.$n.health.json" 2>/dev/null || true
+  # A copy its placement agent installed during the run (a voter a move brought in) as well.
+  for session in $(python3 -c '
+import json, sys
+try:
+    agent = json.load(open(sys.argv[1]))["result"]["health"]["placement"] or {}
+except (OSError, ValueError, KeyError, TypeError):
+    agent = {}
+held = set(sys.argv[2:])
+for ledger in agent.get("installed", []):
+    session = ledger.split("/")[-1]
+    if session not in held:
+        print(session)' "$out/$report.$n.health.json" $(held_sessions "$n" other) $(held_sessions "$n" bench)); do
+    timeout 30 "${compose[@]}" --profile focal exec -T "$n" focal --data-dir /data inspect replicas --replicas \
+      --session "$session" > "$out/$report.$n.${session:0:8}.replicas.json" 2>/dev/null || true
+  done
   timeout 30 "${compose[@]}" --profile focal logs --no-color --tail 300 "$n" > "$out/$report.$n.log" 2>&1 || true
 }
 cleanup() { dc down -v --remove-orphans >/dev/null 2>&1 || true; }

@@ -147,6 +147,10 @@ pub struct AdminSessionReadiness {
 pub struct AdminPlacementAgent {
     pub root_intents: u64,
     pub partition_intents: u64,
+    /// The partition intents the directory refused before admission (its compare among them),
+    /// each replanned from a fresh observation.
+    #[serde(default)]
+    pub partition_refused: u64,
     pub installed: Vec<String>,
     pub last_error: Option<String>,
     /// The last intent the directory or root refused before admission,
