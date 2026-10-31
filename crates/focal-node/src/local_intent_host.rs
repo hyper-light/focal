@@ -35,49 +35,31 @@ impl std::fmt::Debug for LocalIntentFailure {
 }
 type IntentResult = Result<PrivateJournal, LocalIntentError>;
 
-/// Retries only definite admission rejection, preserving the original bytes.
-/// A bounded deadline prevents a stalled writer/admission path from pinning a
-/// controller's authorization projection indefinitely.
+/// Writes the journal through its owner and waits for the owner's answer, which comes once the
+/// write is durable or failed, or as the owner stops. A write the owner did not admit (its queue
+/// or memory full) is answered at once with the journal back, for its caller to ask again on its
+/// next pass. An admitted write was given 5 s of the wall's clock, and one that took longer
+/// was let go with the journal it held: every later write found none, and the node's network
+/// controller or placement intents stopped for good. Under the load of a 33-node run on a busy
+/// host the founder's root network owner stopped so in two runs' bootstraps and twelve nodes'
+/// placement intents in a third (fedora, 2026-10-30): a slow disk was made a permanent failure.
 pub(crate) async fn save_local_intent(
     host: &ControlHost,
     journal: &mut Option<PrivateJournal>,
-    mut bytes: Vec<u8>,
+    bytes: Vec<u8>,
 ) -> Result<(), LocalIntentError> {
     if bytes.len() > 60 * 1024 {
         return Err(LocalIntentError::Capacity);
     }
-    let deadline = Instant::now()
-        .checked_add(Duration::from_secs(5))
-        .ok_or(LocalIntentError::Capacity)?;
-    loop {
-        let owner = journal.take().ok_or(LocalIntentError::Unavailable)?;
-        // An admitted write may still complete after timeout. Drop its future
-        // and recover the original disk record before any subsequent request.
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match focal_rt::time::timeout(remaining, host.persist_local_intent(owner, bytes)).await {
-            Ok(Ok(owner)) => {
-                *journal = Some(owner);
-                return Ok(());
-            }
-            Ok(Err(LocalIntentFailure {
-                error: LocalIntentError::Capacity,
-                rejected: Some(rejected),
-            })) => {
-                let (owner, returned) = *rejected;
-                *journal = Some(owner);
-                bytes = returned;
-                if Instant::now() >= deadline {
-                    return Err(LocalIntentError::Capacity);
-                }
-                focal_rt::time::sleep(Duration::from_millis(10))
-                    .await
-                    .map_err(|_| LocalIntentError::Unavailable)?;
-            }
-            Ok(Err(failure)) => {
-                *journal = failure.rejected.map(|rejected| rejected.0);
-                return Err(failure.error);
-            }
-            Err(_) => return Err(LocalIntentError::Unavailable),
+    let owner = journal.take().ok_or(LocalIntentError::Unavailable)?;
+    match host.persist_local_intent(owner, bytes).await {
+        Ok(owner) => {
+            *journal = Some(owner);
+            Ok(())
+        }
+        Err(failure) => {
+            *journal = failure.rejected.map(|rejected| rejected.0);
+            Err(failure.error)
         }
     }
 }

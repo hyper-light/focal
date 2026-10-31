@@ -806,6 +806,9 @@ EOF
     # Each write's intended start and latency, for where its tail falls in time.
     dc exec -T focal-load cat "/reports/$report.csv" > "$out/$report.csv" || true
     each "${focal_nodes[@]}" -- node_report || true
+    # The directory's placement as the run left it, beside the one it began with: each session's
+    # route and placement epochs then, read against each replica's own (`inspect replicas`).
+    founder_view "$out/$report.placement-end.json" inspect placement || true
     ;;
   focal-bus | focal-bus-fates) endpoints=focal-bus1:7443,focal-bus2:7443,focal-bus3:7443 ;;
   kafka) endpoints=kafka1:9092,kafka2:9092,kafka3:9092 ;;

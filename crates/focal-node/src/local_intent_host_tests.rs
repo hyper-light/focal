@@ -316,3 +316,45 @@ fn physical_control_owner_persists_canceled_journal_behind_blocked_wal_and_reope
     })
     .unwrap()
 }
+
+/// A journal write the owner admitted is waited for to its answer, however long the disk takes,
+/// and the journal comes back with it for the next write. Given 5 s of the wall's clock, a write
+/// that took longer was let go with the journal it held and every later write found none: the
+/// founder's root network owner, and twelve nodes' placement intents, stopped for good under a
+/// 33-node run's load (fedora, 2026-10-30). The owner here answers once the test takes the write
+/// from its queue, past those 5 s, as a disk under that load did.
+#[test]
+fn an_admitted_journal_write_is_waited_for_and_the_journal_comes_back() {
+    focal_rt::block_on(async move {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("intent");
+        let journal =
+            PrivateJournal::open(&path, &focal_seal::test_keys_beside(&path).unwrap()).unwrap();
+        let budget = MemoryBudget::new(1024 * 1024, 32 * 1024).unwrap();
+        let (host, queue) = queued_host(budget.clone());
+        let mut slot = Some(journal);
+        for (bytes, slow) in [(b"first".as_slice(), true), (b"second".as_slice(), false)] {
+            {
+                let save = save_local_intent(&host, &mut slot, bytes.to_vec());
+                let mut save = std::pin::pin!(save);
+                pending(save.as_mut()).await;
+                if slow {
+                    focal_rt::time::sleep(Duration::from_secs(6)).await.unwrap();
+                    pending(save.as_mut()).await;
+                }
+                let Ok(Work::PersistLocalIntent(write)) = queue.try_recv() else {
+                    panic!("the write was admitted to the owner's queue")
+                };
+                write.persist();
+                save.await.unwrap();
+            }
+            assert_eq!(
+                slot.as_ref().unwrap().read().unwrap().unwrap().as_slice(),
+                bytes
+            );
+        }
+        drop(slot);
+        assert_eq!(budget.stats().used, 0);
+    })
+    .unwrap()
+}

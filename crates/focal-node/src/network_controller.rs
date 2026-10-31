@@ -1404,11 +1404,17 @@ impl NetworkController {
                 {
                     result?;
                 }
+                // A journal write the owner had no room for left its intent pending and the journal
+                // in hand: it is asked again on the next pass.
                 if let Some(admission) = &mut self.admission {
-                    focal_rt::boxed(|| {
+                    match focal_rt::boxed(|| {
                         admission.advance(&self.state, current, &eligible, host, &self.budget)
                     })
-                    .await?;
+                    .await
+                    {
+                        Ok(()) | Err(ControllerError::Capacity) => {}
+                        Err(error) => return Err(error),
+                    }
                 }
             }
             // Each step boxed where it is made: this loop's frame holds pointers, not the steps.
