@@ -200,6 +200,35 @@ does at most one thing:
    compare, an unverified proof, an invalid or foreign command); not-leader,
    not-ready, capacity, unavailable and unknown outcomes keep it pending. A
    restart reopens both journals, so a decision is neither repeated nor lost.
+   A partition command names the partition's revision it was prepared at, and
+   every commit moves it: each node's load report, each liveness verdict and
+   every session's change. From level 13 (§21) a node's enrollment, a load
+   report, a liveness verdict and a session's change are sent as
+   `PartitionOperation::Keyed`, which the owner compares against what each
+   changes alone, as its unkeyed form validates it: an enrollment against its
+   node's record (the generation it replaces), a load report against its node's
+   last (its epoch rises),
+   a verdict against its node's last (it never goes back), a session's decision
+   (a plan, its preparation, cutover, activation, drain, retirement, abort or
+   range holders) against the session's revision, and a copy's report (its
+   progress, its readiness, a refusal naming it) against nothing, since each is
+   validated against the plan as it stands (monotone per attempt, at or beyond
+   what the plan holds, signed by the copy). An operation compared against the
+   whole partition lost that compare to every commit between the pass it was
+   prepared in and the pass it was sent in: on 33 nodes the partition took a
+   commit every second or so and refused 7,576 of 8,868 intents (fleet33 c7,
+   2026-10-31), each refusal a journal write and a round trip, and a move's
+   readiness, prepared a whole verification of the session before it was sent,
+   was refused until its run ended, the session closed to every write (c6,
+   2026-10-30). A command's evidence names the authority's and the enrollment's
+   revisions it was prepared under, which every client's enrollment moves: with
+   keyed operations the partition still refused 1,080 load reports and 205
+   enrollments at that compare while 500 agents enrolled (c9, 2026-10-31), so a
+   keyed operation's evidence is verified by its proofs against the authority
+   and enrollment as they stand (`current_verifier`), its decision time still
+   checked. Creating a session, once per session, and the structural operations
+   (sealing, releasing, absorbing and installing a partition) keep both
+   compares.
 2. **Register the founder's session.** From the hosted replica's exported
    facts (`ReplicaHost::registration_facts`, read on the owner thread) the
    agent captures the existing `FirstSessionPlan`, submits the root
@@ -1841,6 +1870,12 @@ A partition is given the root's enrollment as its nodes alone from level 12
 partition's copies of one revision byte for byte, and would refuse the nodes'
 copy its peers at the level take, so the root's permit projects the registry
 only once the fence opens the level, and carries it whole below it.
+A node's enrollment, a load report, a liveness verdict and a session's change
+are compared against what each changes alone from level 13 (`upgrade::KEYED_LEVEL`; §7,
+`PartitionOperation::Keyed`): a binary below the level cannot decode the
+operation, so the agent sends it only once the fence it observes from the root
+opens the level, and sends the unkeyed forms, compared against the whole
+partition, below it.
 A cluster founded by a binary holds the fence at the level
 its founder *announces* from genesis (its one node runs it; a founder
 staging a rollout at a lower level founds at that level, never at one it

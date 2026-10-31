@@ -154,6 +154,7 @@ impl LocalNetworkAdmin {
                             root_intents: status.root_intents,
                             partition_intents: status.partition_intents,
                             partition_refused: status.partition_refused,
+                            refused_by: status.refused_by,
                             installed: status
                                 .installed
                                 .iter()

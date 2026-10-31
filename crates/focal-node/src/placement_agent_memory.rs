@@ -76,6 +76,7 @@ impl PlacementAgent {
             map_bytes::<focal_directory::PartitionId, u64>(self.partition_leaders.len()),
             map_bytes::<u64, u64>(self.member_facts.len()),
             map_bytes::<LedgerId, (ContentHash, u64)>(self.verified_active.len()),
+            map_bytes::<(&'static str, &'static str), u64>(self.refusals.len()),
             map_bytes::<LedgerId, (focal_directory::DurabilityIntent, Vec<(PlanReply, bool)>)>(
                 self.plan_requests.len(),
             ),

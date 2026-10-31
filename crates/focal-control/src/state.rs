@@ -584,10 +584,17 @@ impl Machine {
                 },
                 ControlCommand::VerifiedPartition(command),
             ) => {
-                if directory.revision() != command.command.expected_revision {
+                // A keyed operation is compared against what it changes alone, its evidence by its
+                // proofs against the authority as it stands (24 §7).
+                let compares = command.command.operation.compares_partition();
+                if compares && directory.revision() != command.command.expected_revision {
                     return Err(focal_directory::DirectoryError::CompareFailed.into());
                 }
-                let verifier = authority.verifier(None, &command.evidence)?;
+                let verifier = if compares {
+                    authority.verifier(None, &command.evidence)?
+                } else {
+                    authority.current_verifier(None, &command.evidence)?
+                };
                 Ok(PreparedMachine::Partition {
                     update: directory.prepare(&command.command, &verifier)?,
                     decided_at: Some(command.evidence.decided_at),

@@ -1476,3 +1476,226 @@ fn the_control_groups_voters_are_measured_by_the_sessions_rule() {
         .collect();
     assert_eq!(on_nodes, voters.blocked_by);
 }
+
+/// Prepare and publish `operation` as it was prepared when the partition stood at `revision`.
+fn attempt_at(
+    partition: &mut DirectoryPartition,
+    revision: u64,
+    operation: PartitionOperation,
+) -> Result<(), DirectoryError> {
+    let command = PartitionCommand {
+        expected_revision: revision,
+        delegation_epoch: partition.checkpoint().delegation.epoch,
+        operation,
+    };
+    let encoded = postcard::to_allocvec(&command).unwrap();
+    let replay: PartitionCommand = postcard::from_bytes(&encoded).unwrap();
+    let prepared = partition.prepare(&replay, &Evidence)?;
+    partition.publish(prepared)
+}
+
+/// Operations prepared before another commit to their partition, as an agent's intent is prepared
+/// a pass before it is sent (fleet33 c6, 2026-10-30: a move's readiness refused at the partition's
+/// compare until the run ended; c7, 2026-10-31: 7,576 of 8,868 intents refused): each unkeyed form
+/// compares the whole partition's revision and is refused by a commit that had nothing to do with
+/// it; a keyed one compares what it changes alone (a load report its node's last report, a
+/// session's decision its session's revision, a copy's report nothing), still validated as its
+/// unkeyed form is.
+#[test]
+fn a_keyed_operation_is_compared_against_what_it_changes_alone() {
+    let mut directory = partition(PartitionConfig::default());
+    planned(&mut directory, &regional());
+    change(
+        &mut directory,
+        SessionChange::BeginPreparation { operation: OP },
+    );
+    // Every change below is prepared here...
+    let at = directory.revision();
+    let revision = session(&directory).revision;
+    // ...and a node's load report commits before any of them is sent.
+    apply(
+        &mut directory,
+        PartitionOperation::ReportLoad {
+            load: load(1, 2, 1 << 30),
+        },
+    );
+    let whole = |expected_revision: u64, change: SessionChange| PartitionOperation::Session {
+        ledger: ledger(),
+        expected_revision,
+        change,
+    };
+    let scoped = |expected_revision: Option<u64>, change: SessionChange| {
+        PartitionOperation::Keyed(KeyedOperation::Session {
+            ledger: ledger(),
+            expected_revision,
+            change: Box::new(change),
+        })
+    };
+    assert_eq!(
+        attempt_at(
+            &mut directory,
+            at,
+            whole(revision, report(1, AssignmentPhase::Installed, 0))
+        ),
+        Err(DirectoryError::CompareFailed)
+    );
+    attempt_at(
+        &mut directory,
+        at,
+        scoped(Some(revision), report(1, AssignmentPhase::Installed, 0)),
+    )
+    .unwrap();
+    assert_eq!(
+        plan(&directory).progress[&1].phase,
+        AssignmentPhase::Installed
+    );
+    // The session moved on with that report; another copy's, prepared at the same point, is
+    // compared against nothing and is as true as it was.
+    attempt_at(
+        &mut directory,
+        at,
+        scoped(None, report(2, AssignmentPhase::Installed, 0)),
+    )
+    .unwrap();
+    assert_eq!(
+        plan(&directory).progress[&2].phase,
+        AssignmentPhase::Installed
+    );
+    // A report is still validated against the plan: progress never moves backwards.
+    attempt_at(
+        &mut directory,
+        at,
+        scoped(None, report(3, AssignmentPhase::CaughtUp, 3)),
+    )
+    .unwrap();
+    assert_eq!(
+        attempt_at(
+            &mut directory,
+            at,
+            scoped(None, report(3, AssignmentPhase::CaughtUp, 2))
+        ),
+        Err(DirectoryError::StaleEpoch)
+    );
+    // A decision is compared against its session's revision, which moved...
+    assert_eq!(
+        attempt_at(
+            &mut directory,
+            at,
+            scoped(
+                Some(revision),
+                SessionChange::BeginPreparation { operation: OP }
+            )
+        ),
+        Err(DirectoryError::CompareFailed)
+    );
+    // ...and one that names none is refused before it is prepared.
+    assert!(matches!(
+        attempt_at(
+            &mut directory,
+            at,
+            scoped(None, SessionChange::BeginPreparation { operation: OP })
+        ),
+        Err(DirectoryError::Invalid(_))
+    ));
+    // A node's load report prepared at the same point: refused unkeyed, committed keyed, and a
+    // keyed one whose epoch does not rise past the node's is still refused.
+    assert_eq!(
+        attempt_at(
+            &mut directory,
+            at,
+            PartitionOperation::ReportLoad {
+                load: load(2, 2, 1 << 30)
+            }
+        ),
+        Err(DirectoryError::CompareFailed)
+    );
+    attempt_at(
+        &mut directory,
+        at,
+        PartitionOperation::Keyed(KeyedOperation::ReportLoad {
+            load: load(2, 2, 1 << 30),
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        directory.checkpoint().nodes[&2]
+            .load
+            .map(|load| load.report),
+        Some(2)
+    );
+    assert_eq!(
+        attempt_at(
+            &mut directory,
+            at,
+            PartitionOperation::Keyed(KeyedOperation::ReportLoad {
+                load: load(2, 2, 1 << 30),
+            })
+        ),
+        Err(DirectoryError::StaleNode)
+    );
+    // Likewise the detector's verdict about a node: a keyed one never goes back.
+    let verdict = |keyed: bool| {
+        let (node, generation, alive, incarnation, witness, decided_at) = (3, 1, false, 1, 1, 1);
+        if keyed {
+            PartitionOperation::Keyed(KeyedOperation::Liveness {
+                node,
+                generation,
+                alive,
+                incarnation,
+                witness,
+                decided_at,
+            })
+        } else {
+            PartitionOperation::Liveness {
+                node,
+                generation,
+                alive,
+                incarnation,
+                witness,
+                decided_at,
+            }
+        }
+    };
+    assert_eq!(
+        attempt_at(&mut directory, at, verdict(false)),
+        Err(DirectoryError::CompareFailed)
+    );
+    attempt_at(&mut directory, at, verdict(true)).unwrap();
+    assert_eq!(
+        directory.checkpoint().nodes[&3]
+            .liveness
+            .map(|liveness| liveness.alive),
+        Some(false)
+    );
+    assert_eq!(
+        attempt_at(&mut directory, at, verdict(true)),
+        Err(DirectoryError::StaleNode)
+    );
+    // And a node's enrollment, compared against the node's record: a fourth node enrolled from
+    // the same point, refused unkeyed, committed keyed, and enrolled again over a generation it
+    // no longer holds refused.
+    let enroll = |keyed: bool, expected_generation: Option<u64>| {
+        let node = enrollment(4);
+        if keyed {
+            PartitionOperation::Keyed(KeyedOperation::Enroll {
+                node,
+                expected_generation,
+            })
+        } else {
+            PartitionOperation::Enroll {
+                node,
+                expected_generation,
+            }
+        }
+    };
+    assert_eq!(
+        attempt_at(&mut directory, at, enroll(false, None)),
+        Err(DirectoryError::CompareFailed)
+    );
+    attempt_at(&mut directory, at, enroll(true, None)).unwrap();
+    assert!(directory.checkpoint().nodes.contains_key(&4));
+    assert_eq!(
+        attempt_at(&mut directory, at, enroll(true, None)),
+        Err(DirectoryError::CompareFailed)
+    );
+}

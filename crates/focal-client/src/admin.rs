@@ -151,6 +151,9 @@ pub struct AdminPlacementAgent {
     /// each replanned from a fresh observation.
     #[serde(default)]
     pub partition_refused: u64,
+    /// Those refusals by intent kind and failure.
+    #[serde(default)]
+    pub refused_by: Vec<String>,
     pub installed: Vec<String>,
     pub last_error: Option<String>,
     /// The last intent the directory or root refused before admission,

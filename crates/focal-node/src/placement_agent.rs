@@ -38,9 +38,9 @@ use focal_control::{
     VerifiedPartitionCommand,
 };
 use focal_directory::{
-    AssignmentPhase, AssignmentProgress, Delegation, NodeLoad, OperationId, PartitionCheckpoint,
-    PartitionCommand, PartitionId, PartitionOperation, PlacementPhase, ReplicaReady, SessionChange,
-    SessionDescriptor, roles_of,
+    AssignmentPhase, AssignmentProgress, Delegation, KeyedOperation, NodeLoad, OperationId,
+    PartitionCheckpoint, PartitionCommand, PartitionId, PartitionOperation, PlacementPhase,
+    ReplicaReady, SessionChange, SessionDescriptor, roles_of,
 };
 use focal_enrollment::{CredentialMaterial, PrivateJournal};
 use focal_ledger::{LedgerError, Session, SessionLimits};
@@ -491,8 +491,13 @@ pub struct PlacementAgent {
     last_refusal_kind: Option<&'static str>,
     /// How many intents of that kind were refused since one of it last committed.
     last_refusals: u64,
-    /// The partition intents the owner refused before admission, for the operator's view.
+    /// The partition intents the owner refused before admission, for the operator's view, in all
+    /// and by kind and failure (a row per kind and failure at most).
     partition_refused: u64,
+    refusals: BTreeMap<(&'static str, &'static str), u64>,
+    /// Whether the fence opens `KEYED_LEVEL`: load reports, liveness verdicts and session changes
+    /// are then sent compared against what each changes alone (`PartitionOperation::Keyed`).
+    keyed: bool,
     /// The pending intent the owner has not decided yet, asked again each
     /// pass: which journal, its kind and sequence, how many times it was
     /// asked and the last answer. A pass that resolves it clears it; an
@@ -654,6 +659,8 @@ impl PlacementAgent {
             last_refusal_kind: None,
             last_refusals: 0,
             partition_refused: 0,
+            refusals: BTreeMap::new(),
+            keyed: false,
             retrying: None,
             session_leaders: BTreeMap::new(),
             ticks: 0,
@@ -1011,6 +1018,9 @@ impl PlacementAgent {
         let unless_held = root
             .fence()
             .is_some_and(|fence| crate::upgrade::opened(fence, crate::upgrade::OBSERVE_LEVEL));
+        self.keyed = root
+            .fence()
+            .is_some_and(|fence| crate::upgrade::opened(fence, crate::upgrade::KEYED_LEVEL));
         // Every partition this node can act on, observed at one prefix each.
         let mut observed: Vec<Observed> = Vec::new();
         for delegation in &delegations {
@@ -1645,13 +1655,31 @@ impl PlacementAgent {
                 }
                 None | Some(_) => {}
             }
-            verdict = Some(PartitionOperation::Liveness {
-                node: *node,
-                generation: member.generation,
-                alive,
-                incarnation: member.incarnation,
-                witness: applied_index.max(1),
-                decided_at: now,
+            let (node, generation, incarnation, witness) = (
+                *node,
+                member.generation,
+                member.incarnation,
+                applied_index.max(1),
+            );
+            // Compared against the node's last verdict alone once every voter decodes it (24 §7).
+            verdict = Some(if self.keyed {
+                PartitionOperation::Keyed(KeyedOperation::Liveness {
+                    node,
+                    generation,
+                    alive,
+                    incarnation,
+                    witness,
+                    decided_at: now,
+                })
+            } else {
+                PartitionOperation::Liveness {
+                    node,
+                    generation,
+                    alive,
+                    incarnation,
+                    witness,
+                    decided_at: now,
+                }
             });
             break;
         }
@@ -3114,9 +3142,17 @@ impl PlacementAgent {
                 command: PartitionCommand {
                     expected_revision: directory.revision,
                     delegation_epoch: directory.delegation.epoch,
-                    operation: PartitionOperation::Enroll {
-                        node: grant.enrollment.clone(),
-                        expected_generation,
+                    // Compared against the node's record alone once every voter decodes it.
+                    operation: if self.keyed {
+                        PartitionOperation::Keyed(KeyedOperation::Enroll {
+                            node: grant.enrollment.clone(),
+                            expected_generation,
+                        })
+                    } else {
+                        PartitionOperation::Enroll {
+                            node: grant.enrollment.clone(),
+                            expected_generation,
+                        }
                     },
                 },
                 evidence: control_evidence(
@@ -3187,7 +3223,12 @@ impl PlacementAgent {
             command: PartitionCommand {
                 expected_revision: directory.revision,
                 delegation_epoch: directory.delegation.epoch,
-                operation: PartitionOperation::ReportLoad { load },
+                // Compared against the node's last report alone once every voter decodes it.
+                operation: if self.keyed {
+                    PartitionOperation::Keyed(KeyedOperation::ReportLoad { load })
+                } else {
+                    PartitionOperation::ReportLoad { load }
+                },
             },
             evidence: control_evidence(
                 installed,
@@ -3381,16 +3422,27 @@ impl PlacementAgent {
         let ControlBootstrap::Partition { directory } = &snapshot.state else {
             return Err(AgentError::Identity);
         };
+        // Once every voter of the partition's group decodes it, a change is compared against
+        // its session alone, and a copy's report against nothing (24 §7).
+        let operation = if self.keyed {
+            PartitionOperation::Keyed(KeyedOperation::Session {
+                ledger: descriptor.ledger,
+                expected_revision: (!change.is_report()).then_some(descriptor.revision),
+                change: Box::new(change),
+            })
+        } else {
+            PartitionOperation::Session {
+                ledger: descriptor.ledger,
+                expected_revision: descriptor.revision,
+                change,
+            }
+        };
         Ok(ControlCommand::VerifiedPartition(
             VerifiedPartitionCommand {
                 command: PartitionCommand {
                     expected_revision: snapshot.revisions.partition,
                     delegation_epoch: directory.delegation.epoch,
-                    operation: PartitionOperation::Session {
-                        ledger: descriptor.ledger,
-                        expected_revision: descriptor.revision,
-                        change,
-                    },
+                    operation,
                 },
                 evidence,
             },
@@ -3611,6 +3663,11 @@ impl PlacementAgent {
                 })
             }),
             partition_refused: self.partition_refused,
+            refused_by: self
+                .refusals
+                .iter()
+                .map(|((kind, failure), count)| format!("{kind}: {failure} x{count}"))
+                .collect(),
             installed: self
                 .installs
                 .as_ref()
@@ -3683,6 +3740,11 @@ impl PlacementAgent {
             IntentOutcome::Refused(failure) => {
                 if journal == IntentJournalKind::Partition {
                     self.partition_refused = self.partition_refused.saturating_add(1);
+                    let count = self
+                        .refusals
+                        .entry((kind, refusal_name(failure)))
+                        .or_insert(0);
+                    *count = count.saturating_add(1);
                 }
                 self.last_refusals = if self.last_refusal_kind == Some(kind) {
                     self.last_refusals.saturating_add(1)
@@ -3900,18 +3962,17 @@ fn planned_session_of(
     let ControlCommand::VerifiedPartition(command) = command else {
         return None;
     };
-    let PartitionOperation::Session {
+    let Some((
         ledger,
-        change: SessionChange::Plan {
+        SessionChange::Plan {
             operation, desired, ..
         },
-        ..
-    } = &command.command.operation
+    )) = command.command.operation.session_change()
     else {
         return None;
     };
     Some((
-        *ledger,
+        ledger,
         *operation,
         desired.placement.voters.keys().copied().collect(),
     ))
@@ -3965,13 +4026,26 @@ fn note_load(
         IntentOutcome::Retry(_) => {}
     }
 }
+/// What refused an intent before admission, as the operator's view counts it.
+fn refusal_name(failure: &ControlFailure) -> &'static str {
+    match failure {
+        ControlFailure::CompareFailed => "compare failed",
+        ControlFailure::Rejected => "rejected",
+        ControlFailure::Unauthorized => "unauthorized",
+        ControlFailure::Invalid => "invalid",
+        ControlFailure::WrongOwner => "wrong owner",
+        _ => "other",
+    }
+}
 /// The generation a pending load report reports at, when the intent is one.
 fn reported_load(command: &ControlCommand) -> Option<u64> {
     match command {
         ControlCommand::VerifiedPartition(VerifiedPartitionCommand {
             command:
                 PartitionCommand {
-                    operation: PartitionOperation::ReportLoad { load },
+                    operation:
+                        PartitionOperation::ReportLoad { load }
+                        | PartitionOperation::Keyed(KeyedOperation::ReportLoad { load }),
                     ..
                 },
             ..
@@ -4022,11 +4096,26 @@ fn intent_kind(command: &ControlCommand) -> &'static str {
             focal_directory::AuthorityOperation::ReleaseGroup { .. } => "authority release group",
         },
         ControlCommand::VerifiedRoot(_) => "verified root",
-        ControlCommand::VerifiedPartition(command) => match &command.command.operation {
-            PartitionOperation::Enroll { .. } => "partition enroll",
-            PartitionOperation::ReportLoad { .. } => "partition load",
-            PartitionOperation::Liveness { .. } => "partition liveness",
-            PartitionOperation::Session { change, .. } => match change {
+        ControlCommand::VerifiedPartition(command) => match (
+            &command.command.operation,
+            command.command.operation.session_change(),
+        ) {
+            (
+                PartitionOperation::Enroll { .. }
+                | PartitionOperation::Keyed(KeyedOperation::Enroll { .. }),
+                _,
+            ) => "partition enroll",
+            (
+                PartitionOperation::ReportLoad { .. }
+                | PartitionOperation::Keyed(KeyedOperation::ReportLoad { .. }),
+                _,
+            ) => "partition load",
+            (
+                PartitionOperation::Liveness { .. }
+                | PartitionOperation::Keyed(KeyedOperation::Liveness { .. }),
+                _,
+            ) => "partition liveness",
+            (_, Some((_, change))) => match change {
                 SessionChange::Plan { .. } => "session plan",
                 SessionChange::BeginPreparation { .. } => "session begin preparation",
                 SessionChange::Ready { .. } => "session ready",

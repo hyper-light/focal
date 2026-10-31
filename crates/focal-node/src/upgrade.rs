@@ -9,7 +9,7 @@ use focal_enrollment::UpgradeFence;
 /// The capability level this binary implements. Raised by a release that
 /// activates behaviour older binaries cannot follow; the fence gates that
 /// behaviour until every node runs such a binary.
-pub const CAPABILITY_LEVEL: u32 = 12;
+pub const CAPABILITY_LEVEL: u32 = 13;
 /// The level at which the issuer succeeds itself (24 §11): a credential
 /// issued under a successor issuer is presented with the predecessor's
 /// endorsement, which a binary below this level cannot verify.
@@ -81,6 +81,18 @@ pub const OBSERVE_LEVEL: u32 = 11;
 /// partition's copies of one revision byte for byte and would refuse the nodes' copy its peers
 /// take, so the projection waits for the fence.
 pub const NODES_AUTHORITY_LEVEL: u32 = 12;
+/// The level at which a node's enrollment, its load reports, the detector's liveness verdicts and
+/// a session's changes are sent to their directory partition compared against what each changes
+/// alone, a copy's report against nothing, and their evidence verified by its proofs against the
+/// authority as it stands (`PartitionOperation::Keyed`, 24 §7), where every operation was compared
+/// against the whole partition's revision, which every commit moves, and against the authority's
+/// and enrollment's, which every client's enrollment moves, while an intent is sent a pass after
+/// it is prepared: on 33 nodes the partition took a commit every second or so and refused 7,576 of
+/// 8,868 intents at those compares (fleet33 c7, 2026-10-31), and a move's readiness, prepared a
+/// whole verification of the session before it was sent, was refused until the run ended, its
+/// session closed to every write (c6, 2026-10-30). A binary below this level cannot decode the
+/// operation, so it is sent only once the fence opens the level.
+pub const KEYED_LEVEL: u32 = 13;
 /// The environment variable that lowers the announced level for a staged
 /// rollout or a rehearsal; it can never raise it.
 pub const ANNOUNCED_LEVEL_ENV: &str = "FOCAL_CAPABILITY_LEVEL";

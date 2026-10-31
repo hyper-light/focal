@@ -198,6 +198,21 @@ impl InstalledAuthority {
             .registry
             .verifier(enrollment, &evidence.proofs, evidence.decided_at)?)
     }
+    /// The verifier of a keyed operation's evidence (24 §7): its proofs against the authority and
+    /// enrollment as they stand, whatever revisions the proposer read them at. An operation
+    /// compared against what it changes alone is not refused because a client enrolled or the
+    /// root committed meanwhile; a proof the authority no longer stands behind still fails.
+    pub(crate) fn current_verifier<'a>(
+        &'a self,
+        local: Option<&'a EnrollmentRegistry>,
+        evidence: &'a ControlEvidence,
+    ) -> Result<InstalledAuthorityVerifier<'a>, ControlError> {
+        let enrollment = self.enrollment(local)?;
+        self.check_time(evidence.decided_at)?;
+        Ok(self
+            .registry
+            .verifier(enrollment, &evidence.proofs, evidence.decided_at)?)
+    }
     pub(crate) fn check_time(&self, now: i64) -> Result<(), ControlError> {
         if now < self.decided_at {
             return Err(focal_directory::DirectoryError::ClockRegression.into());

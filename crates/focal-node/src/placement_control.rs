@@ -9,7 +9,8 @@ use crate::{
 };
 use focal_control::{ControlCommand, ControlFailure, ControlRpc};
 use focal_directory::{
-    AssignmentPhase, AuthorityProof, PartitionOperation, SessionChange, SessionFenceKind,
+    AssignmentPhase, AuthorityProof, KeyedOperation, PartitionOperation, SessionChange,
+    SessionFenceKind,
 };
 use focal_ledger::SessionPlacementRequest;
 use focal_wire::{MAX_PLACEMENT_CONTROL_REQUEST_BYTES, PeerRole, VerifiedRequest};
@@ -126,31 +127,42 @@ pub(crate) fn decode_placement_control(
                 return Err(ControlFailure::Unauthorized);
             };
             let own = match &command.command.operation {
-                PartitionOperation::Enroll { node, .. } => node.node == node_id,
-                PartitionOperation::ReportLoad { load } => load.node == node_id,
+                // A session's change, keyed or not: only the sender's own reports.
+                operation @ (PartitionOperation::Session { .. }
+                | PartitionOperation::Keyed(KeyedOperation::Session { .. })) => {
+                    match operation.session_change().map(|(_, change)| change) {
+                        Some(SessionChange::Ready { ready }) => ready.node == node_id,
+                        // A node reports its own installation and, from its own
+                        // applied and committed indexes, its catch-up; custody is
+                        // proven by readiness and promotion decided by the controller.
+                        Some(SessionChange::Progress { progress, .. }) => {
+                            progress.node == node_id
+                                && matches!(
+                                    progress.phase,
+                                    AssignmentPhase::Assigned
+                                        | AssignmentPhase::Installed
+                                        | AssignmentPhase::CaughtUp
+                                )
+                        }
+                        _ => false,
+                    }
+                }
+                PartitionOperation::Enroll { node, .. }
+                | PartitionOperation::Keyed(KeyedOperation::Enroll { node, .. }) => {
+                    node.node == node_id
+                }
+                PartitionOperation::ReportLoad { load }
+                | PartitionOperation::Keyed(KeyedOperation::ReportLoad { load }) => {
+                    load.node == node_id
+                }
                 // A verdict about a node is the partition leader's own
                 // detector's to commit, never a node's word over the wire.
                 PartitionOperation::Liveness { .. }
+                | PartitionOperation::Keyed(KeyedOperation::Liveness { .. })
                 | PartitionOperation::SealForSplit { .. }
                 | PartitionOperation::Release { .. }
                 | PartitionOperation::Absorb { .. }
                 | PartitionOperation::Install { .. } => false,
-                PartitionOperation::Session { change, .. } => match change {
-                    SessionChange::Ready { ready } => ready.node == node_id,
-                    // A node reports its own installation and, from its own
-                    // applied and committed indexes, its catch-up; custody is
-                    // proven by readiness and promotion decided by the controller.
-                    SessionChange::Progress { progress, .. } => {
-                        progress.node == node_id
-                            && matches!(
-                                progress.phase,
-                                AssignmentPhase::Assigned
-                                    | AssignmentPhase::Installed
-                                    | AssignmentPhase::CaughtUp
-                            )
-                    }
-                    _ => false,
-                },
                 // A node registers a session it created alone: a placement
                 // whose only voter, materializer and copy is the sender, under
                 // the creation fence the partition verifies by proof (24 §16).
@@ -220,8 +232,9 @@ pub struct AgentStatus {
     pub node: u64,
     pub root_intents: u64,
     pub partition_intents: u64,
-    /// The partition intents the owner refused before admission.
+    /// The partition intents the owner refused before admission, in all and by kind and failure.
     pub partition_refused: u64,
+    pub refused_by: Vec<String>,
     pub installed: Vec<focal_model::LedgerId>,
     pub last_error: Option<String>,
     /// The last intent the owner refused before admission (24 §7).

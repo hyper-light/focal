@@ -216,6 +216,60 @@ pub enum PartitionOperation {
         expected_revision: u64,
         change: SessionChange,
     },
+    /// An operation compared against what it changes alone, never against the partition's
+    /// revision, and its evidence verified by its proofs against the authority as it stands
+    /// rather than refused because the authority moved on (24 §7). Every other operation compares
+    /// the whole partition's revision, which every commit moves (each node's load report, each
+    /// liveness verdict, every session's change), and the authority's and enrollment's revisions,
+    /// which every client's enrollment moves, so each refuses an operation prepared before it,
+    /// and an intent prepared a pass before it is sent loses those compares as often as they move
+    /// in between. Proposed only once the fence opens the level that decodes it.
+    Keyed(KeyedOperation),
+}
+impl PartitionOperation {
+    /// Whether the command is compared against the partition's revision: every operation but a
+    /// keyed one is.
+    pub fn compares_partition(&self) -> bool {
+        !matches!(self, Self::Keyed(_))
+    }
+    /// The session a session change is to and the change, keyed or not.
+    pub fn session_change(&self) -> Option<(LedgerId, &SessionChange)> {
+        match self {
+            Self::Session { ledger, change, .. } => Some((*ledger, change)),
+            Self::Keyed(KeyedOperation::Session { ledger, change, .. }) => {
+                Some((*ledger, change.as_ref()))
+            }
+            _ => None,
+        }
+    }
+}
+/// A keyed operation (`PartitionOperation::Keyed`): what it changes and what it is compared
+/// against, each as its unkeyed form validates it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KeyedOperation {
+    /// A node's enrollment, compared against the node's record: the generation it replaces.
+    Enroll {
+        node: NodeEnrollment,
+        expected_generation: Option<u64>,
+    },
+    /// A node's load report, compared against the node's last: its report epoch must rise.
+    ReportLoad { load: NodeLoad },
+    /// The detector's verdict about a node, compared against the node's last: it never goes back.
+    Liveness {
+        node: u64,
+        generation: u64,
+        alive: bool,
+        incarnation: u64,
+        witness: u64,
+        decided_at: i64,
+    },
+    /// A session's change: a decision against the session's revision, a copy's report (its
+    /// progress, readiness or refusal, each validated against the plan as it stands) against none.
+    Session {
+        ledger: LedgerId,
+        expected_revision: Option<u64>,
+        change: Box<SessionChange>,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionChange {
@@ -271,6 +325,19 @@ pub enum SessionChange {
     Holders {
         holders: RangeHolders,
     },
+}
+impl SessionChange {
+    /// Whether the change reports what one copy of a pending plan came to (its progress, its
+    /// readiness, a refusal naming it): validated against the plan as it stands (monotone per
+    /// attempt, at or beyond what the plan holds, signed by the copy), it is as true after any
+    /// other change as before, so a keyed report compares no revision.
+    pub fn is_report(&self) -> bool {
+        match self {
+            Self::Progress { .. } | Self::Ready { .. } => true,
+            Self::Refuse { refusal, .. } => refusal.node.is_some(),
+            _ => false,
+        }
+    }
 }
 #[derive(Debug, Clone, Copy)]
 pub struct PartitionConfig {
@@ -474,7 +541,7 @@ impl DirectoryPartition {
         {
             return Err(DirectoryError::StaleEpoch);
         }
-        if command.expected_revision != self.revision() {
+        if command.operation.compares_partition() && command.expected_revision != self.revision() {
             return Err(DirectoryError::CompareFailed);
         }
         if command.delegation_epoch != self.root.state.delegation.epoch {
@@ -486,7 +553,8 @@ impl DirectoryPartition {
             .checked_add(1)
             .ok_or(DirectoryError::CounterExhausted)?;
         let extra = match &command.operation {
-            PartitionOperation::Enroll { node, .. } => {
+            PartitionOperation::Enroll { node, .. }
+            | PartitionOperation::Keyed(KeyedOperation::Enroll { node, .. }) => {
                 add(tree_row::<(u64, NodeRecord)>(), node.endpoint.capacity())?
             }
             PartitionOperation::CreateSession { placement, .. } => add(
@@ -496,13 +564,19 @@ impl DirectoryPartition {
             PartitionOperation::Session { ledger, change, .. } => {
                 partition_session::change_charge(&self.root.state, *ledger, change)?
             }
+            PartitionOperation::Keyed(KeyedOperation::Session { ledger, change, .. }) => {
+                partition_session::change_charge(&self.root.state, *ledger, change)?
+            }
             PartitionOperation::Absorb { moved, .. } => partition_charge(moved)?,
             PartitionOperation::SealForTransfer { .. }
             | PartitionOperation::SealForSplit { .. }
             | PartitionOperation::Release { .. }
             | PartitionOperation::Install { .. }
             | PartitionOperation::ReportLoad { .. }
-            | PartitionOperation::Liveness { .. } => 0,
+            | PartitionOperation::Liveness { .. }
+            | PartitionOperation::Keyed(
+                KeyedOperation::ReportLoad { .. } | KeyedOperation::Liveness { .. },
+            ) => 0,
         };
         let allocation = self
             .budget
@@ -517,7 +591,8 @@ impl DirectoryPartition {
         // epoch they had before it: the log records exactly what changed.
         let touched: Vec<(LedgerId, Option<RouteEpoch>)> = match &command.operation {
             PartitionOperation::CreateSession { ledger, .. }
-            | PartitionOperation::Session { ledger, .. } => {
+            | PartitionOperation::Session { ledger, .. }
+            | PartitionOperation::Keyed(KeyedOperation::Session { ledger, .. }) => {
                 vec![(*ledger, state.sessions.get(ledger).map(|s| s.route_epoch))]
             }
             PartitionOperation::Absorb { moved, .. } => moved
@@ -708,51 +783,14 @@ impl DirectoryPartition {
             PartitionOperation::Enroll {
                 node,
                 expected_generation,
-            } => {
-                let previous = state
-                    .nodes
-                    .get(&node.node)
-                    .map(|old| old.enrollment.generation);
-                if previous != *expected_generation {
-                    return Err(DirectoryError::CompareFailed);
-                }
-                // Any forward generation move is accepted, not only +1: the root
-                // advances a node's generation once per drain/undrain and the
-                // authority snapshot that feeds enrollment holds only the latest
-                // grant, so an intermediate generation may never reach this
-                // partition. The grant is self-contained and authenticated by
-                // verify_enrollment below, and the compare-and-set above pins the
-                // record this decision was made against, so skipping a generation
-                // is safe. Requiring exactly +1 wedged the enrollment permanently.
-                if node.generation <= previous.unwrap_or(0) {
-                    return Err(DirectoryError::StaleNode);
-                }
-                if let Some(old) = state.nodes.get(&node.node)
-                    && node.authority_epoch < old.enrollment.authority_epoch
-                {
-                    return Err(DirectoryError::UnverifiedAuthority);
-                }
-                verifier.verify_enrollment(node)?;
-                Arc::make_mut(&mut state.nodes).insert(
-                    node.node,
-                    NodeRecord {
-                        enrollment: node.clone(),
-                        load: None,
-                        liveness: None,
-                    },
-                );
             }
-            PartitionOperation::ReportLoad { load } => {
-                let node = Arc::make_mut(&mut state.nodes)
-                    .get_mut(&load.node)
-                    .ok_or(DirectoryError::Missing)?;
-                if node.enrollment.generation != load.generation
-                    || node.load.is_some_and(|old| old.report >= load.report)
-                    || load.report == 0
-                {
-                    return Err(DirectoryError::StaleNode);
-                }
-                node.load = Some(*load);
+            | PartitionOperation::Keyed(KeyedOperation::Enroll {
+                node,
+                expected_generation,
+            }) => enroll(&mut state, node, *expected_generation, verifier)?,
+            PartitionOperation::ReportLoad { load }
+            | PartitionOperation::Keyed(KeyedOperation::ReportLoad { load }) => {
+                report_load(&mut state, load)?
             }
             PartitionOperation::Liveness {
                 node,
@@ -761,32 +799,25 @@ impl DirectoryPartition {
                 incarnation,
                 witness,
                 decided_at,
-            } => {
-                let record = Arc::make_mut(&mut state.nodes)
-                    .get_mut(node)
-                    .ok_or(DirectoryError::Missing)?;
-                if record.enrollment.generation != *generation {
-                    return Err(DirectoryError::StaleNode);
-                }
-                // A verdict never goes back: an older incarnation is stale,
-                // and the same incarnation may only change the verdict.
-                if let Some(current) = record.liveness {
-                    if *incarnation < current.incarnation
-                        || (*incarnation == current.incarnation && *alive == current.alive)
-                        || *decided_at < current.decided_at
-                    {
-                        return Err(DirectoryError::StaleNode);
-                    }
-                } else if *alive {
-                    return Err(DirectoryError::Duplicate);
-                }
-                record.liveness = Some(NodeLiveness {
+            }
+            | PartitionOperation::Keyed(KeyedOperation::Liveness {
+                node,
+                generation,
+                alive,
+                incarnation,
+                witness,
+                decided_at,
+            }) => record_liveness(
+                &mut state,
+                *node,
+                *generation,
+                NodeLiveness {
                     alive: *alive,
                     incarnation: *incarnation,
                     witness: *witness,
                     decided_at: *decided_at,
-                });
-            }
+                },
+            )?,
             PartitionOperation::CreateSession {
                 ledger,
                 log_group,
@@ -847,25 +878,26 @@ impl DirectoryPartition {
                 ledger,
                 expected_revision,
                 change,
-            } => {
-                let session = Arc::make_mut(&mut state.sessions)
-                    .get_mut(ledger)
-                    .ok_or(DirectoryError::Missing)?;
-                if session.revision != *expected_revision {
-                    return Err(DirectoryError::CompareFailed);
-                }
-                partition_session::apply_session(
-                    session,
-                    change,
-                    &state.nodes,
-                    self.config,
-                    verifier,
-                )?;
-                session.revision = session
-                    .revision
-                    .checked_add(1)
-                    .ok_or(DirectoryError::CounterExhausted)?;
-            }
+            } => change_session(
+                &mut state,
+                *ledger,
+                Some(*expected_revision),
+                change,
+                self.config,
+                verifier,
+            )?,
+            PartitionOperation::Keyed(KeyedOperation::Session {
+                ledger,
+                expected_revision,
+                change,
+            }) => change_session(
+                &mut state,
+                *ledger,
+                *expected_revision,
+                change,
+                self.config,
+                verifier,
+            )?,
         }
         for (ledger, before) in touched {
             let after = state.sessions.get(&ledger).map(|s| s.route_epoch);
@@ -990,12 +1022,126 @@ fn check_install(
     Ok(fence)
 }
 
+/// Enroll a node, or move it to a later generation: compared against the generation the record
+/// holds (none for a node not yet enrolled), its grant verified.
+fn enroll(
+    state: &mut PartitionCheckpoint,
+    node: &NodeEnrollment,
+    expected_generation: Option<u64>,
+    verifier: &impl AuthorityVerifier,
+) -> Result<(), DirectoryError> {
+    let previous = state
+        .nodes
+        .get(&node.node)
+        .map(|old| old.enrollment.generation);
+    if previous != expected_generation {
+        return Err(DirectoryError::CompareFailed);
+    }
+    // Any forward generation move is accepted, not only +1: the root
+    // advances a node's generation once per drain/undrain and the
+    // authority snapshot that feeds enrollment holds only the latest
+    // grant, so an intermediate generation may never reach this
+    // partition. The grant is self-contained and authenticated by
+    // verify_enrollment below, and the compare-and-set above pins the
+    // record this decision was made against, so skipping a generation
+    // is safe. Requiring exactly +1 wedged the enrollment permanently.
+    if node.generation <= previous.unwrap_or(0) {
+        return Err(DirectoryError::StaleNode);
+    }
+    if let Some(old) = state.nodes.get(&node.node)
+        && node.authority_epoch < old.enrollment.authority_epoch
+    {
+        return Err(DirectoryError::UnverifiedAuthority);
+    }
+    verifier.verify_enrollment(node)?;
+    Arc::make_mut(&mut state.nodes).insert(
+        node.node,
+        NodeRecord {
+            enrollment: node.clone(),
+            load: None,
+            liveness: None,
+        },
+    );
+    Ok(())
+}
+
+/// Record a node's load report: its report epoch must rise past the one the node holds.
+fn report_load(state: &mut PartitionCheckpoint, load: &NodeLoad) -> Result<(), DirectoryError> {
+    let node = Arc::make_mut(&mut state.nodes)
+        .get_mut(&load.node)
+        .ok_or(DirectoryError::Missing)?;
+    if node.enrollment.generation != load.generation
+        || node.load.is_some_and(|old| old.report >= load.report)
+        || load.report == 0
+    {
+        return Err(DirectoryError::StaleNode);
+    }
+    node.load = Some(*load);
+    Ok(())
+}
+
+/// Record the detector's verdict about a node at its enrolled generation.
+fn record_liveness(
+    state: &mut PartitionCheckpoint,
+    node: u64,
+    generation: u64,
+    verdict: NodeLiveness,
+) -> Result<(), DirectoryError> {
+    let record = Arc::make_mut(&mut state.nodes)
+        .get_mut(&node)
+        .ok_or(DirectoryError::Missing)?;
+    if record.enrollment.generation != generation {
+        return Err(DirectoryError::StaleNode);
+    }
+    // A verdict never goes back: an older incarnation is stale,
+    // and the same incarnation may only change the verdict.
+    if let Some(current) = record.liveness {
+        if verdict.incarnation < current.incarnation
+            || (verdict.incarnation == current.incarnation && verdict.alive == current.alive)
+            || verdict.decided_at < current.decided_at
+        {
+            return Err(DirectoryError::StaleNode);
+        }
+    } else if verdict.alive {
+        return Err(DirectoryError::Duplicate);
+    }
+    record.liveness = Some(verdict);
+    Ok(())
+}
+
+/// Apply one session change: compared against the session's revision where it names one, then
+/// validated against the session as it stands, the session's revision counted on.
+fn change_session(
+    state: &mut PartitionCheckpoint,
+    ledger: LedgerId,
+    expected_revision: Option<u64>,
+    change: &SessionChange,
+    config: PartitionConfig,
+    verifier: &impl AuthorityVerifier,
+) -> Result<(), DirectoryError> {
+    let session = Arc::make_mut(&mut state.sessions)
+        .get_mut(&ledger)
+        .ok_or(DirectoryError::Missing)?;
+    if expected_revision.is_some_and(|expected| session.revision != expected) {
+        return Err(DirectoryError::CompareFailed);
+    }
+    partition_session::apply_session(session, change, &state.nodes, config, verifier)?;
+    session.revision = session
+        .revision
+        .checked_add(1)
+        .ok_or(DirectoryError::CounterExhausted)?;
+    Ok(())
+}
+
 fn validate_input(
     operation: &PartitionOperation,
     config: PartitionConfig,
 ) -> Result<(), DirectoryError> {
     match operation {
-        PartitionOperation::Enroll { node, .. } => validate_enrollment(node, config)?,
+        PartitionOperation::Enroll { node, .. }
+        | PartitionOperation::Keyed(KeyedOperation::Enroll { node, .. }) => {
+            validate_enrollment(node, config)?
+        }
         PartitionOperation::Release { delegation }
         | PartitionOperation::Install { delegation }
         | PartitionOperation::Absorb { delegation, .. } => {
@@ -1021,7 +1167,14 @@ fn validate_input(
             witness,
             decided_at,
             ..
-        } => {
+        }
+        | PartitionOperation::Keyed(KeyedOperation::Liveness {
+            node,
+            generation,
+            witness,
+            decided_at,
+            ..
+        }) => {
             if *node == 0 || *generation == 0 || *witness == 0 || *decided_at <= 0 {
                 return Err(DirectoryError::Invalid("node liveness"));
             }
@@ -1033,6 +1186,22 @@ fn validate_input(
             },
             ..
         } => validate_spec_size(placement, config)?,
+        // A decision is compared against the session it was decided on; only a copy's report
+        // stands on its own.
+        PartitionOperation::Keyed(KeyedOperation::Session {
+            expected_revision,
+            change,
+            ..
+        }) => {
+            if expected_revision.is_none() && !change.is_report() {
+                return Err(DirectoryError::Invalid(
+                    "session decision without its revision",
+                ));
+            }
+            if let SessionChange::Plan { desired, .. } = change.as_ref() {
+                validate_spec_size(desired, config)?;
+            }
+        }
         _ => {}
     }
     Ok(())

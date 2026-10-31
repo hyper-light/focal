@@ -1126,3 +1126,123 @@ fn legacy_bootstrap_genesis_and_command_bytes_remain_unchanged() {
     expected.push(2);
     assert_eq!(postcard::to_stdvec(&partition).unwrap(), expected);
 }
+
+/// A keyed partition operation's evidence is verified against the authority as it stands (24 §7):
+/// prepared before the root moved its authority on and the partition installed it, a load report is
+/// refused unkeyed by the evidence's compare (each client's enrollment moves the root's revisions:
+/// on 33 nodes the partition refused 1,080 load reports so while 500 agents enrolled, fleet33 c9,
+/// 2026-10-31), and keyed it reaches what it changes, which alone decides it; its decision time is
+/// still checked.
+#[test]
+fn a_keyed_operation_is_verified_against_the_authority_as_it_stands() {
+    let dirs = tempfile::tempdir().unwrap();
+    let mut roots = activated_roots(dirs.path());
+    let snapshot = roots.snapshot();
+    let delegation = Delegation {
+        namespace: NamespaceRange::all(),
+        partition: PartitionId([3; 16]),
+        region: RegionId::UNKNOWN,
+        log_group: LogGroupId(PART),
+        epoch: 1,
+        activation: None,
+    };
+    roots.commit(ControlCommand::VerifiedRoot(VerifiedRootCommand {
+        command: RootCommand {
+            expected_revision: 0,
+            operation: RootOperation::Delegate { delegation },
+        },
+        evidence: evidence(&snapshot, NOW),
+    }));
+    // The authority every command below was prepared under.
+    let snapshot = roots.snapshot();
+    let directory = DirectoryPartition::new(
+        ClusterId(CLUSTER),
+        delegation,
+        PartitionConfig::default(),
+        budget(),
+    )
+    .unwrap();
+    let mut parts = Group::open(
+        &dirs.path().join("partition"),
+        ControlBootstrap::partition(&directory),
+        PART,
+    );
+    parts.commit(ControlCommand::ActivateAuthority(
+        AuthorityActivation::Partition {
+            expected_partition_revision: 0,
+            snapshot: snapshot.clone(),
+        },
+    ));
+    // The root moves its authority on, and the partition installs it.
+    roots.commit(ControlCommand::Authority(AuthorityCommand {
+        expected_revision: snapshot.authority.revision,
+        enrollment_revision: 1,
+        decided_at: NOW + 1,
+        operation: AuthorityOperation::AdvanceClock,
+    }));
+    let installed = parts.snapshot();
+    parts.commit(ControlCommand::InstallAuthority(AuthorityInstallation {
+        expected_source_index: installed.source_index,
+        decided_at: NOW + 2,
+        snapshot: roots.snapshot(),
+    }));
+    assert_ne!(
+        parts.snapshot().authority.revision,
+        snapshot.authority.revision
+    );
+    let revision = parts.replicas[parts.leader].partition().unwrap().revision();
+    let load = NodeLoad {
+        node: 7,
+        generation: 1,
+        report: 1,
+        available_memory: 1,
+        active_weight: 0,
+        disk_available: 1,
+        capability: 0,
+    };
+    let request = |operation: PartitionOperation, decided_at: i64| ControlRequest {
+        id: ControlRequestId {
+            client: [11; 16],
+            sequence: 1,
+        },
+        acknowledged_through: 0,
+        command: ControlCommand::VerifiedPartition(VerifiedPartitionCommand {
+            command: PartitionCommand {
+                expected_revision: revision,
+                delegation_epoch: 1,
+                operation,
+            },
+            evidence: evidence(&snapshot, decided_at),
+        }),
+    };
+    let leader = parts.leader;
+    assert!(matches!(
+        parts.replicas[leader].submit(
+            request(PartitionOperation::ReportLoad { load }, NOW + 3),
+            &AttemptedBypass
+        ),
+        Err(ControlError::Directory(DirectoryError::CompareFailed))
+    ));
+    // Keyed, it is decided by what it changes: here no node 7 is enrolled.
+    assert!(matches!(
+        parts.replicas[leader].submit(
+            request(
+                PartitionOperation::Keyed(KeyedOperation::ReportLoad { load }),
+                NOW + 3
+            ),
+            &AttemptedBypass
+        ),
+        Err(ControlError::Directory(DirectoryError::Missing))
+    ));
+    // A decision older than the authority's is still a clock regression.
+    assert!(matches!(
+        parts.replicas[leader].submit(
+            request(
+                PartitionOperation::Keyed(KeyedOperation::ReportLoad { load }),
+                NOW + 1
+            ),
+            &AttemptedBypass
+        ),
+        Err(ControlError::Directory(DirectoryError::ClockRegression))
+    ));
+}
