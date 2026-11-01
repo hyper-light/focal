@@ -72,8 +72,17 @@ impl ManagedService {
         let (routes, node, endpoint, server_name) = self.routes.as_ref()?;
         let Some(replica) = replica else {
             // Nothing here serves it: whoever leads does, unless that is this
-            // node without a replica yet, which stays unavailable.
-            return routes.resolve(ledger).await?.hint;
+            // node without a replica yet, which stays unavailable. So does a
+            // route older than the epoch the client claims: this node's view
+            // is behind the client's, and the client, which adopts no older
+            // epoch, took the hint for an invalid answer and ended its write
+            // unknown (fleet33 k27, 2026-11-01: sent while twelve nodes were
+            // starting again). Answered unavailable, it asks another route.
+            return routes
+                .resolve(ledger)
+                .await?
+                .hint
+                .filter(|hint| hint.epoch >= claimed);
         };
         let epoch = routes
             .resolve(ledger)

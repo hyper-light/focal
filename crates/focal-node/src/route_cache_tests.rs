@@ -168,3 +168,29 @@ fn a_node_that_does_not_serve_a_ledger_redirects_to_its_leader_and_a_stale_clien
     })
     .unwrap()
 }
+
+#[test]
+fn a_node_whose_route_is_older_than_the_clients_points_it_nowhere() {
+    focal_rt::block_on(async move {
+        let founder_dir = tempfile::tempdir().unwrap();
+        let peer_dir = tempfile::tempdir().unwrap();
+        let founder_settings = settings(founder_dir.path());
+        let peer_settings = settings(peer_dir.path());
+        let founder = Running::start(&founder_settings).await;
+        let (peer_a, _) = join_peer(&founder, founder_dir.path(), "host-a", &peer_settings).await;
+        let ledger = founder.status.ledger;
+        // Host a holds no replica of the founder's ledger and knows its route at epoch 1.
+        let hint = redirect_from(&peer_a, envelope(ledger, 1, 1)).await;
+        assert_eq!(hint.epoch, RouteEpoch(1));
+        // A client that has learned a later epoch than host a's is not sent back to epoch 1,
+        // which the client would refuse as an invalid answer: host a cannot place it, and says so.
+        let answered = ask(&peer_a, envelope(ledger, 2, 2)).await;
+        assert!(
+            matches!(answered, Response::Error(AccessError::Unavailable)),
+            "{answered:?}"
+        );
+        peer_a.stop().await;
+        founder.stop().await;
+    })
+    .unwrap()
+}
