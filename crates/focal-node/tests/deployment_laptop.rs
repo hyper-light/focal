@@ -35,11 +35,21 @@ mod journey;
 use fleet::*;
 use journey::*;
 
-/// Every file under a directory, relative, sorted.
+/// Every record under a directory, relative, sorted. A running node writes its journals as its
+/// agent works, each through an atomic replace whose temporary (`.pending-…`) is never a record, as
+/// a journal's open treats one a crash left: a listing taken while one was in flight held it and
+/// the next did not, so a dry run that wrote nothing read as one that removed a file (CI,
+/// 2026-10-31).
 fn files(root: &Path) -> BTreeSet<String> {
     fn walk(root: &Path, dir: &Path, out: &mut BTreeSet<String>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
+            if path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".pending-"))
+            {
+                continue;
+            }
             if path.is_dir() {
                 walk(root, &path, out);
             } else {
