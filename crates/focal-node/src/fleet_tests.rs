@@ -339,6 +339,59 @@ fn a_log_is_checkpointed_once_it_outweighs_its_last_image() {
     ));
 }
 
+/// A replica's checkpoints fall on its own lattice of the entry floor's period: from any last
+/// checkpoint the next is due at the next index `i` with `(i + phase) % floor == 0`, after the
+/// whole floor where the last was on it and sooner where it was late or there was none. Without a
+/// phase every replica's lattice was the same, `i % floor == 0`.
+#[test]
+fn a_replicas_checkpoints_fall_on_its_own_point_in_the_floors_period() {
+    const FLOOR: u64 = CHECKPOINT_AFTER_ENTRIES;
+    for phase in [0, 1, 1000, FLOOR - 1] {
+        for snapshot in [0, 1, FLOOR - 1, FLOOR, 12_345, 1 << 40] {
+            let due = checkpoint_floor(snapshot, phase, FLOOR);
+            assert!((1..=FLOOR).contains(&due), "{snapshot} {phase} {due}");
+            assert_eq!((snapshot + due + phase) % FLOOR, 0, "{snapshot} {phase}");
+        }
+        let on = (FLOOR - phase) % FLOOR + 3 * FLOOR;
+        assert_eq!(checkpoint_floor(on, phase, FLOOR), FLOOR, "{phase}");
+    }
+    assert_eq!(checkpoint_floor(17, 5, 0), 0);
+}
+
+/// The replicas of sessions that began together fall at their own points of the period: the 33
+/// replicas of 11 sessions over 33 nodes (the fleet33 runs' shape) are spread across it, no two
+/// sessions' replicas on one node at one point, where every one fell at one index before.
+#[test]
+fn replicas_that_began_together_checkpoint_at_their_own_points() {
+    const FLOOR: u64 = CHECKPOINT_AFTER_ENTRIES;
+    let mut phases = Vec::new();
+    for session in 0..11u64 {
+        let ledger = LedgerId {
+            tenant: TenantId::from_u128(1),
+            session: SessionId::from_u128(100 + u128::from(session)),
+        };
+        for voter in 0..3u64 {
+            let node = 1 + session * 3 + voter;
+            let phase = checkpoint_phase(ledger, node, FLOOR);
+            assert!(phase < FLOOR);
+            assert_eq!(
+                phase,
+                checkpoint_phase(ledger, node, FLOOR),
+                "drawn, not random"
+            );
+            phases.push(phase);
+        }
+    }
+    phases.sort_unstable();
+    let distinct = phases.windows(2).filter(|pair| pair[0] != pair[1]).count() + 1;
+    assert!(distinct >= 30, "{phases:?}");
+    assert!(
+        phases[phases.len() - 1] - phases[0] > FLOOR / 2,
+        "{phases:?}"
+    );
+    assert_eq!(checkpoint_phase(ledger(), 1, 0), 0);
+}
+
 /// A replica's log is kept to the cadence's bound while a steady load
 /// keeps proposals pending (26 §3): it checkpoints its applied prefix
 /// every `checkpoint_after_entries` entries, and a proposal in flight is

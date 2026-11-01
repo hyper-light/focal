@@ -97,6 +97,8 @@ mod admission_tests;
 /// Entries a session applies past its last checkpoint before it may checkpoint
 /// again ([`ReplicaConfig::checkpoint_after_entries`]'s default): the floor
 /// under the size rule, so a small state is not imaged at every few entries.
+/// A replica's first checkpoint, and one after a late one, may come sooner, at
+/// its next point in the floor's period ([`checkpoint_floor`]).
 pub const CHECKPOINT_AFTER_ENTRIES: u64 = 4096;
 /// The times its last image's bytes the applied log a session holds may come
 /// to before it checkpoints, where a checkpoint writes the image alone (the
@@ -137,6 +139,36 @@ pub(crate) fn checkpoint_due(log: CheckpointLog, image: u64, memory: u64, expans
                 .checked_div(CHECKPOINT_MEMORY_SHARE)
                 .unwrap_or(u64::MAX)
 }
+/// Where in the entry floor's period a replica's checkpoints fall: a number in `[0, floor)` drawn
+/// from the session and the node by hash, so the replicas of sessions that began together and
+/// apply at one rate do not all checkpoint at one index. Periodic work that starts in step stays in
+/// step (Floyd and Jacobson, "The Synchronization of Periodic Routing Messages", IEEE/ACM ToN 2(2),
+/// 1994): every replica of a 33-node run checkpointed within a second or so of the others, their
+/// seeds' syncs met on one volume, and every session's commits waited out each wave, 1 to 7 s
+/// (fleet33 c10 to c13, 2026-10-31/11-01).
+pub(crate) fn checkpoint_phase(ledger: LedgerId, node: u64, floor: u64) -> u64 {
+    let mut hasher = blake3::Hasher::new_derive_key("focal.checkpoint.phase.v1");
+    hasher.update(&ledger.tenant.0);
+    hasher.update(&ledger.session.0);
+    hasher.update(&node.to_le_bytes());
+    let mut drawn = [0u8; 8];
+    for (target, source) in drawn.iter_mut().zip(hasher.finalize().as_bytes()) {
+        *target = *source;
+    }
+    u64::from_le_bytes(drawn).checked_rem(floor).unwrap_or(0)
+}
+/// The entries past its last checkpoint at `snapshot` a replica of `phase` applies before it may
+/// checkpoint: up to the next index of its lattice (the indices `i` with `(i + phase) % floor == 0`),
+/// so a checkpoint on the lattice waits the whole floor and one taken late (a checkpoint waits for
+/// persistence and the one before) comes back to it at the next.
+pub(crate) fn checkpoint_floor(snapshot: u64, phase: u64, floor: u64) -> u64 {
+    let offset = snapshot
+        .checked_rem(floor)
+        .and_then(|at| at.checked_add(phase.checked_rem(floor)?))
+        .and_then(|at| at.checked_rem(floor))
+        .unwrap_or(0);
+    floor.saturating_sub(offset)
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplicaConfig {
     pub root: RootCommandId,
@@ -153,8 +185,9 @@ pub struct ReplicaConfig {
     pub tick_ceiling: Duration,
     pub request_timeout: Duration,
     /// Checkpoint and compact the log once this many entries have applied
-    /// past the last snapshot (26 §3, the log's retirement boundary), and the
-    /// size rule holds ([`CHECKPOINT_EXPANSION`]).
+    /// past the last snapshot (26 §3, the log's retirement boundary), or fewer
+    /// up to the replica's next point in this period ([`checkpoint_floor`]),
+    /// and the size rule holds ([`CHECKPOINT_EXPANSION`]).
     pub checkpoint_after_entries: u64,
     /// The times its last image's bytes the applied log may come to before a
     /// checkpoint ([`CHECKPOINT_EXPANSION`]); zero checkpoints at the entry
@@ -1141,6 +1174,8 @@ struct Owner {
     /// The owner's slowest recent steps, for the replica's diagnostics.
     slow: crate::owner_steps::SlowSteps,
     config: ReplicaConfig,
+    /// Where in the entry floor's period this replica's checkpoints fall ([`checkpoint_phase`]).
+    checkpoint_phase: u64,
     limits: WireLimits,
     client_limits: WireLimits,
     views: ReadViews,
@@ -1454,12 +1489,18 @@ impl ReplicaHost {
         getrandom::fill(&mut incarnation).map_err(|_| LedgerError::Capacity)?;
         let incarnation = u64::from_le_bytes(incarnation);
         let lane = session.inflight_window();
+        let checkpoint_phase = checkpoint_phase(
+            session.ledger(),
+            session.scalars().node_id,
+            config.checkpoint_after_entries,
+        );
         let owner = Owner {
             leader_return: crate::leader_return::LeaderReturn::new(session.election_tick()),
             seed_refusals: seeds::SeedRefusals::default(),
             pace: pace.clone(),
             session,
             config,
+            checkpoint_phase,
             limits,
             client_limits,
             views,
@@ -2497,7 +2538,13 @@ impl Owner {
     /// replays.
     fn checkpoint_due(&self) -> Result<bool, LedgerError> {
         let entries = self.log_entries_since_checkpoint();
-        if entries < self.config.checkpoint_after_entries {
+        if entries
+            < checkpoint_floor(
+                self.session.snapshot_index(),
+                self.checkpoint_phase,
+                self.config.checkpoint_after_entries,
+            )
+        {
             return Ok(false);
         }
         // A checkpoint that rewrites the log it keeps (focal-log's) costs the

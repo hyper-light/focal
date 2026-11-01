@@ -165,6 +165,22 @@ same comparison); a replica on focal-log keeps the floor alone. `fleet_tests::a_
 holds the rule; the cadence tests state an expansion of zero, the floor
 alone.
 
+**Each replica at its own point of the floor's period (2026-11-01).**
+Sessions that began together and apply at one rate reached the floor at one
+index, so every replica of a 33-node run checkpointed within a second or so
+of the others; their seeds' syncs met on the volume the nodes share, and
+every session's commits waited out each wave: about 1 s a wave, and 5 to 7 s
+in nine of eleven sessions at one wave whose slowest checkpoint commit took
+6.2 s (09, 2026-11-01). Periodic work that starts in step stays in step
+(Floyd and Jacobson, "The Synchronization of Periodic Routing Messages",
+IEEE/ACM ToN 2(2), 1994). A replica now checkpoints at the indices `i` with
+`(i + phase) % floor == 0`, its phase drawn in `[0, floor)` by hash of its
+session and its node (`fleet::checkpoint_phase`, `checkpoint_floor`): after
+the whole floor where its last checkpoint was on that lattice, sooner after
+its first or one taken late, which comes back to the lattice at its next
+point. The floor gates the size rule alone, so a checkpoint only comes
+sooner; the memory share and the replay bound are unchanged.
+
 **The retention floor.** `RetentionReport` names, per native session, the
 published prefix, the prefix registered consumers still need
 (`CursorRegistry::retention_limit`), the prefix the archive reports holding
