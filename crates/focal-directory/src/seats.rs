@@ -373,3 +373,17 @@ pub fn deaths_stand_for(
         })
         .max()
 }
+
+/// Whether more than half of `placement`'s voters are alive as the directory
+/// holds them (a voter it does not list is not). A session's log changes its
+/// membership only through a majority of its voters, so a session without one
+/// cannot be healed until enough of them are back, and nothing asked of it
+/// meanwhile can be answered.
+pub fn majority_alive(placement: &Placement, nodes: &BTreeMap<u64, NodeRecord>) -> bool {
+    let alive = placement
+        .voters
+        .keys()
+        .filter(|id| nodes.get(id).is_some_and(NodeRecord::is_alive))
+        .count();
+    alive.saturating_mul(2) > placement.voters.len()
+}

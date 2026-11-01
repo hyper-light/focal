@@ -271,6 +271,47 @@ impl PlacementAgent {
     }
 }
 
+/// Whether the directory lists `node` and holds it alive.
+fn held_alive(nodes: &BTreeMap<u64, focal_directory::NodeRecord>, node: u64) -> bool {
+    nodes
+        .get(&node)
+        .is_some_and(focal_directory::NodeRecord::is_alive)
+}
+
+/// The controller's pass over the sessions, each on its own turn: the first that advances ends
+/// the pass with its step, and one that fails leaves the sessions after it their turn. A failed
+/// session ended the pass, so one the controller could not act on (its leader not answering, a
+/// change its voters could not commit) stopped the control of every session after it, pass
+/// after pass: in k27 no session after the first without its quorum, in ledger order, was
+/// healed, and in m4 none was (fleet33, 2026-11-01). The first failure is the pass's, with its
+/// session, where none advanced.
+#[derive(Default)]
+pub(super) struct ControlRound {
+    failed: Option<(AgentError, LedgerId)>,
+}
+impl ControlRound {
+    /// The session's turn: the step that ends the pass, or none to go on.
+    pub(super) fn turn(
+        &mut self,
+        ledger: LedgerId,
+        result: Result<Option<AgentStep>, AgentError>,
+    ) -> Option<AgentStep> {
+        match result {
+            Ok(step) => step,
+            Err(error) => {
+                if self.failed.is_none() {
+                    self.failed = Some((error, ledger));
+                }
+                None
+            }
+        }
+    }
+    /// The pass's failure where no session advanced: the first, with its session.
+    pub(super) fn failure(self) -> Option<(AgentError, LedgerId)> {
+        self.failed
+    }
+}
+
 pub(super) fn same_members(applied: &[u64], granted: &BTreeMap<u64, u64>) -> bool {
     applied.iter().copied().eq(granted.keys().copied())
 }
@@ -298,7 +339,30 @@ impl PlacementAgent {
         let Some(grant) = authority.groups.get(&descriptor.log_group) else {
             return Ok(None);
         };
-        let driver = self.session_driver(handles, descriptor).await;
+        // A session most of whose voters the directory holds dead can change nothing until
+        // enough of them are back, and each call asking it to waited out the call's clock, pass
+        // after pass (fleet33 k27 and m4, 2026-11-01). It is passed over until then.
+        if !focal_directory::majority_alive(&descriptor.active.placement, &directory.nodes) {
+            return Ok(None);
+        }
+        let driver = match self.session_driver(handles, descriptor).await {
+            // A leader the directory holds dead is not asked, each ask waiting out the call's
+            // clock: a voter of the session it holds alive is, and answers where the log leads.
+            SessionDriver::Remote { leader } if !held_alive(&directory.nodes, leader) => {
+                let node = self.state.node;
+                let Some(voter) = descriptor
+                    .active
+                    .placement
+                    .voters
+                    .keys()
+                    .find(|voter| **voter != node && held_alive(&directory.nodes, **voter))
+                else {
+                    return Ok(None);
+                };
+                SessionDriver::Remote { leader: *voter }
+            }
+            driver => driver,
+        };
         if driver.local().is_none() {
             self.claim_for_ranges(descriptor, handles).await;
         }

@@ -726,3 +726,38 @@ fn how_long_a_death_still_stands_is_the_longest_left() {
         );
     }
 }
+
+#[test]
+fn a_session_can_change_its_voters_only_while_most_of_them_live() {
+    let dead = Some(NodeLiveness {
+        alive: false,
+        incarnation: 1,
+        witness: 1,
+        decided_at: 100,
+    });
+    let mut nodes = fleet(&[(1, HOME, 0), (2, HOME, 0), (3, HOME, 0), (4, HOME, 0)]);
+    let sits = sitting(&[1, 2, 3], &[1, 2], 1);
+    // A node with no verdict is alive, as the directory holds it.
+    assert!(majority_alive(&sits, &nodes));
+    // One of three dead: two still decide, and the session can be healed.
+    nodes.get_mut(&2).unwrap().liveness = dead;
+    assert!(majority_alive(&sits, &nodes));
+    // A death outside the placement takes nothing from it.
+    nodes.get_mut(&4).unwrap().liveness = dead;
+    assert!(majority_alive(&sits, &nodes));
+    // Two of three dead: nothing it is asked to change can commit.
+    nodes.get_mut(&3).unwrap().liveness = dead;
+    assert!(!majority_alive(&sits, &nodes));
+    // Back: a verdict says so.
+    nodes.get_mut(&3).unwrap().liveness = Some(NodeLiveness {
+        alive: true,
+        incarnation: 2,
+        witness: 2,
+        decided_at: 110,
+    });
+    assert!(majority_alive(&sits, &nodes));
+    // A voter the directory does not list counts for nothing; half is not more than half.
+    nodes.get_mut(&2).unwrap().liveness = None;
+    assert!(!majority_alive(&sitting(&[1, 2, 5, 6], &[1, 2], 1), &nodes));
+    assert!(majority_alive(&sitting(&[1, 2, 3, 5], &[1, 2], 1), &nodes));
+}

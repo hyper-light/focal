@@ -1160,6 +1160,7 @@ impl PlacementAgent {
         // A pass that observed the partitions is the progress a stuck host cannot make.
         self.ticks = self.ticks.saturating_add(1);
         let root_leader = handles.control.progress().leader == node;
+        let mut round = controller::ControlRound::default();
         for (delegation, access, snapshot, installed) in &observed {
             let ControlBootstrap::Partition { directory } = &snapshot.state else {
                 return Err(AgentError::Identity);
@@ -1289,17 +1290,21 @@ impl PlacementAgent {
                 }
                 for descriptor in directory.sessions.values() {
                     self.step = Some(("control", descriptor.ledger));
-                    if let Some(step) = self
+                    let controlled = self
                         .control(
                             handles, pool, descriptor, directory, snapshot, installed, &root, now,
                         )
-                        .await?
-                    {
+                        .await;
+                    if let Some(step) = round.turn(descriptor.ledger, controlled) {
                         return Ok(step);
                     }
                 }
                 self.step = None;
             }
+        }
+        if let Some((error, ledger)) = round.failure() {
+            self.step = Some(("control", ledger));
+            return Err(error);
         }
         Ok(AgentStep::Idle)
     }

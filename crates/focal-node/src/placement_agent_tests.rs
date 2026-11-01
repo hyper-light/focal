@@ -1913,3 +1913,37 @@ fn a_refused_load_report_is_due_at_the_next_pass_and_a_committed_one_waits_its_i
     );
     assert_eq!(last.get(&partition), Some(&(101, 1)));
 }
+
+/// The controller gives every session its turn: one it cannot act on leaves the sessions after it
+/// theirs, the first that advances ends the pass, and where none advances the pass fails with the
+/// first failure, named by its session.
+#[test]
+fn a_session_the_controller_cannot_act_on_leaves_the_others_their_turn() {
+    let ledger = |session: u8| focal_model::LedgerId {
+        tenant: focal_model::TenantId([1; 16]),
+        session: focal_model::SessionId([session; 16]),
+    };
+    let unanswered = || Err(AgentError::Control(ControlFailure::Unavailable));
+    let mut round = controller::ControlRound::default();
+    assert_eq!(round.turn(ledger(1), unanswered()), None);
+    assert_eq!(round.turn(ledger(2), Ok(None)), None);
+    assert_eq!(
+        round.turn(ledger(3), Ok(Some(AgentStep::Advanced))),
+        Some(AgentStep::Advanced)
+    );
+
+    let mut round = controller::ControlRound::default();
+    assert_eq!(round.turn(ledger(1), unanswered()), None);
+    assert_eq!(round.turn(ledger(2), Err(AgentError::Behind)), None);
+    assert_eq!(round.turn(ledger(3), Ok(None)), None);
+    let (error, failed) = round.failure().unwrap();
+    assert!(matches!(
+        error,
+        AgentError::Control(ControlFailure::Unavailable)
+    ));
+    assert_eq!(failed, ledger(1));
+
+    let mut round = controller::ControlRound::default();
+    assert_eq!(round.turn(ledger(1), Ok(None)), None);
+    assert!(round.failure().is_none());
+}
