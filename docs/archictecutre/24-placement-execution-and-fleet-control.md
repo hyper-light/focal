@@ -277,6 +277,16 @@ does at most one thing:
 Custody under the old route is deliberately not readiness for the new one; the
 session log's cutover record is the first fact the agent waits for.
 
+The verification covers every artifact of the prefix, with the object each
+names, in its digest, and reads the objects' bytes only where this node is one
+of the placement's content copies, the copies required to hold them (26 §1): a
+voter or materializer that is not a copy holds no object. Each object was read
+from every member's store, so a move that replaced a session's one voter
+holding no copy brought in a voter that could never be ready (its store
+answered every object not found), and the session, closed to clients from the
+move's cutover, refused every write until the run ended (09, 2026-10-31: three
+33-node runs).
+
 **Observing a partition led elsewhere.** Each pass observes every partition at
 one prefix: where this node leads it, from its own owner; otherwise through the
 partition's leader, one read of its checkpoint (`ControlRead::State`) and one of

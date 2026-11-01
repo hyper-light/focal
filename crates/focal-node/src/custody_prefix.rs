@@ -73,6 +73,9 @@ pub struct CustodyVerification {
     snapshot: DurableEvidenceSnapshot,
     expected_active: Option<CustodyScope>,
     target: CustodyScope,
+    /// Whether this node is one of the placement's content copies, the copies required to hold the
+    /// session's objects (26 §1): only a copy verifies the objects' bytes.
+    copy: bool,
     checkpoint_installed: bool,
     after: Option<ArtifactId>,
     artifacts: u64,
@@ -101,6 +104,7 @@ impl CustodyVerification {
             policy_revision: prefix.placement_epoch,
         };
         let placement = &snapshot.placement().placement().placement;
+        let copy = placement.content_copies.contains_key(&prefix.node);
         if prefix.index.0 == 0
             || prefix.term.0 == 0
             || prefix.route.0 == 0
@@ -124,6 +128,7 @@ impl CustodyVerification {
             snapshot,
             expected_active,
             target,
+            copy,
             checkpoint_installed: false,
             after: None,
             artifacts: 0,
@@ -216,10 +221,17 @@ impl CustodyVerification {
             self.digest.update(encoded);
             self.after = Some(artifact.artifact.id);
             self.artifacts = self.artifacts.checked_add(1).ok_or(AccessError::Capacity)?;
-            if let Some(reference) = artifact.content {
-                if reference.domain != focal_model::ContentDomainId(self.target.ledger.tenant.0) {
-                    return Err(AccessError::Unauthorized);
-                }
+            // The artifact, with the object it names, is in the digest whatever this node's role;
+            // the object's bytes are verified by the content copies, which hold it (26 §1). A voter
+            // that is not a copy holds no object: each was read from its store, so a voter that
+            // replaced a session's one voter holding no copy was never ready, and the session, closed
+            // from the move's cutover, never served again (fleet33 c6, k22 and m1, 2026-10-30/31).
+            if let Some(reference) = &artifact.content
+                && reference.domain != focal_model::ContentDomainId(self.target.ledger.tenant.0)
+            {
+                return Err(AccessError::Unauthorized);
+            }
+            if let Some(reference) = artifact.content.filter(|_| self.copy) {
                 self.contents = self.contents.checked_add(1).ok_or(AccessError::Capacity)?;
                 self.bytes = self
                     .bytes

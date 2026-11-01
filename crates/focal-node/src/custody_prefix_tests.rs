@@ -66,6 +66,14 @@ fn register(session: &mut Session, id: u128, payload: ArtifactPayload) {
     ));
 }
 fn place(session: &mut Session, route: u64) -> SessionPlacementRequest {
+    place_with_copies(session, route, BTreeMap::from([(1, 1)]))
+}
+/// `place`, the placement's content copies `copies`: node 1 stays its one voter and materializer.
+fn place_with_copies(
+    session: &mut Session,
+    route: u64,
+    copies: BTreeMap<u64, u64>,
+) -> SessionPlacementRequest {
     let members = BTreeMap::from([(1, 1)]);
     let request = SessionPlacementRequest {
         expected_index: session.placement().map_or(0, |fence| fence.index.0),
@@ -93,8 +101,8 @@ fn place(session: &mut Session, route: u64) -> SessionPlacementRequest {
             placement: Placement {
                 preferred_leader: 1,
                 voters: members.clone(),
-                materializers: members.clone(),
-                content_copies: members,
+                materializers: members,
+                content_copies: copies,
             },
         },
     };
@@ -276,6 +284,38 @@ fn exact_checkpoint_and_all_artifacts_survive_advance_compaction_and_content_reo
         assert_eq!(manifest.verified_artifacts, 2);
     })
     .unwrap()
+}
+
+/// A voter that is not one of the placement's content copies holds none of the session's objects
+/// (the copies required to are the content copies, 26 §1): its readiness covers every artifact of
+/// the prefix and the object each names, without the objects' bytes, which the copies verify. Each
+/// object was read from the voter's own store before, so a voter that replaced a session's one
+/// voter holding no copy was never ready, and its session, closed from the move's cutover, never
+/// served again (fleet33 c6, k22 and m1). Here node 1's store holds neither object a content
+/// artifact names: one sealed then removed, one never held.
+#[test]
+fn a_voter_that_is_not_a_content_copy_is_ready_without_the_objects() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut session, store, reference) = fixture(dir.path());
+    let mut absent = reference;
+    absent.root = ContentHash([211; 32]);
+    register(&mut session, 30, ArtifactPayload::Content(absent));
+    place_with_copies(&mut session, 2, BTreeMap::from([(2, 1)]));
+    let snapshot = session.checkpoint_evidence(30_000).unwrap();
+    assert_eq!(snapshot.prefix().artifacts, 3);
+    for part in [&b"abcd"[..], b"efgh", b"ijkl"] {
+        std::fs::remove_file(chunk_path(dir.path(), part)).unwrap();
+    }
+    let budget = memory();
+    let mut owner = CustodyStore::new(store, CustodyConfig::new(1), budget.clone()).unwrap();
+    let state = CustodyVerification::new(snapshot, None, &budget).unwrap();
+    let witness = finish(Box::new(state), &mut owner, &budget).unwrap();
+    assert_eq!(witness.manifest().verified_artifacts, 3);
+    assert_eq!(witness.manifest().verified_content_references, 0);
+    assert_eq!(witness.manifest().verified_content_bytes, 0);
+    drop(witness);
+    drop(owner);
+    assert_eq!(budget.stats().used, 0);
 }
 
 #[test]
