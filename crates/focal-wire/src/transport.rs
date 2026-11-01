@@ -1345,12 +1345,11 @@ impl QuicRemote {
 /// in flight. A route's name is resolved when the route is first reached, and again once its
 /// connection failed, a dial to the address it resolved to failed, or the route was forgotten;
 /// between them the connector is given that address, and reuses the live connection or dials the
-/// address again. Every call resolved its route's name before: thousands of lookups a second
-/// through the process's four places for resolution, so a lookup held up while restarted
-/// containers' names were registered again held every request of every session behind it, 1.3
-/// to 3.4 s with no answer in a 33-node run's load generator (fleet33 k24 and m2, 2026-11-01).
-/// The connection last handed out for each route is remembered, so a failure its caller reports
-/// closes that connection and no later one.
+/// address again. Every call resolved its route's name before: a 33-node run's load generator
+/// resolved its endpoints thousands of times a second through the process's four places for
+/// resolution, where any lookup held up would hold every request of every session behind it
+/// (fleet33, 2026-11-01). The connection last handed out for each route is remembered, so a
+/// failure its caller reports closes that connection and no later one.
 pub struct RouteConnections {
     connector: QuicConnector,
     max_routes: usize,

@@ -5029,8 +5029,8 @@ fn cold_calls_to_one_route_share_one_dial_and_a_stale_failure_forgets_nothing() 
 
 /// A route's name is resolved when the route is first reached, and again once its connection
 /// failed or the route was forgotten, never at each call: every call resolved it before, thousands
-/// of lookups a second through the process's four places for resolution, and a slow lookup held
-/// every request of every session behind it (fleet33 k24 and m2, 2026-11-01).
+/// of lookups a second through the process's four places for resolution, where any lookup held up
+/// would hold every request of every session behind it (fleet33, 2026-11-01).
 #[test]
 fn a_routes_name_is_resolved_at_its_dial_not_at_each_call() {
     focal_rt::block_on(async move {
