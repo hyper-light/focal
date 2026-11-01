@@ -464,6 +464,21 @@ impl PendingClientJoin {
         drop(self.verify(&receipt, now)?);
         Ok(receipt)
     }
+    /// Redeems the enrollment, asking again, the same enrollment exactly, for as long as the
+    /// sponsor's answer says to and the invitation lives, as a node's join does
+    /// ([`crate::network_join::settle`]). A client asked once and gave its operator "enrollment
+    /// outcome is unknown; retry the saved join identity" for an answer that is the reason for the
+    /// next ask: the bootstrap of a 33-node run stopped there while a loaded host's sponsor
+    /// committed the enrollment (fleet33 c14, 2026-11-01).
+    pub async fn redeem_settled(
+        &self,
+        client: &EnrollmentClient,
+    ) -> Result<EnrollmentReceipt, JoinError> {
+        crate::network_join::settle(self.bundle.invitation().expires_at(), |now| {
+            self.redeem(client, now)
+        })
+        .await
+    }
     fn verify(
         &self,
         receipt: &EnrollmentReceipt,

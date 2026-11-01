@@ -587,6 +587,58 @@ fn a_join_asks_again_while_its_sponsor_cannot_decide_and_is_enrolled_once() {
     .unwrap()
 }
 
+/// A client's enrollment is asked again as a node's join is: while its sponsor cannot decide, has no
+/// room or cannot say what came of the ask, the same enrollment, until the sponsor answers, the
+/// client enrolled and committed once. Before, a client asked once and its operator was told to
+/// "retry the saved join identity": a 33-node run's bootstrap stopped there while a loaded host's
+/// sponsor committed the enrollment (fleet33 c14, 2026-11-01).
+#[test]
+fn a_clients_enrollment_asks_again_while_its_sponsor_cannot_decide_and_is_enrolled_once() {
+    focal_rt::block_on(async move {
+        let mut fixture = Fixture::new();
+        let server = Arc::new(
+            EnrollmentServer::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                &fixture.authority.server_identity(),
+                TransportLimits::default(),
+            )
+            .unwrap(),
+        );
+        let invitation = fixture.invite(server.local_addr().unwrap(), EnrollmentRole::Client);
+        let bundle =
+            ClientInvitation::new("agent-0001", fixture.genesis.clone(), invitation).unwrap();
+        let answers = vec![
+            JoinFailure::Unavailable,
+            JoinFailure::Capacity,
+            JoinFailure::OutcomeUnknown,
+        ];
+        let (state, task) = scripted_sponsor(fixture, server.clone(), answers);
+        let disk = tempfile::tempdir().unwrap();
+        crate::set_test_mode(disk.path(), 0o700);
+        let path = disk.path().join("agent-0001.join");
+        let pending =
+            PendingClientJoin::open(&path, &focal_seal::test_keys_beside(&path).unwrap(), bundle)
+                .unwrap();
+        let client =
+            EnrollmentClient::bind("127.0.0.1:0".parse().unwrap(), TransportLimits::default())
+                .unwrap();
+        let receipt = pending.redeem_settled(&client).await.unwrap();
+        assert_eq!(receipt.identity.role, EnrollmentRole::Client);
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(
+                state.asks, 4,
+                "three answers that said to ask again, then the enrollment"
+            );
+            assert_eq!(state.commits, 1, "the enrollment was committed once");
+        }
+        client.close();
+        server.close().unwrap();
+        task.await.unwrap();
+    })
+    .unwrap()
+}
+
 /// A join asked again stops where asking cannot succeed: at once at a terminal refusal, which no ask
 /// changes, after any number of asks the sponsor answered unavailable; and at the invitation's
 /// expiry, after which the founder admits no new join, with the sponsor's last answer. The asks are

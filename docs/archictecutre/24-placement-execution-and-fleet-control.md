@@ -2137,8 +2137,13 @@ not needed; a terminal refusal — revoked, expired, redeemed under another
 key, wrong cluster, unauthorized — retires the journal and its
 never-enrolled key under a marker (`JOIN.retired-<invitation>`) and the
 new invitation is joined; an unknown outcome keeps the journal and the
-exact retry (`PendingJoin::retire`, `terminal_rejection`). An invitation
-file is read through links (a mounted secret is a link into its volume)
+exact retry (`PendingJoin::retire`, `terminal_rejection`). A joining node
+and an enrolling client (`enroll context`) both ask again, the same join
+exactly, while the sponsor's answer is no room, a group between leaders or
+an unknown outcome and the invitation lives (`network_join::settle`); a
+client asked once before, and a 33-node run's bootstrap stopped at one
+whose sponsor, on a loaded host, had not yet committed it (09,
+2026-11-01). An invitation file is read through links (a mounted secret is a link into its volume)
 and must be a regular file nobody but its owner may write and nobody
 outside its group may read (mode `0600` as `invite node` writes it, or
 `0440` as a secret mounted with `defaultMode: 288` under the pod's

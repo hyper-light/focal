@@ -1056,7 +1056,7 @@ async fn enroll(settings: &Settings, selected: &str, invitation: &Path) -> Resul
         .parse()
         .map_err(other)?;
         let client = EnrollmentClient::bind(address, TransportLimits::default()).map_err(other)?;
-        let result = pending.redeem(&client, now()?).await.map_err(other);
+        let result = pending.redeem_settled(&client).await.map_err(other);
         client.close();
         result
     }

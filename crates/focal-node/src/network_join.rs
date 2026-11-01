@@ -433,47 +433,15 @@ impl PendingJoin {
     /// (24 §24), as a Raft client asks again where its leader was lost (Ongaro's thesis §6.2):
     /// before, the node stopped and told its operator to start it again, and a node joining while
     /// the root group elected under a loaded disk exited with "enrollment outcome is unknown".
-    /// Each ask follows the one before it by a pause of full jitter over an exponential step from
-    /// the time that ask took ([`focal_client::RetryPolicy::pause`]; Brooker, 2015), never past
-    /// the invitation's expiry, after which the founder admits no new join: the last answer is
-    /// returned there.
+    /// The asks are paced as [`settle`] paces them, until the invitation's expiry.
     pub async fn redeem_settled(
         &self,
         client: &EnrollmentClient,
     ) -> Result<EnrollmentReceipt, JoinError> {
-        let expires = self.bundle.invitation.expires_at();
-        let mut backoffs = 0u32;
-        loop {
-            let asked = std::time::Instant::now();
-            let now = crate::network_bootstrap::unix_time().map_err(|_| JoinError::Runtime)?;
-            let error = match self.redeem(client, now).await {
-                Ok(receipt) => return Ok(receipt),
-                Err(error) if retryable(&error) => error,
-                Err(error) => return Err(error),
-            };
-            let took = asked.elapsed();
-            let now = crate::network_bootstrap::unix_time().map_err(|_| JoinError::Runtime)?;
-            let left = expires
-                .checked_sub(now)
-                .and_then(|seconds| u64::try_from(seconds).ok())
-                .filter(|seconds| *seconds > 0)
-                .map(std::time::Duration::from_secs);
-            // An ask that took no time gives no step to grow from: none is drawn from it.
-            let (Some(left), false) = (left, took.is_zero()) else {
-                return Err(error);
-            };
-            let policy = focal_client::RetryPolicy {
-                max_attempts: u32::MAX,
-                max_elapsed: left,
-                base_backoff: took,
-                max_backoff: left,
-            };
-            let pause = policy.pause(backoffs).min(left);
-            backoffs = backoffs.saturating_add(1);
-            focal_rt::time::sleep(pause)
-                .await
-                .map_err(|_| JoinError::Runtime)?;
-        }
+        settle(self.bundle.invitation.expires_at(), |now| {
+            self.redeem(client, now)
+        })
+        .await
     }
     fn verify(
         &self,
@@ -774,6 +742,53 @@ pub fn retryable(error: &JoinError) -> bool {
                 )
         )
     )
+}
+/// Asks `ask` at the time of each ask, again, the same join exactly, for as long as the sponsor's
+/// answer says to ([`retryable`]) and the invitation, which lives until `expires`, does: each ask
+/// follows the one before it by a pause of full jitter over an exponential step from the time that
+/// ask took ([`focal_client::RetryPolicy::pause`]; Brooker, 2015), never past the expiry, after
+/// which the founder admits no new join: the last answer is returned there. A node's join and a
+/// client's both ask so ([`PendingJoin::redeem_settled`],
+/// [`PendingClientJoin::redeem_settled`]).
+pub(crate) async fn settle<F>(
+    expires: i64,
+    ask: impl Fn(i64) -> F,
+) -> Result<EnrollmentReceipt, JoinError>
+where
+    F: Future<Output = Result<EnrollmentReceipt, JoinError>>,
+{
+    let mut backoffs = 0u32;
+    loop {
+        let asked = std::time::Instant::now();
+        let now = crate::network_bootstrap::unix_time().map_err(|_| JoinError::Runtime)?;
+        let error = match ask(now).await {
+            Ok(receipt) => return Ok(receipt),
+            Err(error) if retryable(&error) => error,
+            Err(error) => return Err(error),
+        };
+        let took = asked.elapsed();
+        let now = crate::network_bootstrap::unix_time().map_err(|_| JoinError::Runtime)?;
+        let left = expires
+            .checked_sub(now)
+            .and_then(|seconds| u64::try_from(seconds).ok())
+            .filter(|seconds| *seconds > 0)
+            .map(std::time::Duration::from_secs);
+        // An ask that took no time gives no step to grow from: none is drawn from it.
+        let (Some(left), false) = (left, took.is_zero()) else {
+            return Err(error);
+        };
+        let policy = focal_client::RetryPolicy {
+            max_attempts: u32::MAX,
+            max_elapsed: left,
+            base_backoff: took,
+            max_backoff: left,
+        };
+        let pause = policy.pause(backoffs).min(left);
+        backoffs = backoffs.saturating_add(1);
+        focal_rt::time::sleep(pause)
+            .await
+            .map_err(|_| JoinError::Runtime)?;
+    }
 }
 /// Whether the founder refused a join for good: the invitation is revoked,
 /// expired, redeemed under another key, for another cluster, or not
