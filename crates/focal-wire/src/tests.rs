@@ -5027,6 +5027,56 @@ fn cold_calls_to_one_route_share_one_dial_and_a_stale_failure_forgets_nothing() 
     .unwrap()
 }
 
+/// A route's name is resolved when the route is first reached, and again once its connection
+/// failed or the route was forgotten, never at each call: every call resolved it before, thousands
+/// of lookups a second through the process's four places for resolution, and a slow lookup held
+/// every request of every session behind it (fleet33 k24 and m2, 2026-11-01).
+#[test]
+fn a_routes_name_is_resolved_at_its_dial_not_at_each_call() {
+    focal_rt::block_on(async move {
+        let pki = Pki::new();
+        let (certificate, key) = pki.issue(false);
+        let registry = PeerRegistry::new(16).unwrap();
+        registry
+            .register_certificate(&certificate, grant())
+            .unwrap();
+        let handler: Arc<dyn RequestHandler> =
+            Arc::new(|verified: VerifiedRequest| async move { response(verified.request()) });
+        let (server, task) = server(&pki, registry, handler).await;
+        let connector = connector(&pki, certificate, key);
+        let address = server.local_addr().unwrap().to_string();
+        let routes = RouteConnections::new(connector, 2).unwrap();
+        for id in 1..=64u128 {
+            let reply = routes
+                .request(&address, "localhost", &request(id))
+                .await
+                .unwrap();
+            assert_eq!(reply, response(&request(id)));
+        }
+        assert_eq!(
+            routes.resolutions(),
+            1,
+            "one resolution for every call while the route's connection is up"
+        );
+        assert_eq!(routes.dials().await, 1);
+        let current = routes.connect(&address, "localhost").await.unwrap();
+        routes.forget(&address, "localhost", current.generation);
+        routes
+            .request(&address, "localhost", &request(65))
+            .await
+            .unwrap();
+        assert_eq!(
+            routes.resolutions(),
+            2,
+            "forgotten, the route's name is resolved again"
+        );
+        assert_eq!(routes.dials().await, 2);
+        server.close().unwrap();
+        task.join().await.unwrap();
+    })
+    .unwrap()
+}
+
 /// A caller that stopped waiting for a route's dial holds no place among its waiters: a client
 /// reaches a route that gave no answer beside its requests and lets the reach go once a request
 /// is answered, so a dial to a node that is gone, which waits out its idle timeout, filled with

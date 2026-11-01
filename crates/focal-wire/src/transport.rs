@@ -1342,18 +1342,33 @@ impl QuicRemote {
 /// The connections a participant keeps to the routes it reaches — its initial endpoint and the
 /// hints its requests are redirected to — one per route, dialed once (the audit's F60): its
 /// connector's endpoint keeps them, and concurrent cold calls to one route wait on the one dial
-/// in flight. A route's name is resolved afresh on each dial. The connection last handed out for
-/// each route is remembered, so a failure its caller reports closes that connection and no later
-/// one.
+/// in flight. A route's name is resolved when the route is first reached, and again once its
+/// connection failed, a dial to the address it resolved to failed, or the route was forgotten;
+/// between them the connector is given that address, and reuses the live connection or dials the
+/// address again. Every call resolved its route's name before: thousands of lookups a second
+/// through the process's four places for resolution, so a lookup held up while restarted
+/// containers' names were registered again held every request of every session behind it, 1.3
+/// to 3.4 s with no answer in a 33-node run's load generator (fleet33 k24 and m2, 2026-11-01).
+/// The connection last handed out for each route is remembered, so a failure its caller reports
+/// closes that connection and no later one.
 pub struct RouteConnections {
     connector: QuicConnector,
     max_routes: usize,
-    /// The connection each route was last handed, by its endpoint and server name; at most
+    /// The connection each route was last handed, with the address its name resolved to; at most
     /// `max_routes`, the one handed longest ago going first.
-    handed: std::sync::Mutex<std::collections::VecDeque<((String, String), QuicRemote)>>,
+    handed: std::sync::Mutex<std::collections::VecDeque<Handed>>,
+    /// The names it resolved: each route's first, and each after its connection failed.
+    resolutions: std::sync::atomic::AtomicU64,
     /// Connections it closed whose close their endpoint could not queue (the shard's tasks all
     /// taken): each idles out at its connection's idle timeout instead.
     closes_refused: std::sync::atomic::AtomicU64,
+}
+/// The connection a route was last handed, by its endpoint and server name, and the address its
+/// name resolved to.
+struct Handed {
+    route: (String, String),
+    remote: QuicRemote,
+    address: SocketAddr,
 }
 /// A connection the cache handed out.
 pub struct Connected {
@@ -1371,8 +1386,14 @@ impl RouteConnections {
             connector,
             max_routes,
             handed: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            resolutions: std::sync::atomic::AtomicU64::new(0),
             closes_refused: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+    /// The names it resolved: a route's first, and each after its connection failed or was
+    /// forgotten.
+    pub fn resolutions(&self) -> u64 {
+        self.resolutions.load(std::sync::atomic::Ordering::Relaxed)
     }
     pub fn limits(&self) -> &WireLimits {
         self.connector.limits()
@@ -1406,15 +1427,46 @@ impl RouteConnections {
         if endpoint.len() > 512 || server_name.len() > 253 {
             return Err(WireError::Limit);
         }
-        let address = resolve(endpoint, self.limits().request_timeout).await?;
-        let remote = self.connector.connect(address, server_name).await?;
         let route = (endpoint.to_owned(), server_name.to_owned());
+        let known = self.handed.lock().ok().and_then(|handed| {
+            handed
+                .iter()
+                .find(|held| held.route == route)
+                .map(|held| held.address)
+        });
+        let address = match known {
+            Some(address) => address,
+            None => {
+                let _ = self.resolutions.fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |count| Some(count.saturating_add(1)),
+                );
+                resolve(endpoint, self.limits().request_timeout).await?
+            }
+        };
+        let remote = match self.connector.connect(address, server_name).await {
+            Ok(remote) => remote,
+            Err(error) => {
+                // The address the name resolved to took no dial: the next call resolves it again.
+                if known.is_some()
+                    && let Ok(mut handed) = self.handed.lock()
+                {
+                    handed.retain(|held| !(held.route == route && held.address == address));
+                }
+                return Err(error);
+            }
+        };
         if let Ok(mut handed) = self.handed.lock() {
-            handed.retain(|(held, _)| *held != route);
+            handed.retain(|held| held.route != route);
             if handed.len() >= self.max_routes {
                 handed.pop_front();
             }
-            handed.push_back((route, remote.clone()));
+            handed.push_back(Handed {
+                route,
+                remote: remote.clone(),
+                address,
+            });
         }
         Ok(Connected {
             generation: remote.epoch,
@@ -1440,7 +1492,10 @@ impl RouteConnections {
             Ok(exchanged) => Ok(exchanged.response),
             Err(unanswered) => {
                 if crate::connection_failed(unanswered.closed, &unanswered.error, true) {
-                    self.close(&connected.remote);
+                    // The route's name is resolved again at its next dial.
+                    if !self.drop_route(endpoint, server_name, connected.generation) {
+                        self.close(&connected.remote);
+                    }
                 }
                 Err(unanswered.error)
             }
@@ -1449,14 +1504,25 @@ impl RouteConnections {
     /// Close the route's connection of `generation`, which its caller found failed: the next call
     /// dials anew. A failure of a connection no longer the route's forgets nothing.
     pub fn forget(&self, endpoint: &str, server_name: &str, generation: u64) {
+        let _ = self.drop_route(endpoint, server_name, generation);
+    }
+    /// Closes and forgets the route's connection of `generation`, with the address its name
+    /// resolved to: whether it was the route's.
+    fn drop_route(&self, endpoint: &str, server_name: &str, generation: u64) -> bool {
         let Ok(mut handed) = self.handed.lock() else {
-            return;
+            return false;
         };
-        let at = handed.iter().position(|((held, name), remote)| {
-            held == endpoint && name == server_name && remote.epoch == generation
+        let at = handed.iter().position(|held| {
+            held.route.0 == endpoint
+                && held.route.1 == server_name
+                && held.remote.epoch == generation
         });
-        if let Some((_, remote)) = at.and_then(|at| handed.remove(at)) {
-            self.close(&remote);
+        match at.and_then(|at| handed.remove(at)) {
+            Some(held) => {
+                self.close(&held.remote);
+                true
+            }
+            None => false,
         }
     }
 }
