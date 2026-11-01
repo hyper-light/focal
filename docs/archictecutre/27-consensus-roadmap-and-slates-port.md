@@ -507,6 +507,18 @@ election timeout at the pace the group runs at (`retirement_hold`): two seconds 
 network, forty across the planet at the ceiling of the pace. A member that is back
 within it keeps its seat. What an operator asks for is not held.
 
+*Every session has its turn.* The partition's leader controls its sessions in ledger
+order, and one it cannot act on leaves the sessions after it theirs: a session most of
+whose voters the directory holds dead is passed over until enough are back, since
+nothing asked of it can commit (`focal_directory::majority_alive`); a leader the
+directory holds dead is not asked, a voter of the session it holds alive is, which
+answers where the log leads; and a session whose control fails leaves the others their
+turn, the first failure the pass's where none advanced (`ControlRound`). A failed
+session ended the pass, each call to a dead leader waiting out the session-control
+clock first, so a session without its quorum stopped every heal after it: of 33 nodes
+with twelve killed, three sessions were healed before the first without its quorum and
+none after it, though four had lost one voter (2026-11-01).
+
 *A move toward home* gives one seat of a voter that is not at home to a node that is,
 the most loaded voter's first. It is decided as a move of a preferred leader is: for a
 state that has lasted `FOCAL_HOME_BALANCE_HOLD_SECS` (30), one session of a partition

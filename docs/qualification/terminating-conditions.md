@@ -10,7 +10,7 @@ every row names where it is recorded, and a gap is written as a gap.
 |---|---|---|
 | 1 | One binary and CLI, laptop to global, proven by records | partly shown |
 | 2 | More than a thousand agents doing claims, artifacts, testaments and validations | shown at 1,000; the Kubernetes build not attempted |
-| 3 | Delivery under heavy load, horrific networks, dozens of node failures | shown on three nodes; dozens not run |
+| 3 | Delivery under heavy load, horrific networks, dozens of node failures | shown on three nodes and on 33 with twelve failing at once; the custody rule's decision pending; one bootstrap's stop not root-caused |
 | 4 | p99s an order of magnitude beyond Kafka, Redis HA, NATS | plan of record; not shown across its conditions |
 | 5 | Post-quantum encryption in transit and at rest | in transit shown; at rest partly |
 | 6 | Adversarial batteries: bombs, tampering, misuse | partly shown |
@@ -51,21 +51,60 @@ Kubernetes implementation in Rust built by the agents, has not been attempted.
 ## 3. Delivery under load, horrific networks and failures
 
 **Recorded.** Work among 500 agents over netem paths: 80 ms ± 30 ms, 3% loss, and both with 5%
-reordering, every write committed, none refused or unknown (compare.yml on load-reads 09c3b89e,
-runs 39973449354, 39973458138, 39973468524; "2026-10-23 — focal-load reads as many of a caller's
-lifecycle steps at once as it writes"); QUIC learning a reordering path's tolerance ("2026-10-23 —
-QUIC tolerates a path that reorders"); a content copy holder killed for 30 s and isolated for 20 s
-("2026-10-23 — An artifact job does not ask a copy the liveness view holds down" and the entries
-after it: isolated, every write committed; killed, 88 refused and 10 unknown of 12,514 at the
-clients' 30 s clocks); 128 kbit/s relays (the F48/F49 and MTU-probe entries); tests run beside
-busy loops and small memory (the CLI tests' starts, "2026-10-23 — A test's wait for a started node
-is charged to the node's periods").
+reordering, every write committed, none refused or unknown (compare.yml on load-reads 09c3b89e, runs
+39973449354, 39973458138, 39973468524; "2026-10-23 — focal-load reads as many of a caller's
+lifecycle steps at once as it writes"); under 80 ms and 3% loss on every leg a write's median 1.18
+times the loss-free path's (293 against 249 ms), every lifecycle written ("2026-10-28 — A write
+under 80 ms and 3% loss: replication's head-of-line wait, rebuilt by forward erasure correction");
+QUIC learning a reordering path's tolerance ("2026-10-23 — QUIC tolerates a path that reorders"); a
+content copy holder killed for 30 s and isolated for 20 s ("2026-10-23 — An artifact job does not
+ask a copy the liveness view holds down" and the entries after it: isolated, every write committed;
+killed, 88 refused and 10 unknown of 12,514 at the clients' 30 s clocks); 128 kbit/s relays (the
+F48/F49 and MTU-probe entries); tests run beside busy loops and small memory (the CLI tests' starts,
+"2026-10-23 — A test's wait for a started node is charged to the node's periods").
 
-**Open.** Every fault run is three nodes: dozens of nodes failing at once has not been run. Under
-3% loss a claim settles in 14 s at the median, its evidence steps held at the evidence window
-("2026-10-23 — The evidence window keeps a filter a kind of job" is the fix under measurement),
-and an ordinary write's median doubles (0.28 to 0.56 s). An artifact's acknowledgement while a
-required copy is down waits on a design decision (all copies, doc 26 §1, or a quorum of voters).
+At 33 nodes, twelve failing at once 45 s into the work flow (500 agents, 220 claims a second over 11
+sessions on nodes of 0.90 CPU and 512 MiB, fedora, a busy host; the founder and the root's leader
+among the twelve): killed and started again 30 s later ("2026-10-29 — A dozen of 33 nodes killed and
+started again under the work flow"), cut off from every peer and client for 30 s and for 12 s, past
+the QUIC idle timeout ("2026-10-30 — A dozen of 33 nodes partitioned, and their connections dropped,
+under the work flow"), and all three again on the tree the defects those runs found close on, with a
+dozen drawn from the nodes outside the control plane so that the directory heals the sessions they
+leave a voter short under the load (fleet-run c606af7b, its findings fixed at 6bb00314; "2026-11-01
+— Condition 3 at scale: a dozen of 33 nodes killed, partitioned and cut off, on the final tree";
+[condition 3 at scale](campaigns/2026-10-31-fleet33-condition3.md)):
+
+| fedora run | Fault | Written, of 29,700 | Refused | Unknown | Abandoned | Write p50 / p99 (ms) |
+|---|---|---|---|---|---|---|
+| c16-0602 | cut off 12 s | 29,632 | 68 | 0 | 0 | 113.7 / 589.0 |
+| k26-0620 | killed 30 s | 29,593 | 107 | 0 | 0 | 113.9 / 16,012.9 |
+| p9-0647 | cut off 30 s | 29,594 | 106 | 0 | 0 | 105.3 / 16,306.7 |
+| m3-0704 | killed 30 s, the founder spared | 29,633 | 66 | 0 | 1 | 118.6 / 14,886.2 |
+| c17-0721 | cut off 12 s | 29,626 | 74 | 0 | 0 | 91.9 / 582.9 |
+| k27-0749 | killed, down 61 s | 27,954 | 1,742 | 1 | 3 | 905.7 / 46,926.5 |
+| m4-0816 | twelve outside the control plane killed 30 s | 28,595 | 1,105 | 0 | 0 | 152.4 / 22,192.5 |
+
+Every refusal was the all-copies custody rule's or a session's without its quorum. A session that
+lost nothing or a follower committed again within half a second (seconds in k27 and m4, whose host's
+file system held every sync for up to 5.2 s, every node's log on one btrfs volume), one that lost
+its leader within 1.4 to 2.4 s, and one without its quorum as its voters came back. The unknown
+write and the abandoned lifecycles were defects, fixed (22132325, baabea7d), and so was a controller
+that left every session after the first it could not act on unhealed (01a2f923), and a join that
+gave up on a sponsor whose name did not resolve (6bb00314). Their confirmation at 33 nodes on that
+tree waits on the host, whose kiln runner restarted every 20 to 30 minutes under other tenants' load
+while it was to run.
+
+**Open.** An artifact's acknowledgement waits on every content copy of its session (doc 26 §1), so
+while a copy is down its artifact steps wait or are refused (`unavailable` at the client's 30 s
+clock, `owner_bound` at the custody check): every refusal at 33 nodes that is not a session without
+its quorum is this rule's, and whether a quorum of copies (f+1) suffices is the user's decision,
+pending. A session whose quorum is down takes no write until its voters are back. One bootstrap in
+69 stopped at an admin call the founder could not answer, the root group having elected another
+leader the founder never heard of: not root-caused, the nodes saying nothing of the group's
+elections. A node's log syncs wait on its file system's commits, up to 5.2 s on the host's btrfs
+volume, where the harness keeps every node's log (condition 10). Under 3% loss a write's p99 is 753
+to 2,244 ms against 462 to 574 without, its artifact steps held at the evidence door (the 2026-10-28
+entry's open items).
 
 ## 4. p99s an order of magnitude beyond Kafka, Redis HA and NATS
 

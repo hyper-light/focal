@@ -1,0 +1,55 @@
+# k27-0749: every ledger's commits and the host's NVMe (nvme1n1, the root btrfs volume holding /var/lib/docker) per 200 ms, seconds from the fault's start (~/s5/stallzoom.py over ~/s5/host-samples.txt, sampled every 200 ms by ~/s5/hostsample.sh)
+from-fault  commits | flushes writes ms/write inflight cpu_some% io_full%
+   76.0       346 |
+   76.2       505 |
+   76.4       437 |      23   2285      0.7        0        54        1
+   76.6       595 |      27   1499      1.0        0        42        1
+   76.8       342 |      35   1637      1.2        0        38        2
+   77.0       678 |      31   1389      1.2        0        33        1
+   77.2       683 |      35   1541      1.4        0        22        1
+   77.4       601 |      33   1467      1.4        0        24        1
+   77.6       581 |      21    912      1.1        0        33        1
+   77.8       466 |       0      6      0.0        0         9        1
+   78.0         0 |       0      0      0.0        0        16        1
+   78.2         0 |       0   7353     23.0        0        18        2
+   78.4         0 |       0   2333      8.5        0        11        2
+   78.6         0 |       0   1876      0.7        0        19        2
+   78.8         0 |       0   1600      0.5        0         6        3
+   79.0         0 |
+   79.2         0 |       0    903      1.8        0         4        3
+   79.4         0 |       0    475      2.8        0         0        3
+   79.6         0 |       0    421      2.0        0         0        1
+   79.8         0 |       0      0      0.0        0         0        1
+   80.0         0 |       0      1      0.0        0         2        1
+   80.2         0 |       0      0      0.0        0         0        2
+   80.4         0 |       0      0      0.0        0         0        2
+   80.6         0 |       0      0      0.0        0         0        5
+   80.8         0 |       0      0      0.0        0         0        3
+   81.0         0 |       0      0      0.0        0         2        1
+   81.2         0 |       0      0      0.0        0         1        0
+   81.4         0 |       0      0      0.0        0         1        1
+   81.6         0 |       0      0      0.0        0         0        4
+   81.8         0 |       0      0      0.0        0         0        4
+   82.0         0 |       0   1872     14.4        0         7        2
+   82.2         0 |       0  13528     61.2        0        41        0
+   82.4         0 |       0  13735    179.1        0        28        1
+   82.6         6 |      18   7386    312.5        0         9        1
+   82.8       129 |      38    619      1.2        0        17        2
+   83.0       237 |      36    723      1.2        0        18        2
+   83.2       272 |      32    732      1.2        0        23        2
+   83.4       344 |      34    708      1.2        0        26        1
+   83.6       400 |      32    849      1.1        0        24        2
+   83.8       357 |
+   84.0       293 |      28   2360      1.2        0        38        1
+   84.2       465 |      28   1666      2.0        0        29        2
+
+# the volume: findmnt -T /var/lib/docker
+TARGET SOURCE                FSTYPE OPTIONS
+/      /dev/nvme1n1p3[/root] btrfs  rw,relatime,seclabel,compress=zstd:1,ssd,discard=async,space_cache=v2,subvolid=256,subvol=/root
+
+# its transaction commits since the host booted at 2026-11-01 03:19:55 (/sys/fs/btrfs/UUID/commit_stats, read 2026-11-01T08:18:28-08:00)
+commits 5327
+cur_commit_ms 0
+last_commit_ms 10
+max_commit_ms 5206
+total_commit_ms 321284

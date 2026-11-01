@@ -1,0 +1,7 @@
+0s 1793542589192ms seed 1029 (FAULT_SEED)
+45s 1793542634222ms any 12 of 33 (seed 1029, fault 1): focal1 focal6 focal7 focal8 focal9 focal16 focal17 focal23 focal27 focal28 focal31 focal32
+45s 1793542634227ms focal1 focal6 focal7 focal8 focal9 focal16 focal17 focal23 focal27 focal28 focal31 focal32 isolating
+45s 1793542634341ms focal1 focal6 focal7 focal8 focal9 focal16 focal17 focal23 focal27 focal28 focal31 focal32 isolated
+57s 1793542646346ms focal1 focal6 focal7 focal8 focal9 focal16 focal17 focal23 focal27 focal28 focal31 focal32 rejoining
+57s 1793542646577ms focal1 focal6 focal7 focal8 focal9 focal16 focal17 focal23 focal27 focal28 focal31 focal32 rejoined
+141s 1793542730544ms every fault undone

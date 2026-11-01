@@ -1,0 +1,19 @@
+# m4-0816: every ledger's commits and the host's NVMe (nvme1n1, the root btrfs volume holding /var/lib/docker) per 200 ms, seconds from the fault's start (~/s5/stallzoom.py over ~/s5/host-samples-m4.txt, sampled every 200 ms by ~/s5/hostsample.sh)
+from-fault  commits | flushes writes ms/write inflight cpu_some% io_full%
+    8.6       245 |
+    8.8       193 |
+    9.0       226 |      39   1691      1.0        0         1        6
+    9.2       181 |      40   1687      1.0        0         0        6
+    9.4        55 |      34   5134      2.7        0         4        9
+    9.6         0 |       4    525     14.9        0         0        4
+    9.8         0 |       0      0      0.0        0         0        2
+   10.0         0 |       0      0      0.0        0         0        2
+   10.2         0 |       0      1      0.0        0         0        2
+   10.4         0 |       0      0      0.0        0         2        1
+   10.6         0 |       0      6      0.0        0         1        1
+   10.8       103 |       0  21080     58.4        0         0        0
+   11.0       253 |      33   4188     23.7        0         1        3
+   11.2       225 |      41    597      0.9        0         1        5
+   11.4       257 |      41    630      1.0        0         1        5
+   11.6       238 |      41    683      1.0        0         3        4
+   11.8       284 |      41    640      0.9        0         1        4

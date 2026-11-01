@@ -1,0 +1,13 @@
+# m6-0918 (focal:fleet-c16, 01a2f923): the bootstrap stopped at an agent invitation answered unknown; run.sh status and the last line of its log
+run.sh exit=7 after 695 s
+focal: [outcome_unknown] mutation outcome is unknown; recover the exact saved request
+
+# the root btrfs volume's commits of 500 ms or longer through the bootstrap (/sys/fs/btrfs/UUID/commit_stats every 200 ms, ~/s5/btrfssample.sh); the run stopped at 09:31:25
+commit #5882 done 09:23:40, took 956 ms
+commit #5885 done 09:25:08, took 584 ms
+commit #5890 done 09:26:56, took 1229 ms
+commit #5892 done 09:27:25, took 1868 ms
+commit #5898 done 09:29:58, took 1230 ms
+commit #5899 done 09:30:16, took 5391 ms
+commit #5900 done 09:30:44, took 4881 ms
+commit #5903 done 09:31:25, took 570 ms

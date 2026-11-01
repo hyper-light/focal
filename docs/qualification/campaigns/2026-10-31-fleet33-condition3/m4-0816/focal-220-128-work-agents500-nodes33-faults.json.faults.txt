@@ -1,0 +1,18 @@
+0s 1793550616435ms seed 1029 (FAULT_SEED)
+45s 1793550661700ms any 12 of the 29 nodes holding no control vote (seed 1029, fault 1): focal2 focal10 focal11 focal12 focal13 focal20 focal21 focal22 focal24 focal28 focal31 focal32
+45s 1793550661705ms focal2 focal10 focal11 focal12 focal13 focal20 focal21 focal22 focal24 focal28 focal31 focal32 killing
+56s 1793550672899ms focal2 focal10 focal11 focal12 focal13 focal20 focal21 focal22 focal24 focal28 focal31 focal32 killed
+93s 1793550709400ms focal2 focal10 focal11 focal12 focal13 focal20 focal21 focal22 focal24 focal28 focal31 focal32 started
+93s 1793550709868ms focal24 serving
+93s 1793550709872ms focal11 serving
+93s 1793550709893ms focal20 serving
+93s 1793550709897ms focal31 serving
+93s 1793550709941ms focal2 serving
+93s 1793550709989ms focal13 serving
+94s 1793550710067ms focal22 serving
+94s 1793550710176ms focal12 serving
+94s 1793550710215ms focal10 serving
+94s 1793550710673ms focal28 serving
+95s 1793550711480ms focal32 serving
+95s 1793550711819ms focal21 serving
+142s 1793550758931ms every fault undone

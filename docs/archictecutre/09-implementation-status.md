@@ -18294,3 +18294,95 @@ The refusals were artifact steps whose content copy was cut off (`owner_bound` a
 `unavailable` at `artifact.submit` and `validation.report`, the evidence door's `ingress_capacity` at
 `artifact.submit`) and, in p2, writes of a session without its quorum (`unavailable` at
 `claim.create`). Nothing new was found; what is open is the kill campaign's.
+
+### 2026-11-01 — Condition 3 at scale: a dozen of 33 nodes killed, partitioned and cut off, on the final tree
+
+Goal condition 3 at 33 nodes, on the tree the 33-node runs' defects close on (fleet-run c606af7b,
+fedora, a busy host): twelve of the 33 nodes failing at once 45 s into the work flow (500 agents,
+220 claims a second over 11 sessions, 120 s measured), the founder and the root's leader among them,
+killed for 30 s and started again, cut off from every peer and client for 30 s, and for 12 s, past
+the QUIC idle timeout, which drops every connection they hold; a dozen killed that spare the
+founder; and a dozen drawn from the nodes holding no vote in the root's group or a partition's
+(902acac7), so that the directory keeps placing and heals the sessions they leave a voter short.
+Every lifecycle was written and judged, or refused with a typed error, outside one unknown write and
+four abandoned lifecycles, each a defect fixed below; no replica stopped and no node held a member
+dead at the end of any run. Two confirmation runs on the tree that closes what these runs found
+(6bb00314) wait on the host, whose kiln runner restarted every 20 to 30 minutes from 10:20 under
+other tenants' load. The record, with each run's report, report by ledger, agents' state, placement
+as it was left, the placement read every 2 s through the heal runs' faults, and the host's disk
+through k27's stall: [condition 3 at
+scale](../qualification/campaigns/2026-10-31-fleet33-condition3.md).
+
+| fedora run | Fault | Written, of 29,700 | Refused | Unknown | Abandoned | Undelivered | Write p50 / p99 (ms) |
+|---|---|---|---|---|---|---|---|
+| c16-0602 | cut off 12 s | 29,632 | 68 | 0 | 0 | 0 | 113.7 / 589.0 |
+| k26-0620 | killed 30 s | 29,593 | 107 | 0 | 0 | 0 | 113.9 / 16,012.9 |
+| p9-0647 | cut off 30 s | 29,594 | 106 | 0 | 0 | 0 | 105.3 / 16,306.7 |
+| m3-0704 | killed 30 s, the founder spared | 29,633 | 66 | 0 | 1 | 0 | 118.6 / 14,886.2 |
+| c17-0721 | cut off 12 s | 29,626 | 74 | 0 | 0 | 0 | 91.9 / 582.9 |
+| k27-0749 | killed, down 61 s | 27,954 | 1,742 | 1 | 3 | 0 | 905.7 / 46,926.5 |
+| m4-0816 | twelve outside the control plane killed 30 s | 28,595 | 1,105 | 0 | 0 | 0 | 152.4 / 22,192.5 |
+
+Every refusal was the all-copies custody rule's (`owner_bound` at `validation.begin`, `unavailable`
+at `artifact.submit` and `validation.report` while a content copy was down) or a session's without
+its quorum (`unavailable` at `claim.create`, only in those sessions). A session that lost nothing or
+a follower committed again within half a second, one that lost its leader within 1.4 to 2.4 s, and
+one without its quorum as its voters came back. k27 ran while the host's file system held every sync
+for seconds: docker took 11 s to kill the twelve and 31 s to start them, so they were down some 61
+s, and its artifact steps waited out their clocks the longer (1,523 `unavailable`).
+
+**The stalls.** In six runs every session stopped committing at once for 1.1 to 4.8 s while the load
+generator sent on time. Every node's log is on the host's root btrfs volume (`compress=zstd:1`),
+whose transaction commits hold every sync made on it: in k27 and m4, sampled every 200 ms, its NVMe
+completed no flush, nothing in flight at the device, for 4.2 and 1.2 s, while every session's
+commits stopped over the same windows, coming back with the first flushes. m4's was one commit of
+1,467 ms while docker killed the twelve; the load's own commits took 61 to 369 ms, and the volume's
+longest since the host's boot was 5.2 s. Not the neighbour table (no forced collection and no table
+full since the boot), nor name resolution (the runs after c606af7b stalled as well).
+
+**Healing.** k27, its twelve down 61 s, healed three sessions under the load: each dead copy's seat
+went to a node outside the session and the surviving voter became a copy (9d893dca's case), its
+readiness verifying 1,543 to 5,039 artifacts and their objects in 0.2 to 2.5 s. It healed none after
+the first session without its quorum in ledger order, m4 none, and m5 (twelve outside the control
+plane down 66 s) none in the 26.6 s between the directory holding the twelfth death and the twelve
+serving again: the controller's pass ended at the first session it could not act on (fixed below).
+The detector settled the deaths 17.9 to 36.2 s after the kill (a suspicion runs 4.6 to 27.6 s at 33
+members), the directory holding each within a few seconds. That a heal now reaches every session it
+can at 33 nodes waits on the confirmation runs.
+
+**Found and fixed at the cause** (5a7af464 to 6bb00314): the placement controller's pass ended at
+the first session whose control failed, so a session most of whose voters were dead, or whose leader
+was dead, each call waiting out the 5 s session-control clock, stopped the control, and so the
+healing, of every session after it (a session without a live majority is passed over, a dead leader
+is not asked, and a failed session leaves the others their turn, 01a2f923); a node whose route was
+older than its client's handed the client that route, which the client takes for an invalid answer,
+ending a write unknown (k27's one, in a session healed under the load; such a node answers
+unavailable, 22132325); focal-load's agent abandoned a lifecycle whose read a lagging replica
+answered `Behind` (m3, k27; asked again within a hand-off's wait, baabea7d); the founder-spared run
+could take the directory partition's quorum, its voters drawn at each bootstrap (a fault drawn from
+the nodes outside the control plane, 902acac7), and a bootstrap stopped at an agent's invitation
+answered unknown while the host held every sync for 5 s (an invitation is exact by its name, and the
+bootstrap asks one again, c63c52c1), and another at an agent's enrollment, a join answering a
+sponsor whose name did not resolve as an invalid invitation, which no join asks again (it is the
+sponsor unavailable now, asked again, 6bb00314); a client resolved its route's name at every call
+(c606af7b); a client's enrollment asked once (09d5d1eb); a move that replaced a session's one voter
+holding no content copy could never be ready, its readiness reading every object from the node's own
+store, a seal's bundle among them (c6, k22, m1; 29037764), and a voter a move makes a copy brings
+each object it lacks from the copies before it verifies it (9d893dca); every session's commits
+waited out each checkpoint wave, every replica checkpointing at one index of the entry floor (each
+at its own point of the floor's period, 5857518d); the directory partition refused 85% of its
+intents (keyed operations from level 13, 8d40e22f); a client's retransmission timeout doubled for
+every request waiting on a dead route (9f7925b4); an artifact job asked a copy the liveness view
+held dead (015a5835); failover waited on the QUIC idle timeout (c7bcc866); the partition's authority
+refresh carried the whole enrollment registry (1d4dc1d7); focal-load held a run to 64 callers
+(f8d1be7f); a node's local intent journal was let go after 5 s of the wall's clock (67e7900b).
+
+**Open.** The all-copies custody rule holds artifact steps while a copy is down (doc 26 §1; the f+1
+decision is the user's, pending); a session without its quorum takes no write until its voters are
+back; a move closes its session to clients from its cutover to its activation (k27's three moves
+came with 4.1 to 22.2 s without a commit in their sessions, the window from cutover to activation
+alone not yet separated); one bootstrap in 69 stopped at an admin call the founder could not answer,
+the root group having elected a leader the founder and one other node never heard of, not
+root-caused, the nodes saying nothing of the group's elections; on btrfs a node's log syncs wait on
+the volume's commits (condition 10); the confirmation at 33 nodes of what these runs found (m6, k28
+on `focal:fleet-c17`) waits on the host.

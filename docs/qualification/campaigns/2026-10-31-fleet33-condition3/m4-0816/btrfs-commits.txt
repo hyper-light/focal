@@ -1,0 +1,10 @@
+# m4-0816: the root btrfs volume's transaction commits (/sys/fs/btrfs/UUID/commit_stats, sampled every 200 ms by ~/s5/btrfssample.sh), seconds from the kill; docker killed the twelve from 0 to 11.2 s
+commit #5439 completed by  -47.2 s: took 12 ms
+commit #5440 completed by  -46.8 s: took 14 ms
+commit #5441 completed by  -17.6 s: took 102 ms
+commit #5442 completed by  -17.2 s: took 61 ms
+commit #5443 completed by  -10.3 s: took 189 ms
+commit #5444 completed by   10.9 s: took 1467 ms
+commit #5445 completed by   42.7 s: took 126 ms
+commit #5446 completed by   59.5 s: took 321 ms
+commit #5447 completed by   91.2 s: took 97 ms

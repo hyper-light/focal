@@ -1281,7 +1281,10 @@ routed. For a client request the data service consults the directory before
 any replica sees it: with no copy of the ledger here, the answer is
 `RouteChanged` with the directory's leader hint (a node that only follows
 redirects once more, to the leader it knows) or `Unavailable` when nothing is
-known; with a copy, a claimed route epoch behind the directory's is answered
+known, or when the route this node knows is older than the epoch the client
+claims (its view is behind the client's, and a client refuses an older hint
+as an invalid answer, which ended a write unknown in a session healed under
+the load, 2026-11-01); with a copy, a claimed route epoch behind the directory's is answered
 with the current epoch at the replica's own leader (this node's endpoint
 when it leads, else the leader's), a mutation on a follower is redirected to
 the leader the replica's consensus state names, and a current read is served
@@ -2143,7 +2146,11 @@ exactly, while the sponsor's answer is no room, a group between leaders or
 an unknown outcome and the invitation lives (`network_join::settle`); a
 client asked once before, and a 33-node run's bootstrap stopped at one
 whose sponsor, on a loaded host, had not yet committed it (09,
-2026-11-01). An invitation file is read through links (a mounted secret is a link into its volume)
+2026-11-01). A sponsor whose name the resolver did not answer for is
+unavailable, asked again as well; an endpoint that is neither an address
+nor a name is the invitation's fault (`network_join::sponsor_address`).
+Both joins answered every failed resolution as an invalid invitation,
+which ended an enrollment for good on a loaded host (09, 2026-11-01). An invitation file is read through links (a mounted secret is a link into its volume)
 and must be a regular file nobody but its owner may write and nobody
 outside its group may read (mode `0600` as `invite node` writes it, or
 `0440` as a secret mounted with `defaultMode: 288` under the pod's

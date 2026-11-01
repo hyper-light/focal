@@ -1,0 +1,20 @@
+== m3-0704: fault undone at 44.6 s; longest window with no commit in any ledger 0.1 s (20.8-20.9)
+  ledger  0 (a follower): within the fault   0.5 s (0.7-1.2); after it   0.2 s (78.0-78.2)
+  ledger  1 (nothing): within the fault   0.5 s (6.8-7.3); after it   0.2 s (45.8-46.1)
+  ledger  2 (quorum): within the fault  38.0 s (0.2-38.2); after it   0.1 s (77.5-77.7)
+  ledger  3 (a follower): within the fault   0.5 s (6.6-7.1); after it   0.2 s (67.5-67.7)
+  ledger  4 (nothing): within the fault   0.5 s (0.9-1.4); after it   0.1 s (74.8-75.0)
+  ledger  5 (quorum): within the fault  35.6 s (0.2-35.8); after it   0.1 s (74.8-75.0)
+  ledger  6 (nothing): within the fault   0.5 s (0.6-1.1); after it   0.2 s (46.0-46.1)
+  ledger  7 (a follower): within the fault   0.5 s (3.3-3.8); after it   0.1 s (85.8-86.0)
+  ledger  8 (a follower): within the fault   0.5 s (0.6-1.1); after it   0.1 s (74.8-75.0)
+  ledger  9 (quorum): within the fault  39.7 s (0.2-39.9); after it   0.4 s (59.1-59.4)
+  ledger 10 (leader): within the fault   1.4 s (0.2-1.6); after it   0.1 s (78.0-78.1)
+  by what it lost: a follower: 4 ledgers, longest within the fault 0.5 to 0.5 s
+  by what it lost: leader: 1 ledgers, longest within the fault 1.4 to 1.4 s
+  by what it lost: nothing: 3 ledgers, longest within the fault 0.5 to 0.5 s
+  by what it lost: quorum: 3 ledgers, longest within the fault 35.6 to 39.7 s
+== m3-0704: 33 replicas
+  lacking/refused: none
+  behind: none
+  seals applied by session: {'28f6d205': [2], '47485f5b': [1], '5992e62f': [1], '629ac469': [2], '7e4375ed': [1], '966014b3': [1], 'b7578d1f': [1], 'bfaa46f9': [2], 'f26ce23f': [1], 'fc5e5302': [1], 'founder': [1]}
