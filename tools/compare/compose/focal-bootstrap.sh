@@ -185,10 +185,15 @@ done 3< "$tmp/sessions"
 echo "$(wc -l < "$tmp/sessions" | tr -d ' ') sessions activated natively"
 
 # The generator's client, enrolled over QUIC like every competitor's client, and the
-# deliver mode's consumer, a client of its own that completes what the first issues.
-f1 invite client --name bench --output /invite/client.invite
+# deliver mode's consumer, a client of its own that completes what the first issues. An
+# invitation whose commit the founder could not learn within its control path's bound is answered
+# unknown, and the CLI says to recover the exact request: one is exact by its name, so it is asked
+# again as the bootstrap's other steps are (fleet33 m6, 2026-11-01: an agent's invitation answered
+# unknown while the host's file system held every sync for 5 s at a time, and the bootstrap
+# stopped there).
+retry 30 f1 invite client --name bench --output /invite/client.invite
 $DC exec -T focal-load focal --data-dir /client enroll context --invite-file /invite/client.invite bench
-f1 invite client --name consumer --output /invite/consumer.invite
+retry 30 f1 invite client --name consumer --output /invite/consumer.invite
 $DC exec -T focal-load focal --data-dir /client enroll context --invite-file /invite/consumer.invite consumer
 # AGENTS (environment), for the deliver mode among agents: that many more clients, each an
 # identity of its own (agent-0000, ...) in a client data directory of its own under /client/agents
@@ -200,7 +205,12 @@ if [ -n "${AGENTS:-}" ]; then
     i=0
     while [ "$i" -lt "$AGENTS" ]; do
       name=$(printf "agent-%04d" "$i")
-      focal --data-dir /data invite client --name "$name" --output "/invite/$name.invite" >/dev/null
+      tries=0
+      until focal --data-dir /data invite client --name "$name" --output "/invite/$name.invite" >/dev/null; do
+        tries=$((tries + 1))
+        [ "$tries" -lt 30 ] || exit 1
+        sleep 1
+      done
       i=$((i + 1))
     done'
   $DC exec -T -e AGENTS="$AGENTS" focal-load sh -c '
