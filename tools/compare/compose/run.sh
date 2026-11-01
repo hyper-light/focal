@@ -705,13 +705,18 @@ case "$system" in
       echo "focal-load runs on its own schedule and callers: no closed loop or window here" >&2
       exit 2
     fi
-    # A bootstrap that fails leaves each node's health and log's end beside the run's log, for why
-    # it failed: the containers go with the run.
+    # A bootstrap that fails leaves each node's health, metrics and log's end beside the run's log,
+    # for why it failed: the containers go with the run. The metrics say what the health does not: a
+    # root owner held behind its own write (`focal_root_periods_refused_total`), its longest stall
+    # (`focal_root_period_longest_ms`) and the frames it held and let go (p9-0639, 2026-11-01: the
+    # founder answered no admin call while its root group led elsewhere, and nothing said why).
     bash focal-bootstrap.sh || {
       status=$?
       for n in "${focal_nodes[@]}"; do
         timeout 30 "${compose[@]}" --profile focal exec -T "$n" focal --data-dir /data inspect node --health \
           > "$out/bootstrap.$n.health.json" 2>/dev/null || true
+        timeout 30 "${compose[@]}" --profile focal exec -T "$n" focal --data-dir /data inspect node --metrics \
+          > "$out/bootstrap.$n.metrics.txt" 2>/dev/null || true
         timeout 30 "${compose[@]}" --profile focal logs --no-color --tail 300 "$n" > "$out/bootstrap.$n.log" 2>&1 || true
       done
       exit "$status"

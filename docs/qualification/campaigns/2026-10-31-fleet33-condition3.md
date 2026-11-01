@@ -372,15 +372,16 @@ behind it (015a5835).
   p9-0639, once in the 69 runs of the three campaigns): the founder's `invite client` ran out the
   admin socket's 20 s while the root group had elected focal2 at term 2 (31 of the 33 nodes named
   it, most at index 612), the founder at term 1 named no leader, and focal3 at term 1 still named
-  the founder: neither had heard the new term for the call's 20 s. Not root-caused. One mechanism
-  fits every fact and is not shown: a root replica whose own write is pending steps no peer's frame
-  until it completes (`ControlHost::must_wait`; frames past `WAITING_FRAMES` are refused), so a
-  founder whose write the host's file system held would step no acknowledgement, leave its
-  leadership by check-quorum (term 1, no leader) and step none of the new leader's frames, as a
-  learner held so would still name the founder; and the founder alone issues invitations, so the
-  bootstrap's call waited on it. The nodes' health says nothing of a pending write or of frames
-  waiting behind it, which a run must read to confirm or rule it out (the root replica's pending
-  write, waiting and let-go frames beside its term and leader).
+  the founder: neither had heard the new term for the call's 20 s. Not root-caused. One mechanism is
+  consistent with these facts and is not shown: a root replica whose own write is pending steps no
+  peer's frame and takes no tick until the write completes (`ControlHost::must_wait`; frames past
+  `WAITING_FRAMES` are refused), so a founder whose writes the host's file system held would record
+  no acknowledgement, leave its leadership at a quorum check between them (focal's core runs one;
+  term 1, no leader) and step none of the new leader's frames, as a learner held so would still name
+  the founder; and the founder alone issues invitations, so the bootstrap's call waited on it. The
+  nodes' metrics would show it (`focal_root_periods_refused_total`, `focal_root_period_longest_ms`,
+  the frames held and let go), but a failed bootstrap kept only their health; it now keeps their
+  metrics too.
 
 ## The records
 
