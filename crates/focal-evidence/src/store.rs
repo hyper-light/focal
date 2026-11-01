@@ -466,6 +466,9 @@ pub struct ContentStore {
     staged_by_domain: BTreeMap<ContentDomainId, u64>,
     terminal_uploads: usize,
     failed: bool,
+    /// The I/O error that stopped the store, the first one: every call after it fails until the
+    /// store is opened again, so what stopped it is kept to be said.
+    failure: Option<String>,
     disk: DiskBudget,
     /// The collector's pass in progress (26 §5).
     collector: gc::CollectorState,
@@ -742,6 +745,7 @@ impl ContentStore {
             terminal_uploads: 0,
             disk,
             failed: false,
+            failure: None,
             collector: gc::CollectorState::new(),
             plans,
             keys,
@@ -819,9 +823,7 @@ impl ContentStore {
                 u64::try_from(bytes.len()).map_err(|_| ContentError::Capacity)?,
             )?;
             if let Err(error) = install_verified_chunk(&path, bytes, hash) {
-                if matches!(error, ContentError::Io(_)) {
-                    self.failed = true;
-                }
+                self.fail_on(&error);
                 return Err(error);
             }
             record.commit();
@@ -860,9 +862,7 @@ impl ContentStore {
                 key.install(&key.path(&directory, hash, sealing::Kind::Record)?, bytes)
             });
         if let Err(error) = installed {
-            if matches!(error, ContentError::Io(_)) {
-                self.failed = true;
-            }
+            self.fail_on(&error);
             return Err(error);
         }
         record.commit();
@@ -901,9 +901,7 @@ impl ContentStore {
                 .map_err(ContentError::Io)
                 .and_then(|()| atomic_install(&path, bytes));
             if let Err(error) = installed {
-                if matches!(error, ContentError::Io(_)) {
-                    self.failed = true;
-                }
+                self.fail_on(&error);
                 return Err(error);
             }
             record.commit();
@@ -1698,9 +1696,22 @@ impl ContentStore {
         }
     }
     fn mark_failure<T>(&mut self, result: &Result<T, ContentError>) {
-        if matches!(result, Err(ContentError::Io(_))) {
+        if let Err(error) = result {
+            self.fail_on(error);
+        }
+    }
+    /// The store stops at an I/O error, the first one kept.
+    fn fail_on(&mut self, error: &ContentError) {
+        if let ContentError::Io(io) = error {
+            if self.failure.is_none() {
+                self.failure = Some(io.to_string());
+            }
             self.failed = true;
         }
+    }
+    /// The I/O error that stopped the store, where one did.
+    pub fn failure(&self) -> Option<&str> {
+        self.failure.as_deref()
     }
 
     /// Staged bytes of one content domain.

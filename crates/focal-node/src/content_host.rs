@@ -291,6 +291,8 @@ impl ContentHost {
                 let mut next_expiry = Instant::now();
                 // A conversion step the volume had no room for waits for the next tick.
                 let mut held = false;
+                // Whether the store's stop has been said: once, as it stops.
+                let mut stopped_told = false;
                 loop {
                     let now = Instant::now();
                     if now >= next_expiry {
@@ -327,6 +329,17 @@ impl ContentHost {
                             // outcome is unknown) is said here: the call, how long it waited for
                             // the owner and how long the owner took over it.
                             let done = Instant::now();
+                            // The store stops at its first I/O error and every call after it
+                            // fails (the caller is told the outcome is unknown): said once, with
+                            // the error, as it happens.
+                            if !stopped_told && let Some(failure) = owner.content().failure() {
+                                stopped_told = true;
+                                use std::io::Write as _;
+                                let _ = writeln!(
+                                    std::io::stderr().lock(),
+                                    "focal: the content store stopped after a {name} call's I/O error: {failure}; every call to it fails until the node starts again",
+                                );
+                            }
                             if done.saturating_duration_since(asked) >= timeout {
                                 use std::io::Write as _;
                                 let _ = writeln!(
