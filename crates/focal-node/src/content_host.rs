@@ -224,16 +224,32 @@ impl ContentHost {
             _ => Err(AccessError::Unavailable),
         }
     }
-    pub async fn verify_prefix(
+    /// [`Self::begin_verification`] carried to its end. An object this node must hold and lacks
+    /// is given to `bring`, and the verification reads its artifact again once `bring` has
+    /// brought it; one `bring` refuses, or brings and is still lacking, ends the verification.
+    pub async fn verify_prefix<F>(
         &self,
         snapshot: focal_ledger::DurableEvidenceSnapshot,
         expected_active: Option<CustodyScope>,
-    ) -> Result<VerifiedCustody, AccessError> {
+        bring: impl Fn(ContentRef) -> F,
+    ) -> Result<VerifiedCustody, AccessError>
+    where
+        F: Future<Output = Result<(), AccessError>>,
+    {
         let mut progress = self.begin_verification(snapshot, expected_active).await?;
+        let mut brought = None;
         loop {
             match progress {
                 CustodyVerificationProgress::Complete(witness) => return Ok(*witness),
                 CustodyVerificationProgress::Pending(verification) => {
+                    progress = self.advance_verification(verification).await?;
+                }
+                CustodyVerificationProgress::Lacking(verification, object) => {
+                    if brought.as_ref() == Some(&object) {
+                        return Err(AccessError::Unavailable);
+                    }
+                    bring(object.clone()).await?;
+                    brought = Some(object);
                     progress = self.advance_verification(verification).await?;
                 }
             }

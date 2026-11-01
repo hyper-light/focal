@@ -279,13 +279,23 @@ session log's cutover record is the first fact the agent waits for.
 
 The verification covers every artifact of the prefix, with the object each
 names, in its digest, and reads the objects' bytes only where this node is one
-of the placement's content copies, the copies required to hold them (26 §1): a
-voter or materializer that is not a copy holds no object. Each object was read
-from every member's store, so a move that replaced a session's one voter
-holding no copy brought in a voter that could never be ready (its store
-answered every object not found), and the session, closed to clients from the
-move's cutover, refused every write until the run ended (09, 2026-10-31: three
-33-node runs).
+of the placement's content copies, the copies required to hold them (26 §1). A
+voter or materializer that is not a copy holds every artifact's object (its
+replay and its checkpoint install each pull the objects they lack, §20) but no
+seal's bundle: a bundle is no artifact's object, and the archive gives it to
+the content copies alone. Each object was read from every member's store, so a
+move that replaced a session's one voter holding no copy brought in a voter
+that could never be ready, and the session, closed to clients from the move's
+cutover, refused every write until the run ended (09, 2026-10-31: three 33-node
+runs). A copy that lacks an object brings it before it verifies it: a voter a
+move makes a copy, when the copy it replaces is dead, holds none of the seals'
+bundles. The verification hands the object to the agent
+(`CustodyVerificationProgress::Lacking`), which pulls it under the custody
+scope the node holds from the active placement's copies first, then the other
+members, none the liveness view holds down, and the verification reads that
+artifact again; an object no member gives, or one still lacking once given,
+ends the readiness until the next pass, whose verification starts again with
+what was brought.
 
 **Observing a partition led elsewhere.** Each pass observes every partition at
 one prefix: where this node leads it, from its own owner; otherwise through the
@@ -1756,7 +1766,10 @@ of §5 and 26 §1), then brings the replica's next poll forward
 (`custody_pulled`); the retained delivery retries at every poll, as any
 retryable custody refusal does, and applies once the objects are local. An
 object no peer supplies leaves the delivery retained and the copy short of
-readiness, which the placement view reports. Only an activated native
+readiness, which the placement view reports. A seal's bundle is no artifact's
+object: no install or replay reads it, and the archive gives it to the content
+copies alone, so a node a move makes a copy brings each bundle it lacks at its
+readiness (§7). Only an activated native
 engine projects rows into the evidence export; a replica that can host one
 but still serves legacy history exports the graph's projection. Custody reads — a seed, an object's manifest, the transfer
 that describes it (an open, or an ask of what the copy holds), its chunks, a verification and a cancel — are admitted

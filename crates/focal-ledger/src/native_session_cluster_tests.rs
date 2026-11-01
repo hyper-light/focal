@@ -1157,6 +1157,89 @@ fn followers_retain_a_refused_evidence_record_until_custody_arrives_then_apply_i
     );
 }
 
+/// Copies the object `reference` names from `from`'s store into `to`'s, chunk by verified chunk,
+/// as a pull from a peer does.
+fn give_object(cluster: &mut Cluster, from: u64, to: u64, reference: &ContentRef) {
+    let source = cluster.node(from).store_for_test();
+    let exported = source.export_manifest(reference).unwrap();
+    let chunks: Vec<Vec<u8>> = (0..exported.chunks())
+        .map(|index| source.read_transfer_chunk(&exported, index).unwrap())
+        .collect();
+    let manifest = exported.encoded().to_vec();
+    let target = cluster.node(to).store_for_test_mut();
+    let incoming = target.prepare_import(reference.clone(), manifest).unwrap();
+    for (index, bytes) in chunks.iter().enumerate() {
+        target.import_chunk(&incoming, index, bytes).unwrap();
+    }
+    assert_eq!(&target.complete_import(&incoming).unwrap(), reference);
+}
+
+#[test]
+fn a_replica_brought_up_by_a_checkpoint_waits_for_the_objects_its_artifacts_name() {
+    let mut cluster = Cluster::new();
+    cluster.elect(1, &[]);
+    cluster.received_claim(1);
+    let parent = Parent::from_claim(
+        cluster
+            .node(1)
+            .committed_core()
+            .unwrap()
+            .native_claim(ClaimId::from_u128(1))
+            .unwrap(),
+    )
+    .unwrap();
+    let (artifact, _slot) = fx::work_artifact(ledger(), 801, &parent, 0, fx::PROOF).unwrap();
+    let claim = cluster.claim(1, 1);
+    let submit = fx::submit_work(cluster.next(PARTIES.subject), claim, 0, artifact);
+    // Replica 3 is cut off while the artifact commits; replica 2 applies it once it holds the
+    // object, as a follower replaying the record does.
+    cluster.retry_ok = vec![2];
+    cluster.commit(1, PARTIES.subject, submit, &[3]);
+    let pointer = cluster
+        .node(1)
+        .committed_core()
+        .unwrap()
+        .native_artifact(ArtifactId::from_u128(801))
+        .unwrap()
+        .custody()
+        .payload();
+    let reference = ContentRef {
+        domain: pointer.domain,
+        root: pointer.root,
+        length: pointer.length,
+        class: pointer.class,
+    };
+    give_object(&mut cluster, 1, 2, &reference);
+    cluster.retry_ok.clear();
+    cluster.settle(&[3]);
+    // The leader checkpoints past the artifact and its log moves on without replica 3.
+    cluster.node(1).begin_checkpoint().unwrap();
+    cluster.pump(&[3]);
+    assert!(!cluster.node(1).checkpoint_pending());
+    let next = cluster.creation(2);
+    cluster.commit(1, PARTIES.issuer, next, &[3]);
+    let behind = cluster.sequence(3);
+    // Brought up by the checkpoint, replica 3 holds none of the objects its artifacts name: its
+    // install is retained, naming the object, until the object is local (24 §20, a fresh copy's
+    // objects).
+    cluster.retry_ok = vec![3];
+    cluster.settle(&[]);
+    let missing = cluster
+        .node(3)
+        .pending_custody()
+        .expect("a checkpoint whose artifacts name objects waits for them")
+        .missing_objects()
+        .unwrap();
+    assert_eq!(missing, vec![reference.clone()]);
+    assert_eq!(cluster.sequence(3), behind);
+    give_object(&mut cluster, 1, 3, &reference);
+    cluster.retry_ok.clear();
+    cluster.settle(&[]);
+    assert!(cluster.node(3).pending_custody().is_none());
+    assert_eq!(cluster.sequence(3), cluster.sequence(1));
+    assert_same_digest(&mut cluster, &[1, 2]);
+}
+
 #[test]
 fn a_follower_under_memory_pressure_keeps_its_delivery_and_finishes_when_memory_returns() {
     let mut cluster = Cluster::new();

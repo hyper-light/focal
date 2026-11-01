@@ -3462,7 +3462,7 @@ impl PlacementAgent {
         installed: &ControlAuthoritySnapshot,
         now: i64,
     ) -> Result<Option<AgentStep>, AgentError> {
-        let _ = (access, pool);
+        let _ = access;
         let node = self.state.node;
         let Some(plan) = &descriptor.pending else {
             return Ok(None);
@@ -3522,8 +3522,45 @@ impl PlacementAgent {
             return Ok(None);
         }
         let expected = self.custody.get(&descriptor.ledger).copied();
+        // Where an object this node must hold and lacks is brought from: the copies that hold
+        // every object, the active placement's first (26 §1), then the other members, none the
+        // liveness view holds down.
+        let active = &descriptor.active.placement;
+        let desired = &plan.desired.placement;
+        let mut sources: Vec<u64> = Vec::new();
+        for peer in active
+            .content_copies
+            .keys()
+            .chain(desired.content_copies.keys())
+            .chain(active.voters.keys())
+            .chain(desired.voters.keys())
+        {
+            if *peer != node
+                && !sources.contains(peer)
+                && handles
+                    .liveness
+                    .status_of(*peer)
+                    .is_none_or(|status| status == crate::liveness::MemberStatus::Alive)
+            {
+                sources.try_reserve(1).map_err(|_| AgentError::Capacity)?;
+                sources.push(*peer);
+            }
+        }
         let began = focal_rt::time::Instant::now();
-        let custody = handles.content.verify_prefix(evidence, expected).await?;
+        // A pull's transfer is boxed where an object is lacking, not carried in every pass's future.
+        let content = &handles.content;
+        let custody = content
+            .verify_prefix(evidence, expected, |object| {
+                Box::pin(bring_object(
+                    content,
+                    pool,
+                    node,
+                    descriptor.ledger,
+                    &sources,
+                    object,
+                ))
+            })
+            .await?;
         // What a readiness verification read, and how long the closed session waited on it.
         let manifest = custody.manifest();
         use std::io::Write as _;
@@ -3844,6 +3881,32 @@ pub(crate) fn next_partition_target(
         .chain(voters.range(..=failed))
         .map(|(voter, _)| *voter)
         .find(|voter| *voter != failed && *voter != node && !dead(*voter))
+}
+
+/// Bring `object` to this node from the first of `sources` that gives it, under the custody scope
+/// this node holds for the ledger, as a replay's missing objects are pulled (24 §20).
+async fn bring_object(
+    content: &crate::content_host::ContentHost,
+    pool: &PeerConnectionPool,
+    node: u64,
+    ledger: LedgerId,
+    sources: &[u64],
+    object: focal_model::ContentRef,
+) -> Result<(), AccessError> {
+    let policy = content
+        .policy(ledger)
+        .await?
+        .ok_or(AccessError::Unavailable)?;
+    let scope = policy.scope();
+    let mut refused = AccessError::Unavailable;
+    for peer in sources {
+        match crate::evidence_service::pull_object(content, pool, node, *peer, scope, &object).await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => refused = error,
+        }
+    }
+    Err(refused)
 }
 
 async fn submit_partition(

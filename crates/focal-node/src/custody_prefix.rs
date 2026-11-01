@@ -89,6 +89,9 @@ pub struct CustodyVerification {
 }
 pub enum CustodyVerificationProgress {
     Pending(Box<CustodyVerification>),
+    /// This node is one of the content copies and lacks the object an artifact names: once its
+    /// caller has brought the object here, the continuation reads that artifact again.
+    Lacking(Box<CustodyVerification>, focal_model::ContentRef),
     Complete(Box<VerifiedCustody>),
 }
 impl CustodyVerification {
@@ -215,34 +218,45 @@ impl CustodyVerification {
             {
                 return Err(AccessError::InvalidRequest);
             }
+            if let Some(reference) = &artifact.content
+                && reference.domain != focal_model::ContentDomainId(self.target.ledger.tenant.0)
+            {
+                return Err(AccessError::Unauthorized);
+            }
+            // The artifact, with the object it names, is in the digest whatever this node's role;
+            // the object's bytes are verified where this node is one of the content copies, the
+            // copies required to hold them (26 §1). A voter that is not one holds no seal's bundle,
+            // which only the copies are given, so a voter that replaced a session's one voter
+            // holding no copy was never ready, and the session, closed from the move's cutover,
+            // never served again (fleet33 c6, k22 and m1, 2026-10-30/31). A copy that lacks an
+            // object (a voter the move made a copy) is handed it to bring, and reads this artifact
+            // again once it has.
+            let transfer = match artifact.content.as_ref().filter(|_| self.copy) {
+                Some(reference) => match owner.content().export_manifest(reference) {
+                    Ok(transfer) => Some((reference.length, transfer)),
+                    Err(focal_evidence::ContentError::Io(error))
+                        if error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        let object = reference.clone();
+                        return Ok(CustodyVerificationProgress::Lacking(self, object));
+                    }
+                    Err(error) => return Err(content_error(error)),
+                },
+                None => None,
+            };
             let mut buffer = [0u8; 256];
             let encoded = postcard::to_slice(&artifact, &mut buffer)
                 .map_err(|_| AccessError::InvalidRequest)?;
             self.digest.update(encoded);
             self.after = Some(artifact.artifact.id);
             self.artifacts = self.artifacts.checked_add(1).ok_or(AccessError::Capacity)?;
-            // The artifact, with the object it names, is in the digest whatever this node's role;
-            // the object's bytes are verified by the content copies, which hold it (26 §1). A voter
-            // that is not a copy holds no object: each was read from its store, so a voter that
-            // replaced a session's one voter holding no copy was never ready, and the session, closed
-            // from the move's cutover, never served again (fleet33 c6, k22 and m1, 2026-10-30/31).
-            if let Some(reference) = &artifact.content
-                && reference.domain != focal_model::ContentDomainId(self.target.ledger.tenant.0)
-            {
-                return Err(AccessError::Unauthorized);
-            }
-            if let Some(reference) = artifact.content.filter(|_| self.copy) {
+            if let Some((length, transfer)) = transfer {
                 self.contents = self.contents.checked_add(1).ok_or(AccessError::Capacity)?;
                 self.bytes = self
                     .bytes
-                    .checked_add(reference.length)
+                    .checked_add(length)
                     .ok_or(AccessError::Capacity)?;
-                self.transfer = Some(
-                    owner
-                        .content()
-                        .export_manifest(&reference)
-                        .map_err(content_error)?,
-                );
+                self.transfer = Some(transfer);
                 self.next_chunk = 0;
                 self.content_digest = blake3::Hasher::new();
             }

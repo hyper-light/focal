@@ -197,10 +197,15 @@ fn finish(
     for _ in 0..64 {
         match state.advance(owner, budget)? {
             CustodyVerificationProgress::Pending(next) => state = next,
+            CustodyVerificationProgress::Lacking(..) => return Err(AccessError::Unavailable),
             CustodyVerificationProgress::Complete(witness) => return Ok(*witness),
         }
     }
     panic!("bounded fixture verification did not finish");
+}
+/// What a node that can bring no object brings: nothing.
+async fn bring_none(_: ContentRef) -> Result<(), AccessError> {
+    Err(AccessError::Unavailable)
 }
 /// Where the node's store keeps the chunk of `bytes`: sealed, its name is keyed and found through
 /// the data directory's keys (29 §11).
@@ -239,7 +244,10 @@ fn exact_checkpoint_and_all_artifacts_survive_advance_compaction_and_content_reo
             budget.clone(),
         )
         .unwrap();
-        let witness = host.verify_prefix(snapshot, None).await.unwrap();
+        let witness = host
+            .verify_prefix(snapshot, None, bring_none)
+            .await
+            .unwrap();
         assert_eq!(witness.manifest().prefix, prefix);
         assert!(witness.manifest().prefix.sequence < session.sequence());
         assert_eq!(witness.manifest().verified_artifacts, 2);
@@ -252,7 +260,7 @@ fn exact_checkpoint_and_all_artifacts_survive_advance_compaction_and_content_reo
         );
         session.move_read_clock_ahead(std::time::Duration::from_secs(30));
         let next = session.checkpoint_evidence(30_000).unwrap();
-        assert!(host.verify_prefix(next, None).await.is_err());
+        assert!(host.verify_prefix(next, None, bring_none).await.is_err());
         let manifest_hash = witness.digest();
         drop(witness);
         host.stop().await.unwrap();
@@ -286,13 +294,14 @@ fn exact_checkpoint_and_all_artifacts_survive_advance_compaction_and_content_reo
     .unwrap()
 }
 
-/// A voter that is not one of the placement's content copies holds none of the session's objects
-/// (the copies required to are the content copies, 26 §1): its readiness covers every artifact of
-/// the prefix and the object each names, without the objects' bytes, which the copies verify. Each
-/// object was read from the voter's own store before, so a voter that replaced a session's one
-/// voter holding no copy was never ready, and its session, closed from the move's cutover, never
-/// served again (fleet33 c6, k22 and m1). Here node 1's store holds neither object a content
-/// artifact names: one sealed then removed, one never held.
+/// A voter that is not one of the placement's content copies owes none of the session's objects
+/// (the copies required to hold them are the content copies, 26 §1), and holds no seal's bundle,
+/// which only the copies are given: its readiness covers every artifact of the prefix and the
+/// object each names, without the objects' bytes, which the copies verify. Each object was read
+/// from the voter's own store before, so a voter that replaced a session's one voter holding no
+/// copy was never ready, and its session, closed from the move's cutover, never served again
+/// (fleet33 c6, k22 and m1). Here node 1's store holds neither object a content artifact names:
+/// one sealed then removed, one never held.
 #[test]
 fn a_voter_that_is_not_a_content_copy_is_ready_without_the_objects() {
     let dir = tempfile::tempdir().unwrap();
@@ -316,6 +325,145 @@ fn a_voter_that_is_not_a_content_copy_is_ready_without_the_objects() {
     drop(witness);
     drop(owner);
     assert_eq!(budget.stats().used, 0);
+}
+
+/// Gives `target` the object `reference` names from `source`, chunk by verified chunk, as a pull
+/// from a peer does.
+fn give(source: &ContentStore, target: &mut ContentStore, reference: &ContentRef) {
+    let exported = source.export_manifest(reference).unwrap();
+    let chunks: Vec<Vec<u8>> = (0..exported.chunks())
+        .map(|index| source.read_transfer_chunk(&exported, index).unwrap())
+        .collect();
+    let incoming = target
+        .prepare_import(reference.clone(), exported.encoded().to_vec())
+        .unwrap();
+    for (index, bytes) in chunks.iter().enumerate() {
+        target.import_chunk(&incoming, index, bytes).unwrap();
+    }
+    assert_eq!(&target.complete_import(&incoming).unwrap(), reference);
+}
+/// A peer's store holding one object of twelve bytes no fixture node holds.
+fn peer_object(path: &std::path::Path) -> (ContentStore, ContentRef) {
+    let mut peer = ContentStore::open(
+        path.join("content"),
+        limits(),
+        &focal_seal::test_keys_beside(path.join("content")).unwrap(),
+    )
+    .unwrap();
+    let upload = UploadId([8; 16]);
+    peer.begin(
+        upload,
+        ContentDomainId(ledger().tenant.0),
+        ContentClass::Evidence,
+        12,
+        None,
+    )
+    .unwrap();
+    for (index, part) in b"mnopqrstuvwx".chunks(4).enumerate() {
+        peer.append(upload, (index * 4) as u64, part).unwrap();
+    }
+    let reference = peer.seal(upload).unwrap();
+    (peer, reference)
+}
+
+/// A content copy brings an object it lacks before it is ready. A seal's bundle is given to the
+/// content copies alone (`archive`), so a voter a move makes a copy, the copy it replaces killed,
+/// holds none, and its readiness read each from its own store and failed on every attempt, its
+/// session closed from the move's cutover. Its verification hands the object it lacks to its
+/// caller, lacking it still until it is brought, and reads that artifact again once it is. Here
+/// node 1, a copy, holds the object artifact 20 names and not the one artifact 30 names, which a
+/// peer holds.
+#[test]
+fn a_copy_that_lacks_an_object_brings_it_before_it_is_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut session, store, _) = fixture(dir.path());
+    let peer_dir = tempfile::tempdir().unwrap();
+    let (peer, lacked) = peer_object(peer_dir.path());
+    register(&mut session, 30, ArtifactPayload::Content(lacked.clone()));
+    place(&mut session, 2);
+    let snapshot = session.checkpoint_evidence(30_000).unwrap();
+    assert_eq!(snapshot.prefix().artifacts, 3);
+    let budget = memory();
+    let mut owner = CustodyStore::new(store, CustodyConfig::new(1), budget.clone()).unwrap();
+    let mut state = Box::new(CustodyVerification::new(snapshot, None, &budget).unwrap());
+    let mut brought = Vec::new();
+    let mut witness = None;
+    for _ in 0..64 {
+        match state.advance(&mut owner, &budget).unwrap() {
+            CustodyVerificationProgress::Pending(next) => state = next,
+            CustodyVerificationProgress::Lacking(next, object) => {
+                let CustodyVerificationProgress::Lacking(next, again) =
+                    next.advance(&mut owner, &budget).unwrap()
+                else {
+                    panic!("an object not brought is lacking still");
+                };
+                assert_eq!(again, object);
+                give(&peer, owner.content_mut(), &object);
+                brought.push(object);
+                state = next;
+            }
+            CustodyVerificationProgress::Complete(verified) => {
+                witness = Some(*verified);
+                break;
+            }
+        }
+    }
+    let witness = witness.expect("bounded fixture verification finishes");
+    assert_eq!(brought, vec![lacked]);
+    assert_eq!(witness.manifest().verified_artifacts, 3);
+    assert_eq!(witness.manifest().verified_content_references, 2);
+    assert_eq!(witness.manifest().verified_content_bytes, 24);
+    drop(witness);
+    drop(owner);
+    assert_eq!(budget.stats().used, 0);
+}
+
+/// An object its node's caller does not bring ends the readiness: refused, with the refusal; or
+/// brought and lacking still, once, never asked for again.
+#[test]
+fn a_readiness_whose_object_is_not_brought_ends() {
+    focal_rt::block_on(async move {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut session, store, _) = fixture(dir.path());
+        let peer_dir = tempfile::tempdir().unwrap();
+        let (_peer, lacked) = peer_object(peer_dir.path());
+        register(&mut session, 30, ArtifactPayload::Content(lacked.clone()));
+        place(&mut session, 2);
+        let budget = memory();
+        let (host, owner) = ContentHost::spawn(
+            store,
+            CustodyConfig::new(1),
+            WireLimits::default(),
+            budget.clone(),
+        )
+        .unwrap();
+        let refused = host
+            .verify_prefix(
+                session.checkpoint_evidence(30_000).unwrap(),
+                None,
+                |_| async { Err(AccessError::Capacity) },
+            )
+            .await;
+        assert!(matches!(refused, Err(AccessError::Capacity)));
+        let asked = std::cell::RefCell::new(Vec::new());
+        let unbrought = host
+            .verify_prefix(
+                session.checkpoint_evidence(30_000).unwrap(),
+                None,
+                |object| {
+                    asked.borrow_mut().push(object);
+                    async { Ok(()) }
+                },
+            )
+            .await;
+        assert!(matches!(unbrought, Err(AccessError::Unavailable)));
+        assert_eq!(asked.into_inner(), vec![lacked]);
+        host.stop().await.unwrap();
+        owner.join().unwrap();
+        drop(host);
+        assert_eq!(budget.stats().used, 0);
+    })
+    .unwrap()
 }
 
 #[test]
@@ -418,14 +566,14 @@ fn canceled_continuation_releases_owned_charge_and_expired_or_dropped_snapshot_f
         session.move_read_clock_ahead(std::time::Duration::from_millis(30_000));
         session.advance_read_clock().unwrap();
         assert!(matches!(
-            host.verify_prefix(expired_snapshot, None).await,
+            host.verify_prefix(expired_snapshot, None, bring_none).await,
             Err(AccessError::SnapshotExpired)
         ));
         assert_eq!(budget.stats().used, baseline);
         let snapshot = session.checkpoint_evidence(30_000).unwrap();
         drop(session);
         assert!(matches!(
-            host.verify_prefix(snapshot, None).await,
+            host.verify_prefix(snapshot, None, bring_none).await,
             Err(AccessError::SnapshotExpired)
         ));
         assert_eq!(budget.stats().used, baseline);
