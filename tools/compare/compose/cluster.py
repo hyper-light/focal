@@ -21,6 +21,11 @@ of them (focal-nodes.sh writes the model; run.sh and focal-bootstrap.sh ask this
     cluster.py pick SEED COUNT NAME...
                                   COUNT of the NAMEs, each as likely as any other, the same ones
                                   for the same SEED
+    cluster.py uncontrolled TABLE < PLACEMENT
+                                  the nodes of TABLE that hold no vote in the control plane: none
+                                  of the root's group's voters nor of any partition's, as the
+                                  placement's `control` lists them, in TABLE's order. Exits 1 when
+                                  the placement lists no control voters (nothing to spare by)
     cluster.py wanted TABLE      the sessions the fleet holds: one for every node of its largest
                                   zone (11 at 33 nodes, 1 at three)
     cluster.py founders TABLE < PLACEMENT
@@ -132,6 +137,21 @@ def role(name, expected, document, wanted_session):
                     print(containers[node], session["session"], session["content_copies"], leader)
                     return True
     return False
+
+
+def uncontrolled(expected, document):
+    """The nodes of TABLE that hold no vote in the root's group or a partition's: a fault drawn
+    from them leaves the control plane every voter, so it goes on placing (healing included)."""
+    placement = placement_of(document)
+    control = placement.get("control") or {}
+    groups = [control.get("root") or {}] + list(control.get("partitions") or [])
+    voters = {voter for group in groups for voter in group.get("voters") or []}
+    if not voters:
+        return False
+    names = by_address(expected, placement)
+    held = {names[voter] for voter in voters if voter in names}
+    print(" ".join(name for name, _, _ in expected if name not in held))
+    return True
 
 
 def wanted(expected):
@@ -308,6 +328,8 @@ def main(argv):
         return 0 if joined(table(argv[1]), sys.stdin.read()) else 1
     if len(argv) == 4 and argv[0] == "role" and argv[1] in ("leader", "copy"):
         return 0 if role(argv[1], table(argv[2]), json.load(sys.stdin), argv[3]) else 1
+    if len(argv) == 2 and argv[0] == "uncontrolled":
+        return 0 if uncontrolled(table(argv[1]), json.load(sys.stdin)) else 1
     if len(argv) == 2 and argv[0] == "wanted":
         print(wanted(table(argv[1])))
         return 0

@@ -45,7 +45,12 @@
 #                       a node (focalK, K of 1 to NODES), a list of them (`focal4,focal7`), a
 #                       count (`12`: any 12 of the nodes, each as likely as another, chosen as the
 #                       fault begins, the same ones again for the same FAULT_SEED, which the log
-#                       states), or a role in the bench session's placement as the fault begins
+#                       states), a count of the nodes outside the control plane (`12-control`: as
+#                       a count, drawn from the nodes holding no vote in the root's group or a
+#                       partition's as the fault begins, so the control plane keeps every voter,
+#                       which the bootstrap draws afresh each run, and goes on placing: the
+#                       sessions the fault leaves a voter short are healed under the load), or a
+#                       role in the bench session's placement as the fault begins
 #                       (`focal inspect placement`): `copy`, a node holding one of its content
 #                       copies other than its preferred leader, or `leader`, its preferred leader.
 #                       A role makes a run hit what it names whichever node the run seated there.
@@ -365,12 +370,28 @@ fault_node() {
   done
   return 1
 }
+# The nodes holding no vote in the control plane now (cluster.py uncontrolled), space-separated, from
+# the first node that answers. Nothing where no node answers.
+fault_uncontrolled() {
+  local n placement
+  for n in "${focal_nodes[@]}"; do
+    placement=$(timeout 30 "${compose[@]}" --profile focal exec -T "$n" focal --data-dir /data inspect placement 2>/dev/null) || continue
+    python3 cluster.py uncontrolled "$table" <<< "$placement"
+    return
+  done
+  return 1
+}
 # Whether a fault's NODES can be taken: a node of the cluster, a list of them none twice, a count of
-# 1 to the cluster's nodes, or a role.
+# 1 to the cluster's nodes (of all of them, or `-control`, of those outside the control plane), or a
+# role.
 fault_nodes_valid() {
-  local nodes=$1 node seen=" " names=()
+  local nodes=$1 node seen=" " names=() count
   case "$nodes" in
     copy | leader) return 0 ;;
+    *-control)
+      count=${nodes%-control}
+      case "$count" in '' | *[!0-9]*) return 1 ;; esac
+      [ "$count" -ge 1 ] && [ "$count" -le "${#focal_nodes[@]}" ]; return ;;
     '' | *[!0-9]*) ;;
     *) [ "$nodes" -ge 1 ] && [ "$nodes" -le "${#focal_nodes[@]}" ]; return ;;
   esac
@@ -383,15 +404,23 @@ fault_nodes_valid() {
   done
 }
 # The nodes a fault's NODES names as it begins, space-separated: a list as given, a count drawn by
-# the run's seed and the fault's place in FAULTS (INDEX), a role as the placement holds it. How a
-# count or a role came out is logged. Fails where no node holds the role.
+# the run's seed and the fault's place in FAULTS (INDEX) from every node or from those outside the
+# control plane, a role as the placement holds it. How a count or a role came out is logged. Fails
+# where no node holds the role, or fewer nodes than the count hold no control vote.
 fault_nodes() {
-  local nodes=$1 index=$2 found
+  local nodes=$1 index=$2 found spared=()
   case "$nodes" in
     copy | leader)
       found=$(fault_node "$nodes") || return 1
       fault_log "$nodes is ${found%% *} (session, copies, leader: ${found#* })"
       echo "${found%% *}"
+      ;;
+    *-control)
+      found=$(fault_uncontrolled) || return 1
+      read -ra spared <<< "$found"
+      found=$(python3 cluster.py pick "$fault_seed:$index" "${nodes%-control}" "${spared[@]}") || return 1
+      fault_log "any ${nodes%-control} of the ${#spared[@]} nodes holding no control vote (seed $fault_seed, fault $index): $found"
+      echo "$found"
       ;;
     *[!0-9]*) echo "${nodes//,/ }" ;;
     *)
@@ -416,9 +445,9 @@ faults_check() {
           echo "FAULTS: no nodes $nodes among ${focal_nodes[*]}" >&2
           return 2
         fi
+        # Valid NODES beginning with a digit are counts (`12`, `12-control`).
         case "$nodes" in
-          '' | *[!0-9]*) ;;
-          *) if [ -z "$fault_seed" ]; then fault_seed=$(od -An -N4 -tu4 /dev/urandom | tr -d ' '); fi ;;
+          [0-9]*) if [ -z "$fault_seed" ]; then fault_seed=$(od -An -N4 -tu4 /dev/urandom | tr -d ' '); fi ;;
         esac
         ;;
       *) echo "FAULTS: no fault $spec" >&2; return 2 ;;
