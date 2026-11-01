@@ -19,7 +19,7 @@ const FLOOR: Duration = Duration::from_secs(1);
 const CEILING: Duration = Duration::from_secs(60);
 
 /// The smoothed round trip and its deviation (RFC 6298 §2.2, §2.3), and how many timeouts have
-/// expired since the last answer.
+/// expired since the last answer: the backoff each request's timer is armed at.
 #[derive(Debug, Default)]
 pub(crate) struct Rto {
     smoothed: Option<(Duration, Duration)>,
@@ -46,9 +46,23 @@ impl Rto {
         });
         self.expired = 0;
     }
-    /// A timeout expired with no answer: the next is twice as long (RFC 6298 §5.5).
-    pub(crate) fn expired(&mut self) {
-        self.expired = self.expired.saturating_add(1);
+    /// What a request's timer is armed with: the timeout, and the backoff it stands at.
+    pub(crate) fn arm(&self) -> (Duration, u32) {
+        (self.timeout(), self.expired)
+    }
+    /// A request's timer, armed at backoff `armed`, expired with no answer: the timeout doubles
+    /// (RFC 6298 §5.5) once for each timeout that expires, however many requests waited on it. A
+    /// sender's one retransmission timer backs off once when it expires, not once for every segment
+    /// outstanding under it; every request doubling it did so as often as the client had requests
+    /// waiting on a route that died, so an agent with five waiting on a killed leader held its
+    /// next requests to a timeout past their 30 s clock, and they waited on the dead route alone
+    /// until it ran out (fleet33 k21, 2026-10-31: 31 writes refused `unavailable` in a session led
+    /// again within 1.6 s). A request armed at a backoff another's expiry already doubled changes
+    /// nothing.
+    pub(crate) fn expired(&mut self, armed: u32) {
+        if self.expired == armed {
+            self.expired = self.expired.saturating_add(1);
+        }
     }
     /// How long a request is waited on before it is sent by the next route as well: the smoothed
     /// time and four deviations (RFC 6298 §2.3, K = 4), a second at least, doubled for each
@@ -87,13 +101,41 @@ mod tests {
         rto.sample(Duration::from_secs(2));
         assert_eq!(rto.timeout(), Duration::from_micros(2_848_125));
         // Each expiry doubles it, to the ceiling; an answer ends the backoff.
-        rto.expired();
+        let (_, armed) = rto.arm();
+        rto.expired(armed);
         assert_eq!(rto.timeout(), Duration::from_micros(5_696_250));
         for _ in 0..40 {
-            rto.expired();
+            let (_, armed) = rto.arm();
+            rto.expired(armed);
         }
         assert_eq!(rto.timeout(), Duration::from_secs(60));
         rto.sample(Duration::from_secs(2));
         assert!(rto.timeout() < Duration::from_secs(60));
+    }
+
+    /// Requests waiting on one timeout that all expire back it off once, as a sender's one timer
+    /// does; a request armed after that backoff backs it off again. Each request's expiry doubled
+    /// it before: five waiting on a killed leader took a 1 s timeout to 32 s, past the requests'
+    /// 30 s clock (fleet33 k21, 2026-10-31).
+    #[test]
+    fn requests_waiting_on_one_timeout_back_it_off_once() {
+        let mut rto = Rto::default();
+        rto.sample(Duration::from_millis(40));
+        let waiting: Vec<(Duration, u32)> = (0..5).map(|_| rto.arm()).collect();
+        for (timeout, _) in &waiting {
+            assert_eq!(*timeout, Duration::from_secs(1));
+        }
+        for (_, armed) in &waiting {
+            rto.expired(*armed);
+        }
+        assert_eq!(rto.timeout(), Duration::from_secs(2));
+        let (timeout, armed) = rto.arm();
+        assert_eq!(timeout, Duration::from_secs(2));
+        rto.expired(armed);
+        assert_eq!(rto.timeout(), Duration::from_secs(4));
+        // An answer ends the backoff; an expiry armed before it changes nothing after.
+        rto.sample(Duration::from_millis(40));
+        rto.expired(armed);
+        assert_eq!(rto.timeout(), Duration::from_secs(1));
     }
 }

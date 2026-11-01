@@ -1177,11 +1177,7 @@ impl<T: ClientTransport> Client<T> {
         if !hedges(&request.operation) {
             return Ok(Hedged::alone(first.await));
         }
-        let mut wait = self
-            .rto
-            .lock()
-            .map_err(|_| ClientError::Transport)?
-            .timeout();
+        let (mut wait, armed) = self.rto.lock().map_err(|_| ClientError::Transport)?.arm();
         let mut next = route.cloned();
         let mut let_go = false;
         // The next routes are asked as often as a refused request is resent within the clock.
@@ -1214,7 +1210,7 @@ impl<T: ClientTransport> Client<T> {
                 self.rto
                     .lock()
                     .map_err(|_| ClientError::Transport)?
-                    .expired();
+                    .expired(armed);
             }
             self.reroute(homed, request.ledger, &mut next)?;
             if next.as_ref() == route {
