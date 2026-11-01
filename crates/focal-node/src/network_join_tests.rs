@@ -812,3 +812,22 @@ fn a_client_adopts_the_endorsed_issuers_it_did_not_hold_within_the_bound_and_ref
         Err(JoinError::Invalid)
     ));
 }
+
+/// A sponsor whose name the resolver cannot answer for is not reachable now, and a join asks
+/// again; an endpoint that is neither an address nor a name is the invitation's fault, and asking
+/// again would not change it. `.invalid` names never resolve (RFC 6761 §6.4).
+#[test]
+fn a_sponsor_whose_name_does_not_resolve_is_asked_again_and_a_malformed_one_is_not() {
+    focal_rt::block_on(async {
+        let unresolved = sponsor_address("sponsor.focal.invalid:7443")
+            .await
+            .unwrap_err();
+        assert!(retryable(&unresolved), "{unresolved:?}");
+        let malformed = sponsor_address("not an endpoint").await.unwrap_err();
+        assert!(matches!(malformed, JoinError::Invalid), "{malformed:?}");
+        assert!(!retryable(&malformed));
+        let address: SocketAddr = "127.0.0.1:7443".parse().unwrap();
+        assert_eq!(sponsor_address("127.0.0.1:7443").await.unwrap(), address);
+    })
+    .unwrap();
+}

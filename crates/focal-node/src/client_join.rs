@@ -446,9 +446,8 @@ impl PendingClientJoin {
             return Ok(receipt);
         }
         let address =
-            crate::network_state::resolve_endpoint(&self.bundle.invitation().trust().endpoint)
-                .await
-                .map_err(|_| JoinError::Invalid)?;
+            crate::network_join::sponsor_address(&self.bundle.invitation().trust().endpoint)
+                .await?;
         let receipt = std::panic::AssertUnwindSafe(client.redeem(
             address,
             self.bundle.invitation(),

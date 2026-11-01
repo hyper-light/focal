@@ -407,10 +407,7 @@ impl PendingJoin {
             self.verify(&receipt, now)?;
             return Ok(receipt);
         }
-        let address =
-            crate::network_state::resolve_endpoint(&self.bundle.invitation.trust().endpoint)
-                .await
-                .map_err(|_| JoinError::Invalid)?;
+        let address = sponsor_address(&self.bundle.invitation.trust().endpoint).await?;
         let receipt = std::panic::AssertUnwindSafe(client.redeem(
             address,
             &self.bundle.invitation,
@@ -726,6 +723,22 @@ fn genesis_registry(genesis: &NetworkGenesis) -> Result<EnrollmentRegistry, Join
         genesis.founder.cluster,
         EnrollmentLimits::default(),
     )?)
+}
+/// Where the sponsor an invitation names is now. An endpoint that is neither an address nor a name
+/// is the invitation's fault ([`JoinError::Invalid`]); a name the resolver did not answer for, in
+/// its time or at all, is a sponsor not reachable now, as one whose dial fails is, so the join asks
+/// again ([`retryable`]). A node's join and a client's both reach their sponsor so. Both answered
+/// every resolution that failed as an invalid invitation, which no join asks again: a client's
+/// enrollment ended so in the bootstrap of a 33-node run whose host ran at a load near 100, the
+/// one check of an enrollment that depends on the moment (the rest read its saved state), and the
+/// same enrollment, asked again later, enrolled (fleet33 m6, 2026-11-01).
+pub(crate) async fn sponsor_address(endpoint: &str) -> Result<SocketAddr, JoinError> {
+    crate::network_state::resolve_endpoint(endpoint)
+        .await
+        .map_err(|error| match error {
+            NodeError::Io(_) => JoinError::Transport(JoinTransportError::Unavailable),
+            _ => JoinError::Invalid,
+        })
 }
 /// Whether a join's answer says to ask again, the same join exactly: the sponsor had no room, its
 /// group could not decide (between leaders), or the outcome is unknown, the exchange lost or past
