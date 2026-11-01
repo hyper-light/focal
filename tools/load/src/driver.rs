@@ -82,6 +82,18 @@ const MAX_WALK_ENTRIES: usize = 100_000;
 /// Directory depth the size walk descends to.
 const MAX_WALK_DEPTH: usize = 16;
 
+/// Whether a lifecycle read that came back with `error` is asked again, within a hand-off's wait:
+/// its client reached no node, or none serving its ledger could answer it yet, unavailable or
+/// behind the read's token (a replica still catching up, a node started again). An agent abandoned
+/// a lifecycle at "serving replica is behind" from a restarted node (fleet33 m3, 2026-11-01).
+pub(crate) fn read_again(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Transport
+            | ClientError::Access(AccessError::Unavailable | AccessError::Behind { .. })
+    )
+}
+
 #[cfg(test)]
 #[path = "driver_tests.rs"]
 mod tests;
@@ -1072,7 +1084,8 @@ impl Shared<'_> {
     }
     /// One page of `query`, as `actor` reads it at `consistency`, at most `wanted` objects;
     /// `None`, with the reason noted, when it could not be read or held nothing. A read its
-    /// client could not have answered, no node reached or none serving its ledger, is asked again
+    /// client could not have answered ([`read_again`]), no node reached or none serving its ledger
+    /// that could answer it yet, is asked again
     /// until its ledger answers it or a hand-off's wait has passed since it was first asked, as an
     /// agent asks again: a linearizable read needs its session's leader, and one asked of a
     /// session that lost its quorum failed at its client's 30 s clock however soon the voters
@@ -1113,9 +1126,7 @@ impl Shared<'_> {
                         Ok(None)
                     }
                 },
-                Err(ClientError::Transport | ClientError::Access(AccessError::Unavailable))
-                    if asked.elapsed() < watch::WAIT =>
-                {
+                Err(error) if read_again(&error) && asked.elapsed() < watch::WAIT => {
                     focal_rt::time::sleep(RetryPolicy::default().max_backoff)
                         .await
                         .map_err(LoadError::Runtime)?;

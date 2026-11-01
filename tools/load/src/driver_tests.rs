@@ -230,3 +230,19 @@ fn refused_lifecycles_are_counted_by_their_cause() {
     assert_eq!(total.refused_by_cause.owner_memory, 4);
     assert_eq!(causes(&total), total.refused);
 }
+
+/// A lifecycle read a replica behind the read's token answers is asked again, as one no node could
+/// answer is: an agent abandoned a lifecycle at "serving replica is behind" from a node started
+/// again and still catching up (fleet33 m3, 2026-11-01). What its ledger answered for good stands.
+#[test]
+fn a_read_a_replica_behind_answers_is_asked_again() {
+    assert!(read_again(&ClientError::Access(AccessError::Behind {
+        published: focal_model::SessionSeq(7),
+    })));
+    assert!(read_again(&ClientError::Access(AccessError::Unavailable)));
+    assert!(read_again(&ClientError::Transport));
+    assert!(!read_again(&ClientError::Access(AccessError::Unauthorized)));
+    assert!(!read_again(&ClientError::Access(
+        AccessError::InvalidRequest
+    )));
+}
