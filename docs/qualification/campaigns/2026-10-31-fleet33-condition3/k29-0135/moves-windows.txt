@@ -1,0 +1,2 @@
+0fe65764 ledger 4: activated by 88.5 s; longest without a commit 15.6 s (72.2-87.9)
+a15dacbb ledger 0: activated by 110.0 s; longest without a commit 0.3 s (97.6-97.9)

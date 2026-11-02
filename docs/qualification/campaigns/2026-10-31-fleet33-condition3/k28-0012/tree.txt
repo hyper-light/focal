@@ -1,0 +1,5 @@
+e558cefa AL: a bootstrap that fails keeps each node's metrics beside its health and log: the founder of p9-0639 answered no admin call while its root group led elsewhere, and its health said nothing of why, where its metrics would have (`focal_root_periods_refused_total`, the periods its root replica took no tick for a write still pending; `focal_root_period_longest_ms`, its longest stall; the frames held and let go). The record states the one mechanism consistent with p9-0639's facts, not shown: a root replica whose own write is pending steps no frame and takes no tick until it completes (`ControlHost::must_wait`), so a founder whose writes the file system held would record no acknowledgement, leave its leadership at a quorum check between them, and step none of the new leader's frames, while the founder alone issues invitations
+ M docs/archictecutre/09-implementation-status.md
+ M docs/qualification/campaigns/2026-10-31-fleet33-condition3.md
+ M docs/qualification/terminating-conditions.md
+ M tools/compare/compose/run.sh

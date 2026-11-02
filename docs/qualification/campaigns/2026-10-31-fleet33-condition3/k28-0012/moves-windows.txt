@@ -1,0 +1,4 @@
+0ee10e8d ledger 8: activated by 73.1 s; longest without a commit 8.7 s (64.1-72.8)
+26051805 ledger 4: activated by 86.5 s; longest without a commit 7.9 s (77.6-85.5)
+3cb0176b ledger 6: activated by 93.0 s; longest without a commit 12.9 s (79.7-92.6)
+4a7b4060 ledger 3: activated by 108.4 s; longest without a commit 0.2 s (94.9-95.0)

@@ -1,8 +1,8 @@
-<!-- Qualification record: goal condition 3 at scale, a dozen of 33 focal nodes killed, partitioned and cut off under the work flow, 2026-10-31 to 2026-11-01, fedora (Linux x86-64), the final runs at fleet-run c606af7b (m4 with the harness at 902acac7), every fix the runs found at 6bb00314, its confirmation at 33 nodes pending. -->
+<!-- Qualification record: goal condition 3 at scale, a dozen of 33 focal nodes killed, partitioned and cut off under the work flow, 2026-10-31 to 2026-11-01, fedora (Linux x86-64), the final runs at fleet-run c606af7b (m4 with the harness at 902acac7), every fix the runs found at 6bb00314, confirmed at 33 nodes 2026-11-01 and 02 (m6, k28, m7, k29), with what the confirmation found fixed at 832a0567. -->
 
 # Condition 3 at scale: a dozen of 33 nodes killed, partitioned and cut off under the work flow
 
-Dates: 2026-10-31 to 2026-11-01. The final runs at `fleet-run` c606af7b (image `focal:fleet-c15`),
+Dates: 2026-10-31 to 2026-11-02. The final runs at `fleet-run` c606af7b (image `focal:fleet-c15`),
 the tree on which the defects that [the kill campaign](2026-10-29-fleet33-kill12.md), [the
 partition campaign](2026-10-30-fleet33-partition12.md) and the runs below found close; m4 ran the
 same image with the harness at 902acac7, which draws a fault's nodes from those outside the control
@@ -10,8 +10,9 @@ plane (below). What the final runs found closes at five commits: 01a2f923 (a ses
 could not act on stopped the control of every session after it), 22132325 (a node whose route was
 older than its client's sent the client back to it), baabea7d (focal-load: an agent asks again a
 read a lagging replica answered), c63c52c1 (the bootstrap asks an invitation again) and 6bb00314 (a
-join asks again a sponsor whose name did not resolve); their confirmation at 33 nodes waits on
-fedora (below). ab1630ba corrects two comments. The harness (`tools/compare/compose`) reads every
+join asks again a sponsor whose name did not resolve). Four runs at 33 nodes confirm them (m6 and
+k28 on that tree, m7 and k29 with b9f8a514), and those runs found two more defects, fixed at the
+cause in b9f8a514 and 832a0567 (below). ab1630ba corrects two comments. The harness (`tools/compare/compose`) reads every
 node's replicas of the sessions its agent installed during the run as well (each run's
 `tree.txt`).
 
@@ -106,7 +107,8 @@ session the controller could not act on ended its pass (found and fixed below). 
 read every 2 s (`m4-0816/placement-samples.txt`), shows the directory recording the deaths one at a
 time, the first 17.2 s after the kill and the twelfth at 40.7 s, every session missing a voter
 `blocked` by its dead node from then, and no heal planned before the twelve served again at 48 to
-50 s. That a heal now reaches every session it can at 33 nodes is the confirmation's to show (below).
+50 s. On the fixed tree a heal reaches every session it can: m6 activated two sessions on new
+voters while the twelve were still down and two more after (below).
 
 **The stalls.** In six runs no session committed for a moment, all at once (k24 1.3 s, m2 2.1 s, c15
 1.5 s, p9 1.1 s, k27 4.8 s, m4 1.4 s), while the load generator sent on time and each node's local
@@ -126,15 +128,86 @@ Not the neighbour table (no forced collection and no table full since the boot, 
 nor name resolution (p9, k27 and m4 ran with c606af7b). The harness keeps all 33 nodes' logs on the
 one volume, so its pause is every node's at once.
 
-**Confirmation at 33 nodes: pending.** Two runs on the tree that closes what these runs found,
-m6 (twelve outside the control plane killed for 60 s, its placement read every 2 s) and k28 (the
-twelve killed for 30 s), on image `focal:fleet-c17` (6bb00314), wait on fedora. m6's first attempt on
-`focal:fleet-c16` (01a2f923) stopped in its bootstrap at an agent's invitation (c63c52c1) and its
-second at an agent's enrollment (6bb00314); from 10:20 the host's kiln runner restarted every 20 to
-30 minutes while other tenants' kiln tests ran there, at loads up to 457, ending every build and run
-it carried, the image's three builds among them. The fixes rest until then on their tests and on
-CI on Linux, macOS and Windows (01a2f923: runs 41329353459 and 41329353386; 6bb00314: runs
-41337828996 and 41337829189).
+**Confirmation at 33 nodes (2026-11-01 and 02).** m6 and k28 ran on image `focal:fleet-c17`
+(e558cefa, every fix above), after the host's kiln runner had ended every build and run it carried
+from 10:20 to 17:09 under other tenants' tests and then went offline until 23:20. m7 and k29 ran on
+`focal:fleet-c18` (b9f8a514, below). Every run used the final campaign's fault seed (1029), so k28
+and k29 killed the same twelve as k26 and k27, the founder among them. The m runs' draw changed
+with the nodes holding control votes.
+
+| Run | Image | Fault | Written | Refused (by cause) | Unknown / abandoned | Write p50 / p99 (ms) | Moves activated (longest without a commit) |
+|---|---|---|---|---|---|---|---|
+| m6-2352 | fleet-c17 | twelve outside the control plane killed 60 s | 27,217 | 2,483 (`owner_bound` 22, `unavailable` 2,461) | 0 / 0 | 160.0 / 24,319.0 | 4 (5.2, 19.6, 8.1, 15.9 s), 1 in custody at the end |
+| k28-0012 | fleet-c17 | twelve killed 30 s | 29,271 | 429 (`owner_bound` 33, `ingress_capacity` 49, `unavailable` 347) | 0 / 0 | 143.6 / 20,027.0 | 4 (8.7, 7.9, 12.9, 0.2 s), 1 in custody |
+| m7-0110 | fleet-c18 | twelve outside the control plane killed, down to the run's end | 21,724 | 7,884 (`owner_bound` 20, `unavailable` 7,864) | 1 / 91 | 256.3 / 14,357.4 | 3 (7.5, 17.4, 15.9 s), 1 in custody |
+| k29-0135 | fleet-c18 | twelve killed 30 s | 28,983 | 717 (`owner_bound` 28, `ingress_capacity` 40, `unavailable` 649) | 0 / 0 | 259.3 / 18,053.9 | 2 (15.6, 0.3 s), 1 in custody |
+
+Each session's longest window without a commit in the run, by what the fault took from it (one
+that moved after the fault has its move's window there):
+
+| Run | Quorum | The leader | A follower | Nothing |
+|---|---|---|---|---|
+| m6-2352 | 3 sessions, 66.4 to 70.2 s | 1, 15.9 s | 4, 0.4 to 19.6 s | 3, 0.4 to 0.6 s |
+| k28-0012 | 3, 37.4 to 41.2 s | 2, 1.5 to 2.7 s | 4, 0.6 to 12.9 s | 2, 0.5 to 0.7 s |
+| k29-0135 | 3, 39.9 to 43.2 s | 2, 1.2 to 2.5 s | 3, 0.7 to 15.6 s | 3, 0.7 to 0.9 s |
+
+What the runs confirm:
+
+- **Heals reach every session they can (01a2f923).** In m6 the directory held the twelve dead
+  from 22.6 to 36.8 s after the kill. Two sessions it could act on were activated on new voters
+  while the twelve were still down (05debf56 by 52.3 s, 71c4614f by 59.0 s), two more after (by
+  101.2 and 105.5 s), and a fifth was in custody at the end. In m5, on the tree before the fix,
+  none was. k28, k29 and m7 moved four, two and three. A session most of whose voters were dead
+  was passed over until they were back (quorum column).
+- **No write's outcome stayed unknown and no lifecycle was abandoned** where the fault ended
+  within the run (22132325, baabea7d): 0 and 0 in m6, k28 and k29. m7's 1 unknown and 91 abandoned
+  are all in the four sessions that had no quorum to the run's end. Docker took 186 s to kill the
+  twelve, with the host's disk saturated throughout (I/O pressure 50 to 76 % some, 17 to 64 %
+  full), so they were started again only after the measured window. An agent abandons a lifecycle
+  whose read went unanswered past a hand-off's wait (focal-load's `read_page`). These were in
+  flight when the run stopped.
+- **Every bootstrap completed** (c63c52c1, 6bb00314): m6, k28, m7 and k29 each enrolled 500
+  agents. m7's bootstrap went through two root-group stalls (below) only because the bootstrap now
+  asks an invitation again.
+- **Every refusal is typed.** Each is the custody rule's (`unavailable` at the client's 30 s clock
+  on artifact steps, `owner_bound` at the custody check), a session's without its quorum, or
+  `ingress_capacity` (k28, k29, open below).
+
+What the confirmation found, fixed at the cause:
+
+- **A move's session was closed to its clients longer the later it came in ledger order**
+  (b9f8a514). From its log's cutover until its activation, a moving session commits nothing (24 §3).
+  A controller pass takes one step, the first session with one taking it, and sessions were served
+  in ledger order. So a closed session waited through every step of a session before it that was
+  still serving: m6's four windows were 5.2 s for the first in ledger order and up to 19.6 s for one
+  whose three promotions waited behind another session's move. The controller now serves sessions
+  nearest their activation first. m7's windows (7.5 to 17.4 s, on a host whose disk was saturated
+  through the fault) show what is left. Each window opens at the log's cutover, and each existing
+  voter re-verified its custody six to eight times (0.5 to 0.8 s each, about 4,000 artifacts and
+  4.3 MB) before its readiness counted. The new copies' was taken the first time. The readiness
+  intents went through the root's owner (next).
+- **The root group stalled while its owner synced node-local journals** (832a0567). Every node's
+  placement intents (and its network controller's) were written by the root's control owner, which
+  synced the journal's file and its directory itself. Sampled inside the nodes every 200 ms (k29),
+  the founder's and focal3's root owners were in `fsync` on `placement-partition/.pending-…` and on
+  the directory, in btrfs's `wait_log_commit` and in `barrier_all_devices`, a full commit. While it
+  waits the root replica takes no tick, sends no heartbeat and steps no frame. In m7's bootstrap
+  the founder's and focal3's root owners stalled together for 5.9 s and for 20 s, with no
+  checkpoint under way and their floor at 170, and the group elected another leader as each stall
+  ended. That is p9-0639's stop, which c63c52c1's retry got m7 past. Intents also queued behind the
+  owner's other work and were refused `Capacity` when its queue was full. A journal writer of their
+  own now makes them. Its confirmation at 33 nodes (m8, k30 on `focal:fleet-c19`) is under way.
+
+Open from the confirmation:
+
+- **`ingress_capacity` in the runs that kill the founder** (k28 49, k29 40, never in m6 or m7).
+  Each time it was one session that had lost one voter (k28: its leader, k29: a follower), about
+  13 s after the kill. Its two remaining voters, both alive and neither stalled (their sessions'
+  longest periods 158 and 785 ms), committed nothing for 2.8 s (k29) and about 4 s (k28, where the
+  follower then ran an election its leader won again). The leader's door filled, and the writes
+  past its bound were refused at once. The host's bridge and softnet dropped nothing then, and
+  every other session committed. Not root-caused: what held the two voters' replication is not
+  in what the runs kept.
 
 ## Found and fixed at the cause
 
@@ -350,10 +423,12 @@ behind it (015a5835).
 - **A session without its quorum takes no write** until its voters are back: killed, until they serve
   again after their restart; cut off, until the heal. Its writes begun meanwhile are refused at their
   clocks (`claim.create`) or resent and answered once.
-- **A move closes its session to clients** from its cutover until its activation (24 §3). k27's three
-  moves came with windows of 4.1, 6.0 and 22.2 s in which their sessions committed nothing, the last
-  beside the twelve's restart; the window from cutover to activation alone is not separated (k27's
-  placement was not read during the run), which the confirmation's m6 measures.
+- **A move closes its session to clients** from its log's cutover until its activation (24 §3).
+  Measured with the placement read every 2 s, the windows were 5.2 to 19.6 s in m6 and 7.5 to 17.4 s
+  in m7. Part of that was a closed session waiting behind other sessions' steps (fixed, b9f8a514).
+  The rest is each existing voter's custody, verified again on every pass until its readiness was
+  taken (the confirmation, above), and a window still holds the custody verification and the
+  directory's steps from promotion to activation. m8 and k30 measure it with 832a0567.
 - **A readiness verifies a session within one export** (10 s): the copies of the sessions k27 healed
   verified 1,543 to 5,039 artifacts and their objects (54 KB to 4.4 MB) in 0.2 to 2.5 s on this
   host, so a session some ten times larger than these runs leave would need its verification
@@ -369,9 +444,10 @@ behind it (015a5835).
   directory), and what that changes in such commits, is not measured (condition 10, medium-aware
   disk).
 - **A bootstrap stopped at an admin call the founder could not answer** (p9's first attempt,
-  p9-0639, once in the 69 runs of the three campaigns): the first agent's invitation, asked of the
+  p9-0639, once in the 69 runs of the three campaigns; root-caused by the confirmation, above: the
+  root's owner syncing node-local journals, 832a0567, its confirmation under way): the first agent's invitation, asked of the
   founder just after the bench's and the consumer's had committed and both clients had enrolled,
-  ran out the admin socket's 20 s. Through those 20 s the founder led the root group at term 1 and
+  ran out the admin socket's 20 s (what follows is the account as these runs left it). Through those 20 s the founder led the root group at term 1 and
   committed nothing. The group elected focal2 at term 2 only as the call ended: its first entry
   (612) committed while the nodes' health was read, 1.5 to 9.5 s after the call ended: focal2, read 1.7 s
   after it, had applied 611, and focal4, read 0.6 s later, and every node after it, 612. The founder, at term 1,
@@ -397,7 +473,13 @@ fedora computed it (`sha256.txt`, checked here after the copy); k27's and m4's h
 (`host-stall.txt`), m4's volume commits (`btrfs-commits.txt`), m3's lookups of the nodes' names
 timed from inside the generator's container (`dnsprobe.log`), m4's, m5's and the confirmation runs'
 placement every 2 s through the fault (`placement-samples.txt`), with the founder's detector counts
-beside it from m5 on (`placement-metrics.txt`). Each run's whole directory, every node's log,
+beside it from m5 on (`placement-metrics.txt`). The confirmation runs keep each moved session's longest window
+without a commit around its activation (`moves-windows.txt`). m7 and k29 also keep the founder's and
+focal3's root replica every second from their bootstraps (`root-samples.txt`: the floor, applied
+index, term, leader, periods and longest period). k29 keeps, sampled inside the founder's and
+focal3's containers every 200 ms, the root owner's, the hyper-log thread's and the hyper-log I/O
+thread's state, syscall and wait channel, and the file the owner was syncing
+(`syscalls-focal1.txt`, `syscalls-focal3.txt`). Each run's whole directory, every node's log,
 health, metrics and replicas among them, is on fedora under `~/s5/runs/<run>` (the intermediate
 runs' too), beside the run kit (`~/s5/campaign.sh`, `fleet-run.sh`, `killreport.py`, `agents.py`,
 `gaps.py`, `hostsample.sh`, `placesample.sh`, `btrfssample.sh`, `stallzoom.py`).

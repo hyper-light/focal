@@ -1,0 +1,4 @@
+05debf56 ledger 1: activated by 52.3 s; longest without a commit 5.2 s (46.7-51.9)
+71c4614f ledger 2: activated by 59.0 s; longest without a commit 19.6 s (37.6-57.2)
+954f4f47 ledger 5: activated by 101.2 s; longest without a commit 8.1 s (93.1-101.2)
+a16566df ledger 10: activated by 105.5 s; longest without a commit 15.9 s (90.5-106.3)

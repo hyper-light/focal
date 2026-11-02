@@ -1,0 +1,16 @@
+== k28-0012: fault undone at 44.1 s; longest window with no commit in any ledger 0.5 s (0.9-1.4)
+  ledger  0 (quorum): within the fault  37.4 s (0.2-37.7); after it   1.2 s (49.6-50.8)
+  ledger  1 (nothing): within the fault   0.5 s (0.9-1.4); after it   0.5 s (65.0-65.6)
+  ledger  2 (leader): within the fault   1.5 s (0.2-1.7); after it   0.6 s (65.0-65.6)
+  ledger  3 (a follower): within the fault   0.6 s (0.9-1.5); after it   0.5 s (65.1-65.6)
+  ledger  4 (a follower): within the fault   0.6 s (39.8-40.4); after it   7.9 s (77.6-85.5)
+  ledger  5 (leader): within the fault   2.7 s (16.0-18.7); after it   0.7 s (45.9-46.5)
+  ledger  6 (a follower): within the fault   0.6 s (0.9-1.4); after it  12.9 s (79.7-92.6)
+  ledger  7 (nothing): within the fault   0.7 s (0.7-1.4); after it   0.5 s (65.1-65.6)
+  ledger  8 (a follower): within the fault   1.0 s (0.5-1.4); after it   8.7 s (64.1-72.8)
+  ledger  9 (quorum): within the fault  41.2 s (0.2-41.4); after it   0.6 s (65.1-65.6)
+  ledger 10 (quorum): within the fault  39.8 s (0.2-40.0); after it   2.0 s (67.6-69.6)
+  by what it lost: a follower: 4 ledgers, longest within the fault 0.6 to 1.0 s
+  by what it lost: leader: 2 ledgers, longest within the fault 1.5 to 2.7 s
+  by what it lost: nothing: 2 ledgers, longest within the fault 0.5 to 0.7 s
+  by what it lost: quorum: 3 ledgers, longest within the fault 37.4 to 41.2 s

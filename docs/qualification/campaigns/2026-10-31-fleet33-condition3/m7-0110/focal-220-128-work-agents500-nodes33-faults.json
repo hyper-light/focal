@@ -1,0 +1,763 @@
+{
+  "shape": {
+    "claims": 29700,
+    "seed": 1,
+    "reads": 0,
+    "transport": "enrolled",
+    "data_dir": null,
+    "profile": "authored_v1",
+    "concurrency": 176,
+    "connections": 16,
+    "inflight": 64,
+    "enrollment": "/client/CLIENT.contexts/enrollment-bench",
+    "worker": null,
+    "consumer_enrollment": null,
+    "poll_ms": 2,
+    "inbox_wait_ms": 20000,
+    "agents": 500,
+    "agent_enrollments": "/client/agents",
+    "homes": null,
+    "ledgers": [
+      {
+        "session": "6576e73974e7391625f3aad4f7cd1c26",
+        "homes": [
+          {
+            "endpoint": "10.231.0.21:7443",
+            "server_name": "node-16150093301072009480.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.29:7443",
+            "server_name": "node-16150093301072009488.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.31:7443",
+            "server_name": "node-16150093301072009490.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "8539c3beb9f1b7264d71c31846f4b4b7",
+        "homes": [
+          {
+            "endpoint": "10.231.0.24:7443",
+            "server_name": "node-16150093301072009483.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.28:7443",
+            "server_name": "node-16150093301072009486.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.44:7443",
+            "server_name": "node-16150093301072009504.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "e07ee5749c9daac3e3a919f7f4d546ea",
+        "homes": [
+          {
+            "endpoint": "10.231.0.27:7443",
+            "server_name": "node-16150093301072009487.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.35:7443",
+            "server_name": "node-16150093301072009494.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.46:7443",
+            "server_name": "node-16150093301072009505.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "cd025d7929a5e96e1c6991aacb68b7f4",
+        "homes": [
+          {
+            "endpoint": "10.231.0.30:7443",
+            "server_name": "node-16150093301072009489.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.47:7443",
+            "server_name": "node-16150093301072009506.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.52:7443",
+            "server_name": "node-16150093301072009510.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "753dd555a6a6d5cdb8a33bb16f5b7169",
+        "homes": [
+          {
+            "endpoint": "10.231.0.33:7443",
+            "server_name": "node-16150093301072009492.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.38:7443",
+            "server_name": "node-16150093301072009497.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.43:7443",
+            "server_name": "node-16150093301072009502.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "c332d74d8164cf263fba4702ad49abc9",
+        "homes": [
+          {
+            "endpoint": "10.231.0.36:7443",
+            "server_name": "node-16150093301072009495.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.41:7443",
+            "server_name": "node-16150093301072009500.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.49:7443",
+            "server_name": "node-16150093301072009508.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "095620f471b89d2a3da2a4e2f1e065ea",
+        "homes": [
+          {
+            "endpoint": "10.231.0.25:7443",
+            "server_name": "node-16150093301072009484.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.39:7443",
+            "server_name": "node-16150093301072009498.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.53:7443",
+            "server_name": "node-16150093301072009512.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "dd5fff217e5dbd50f0161bc50374a04e",
+        "homes": [
+          {
+            "endpoint": "10.231.0.40:7443",
+            "server_name": "node-16150093301072009499.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.42:7443",
+            "server_name": "node-16150093301072009501.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.50:7443",
+            "server_name": "node-16150093301072009509.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "172b1a3cd9a2514c5d4ea067128b7780",
+        "homes": [
+          {
+            "endpoint": "10.231.0.26:7443",
+            "server_name": "node-16150093301072009485.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.37:7443",
+            "server_name": "node-16150093301072009496.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.45:7443",
+            "server_name": "node-16150093301072009503.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "d4f4c5485b0c92057c0c3910f7c751ba",
+        "homes": [
+          {
+            "endpoint": "10.231.0.22:7443",
+            "server_name": "node-16150093301072009482.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.23:7443",
+            "server_name": "node-16150093301072009481.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.48:7443",
+            "server_name": "node-16150093301072009507.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          }
+        ]
+      },
+      {
+        "session": "809aa4496f9d39cd2197347540b28fcb",
+        "homes": [
+          {
+            "endpoint": "10.231.0.32:7443",
+            "server_name": "node-16150093301072009491.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.34:7443",
+            "server_name": "node-16150093301072009493.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          },
+          {
+            "endpoint": "10.231.0.51:7443",
+            "server_name": "node-16150093301072009511.412c5924c1e60c3c82a924ab2713bd7e.focal.internal"
+          }
+        ]
+      }
+    ],
+    "rate": 220,
+    "warmup_ms": 15000,
+    "lifecycle": "work",
+    "lifecycle_reads": null,
+    "reopen": false
+  },
+  "committed": 240544,
+  "refused": 7884,
+  "unknown": 1,
+  "expired": 0,
+  "lifecycles": 21724,
+  "abandoned": 91,
+  "floors_advanced": 1691,
+  "wall_ms": 266948,
+  "throughput_ops_per_s": 901.0881080443203,
+  "latency_ns": {
+    "p50": 261423060,
+    "p95": 9791323038,
+    "p99": 60495809277,
+    "p999": 121234208147,
+    "max": 149328091773
+  },
+  "latency_ns_first_half": {
+    "p50": 215216138,
+    "p95": 1426044046,
+    "p99": 73999823610,
+    "p999": 121395769858,
+    "max": 121797477965
+  },
+  "latency_ns_second_half": {
+    "p50": 306933162,
+    "p95": 29684416494,
+    "p99": 60410208857,
+    "p999": 90969428886,
+    "max": 149328091773
+  },
+  "measured_writes": {
+    "committed": 213015,
+    "refused": 7884,
+    "unknown": 1,
+    "expired": 0,
+    "committed_latency_ns": {
+      "p50": 256338521,
+      "p95": 1198642199,
+      "p99": 14357401859,
+      "p999": 73960603083,
+      "max": 92128828723
+    },
+    "refused_latency_ns": {
+      "p50": 55116086482,
+      "p95": 91116001920,
+      "p99": 121458983224,
+      "p999": 121670559084,
+      "max": 149328091773
+    },
+    "unknown_latency_ns": {
+      "p50": 121537178316,
+      "p95": 121537178316,
+      "p99": 121537178316,
+      "p999": 121537178316,
+      "max": 121537178316
+    },
+    "expired_latency_ns": {
+      "p50": 0,
+      "p95": 0,
+      "p99": 0,
+      "p999": 0,
+      "max": 0
+    },
+    "schedule_delay_ns": {
+      "p50": 4892,
+      "p95": 19265155,
+      "p99": 6092760775,
+      "p999": 31169744241,
+      "max": 42074313997
+    },
+    "client_request_latency_ns": {
+      "p50": 259512720,
+      "p95": 6428300064,
+      "p99": 60459167507,
+      "p999": 121232637784,
+      "max": 121797090026
+    }
+  },
+  "write_phase_start_epoch_ns": 1793611606741388848,
+  "reads": 0,
+  "read_hits": 0,
+  "read_wall_ms": 0,
+  "read_throughput_ops_per_s": 0.0,
+  "read_latency_ns": {
+    "p50": 0,
+    "p95": 0,
+    "p99": 0,
+    "p999": 0,
+    "max": 0
+  },
+  "workers": 176,
+  "refusals": [
+    [
+      "refused: NativeRefusal { kind: Capacity, detail: \"custody: # of # required copies hold the artifact; missing nodes #\" }",
+      17
+    ],
+    [
+      "access: Unavailable",
+      7864
+    ],
+    [
+      "lifecycle read: client: authoritative ledger service is unavailable",
+      89
+    ],
+    [
+      "refused: NativeRefusal { kind: Capacity, detail: \"custody: # of # required copies hold the artifact; missing nodes #,#\" }",
+      3
+    ],
+    [
+      "lifecycle read: client: transport unavailable",
+      2
+    ],
+    [
+      "client: outcome unknown for request #a#b; retry the same identity",
+      1
+    ]
+  ],
+  "reopen_ms": null,
+  "first_read_after_reopen_ns": null,
+  "reopen_read_hit": null,
+  "data_dir_bytes": null,
+  "deliver": {
+    "delivered": 18436,
+    "handled_latency_ns": {
+      "p50": 3646200877,
+      "p95": 41727390243,
+      "p99": 82635566915,
+      "p999": 93416733066,
+      "max": 94803781123
+    },
+    "satisfied_latency_ns": {
+      "p50": 7544036435,
+      "p95": 52078883459,
+      "p99": 87687843298,
+      "p999": 98606633110,
+      "max": 100626578000
+    },
+    "undelivered": 0,
+    "consumer_polls": 0,
+    "consumer_events": 0,
+    "consumer_waits": 0,
+    "issuer_polls": 0,
+    "issuer_events": 0,
+    "issuer_waits": 0,
+    "agents": 500,
+    "agent_polls": 75223,
+    "agent_events": 87439,
+    "agent_waits": 74723,
+    "tail_failures": 828
+  },
+  "ledgers": [
+    {
+      "ledger": {
+        "tenant": "0560370ace47cc6f683482c3502001b9",
+        "session": "6576e73974e7391625f3aad4f7cd1c26"
+      },
+      "callers": 16,
+      "agents": 46,
+      "started": 2700,
+      "written": 2700,
+      "judged": 2700,
+      "refused": 0,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 0,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 0,
+      "abandoned": 0,
+      "undelivered": 0,
+      "committed": 29700,
+      "resent": 0,
+      "tail_events": 10800,
+      "tail_failures": 75,
+      "refusals": []
+    },
+    {
+      "ledger": {
+        "tenant": "0560370ace47cc6f683482c3502001b9",
+        "session": "8539c3beb9f1b7264d71c31846f4b4b7"
+      },
+      "callers": 16,
+      "agents": 46,
+      "started": 2700,
+      "written": 2700,
+      "judged": 2700,
+      "refused": 0,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 0,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 0,
+      "abandoned": 0,
+      "undelivered": 0,
+      "committed": 29700,
+      "resent": 5,
+      "tail_events": 10800,
+      "tail_failures": 91,
+      "refusals": []
+    },
+    {
+      "ledger": {
+        "tenant": "0560370ace47cc6f683482c3502001b9",
+        "session": "e07ee5749c9daac3e3a919f7f4d546ea"
+      },
+      "callers": 16,
+      "agents": 46,
+      "started": 2700,
+      "written": 2467,
+      "judged": 2467,
+      "refused": 233,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 16,
+        "ingress_capacity": 0,
+        "unavailable": 217,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 0,
+      "abandoned": 0,
+      "undelivered": 0,
+      "committed": 27928,
+      "resent": 854,
+      "tail_events": 10138,
+      "tail_failures": 178,
+      "refusals": [
+        [
+          "refused: NativeRefusal { kind: Capacity, detail: \"custody: # of # required copies hold the artifact; missing nodes #\" }",
+          16
+        ],
+        [
+          "access: Unavailable",
+          217
+        ]
+      ]
+    },
+    {
+      "ledger": {
+        "tenant": "0560370ace47cc6f683482c3502001b9",
+        "session": "cd025d7929a5e96e1c6991aacb68b7f4"
+      },
+      "callers": 16,
+      "agents": 46,
+      "started": 2700,
+      "written": 765,
+      "judged": 770,
+      "refused": 1912,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 1,
+        "ingress_capacity": 0,
+        "unavailable": 1911,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 1,
+      "abandoned": 22,
+      "undelivered": 0,
+      "committed": 8612,
+      "resent": 989,
+      "tail_events": 3129,
+      "tail_failures": 133,
+      "refusals": [
+        [
+          "access: Unavailable",
+          1911
+        ],
+        [
+          "lifecycle read: client: authoritative ledger service is unavailable",
+          21
+        ],
+        [
+          "refused: NativeRefusal { kind: Capacity, detail: \"custody: # of # required copies hold the artifact; missing nodes #,#\" }",
+          1
+        ],
+        [
+          "lifecycle read: client: transport unavailable",
+          1
+        ],
+        [
+          "client: outcome unknown for request #a#b; retry the same identity",
+          1
+        ]
+      ]
+    },
+    {
+      "ledger": {
+        "tenant": "0560370ace47cc6f683482c3502001b9",
+        "session": "753dd555a6a6d5cdb8a33bb16f5b7169"
+      },
+      "callers": 16,
+      "agents": 46,
+      "started": 2700,
+      "written": 2700,
+      "judged": 2700,
+      "refused": 0,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 0,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 0,
+      "abandoned": 0,
+      "undelivered": 0,
+      "committed": 29700,
+      "resent": 0,
+      "tail_events": 10800,
+      "tail_failures": 47,
+      "refusals": []
+    },
+    {
+      "ledger": {
+        "tenant": "0560370ace47cc6f683482c3502001b9",
+        "session": "c332d74d8164cf263fba4702ad49abc9"
+      },
+      "callers": 16,
+      "agents": 45,
+      "started": 2700,
+      "written": 2700,
+      "judged": 2700,
+      "refused": 0,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 0,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 0,
+      "abandoned": 0,
+      "undelivered": 0,
+      "committed": 29700,
+      "resent": 0,
+      "tail_events": 10800,
+      "tail_failures": 32,
+      "refusals": []
+    },
+    {
+      "ledger": {
+        "tenant": "0560370ace47cc6f683482c3502001b9",
+        "session": "095620f471b89d2a3da2a4e2f1e065ea"
+      },
+      "callers": 16,
+      "agents": 45,
+      "started": 2700,
+      "written": 764,
+      "judged": 767,
+      "refused": 1914,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 1,
+        "ingress_capacity": 0,
+        "unavailable": 1913,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 0,
+      "abandoned": 22,
+      "undelivered": 0,
+      "committed": 8602,
+      "resent": 1015,
+      "tail_events": 3125,
+      "tail_failures": 29,
+      "refusals": [
+        [
+          "access: Unavailable",
+          1913
+        ],
+        [
+          "lifecycle read: client: authoritative ledger service is unavailable",
+          22
+        ],
+        [
+          "refused: NativeRefusal { kind: Capacity, detail: \"custody: # of # required copies hold the artifact; missing nodes #\" }",
+          1
+        ]
+      ]
+    },
+    {
+      "ledger": {
+        "tenant": "0560370ace47cc6f683482c3502001b9",
+        "session": "dd5fff217e5dbd50f0161bc50374a04e"
+      },
+      "callers": 16,
+      "agents": 45,
+      "started": 2700,
+      "written": 765,
+      "judged": 766,
+      "refused": 1908,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 1908,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 0,
+      "abandoned": 27,
+      "undelivered": 0,
+      "committed": 8610,
+      "resent": 916,
+      "tail_events": 3128,
+      "tail_failures": 48,
+      "refusals": [
+        [
+          "access: Unavailable",
+          1908
+        ],
+        [
+          "lifecycle read: client: authoritative ledger service is unavailable",
+          27
+        ]
+      ]
+    },
+    {
+      "ledger": {
+        "tenant": "0560370ace47cc6f683482c3502001b9",
+        "session": "172b1a3cd9a2514c5d4ea067128b7780"
+      },
+      "callers": 16,
+      "agents": 45,
+      "started": 2700,
+      "written": 2700,
+      "judged": 2700,
+      "refused": 0,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 0,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 0,
+      "abandoned": 0,
+      "undelivered": 0,
+      "committed": 29700,
+      "resent": 0,
+      "tail_events": 10800,
+      "tail_failures": 30,
+      "refusals": []
+    },
+    {
+      "ledger": {
+        "tenant": "0560370ace47cc6f683482c3502001b9",
+        "session": "d4f4c5485b0c92057c0c3910f7c751ba"
+      },
+      "callers": 16,
+      "agents": 45,
+      "started": 2700,
+      "written": 2700,
+      "judged": 2700,
+      "refused": 0,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 0,
+        "ingress_capacity": 0,
+        "unavailable": 0,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 0,
+      "abandoned": 0,
+      "undelivered": 0,
+      "committed": 29700,
+      "resent": 0,
+      "tail_events": 10800,
+      "tail_failures": 135,
+      "refusals": []
+    },
+    {
+      "ledger": {
+        "tenant": "0560370ace47cc6f683482c3502001b9",
+        "session": "809aa4496f9d39cd2197347540b28fcb"
+      },
+      "callers": 16,
+      "agents": 45,
+      "started": 2700,
+      "written": 763,
+      "judged": 766,
+      "refused": 1917,
+      "refused_by_cause": {
+        "owner_memory": 0,
+        "owner_bound": 2,
+        "ingress_capacity": 0,
+        "unavailable": 1915,
+        "expired": 0,
+        "other": 0
+      },
+      "unknown": 0,
+      "abandoned": 20,
+      "undelivered": 0,
+      "committed": 8592,
+      "resent": 606,
+      "tail_events": 3119,
+      "tail_failures": 30,
+      "refusals": [
+        [
+          "refused: NativeRefusal { kind: Capacity, detail: \"custody: # of # required copies hold the artifact; missing nodes #,#\" }",
+          2
+        ],
+        [
+          "access: Unavailable",
+          1915
+        ],
+        [
+          "lifecycle read: client: authoritative ledger service is unavailable",
+          19
+        ],
+        [
+          "lifecycle read: client: transport unavailable",
+          1
+        ]
+      ]
+    }
+  ],
+  "totals": {
+    "started": 29700,
+    "written": 21724,
+    "judged": 21736,
+    "refused": 7884,
+    "refused_by_cause": {
+      "owner_memory": 0,
+      "owner_bound": 20,
+      "ingress_capacity": 0,
+      "unavailable": 7864,
+      "expired": 0,
+      "other": 0
+    },
+    "unknown": 1,
+    "abandoned": 91,
+    "undelivered": 0,
+    "committed": 240544,
+    "resent": 4385
+  }
+}

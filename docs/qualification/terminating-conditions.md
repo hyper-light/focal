@@ -10,7 +10,7 @@ every row names where it is recorded, and a gap is written as a gap.
 |---|---|---|
 | 1 | One binary and CLI, laptop to global, proven by records | partly shown |
 | 2 | More than a thousand agents doing claims, artifacts, testaments and validations | shown at 1,000; the Kubernetes build not attempted |
-| 3 | Delivery under heavy load, horrific networks, dozens of node failures | shown on three nodes and on 33 with twelve failing at once; the custody rule's decision pending; one bootstrap's stop not root-caused |
+| 3 | Delivery under heavy load, horrific networks, dozens of node failures | shown on three nodes and on 33 with twelve failing at once, confirmed on the fixed tree; the custody rule's decision pending; `ingress_capacity` in runs that kill the founder not root-caused |
 | 4 | p99s an order of magnitude beyond Kafka, Redis HA, NATS | plan of record; not shown across its conditions |
 | 5 | Post-quantum encryption in transit and at rest | in transit shown; at rest partly |
 | 6 | Adversarial batteries: bombs, tampering, misuse | partly shown |
@@ -90,19 +90,39 @@ file system held every sync for up to 5.2 s, every node's log on one btrfs volum
 its leader within 1.4 to 2.4 s, and one without its quorum as its voters came back. The unknown
 write and the abandoned lifecycles were defects, fixed (22132325, baabea7d), and so was a controller
 that left every session after the first it could not act on unhealed (01a2f923), and a join that
-gave up on a sponsor whose name did not resolve (6bb00314). Their confirmation at 33 nodes on that
-tree waits on the host, whose kiln runner restarted every 20 to 30 minutes under other tenants' load
-while it was to run.
+gave up on a sponsor whose name did not resolve (6bb00314).
+
+Confirmed at 33 nodes on that tree (`focal:fleet-c17`) and with the confirmation's first fix
+(`focal:fleet-c18`, b9f8a514), the same seed and faults:
+
+| fedora run | Fault | Written, of 29,700 | Refused | Unknown | Abandoned | Write p50 / p99 (ms) |
+|---|---|---|---|---|---|---|
+| m6-2352 | twelve outside the control plane killed 60 s | 27,217 | 2,483 | 0 | 0 | 160.0 / 24,319.0 |
+| k28-0012 | killed 30 s | 29,271 | 429 | 0 | 0 | 143.6 / 20,027.0 |
+| m7-0110 | as m6; down to the run's end (docker took 186 s to kill them) | 21,724 | 7,884 | 1 | 91 | 256.3 / 14,357.4 |
+| k29-0135 | killed 30 s | 28,983 | 717 | 0 | 0 | 259.3 / 18,053.9 |
+
+The directory healed every session it could, two of them while the twelve were still down (m6;
+none in m5 before 01a2f923). No outcome stayed unknown and no lifecycle was abandoned where the
+fault ended within the run. m7's were all in sessions without a quorum to the run's end. A session
+without its quorum committed again 37 to 70 s after the kill, as its voters came back. The
+confirmation found two more defects and fixed them at the cause: a move's session was closed to its
+clients longer the later it came in ledger order (5.2 to 19.6 s, b9f8a514), and the root's owner
+synced every node-local intent journal itself. That stalled the root group for up to 20 s in a
+bootstrap, which is p9-0639's stop (832a0567, its own run at 33 nodes under way).
 
 **Open.** An artifact's acknowledgement waits on every content copy of its session (doc 26 §1), so
 while a copy is down its artifact steps wait or are refused (`unavailable` at the client's 30 s
 clock, `owner_bound` at the custody check): every refusal at 33 nodes that is not a session without
 its quorum is this rule's, and whether a quorum of copies (f+1) suffices is the user's decision,
-pending. A session whose quorum is down takes no write until its voters are back. One bootstrap in
-69 stopped at an admin call the founder could not answer: through the call's 20 s the founder led
-the root group and committed nothing, another leader elected only as the call ended. Not
-root-caused; a failed bootstrap now keeps each node's metrics and its container's pressure. A node's log syncs wait on its file system's commits, up to 5.2 s on the host's btrfs
-volume, where the harness keeps every node's log (condition 10). Under 3% loss a write's p99 is 753
+pending. A session whose quorum is down takes no write until its voters are back. A move closes its
+session to its clients from its log's cutover to its activation, 7.5 to 17.4 s in m7, most of it
+existing voters' custody verified again until their readiness was taken (measured again with
+832a0567). In the runs that kill the founder, one session that lost one voter stopped committing
+for 2.8 to 4 s about 13 s after the kill, its two live voters unstalled, and refused writes past its
+door's bound (`ingress_capacity`, 49 and 40): not root-caused. A node's log syncs wait on its file
+system's commits, up to 5.2 s on the host's btrfs volume, where the harness keeps every node's log
+(condition 10). Under 3% loss a write's p99 is 753
 to 2,244 ms against 462 to 574 without, its artifact steps held at the evidence door (the 2026-10-28
 entry's open items).
 
