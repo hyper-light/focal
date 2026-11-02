@@ -162,7 +162,6 @@ use directory_authority_host::{PendingAuthority, RefreshReply};
 
 #[path = "local_intent_host.rs"]
 mod local_intent_host;
-use local_intent_host::LocalIntentWrite;
 pub(crate) use local_intent_host::{LocalIntentError, save_local_intent};
 
 enum Work {
@@ -261,7 +260,7 @@ pub struct ControlHost {
     peers: mpsc::SyncSender<Work>,
     /// Local intents' journal writes, made on a thread of their own and never on the owner's
     /// (`local_intent_host`).
-    journals: mpsc::SyncSender<Box<LocalIntentWrite>>,
+    journals: mpsc::SyncSender<local_intent_host::JournalWork>,
     progress: watch::Receiver<ControlProgressState>,
     config: ControlHostConfig,
     limits: WireLimits,
@@ -455,7 +454,10 @@ enum FrameAdmission {
 /// write is a file written whole and synced, which a busy volume holds for seconds: on a thread of
 /// its own, no consensus owner waits on one. Bounded as the owner's own queue is (`bound`), it ends
 /// with the host's last handle. `None` without a thread.
-fn journal_writer(node: u64, bound: usize) -> Option<mpsc::SyncSender<Box<LocalIntentWrite>>> {
+fn journal_writer(
+    node: u64,
+    bound: usize,
+) -> Option<mpsc::SyncSender<local_intent_host::JournalWork>> {
     let (journals, writes) = mpsc::sync_channel(bound);
     std::thread::Builder::new()
         .name(format!("focal-journal-{node}"))

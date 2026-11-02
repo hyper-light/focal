@@ -1,7 +1,7 @@
 use super::*;
 use std::{future::Future, task::Poll};
 
-fn queued_host(budget: MemoryBudget) -> (ControlHost, mpsc::Receiver<Box<LocalIntentWrite>>) {
+fn queued_host(budget: MemoryBudget) -> (ControlHost, mpsc::Receiver<JournalWork>) {
     let namespace = LedgerId {
         tenant: focal_model::TenantId::from_u128(1),
         session: focal_model::SessionId::from_u128(1),
@@ -155,7 +155,9 @@ fn canceled_queued_intent_retains_lock_and_charge_until_persistence_or_unknown_d
             if persist {
                 drop(save);
                 assert_eq!(budget.stats().used, admitted);
-                let write = queue.try_recv().unwrap();
+                let Ok(JournalWork::Write(write)) = queue.try_recv() else {
+                    panic!("queued local intent")
+                };
                 write.persist();
                 assert_eq!(budget.stats().used, 0);
             } else {
@@ -194,7 +196,9 @@ fn delivered_journal_reply_retains_charge_and_lock_until_consumed() {
         let mut save = Box::pin(host.persist_local_intent(journal, b"committed".to_vec()));
         pending(save.as_mut()).await;
         let charged = budget.stats().used;
-        let write = queue.try_recv().unwrap();
+        let Ok(JournalWork::Write(write)) = queue.try_recv() else {
+            panic!("queued local intent")
+        };
         write.persist();
         assert_eq!(budget.stats().used, charged);
         assert!(matches!(
@@ -219,7 +223,7 @@ fn delivered_journal_reply_retains_charge_and_lock_until_consumed() {
 }
 
 #[test]
-fn physical_control_owner_persists_canceled_journal_behind_blocked_wal_and_reopens() {
+fn a_canceled_journal_write_is_made_while_the_owner_waits_on_its_wal_and_reopens() {
     // focal-log's writer, paused: a node below the storage level.
     let _level = crate::upgrade::announce_for_test(crate::upgrade::BELOW_STORAGE_LEVEL);
     focal_rt::block_on(async move {
@@ -267,17 +271,23 @@ fn physical_control_owner_persists_canceled_journal_behind_blocked_wal_and_reope
             },
         ));
         pending(write.as_mut()).await;
-        // FIFO owner work: this intent is queued after the mutation whose WAL
-        // durability is blocked, so cancellation necessarily precedes journal IO.
+        // The owner waits on its WAL, whose durability is blocked. A journal write is not queued
+        // behind it: its caller cancels it once admitted, and the host's journal writer makes it
+        // all the same while the owner still waits.
         let mut save =
             Box::pin(host.persist_local_intent(journal, b"after canceled caller".to_vec()));
         pending(save.as_mut()).await;
         drop(save);
-        assert!(matches!(
-            PrivateJournal::open(&path, &focal_seal::test_keys_beside(&path).unwrap()),
-            Err(EnrollmentError::Locked)
-        ));
-        assert!(budget.stats().used >= 16 * 1024);
+        // A later request to the journal writer proves the canceled write has been made; the
+        // abandoned reply released its journal lock and admission charge, the owner still held.
+        host.settle_local_intents().await.unwrap();
+        assert!(!host.progress().stopped);
+        let mut journal =
+            PrivateJournal::open(&path, &focal_seal::test_keys_beside(&path).unwrap()).unwrap();
+        assert_eq!(
+            journal.read().unwrap().unwrap().as_slice(),
+            b"after canceled caller"
+        );
         pause.resume().unwrap();
         crate::test_waits::charged(
             || vec![host.periods()],
@@ -288,15 +298,6 @@ fn physical_control_owner_persists_canceled_journal_behind_blocked_wal_and_reope
         .await
         .unwrap()
         .unwrap();
-        // A later owner request proves the queued write has been processed; the
-        // abandoned reply releases its journal lock and admission charge.
-        drop(host.observe_root().await.unwrap());
-        let mut journal =
-            PrivateJournal::open(&path, &focal_seal::test_keys_beside(&path).unwrap()).unwrap();
-        assert_eq!(
-            journal.read().unwrap().unwrap().as_slice(),
-            b"after canceled caller"
-        );
         journal = host
             .persist_local_intent(journal, b"returned ownership".to_vec())
             .await
@@ -349,7 +350,7 @@ fn an_admitted_journal_write_is_waited_for_and_the_journal_comes_back() {
                     focal_rt::time::sleep(Duration::from_secs(6)).await.unwrap();
                     pending(save.as_mut()).await;
                 }
-                let Ok(write) = queue.try_recv() else {
+                let Ok(JournalWork::Write(write)) = queue.try_recv() else {
                     panic!("the write was admitted to the journal writer's queue")
                 };
                 write.persist();

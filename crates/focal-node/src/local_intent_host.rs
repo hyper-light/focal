@@ -70,6 +70,16 @@ pub(crate) async fn save_local_intent(
     }
 }
 
+/// What a host's journal writer takes, in the order it was admitted.
+pub(super) enum JournalWork {
+    Write(Box<LocalIntentWrite>),
+    /// Answered once every write admitted before it is made, or failed: the barrier for one that
+    /// reopens a journal whose last write it abandoned (`ControlHost::settle_local_intents`). A
+    /// node opens its journals once, so only its tests reopen one.
+    #[cfg(test)]
+    Settled(OneshotSender<()>),
+}
+
 pub(super) struct LocalIntentWrite {
     journal: PrivateJournal,
     bytes: Vec<u8>,
@@ -96,6 +106,21 @@ impl LocalIntentWrite {
 }
 
 impl ControlHost {
+    /// Waits until every local intent write this host admitted before the call is made, or failed:
+    /// the barrier for one that reopens a journal whose last write it abandoned, whose lock that
+    /// write holds until its writer finishes it. Refused at once where the writer's queue is full
+    /// or the writer is gone.
+    #[cfg(test)]
+    pub(crate) async fn settle_local_intents(&self) -> Result<(), LocalIntentError> {
+        let (reply, settled) = hyper_rt::sync::oneshot().map_err(|_| LocalIntentError::Capacity)?;
+        self.journals
+            .try_send(JournalWork::Settled(reply))
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => LocalIntentError::Capacity,
+                mpsc::TrySendError::Disconnected(_) => LocalIntentError::Unavailable,
+            })?;
+        settled.await.map_err(|_| LocalIntentError::Unavailable)
+    }
     /// Local composition only; wire callers cannot supply a path or journal.
     /// Rejected admission returns ownership intact. Once admitted, any failure
     /// consumes the journal and requires recovery of its original durable state.
@@ -145,13 +170,20 @@ impl ControlHost {
             response,
             input,
         });
-        if let Err(error) = self.journals.try_send(write) {
+        if let Err(error) = self.journals.try_send(JournalWork::Write(write)) {
             // Not admitted either way: the journal goes back whole.
-            let (error, write) = match error {
-                mpsc::TrySendError::Full(write) => (LocalIntentError::Capacity, write),
-                mpsc::TrySendError::Disconnected(write) => (LocalIntentError::Unavailable, write),
+            let (error, work) = match error {
+                mpsc::TrySendError::Full(work) => (LocalIntentError::Capacity, work),
+                mpsc::TrySendError::Disconnected(work) => (LocalIntentError::Unavailable, work),
             };
-            return Err(write.rejected(error));
+            return Err(match work {
+                JournalWork::Write(write) => write.rejected(error),
+                #[cfg(test)]
+                JournalWork::Settled(_) => LocalIntentFailure {
+                    error,
+                    rejected: None,
+                },
+            });
         }
         let (result, _input) = receive.await.map_err(|_| LocalIntentFailure {
             error: LocalIntentError::Unavailable,
@@ -172,8 +204,17 @@ mod tests;
 /// was admitted, until the host's every handle is gone. A write that unwound is answered by
 /// nothing: its caller hears the writer's absence, as for any write whose outcome is unknown, and
 /// recovers the journal's durable state; the writes after it go on.
-pub(super) fn write_journals(writes: &mpsc::Receiver<Box<LocalIntentWrite>>) {
-    for write in writes {
-        let _ = catch_unwind(AssertUnwindSafe(move || write.persist()));
+pub(super) fn write_journals(writes: &mpsc::Receiver<JournalWork>) {
+    for work in writes {
+        match work {
+            JournalWork::Write(write) => {
+                let _ = catch_unwind(AssertUnwindSafe(move || write.persist()));
+            }
+            // The writes before it are made: a caller that has gone hears nothing.
+            #[cfg(test)]
+            JournalWork::Settled(reply) => {
+                let _ = reply.send(());
+            }
+        }
     }
 }
