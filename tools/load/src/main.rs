@@ -156,9 +156,17 @@ fn run(args: &Args) -> Result<(), LoadError> {
         } else {
             String::new()
         };
+        let retried = if counts.retried > 0 {
+            format!(
+                "; {} writes retried after a refusal ({:?})",
+                counts.retried, counts.retried_by_cause
+            )
+        } else {
+            String::new()
+        };
         writeln!(
             stderr,
-            "{name}: lifecycles {} started, {} written, {} judged; {} refused{causes}, {} unknown, {} abandoned, {} undelivered",
+            "{name}: lifecycles {} started, {} written, {} judged; {} refused{causes}, {} unknown, {} abandoned, {} undelivered{retried}",
             counts.started,
             counts.written,
             counts.judged,

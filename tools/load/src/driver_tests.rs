@@ -246,3 +246,85 @@ fn a_read_a_replica_behind_answers_is_asked_again() {
         AccessError::InvalidRequest
     )));
 }
+
+/// A write refused for capacity or availability admitted nothing, and a run that retries such
+/// refusals sends it again under its own identity, counted under the cause its refusal named: the
+/// door's capacity and an unreached leader as the node answered them or as the client reported
+/// them once its own resends were spent, and an owner's capacity refusal, a required copy short of
+/// custody among them (fleet33 c18, k28-k33, m8: lifecycles ended at refusals the agent contract
+/// says to retry). An answer that stands is never sent again: a commit, a refusal by name in a
+/// closed generation, a domain's refusal, an outcome the client could not learn.
+#[test]
+fn only_a_refusal_that_admitted_nothing_is_sent_again() {
+    let reply = |result: Response| -> Result<ResponseEnvelope, ClientError> {
+        let ledger = LedgerId {
+            tenant: focal_model::TenantId::from_u128(1),
+            session: focal_model::SessionId::from_u128(1),
+        };
+        Ok(ResponseEnvelope {
+            protocol: focal_wire::NATIVE_PROTOCOL_VERSION,
+            ledger,
+            route_epoch: RouteEpoch(1),
+            request_epoch: RequestEpoch(1),
+            request_id: RequestId::from_u128(1),
+            result,
+        })
+    };
+    let owner = |kind: NativeRefusalKind, detail: &str| {
+        reply(Response::Native(NativeMutationReply::Refused(
+            focal_wire::NativeRefusal {
+                kind,
+                detail: detail.into(),
+            },
+        )))
+    };
+    let custody = owner(
+        NativeRefusalKind::Capacity,
+        "custody: 2 of 3 required copies hold the artifact; missing nodes 7",
+    );
+    assert_eq!(retried_for(&custody), Some(RefusalCause::OwnerBound));
+    let memory = owner(
+        NativeRefusalKind::Capacity,
+        "native owner memory: Capacity { requested: 360, available: 140 }",
+    );
+    assert_eq!(retried_for(&memory), Some(RefusalCause::OwnerMemory));
+    assert_eq!(
+        retried_for(&reply(Response::Error(AccessError::Capacity))),
+        Some(RefusalCause::IngressCapacity)
+    );
+    assert_eq!(
+        retried_for(&reply(Response::Error(AccessError::Unavailable))),
+        Some(RefusalCause::Unavailable)
+    );
+    assert_eq!(
+        retried_for(&Err(ClientError::Access(AccessError::Capacity))),
+        Some(RefusalCause::IngressCapacity)
+    );
+    assert_eq!(
+        retried_for(&Err(ClientError::Access(AccessError::Unavailable))),
+        Some(RefusalCause::Unavailable)
+    );
+    // Answers that stand.
+    let closed = owner(
+        NativeRefusalKind::Refused(NativeErrorCode::EpochNotAdmitted),
+        "epoch not admitted",
+    );
+    assert_eq!(retried_for(&closed), None);
+    assert_eq!(
+        retried_for(&reply(Response::Error(AccessError::Unauthorized))),
+        None
+    );
+    assert_eq!(
+        retried_for(&Err(ClientError::Access(AccessError::InvalidRequest))),
+        None
+    );
+    assert_eq!(retried_for(&Err(ClientError::Transport)), None);
+    // The refusal's cause is the one the run counts it under where it ends a lifecycle.
+    for result in [custody, memory] {
+        let cause = retried_for(&result);
+        match classify(result) {
+            Reply::Refused(_, counted) => assert_eq!(cause, Some(counted)),
+            _ => panic!("an owner's capacity refusal is a refusal"),
+        }
+    }
+}

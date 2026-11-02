@@ -19,7 +19,7 @@ use crate::native;
 use crate::progress::{PROGRESS, Stage};
 use crate::report::{self, Latency, LedgerReport, Report};
 use crate::seats::{self, Seat, share};
-use crate::shape::{Home, Lifecycle, Profile, Transport, WorkloadShape};
+use crate::shape::{Home, Lifecycle, OnRefusal, Profile, Transport, WorkloadShape};
 use crate::watch::{self, Side, TailCounts, Watch};
 use focal_client::native_store::{NativeIdentity, NativeIdentityKind};
 use focal_client::operations::NativeAuthoredOperation;
@@ -243,6 +243,8 @@ struct Job {
     lifecycle: Lifecycle,
     /// Write phase: the most of this worker's lifecycle reads under way at once.
     lifecycle_reads: u16,
+    /// Write phase: what becomes of a write refused for capacity or availability.
+    on_refusal: OnRefusal,
     /// Write phase: the aggregate offered rate. Every caller takes its interleaved places on
     /// that one schedule, including a rate's remainder across callers.
     pace: Option<u64>,
@@ -382,18 +384,7 @@ fn classify(result: Result<ResponseEnvelope, ClientError>) -> Reply {
                 Reply::Expired
             }
             Response::Native(NativeMutationReply::Refused(refusal)) => {
-                // The owner names the bound that refused (its memory, its pending
-                // candidates): a full session is refused for its memory.
-                let cause = match refusal.kind {
-                    NativeRefusalKind::Capacity
-                        if refusal.detail.starts_with("native owner memory") =>
-                    {
-                        RefusalCause::OwnerMemory
-                    }
-                    NativeRefusalKind::Capacity => RefusalCause::OwnerBound,
-                    _ => RefusalCause::Other,
-                };
-                Reply::Refused(format!("refused: {refusal:?}"), cause)
+                Reply::Refused(format!("refused: {refusal:?}"), owner_cause(&refusal))
             }
             Response::Native(NativeMutationReply::Pending(_)) => {
                 Reply::Unknown("pending: ticket, not a receipt".into())
@@ -407,6 +398,47 @@ fn classify(result: Result<ResponseEnvelope, ClientError>) -> Reply {
             Reply::Refused(format!("access: {error:?}"), access(&error))
         }
         Err(error) => Reply::Unknown(format!("client: {error}")),
+    }
+}
+
+/// The bound an owner's refusal names (its memory, its pending candidates, a required copy short
+/// of custody): a full session is refused for its memory.
+fn owner_cause(refusal: &focal_wire::NativeRefusal) -> RefusalCause {
+    match refusal.kind {
+        NativeRefusalKind::Capacity if refusal.detail.starts_with("native owner memory") => {
+            RefusalCause::OwnerMemory
+        }
+        NativeRefusalKind::Capacity => RefusalCause::OwnerBound,
+        _ => RefusalCause::Other,
+    }
+}
+
+/// The cause a write is sent again for where its run retries refusals ([`OnRefusal::Retry`]): a
+/// refusal of capacity or availability, each of which admitted nothing. A node's door full or no
+/// leader reached (`AccessError::Capacity`, `Unavailable`), as the node answered or as the client
+/// reported once its own bounded resends of it were spent; and an owner's capacity refusal
+/// (`NativeRefusalKind::Capacity`: its memory, its bound, or a required copy short of custody,
+/// which the node refuses at eligibility, before the owner admits the frame, as "a retryable
+/// capacity condition naming the copies"). `None` for an answer that stands: committed, refused
+/// by name in a generation the owner closed (re-issued in the next, as before), refused by the
+/// domain, or an outcome the client could not learn (resent as it always was).
+pub(crate) fn retried_for(result: &Result<ResponseEnvelope, ClientError>) -> Option<RefusalCause> {
+    match result {
+        Ok(envelope) => match &envelope.result {
+            Response::Native(NativeMutationReply::Refused(refusal))
+                if matches!(refusal.kind, NativeRefusalKind::Capacity) =>
+            {
+                Some(owner_cause(refusal))
+            }
+            Response::Error(error @ (AccessError::Capacity | AccessError::Unavailable)) => {
+                Some(access(error))
+            }
+            _ => None,
+        },
+        Err(ClientError::Access(error @ (AccessError::Capacity | AccessError::Unavailable))) => {
+            Some(access(error))
+        }
+        Err(_) => None,
     }
 }
 
@@ -1256,6 +1288,12 @@ impl Shared<'_> {
                     (envelope, 0, identities)
                 }
             };
+            // The exact frame, kept to be sent again where a refusal admitted nothing and the run
+            // retries such refusals; nothing is kept where it ends them.
+            let kept = match self.job.on_refusal {
+                OnRefusal::Retry => Some(envelope.clone()),
+                OnRefusal::End => None,
+            };
             let sent = Instant::now();
             let mut response = actor.conn.request(envelope).await;
             // A write whose client could not learn its outcome within its clock is resent under its
@@ -1267,7 +1305,11 @@ impl Shared<'_> {
             // return, and a write sent into it was reported unknown at its client's 30 s clock
             // however soon they returned after it (twelve of 33 nodes killed for 30 s,
             // 2026-10-29). Each pause between is the client's own longest pause between resends.
+            // Where the run retries refusals ([`OnRefusal::Retry`]), one that admitted nothing
+            // ([`retried_for`]) is sent again the same way, under the same bound: the same
+            // identity, so whichever of its sends reaches the ledger first is the one it executes.
             let mut resent = false;
+            let mut retried = RefusalCause::None;
             let response = loop {
                 match response {
                     Err(ClientError::OutcomeUnknown { request })
@@ -1279,12 +1321,30 @@ impl Shared<'_> {
                             .map_err(LoadError::Runtime)?;
                         response = actor.conn.request(*request).await;
                     }
-                    answered => break answered,
+                    answered => match (&kept, retried_for(&answered)) {
+                        (Some(frame), Some(cause)) if sent.elapsed() < watch::WAIT => {
+                            if retried == RefusalCause::None {
+                                retried = cause;
+                            }
+                            focal_rt::time::sleep(RetryPolicy::default().max_backoff)
+                                .await
+                                .map_err(LoadError::Runtime)?;
+                            response = actor.conn.request(frame.clone()).await;
+                        }
+                        _ => break answered,
+                    },
                 }
             };
-            if resent {
+            if resent || retried != RefusalCause::None {
                 let mut outcome = self.outcome.borrow_mut();
-                outcome.counts.resent = outcome.counts.resent.saturating_add(1);
+                let counts = &mut outcome.counts;
+                if resent {
+                    counts.resent = counts.resent.saturating_add(1);
+                }
+                if retried != RefusalCause::None {
+                    counts.retried = counts.retried.saturating_add(1);
+                    counts.retried_by_cause.count(retried);
+                }
             }
             let finished = Instant::now();
             let reply = classify(response);
@@ -1309,6 +1369,7 @@ impl Shared<'_> {
                     Reply::Refused(_, cause) => *cause,
                     _ => RefusalCause::None,
                 },
+                retried,
                 step,
             })?;
             if let Finished::Advance { epoch, minimum } = actor.generations.finish(minted.epoch)? {
@@ -2506,6 +2567,7 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
             created: Vec::new(),
             lifecycle: shape.lifecycle,
             lifecycle_reads: shape.lifecycle_reads(),
+            on_refusal: shape.refused,
             pace,
         });
     }
@@ -2657,6 +2719,7 @@ async fn run_on_shard(shape: WorkloadShape) -> Result<Report, LoadError> {
                 created: outcome.created.clone(),
                 lifecycle: Lifecycle::Create,
                 lifecycle_reads: 1,
+                on_refusal: OnRefusal::End,
                 // Reads are not paced: they measure the read path closed-loop.
                 pace: None,
             });

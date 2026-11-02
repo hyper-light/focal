@@ -22,7 +22,11 @@
 #   of from the next agent's inbox (focal-load's `lifecycle: work`); RATE is claims a second.
 #   Every session the cluster holds is a ledger driven at once (focal-load's `ledgers`), each
 #   its share of the agents and the rate, so AGENTS is three a session at least (3 at three
-#   nodes, 33 at 33).
+#   nodes, 33 at 33). REFUSED=retry (environment): each agent sends a write refused for capacity
+#   or availability again under its identity, as focal's agent contract says, until it commits or
+#   focal-load's hand-off wait has passed (focal-load's `refused: retry`); where unset, the
+#   refusal ends its lifecycle (`end`), as the comparison counts a client that gives up. A run
+#   that retries names it in its report's file (`-retry`).
 #   NODES (environment), focal: the nodes its cluster runs, focal1 to focalN over zones a, b and c
 #   (focal-nodes.sh, written beside compose.yaml for every run: 3 to 203, 3 where unset, as every
 #   competitor runs three). Past three, nodes that would hold more CPUs than the host has beside
@@ -697,7 +701,10 @@ trap cleanup EXIT
 cleanup
 pull_images
 dc up -d
-report="$system-$rate-$payload$window$suffix$nodes_suffix${FAULTS:+-faults}.json"
+# A work run whose agents retry refusals names it in its report's file (`-retry`).
+retry_suffix=""
+if [ "$mode" = work ] && [ "${REFUSED:-end}" = retry ]; then retry_suffix="-retry"; fi
+report="$system-$rate-$payload$window$suffix$nodes_suffix$retry_suffix${FAULTS:+-faults}.json"
 
 case "$system" in
   focal)
@@ -790,7 +797,12 @@ print(s if isinstance(s, str) else bytes(s).hex())' <<< "$identity")
       ledgers=$(python3 cluster.py ledgers "$table" "$out/$report.contacts.json" < "$out/$report.placement.json")
       sessions=$(grep -c '^  - session: ' <<< "$ledgers")
       callers=$(( callers * sessions ))
+      case "${REFUSED:-end}" in
+        end | retry) ;;
+        *) echo "REFUSED is end or retry, not ${REFUSED}" >&2; exit 2 ;;
+      esac
       lifecycle="lifecycle: work
+refused: ${REFUSED:-end}
 agents: $AGENTS
 agent_enrollments: /client/agents
 $ledgers"
@@ -830,6 +842,12 @@ EOF
       # A work claim's agents wait four times: the post, the testament, the evaluation due and
       # the settlement.
       bound=$(( bound + 4 * 120 ))
+      # Retrying refusals, a claim's write refused while a fault holds its session waits up to
+      # focal-load's hand-off wait once more: its steps go one after another, so the steps after
+      # it are sent once it committed, past the fault the run's one schedule of faults holds.
+      if [ "${REFUSED:-end}" = retry ]; then
+        bound=$(( bound + 120 ))
+      fi
     fi
     # The cluster at rest first, where REST asks: founded, its clients enrolled, the generator idle.
     if [ "$rest" -gt 0 ]; then

@@ -125,6 +125,12 @@ pub struct LifecycleCounts {
     /// identity until their ledger answered them (each then counted as it was answered), or until a
     /// hand-off's wait had passed (counted `unknown`).
     pub resent: u64,
+    /// Writes refused for capacity or availability and sent again under their own identity, in a
+    /// run that retries such refusals (`refused: retry`), each then counted as it was answered:
+    /// committed, or refused once a hand-off's wait had passed. A write counts once, under the
+    /// cause its first refusal named in `retried_by_cause`.
+    pub retried: u64,
+    pub retried_by_cause: RefusedByCause,
 }
 impl LifecycleCounts {
     /// `other`'s counts added to these.
@@ -139,6 +145,8 @@ impl LifecycleCounts {
         self.undelivered = self.undelivered.saturating_add(other.undelivered);
         self.committed = self.committed.saturating_add(other.committed);
         self.resent = self.resent.saturating_add(other.resent);
+        self.retried = self.retried.saturating_add(other.retried);
+        self.retried_by_cause.add(&other.retried_by_cause);
     }
 }
 
@@ -154,6 +162,9 @@ pub struct WriteSample {
     pub request: u128,
     pub outcome: WriteOutcome,
     pub refusal: RefusalCause,
+    /// The cause the write's first refusal named, where it was sent again for it (`refused:
+    /// retry`): its outcome is then what its last send was answered.
+    pub retried: RefusalCause,
     /// The step of the claim's lifecycle the write is (0: its creation).
     pub step: u8,
 }
@@ -408,12 +419,12 @@ fn write_csv<'a>(
     }
     writeln!(
         output,
-        "start_ns,latency_ns,sent_ns,finished_ns,worker,write,attempt,epoch,request,outcome,phase_start_ns,run_start_epoch_ns,refusal,step"
+        "start_ns,latency_ns,sent_ns,finished_ns,worker,write,attempt,epoch,request,outcome,phase_start_ns,run_start_epoch_ns,refusal,step,retried"
     )?;
     for sample in &ordered.values {
         writeln!(
             output,
-            "{},{},{},{},{},{},{},{},{:032x},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{:032x},{},{},{},{},{},{}",
             sample.start_ns.saturating_sub(origin),
             sample.latency_ns(),
             sample.sent_ns.saturating_sub(origin),
@@ -427,7 +438,8 @@ fn write_csv<'a>(
             sample.start_ns,
             run_start_epoch_ns,
             sample.refusal.name(),
-            sample.step
+            sample.step,
+            sample.retried.name()
         )?;
     }
     output.flush()?;

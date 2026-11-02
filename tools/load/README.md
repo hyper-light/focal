@@ -28,6 +28,7 @@ profile: authored_v1  # optional; the frame profile — the transport's own by d
 concurrency: 1        # optional; concurrent callers, at least 1
 rate: 100             # optional; fixed offered rate over all callers
 warmup_ms: 15000      # optional; intended starts before this time are not measured
+refused: end          # optional; `end` (default) or `retry` a write refused for capacity or availability
 reopen: false         # optional, embedded only; reopen the node afterwards and time it
 ```
 
@@ -61,6 +62,18 @@ at exactly this run's retained size.
 
 Each run uses a distinct identity space per `seed` (and per worker under it),
 so two runs never collide and a run is reproducible.
+
+`refused` says what a caller does with a write refused for capacity or availability: a
+session's door full, no leader or quorum reached within the client's clock, a required copy
+short of custody, an owner's bound or memory. Each admitted nothing. `end` (the default) ends
+the write's lifecycle there, counted under its cause, as a client that reports a refusal and
+gives up: the comparison's measure of an overload. `retry` sends the write again as focal's
+agent contract says an agent does ("A `capacity` refusal admitted nothing; the reference stays
+`Pending` for a later retry", `skills/*/references/workflow-contract.md`): the same request,
+its identity, bytes and generation, after the client's longest pause between resends, until
+its ledger commits it or a hand-off's wait (two minutes, `src/watch.rs`) has passed since it
+was first sent. Its first refusal is counted under `retried`, so a run under faults says both
+what its agents met and what they completed.
 
 ### Deliver among agents
 
@@ -191,12 +204,17 @@ and a lifecycle at least. `reads`, `reopen` and `data_dir` apply to a run of one
       "refused": 0, "refused_by_cause": { "owner_memory": 0, "owner_bound": 0,
         "ingress_capacity": 0, "unavailable": 0, "expired": 0, "other": 0 },
       "unknown": 0, "abandoned": 0, "undelivered": 0, "committed": 1000, "resent": 0,
+      "retried": 0, "retried_by_cause": { "owner_memory": 0, "owner_bound": 0,
+        "ingress_capacity": 0, "unavailable": 0, "expired": 0, "other": 0 },
       "tail_events": 0, "tail_failures": 0, "refusals": [] }
   ],
   "totals": { "started": 1000, "written": 1000, "judged": 0, "refused": 0,
               "refused_by_cause": { "owner_memory": 0, "owner_bound": 0, "ingress_capacity": 0,
                                     "unavailable": 0, "expired": 0, "other": 0 },
-              "unknown": 0, "abandoned": 0, "undelivered": 0, "committed": 1000, "resent": 0 }
+              "unknown": 0, "abandoned": 0, "undelivered": 0, "committed": 1000, "resent": 0,
+              "retried": 0, "retried_by_cause": { "owner_memory": 0, "owner_bound": 0,
+                                                  "ingress_capacity": 0, "unavailable": 0,
+                                                  "expired": 0, "other": 0 } }
 }
 ```
 
@@ -216,7 +234,10 @@ whether or not the release after it committed. `committed` counts the ledger's w
 `resent` counts writes whose client could not learn their outcome within its clock: an agent
 sends such a write again under its own identity, its generation held open, until its ledger
 answers it (each then counted as it was answered) or a hand-off's wait has passed since it was
-first sent (counted `unknown`), as the client's error says to.
+first sent (counted `unknown`), as the client's error says to. `retried` counts writes a
+`refused: retry` run sent again after a refusal of capacity or availability, each once, under
+the cause its first refusal named in `retried_by_cause`, and each then counted as it was
+answered: committed, or `refused` once a hand-off's wait had passed.
 The run's own `lifecycles` is `totals.written`.
 
 The callers issue their writes in request generations as the CLI's journal
@@ -259,7 +280,9 @@ python3 tools/compare/analyze_tail.py --report report.json --csv writes.csv
 ```
 
 The CSV retains `start_ns,latency_ns` as its first columns and adds
-`sent_ns,finished_ns,worker,write,attempt,epoch,request,outcome,phase_start_ns,run_start_epoch_ns`.
+`sent_ns,finished_ns,worker,write,attempt,epoch,request,outcome,phase_start_ns,run_start_epoch_ns,refusal,step,retried`
+(`refusal` the cause of a refused row, `step` the write's place in its lifecycle, `retried` the
+cause of its first refusal where a `refused: retry` run sent it again).
 There is one row per attempt after warm-up, sorted by intended start. The
 first retained intended start is zero for `start_ns`, `sent_ns` and
 `finished_ns`. `phase_start_ns` retains the intended offset from the entire

@@ -91,6 +91,26 @@ impl Lifecycle {
     }
 }
 
+/// What a caller does with a write refused for capacity or availability: a session's door full,
+/// no leader or quorum reached within the client's clock, a required copy short of custody, an
+/// owner's bound or memory. Each such refusal admitted nothing (the driver's `classify`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnRefusal {
+    /// The refusal ends its lifecycle, counted under its cause: a client that reports a refusal
+    /// and gives up, as the comparison counts the other systems' (an overload's measure).
+    #[default]
+    End,
+    /// The write is sent again, as focal's agent contract says an agent does: "A `capacity`
+    /// refusal admitted nothing; the reference stays `Pending` for a later retry", and
+    /// `request.retry` "resends the exact frame" (`skills/*/references/workflow-contract.md`).
+    /// The same request, its identity, bytes and generation, after the client's longest pause
+    /// between resends, until its ledger commits it or a hand-off's wait has passed since it was
+    /// first sent, its first refusal counted under `retried`. A lifecycle then ends refused only
+    /// where its write was still refused past that wait, or for a cause no retry changes.
+    Retry,
+}
+
 /// The native content profile the request frames are encoded for. It must be
 /// the profile the ledger was activated with: the embedded node is activated
 /// by this tool (`projection_only` unless the shape says otherwise); a node
@@ -229,6 +249,10 @@ pub struct WorkloadShape {
     /// count lifecycles, each started at its place on the schedule.
     #[serde(default)]
     pub lifecycle: Lifecycle,
+    /// What a caller does with a write refused for capacity or availability (default `end`:
+    /// see [`OnRefusal`]).
+    #[serde(default)]
+    pub refused: OnRefusal,
     /// The most of one caller's lifecycle reads under way at once: unset, as many as its writes
     /// (`inflight`). Every step of a lifecycle after its creation reads what it binds to, at
     /// least at the write before it, before it writes, so a caller's reads are its lifecycles'

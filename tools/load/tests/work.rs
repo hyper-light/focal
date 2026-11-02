@@ -205,3 +205,43 @@ fn work_needs_three_agents() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// A run that retries refusals (`refused: retry`) keeps each write's exact frame to send again and
+/// counts what it retried: with nothing refused, every write commits once and none is retried, and
+/// the report says so in its totals and its ledger's row, as a run that ends at refusals does.
+#[test]
+fn a_run_that_retries_refusals_commits_every_write_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let shape = directory.path().join("shape.yaml");
+    let report = directory.path().join("report.json");
+    std::fs::write(
+        &shape,
+        "claims: 16\ntransport: embedded\nprofile: authored_v1\nlifecycle: work\n\
+         refused: retry\nconcurrency: 4\ninflight: 4\nrate: 60\nagents: 8\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_focal-load"))
+        .args([
+            "--shape",
+            shape.to_str().unwrap(),
+            "--out",
+            report.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+    assert_eq!(report["refused"], 0, "{}", report["refusals"]);
+    assert_eq!(report["committed"], 16 * 11, "{report}");
+    for counts in [&report["totals"], &report["ledgers"][0]] {
+        assert_eq!(counts["written"], 16, "{counts}");
+        assert_eq!(counts["retried"], 0, "{counts}");
+        for cause in counts["retried_by_cause"].as_object().unwrap().values() {
+            assert_eq!(cause, 0, "{counts}");
+        }
+    }
+}
