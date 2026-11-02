@@ -1,5 +1,11 @@
-//! Trusted local retry-journal IO uses the existing physical control owner.
-//! Payloads and journal locks move; no async executor performs the fsync.
+//! Trusted local retry-journal IO runs on a writer thread of its own beside each control owner
+//! (`write_journals`). Payloads and journal locks move to it, no async executor performs the
+//! fsync, and no consensus owner waits on one. On the root's owner, a placement intent's journal
+//! write held the owner in `fsync` for as long as the volume took (fleet33 k29, 2026-11-02:
+//! btrfs's log commit and its full commit with device barriers, on the journal's staged file and
+//! its directory). Meanwhile the root replica took no input and sent no heartbeat, so its group
+//! stalled for up to 20 s in a bootstrap and elected another leader as the stall ended (m7, as in
+//! p9-0639).
 use super::*;
 use focal_enrollment::{EnrollmentError, PrivateJournal};
 
@@ -35,10 +41,10 @@ impl std::fmt::Debug for LocalIntentFailure {
 }
 type IntentResult = Result<PrivateJournal, LocalIntentError>;
 
-/// Writes the journal through its owner and waits for the owner's answer, which comes once the
-/// write is durable or failed, or as the owner stops. A write the owner did not admit (its queue
-/// or memory full) is answered at once with the journal back, for its caller to ask again on its
-/// next pass. An admitted write was given 5 s of the wall's clock, and one that took longer
+/// Writes the journal through its host's journal writer and waits for the answer, which comes once
+/// the write is durable or failed, or as the writer ends. A write the writer did not admit (its
+/// queue or memory full) is answered at once with the journal back, for its caller to ask again on
+/// its next pass. An admitted write was given 5 s of the wall's clock, and one that took longer
 /// was let go with the journal it held: every later write found none, and the node's network
 /// controller or placement intents stopped for good. Under the load of a 33-node run on a busy
 /// host the founder's root network owner stopped so in two runs' bootstraps and twelve nodes'
@@ -133,24 +139,19 @@ impl ControlHost {
                 rejected: Some(Box::new((journal, bytes))),
             });
         };
-        let work = Work::PersistLocalIntent(Box::new(LocalIntentWrite {
+        let write = Box::new(LocalIntentWrite {
             journal,
             bytes,
             response,
             input,
-        }));
-        if let Err(error) = self.sender.try_send(work) {
-            let (error, work) = match error {
-                mpsc::TrySendError::Full(work) => (LocalIntentError::Capacity, work),
-                mpsc::TrySendError::Disconnected(work) => (LocalIntentError::Unavailable, work),
+        });
+        if let Err(error) = self.journals.try_send(write) {
+            // Not admitted either way: the journal goes back whole.
+            let (error, write) = match error {
+                mpsc::TrySendError::Full(write) => (LocalIntentError::Capacity, write),
+                mpsc::TrySendError::Disconnected(write) => (LocalIntentError::Unavailable, write),
             };
-            return Err(match work {
-                Work::PersistLocalIntent(work) => work.rejected(error),
-                _ => LocalIntentFailure {
-                    error: LocalIntentError::Unavailable,
-                    rejected: None,
-                },
-            });
+            return Err(write.rejected(error));
         }
         let (result, _input) = receive.await.map_err(|_| LocalIntentFailure {
             error: LocalIntentError::Unavailable,
@@ -166,3 +167,13 @@ impl ControlHost {
 #[cfg(test)]
 #[path = "local_intent_host_tests.rs"]
 mod tests;
+
+/// One control host's journal writer: each admitted write made whole and durable in the order it
+/// was admitted, until the host's every handle is gone. A write that unwound is answered by
+/// nothing: its caller hears the writer's absence, as for any write whose outcome is unknown, and
+/// recovers the journal's durable state; the writes after it go on.
+pub(super) fn write_journals(writes: &mpsc::Receiver<Box<LocalIntentWrite>>) {
+    for write in writes {
+        let _ = catch_unwind(AssertUnwindSafe(move || write.persist()));
+    }
+}

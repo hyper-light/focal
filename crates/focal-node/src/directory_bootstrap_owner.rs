@@ -101,9 +101,12 @@ impl ControlHost {
         .map_err(|_| DirectoryBootstrapError::Capacity)?;
         let pace = crate::control_host::TickPeriod::default();
         let owner_pace = pace.clone();
+        let journals = super::journal_writer(plan.host(), config.queue_items)
+            .ok_or(DirectoryBootstrapError::Capacity)?;
         let host = Self {
             sender,
             peers,
+            journals,
             progress: changes.clone(),
             config: config.clone(),
             limits: limits.clone(),

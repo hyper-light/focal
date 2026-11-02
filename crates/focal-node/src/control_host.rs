@@ -166,7 +166,6 @@ use local_intent_host::LocalIntentWrite;
 pub(crate) use local_intent_host::{LocalIntentError, save_local_intent};
 
 enum Work {
-    PersistLocalIntent(Box<LocalIntentWrite>),
     Request(Box<VerifiedRequest>, OneshotSender<Completed>, Allocation),
     /// A peer's frame from its lane (`ControlHost::take_frame`): stepped as the same request is,
     /// answered by nothing but its group's own answer.
@@ -260,6 +259,9 @@ impl Completed {
 pub struct ControlHost {
     sender: mpsc::SyncSender<Work>,
     peers: mpsc::SyncSender<Work>,
+    /// Local intents' journal writes, made on a thread of their own and never on the owner's
+    /// (`local_intent_host`).
+    journals: mpsc::SyncSender<Box<LocalIntentWrite>>,
     progress: watch::Receiver<ControlProgressState>,
     config: ControlHostConfig,
     limits: WireLimits,
@@ -448,6 +450,18 @@ enum FrameAdmission {
     },
     /// Kept for the write in flight, in its order; `ordered` where it is an ordered frame.
     Waits { source: u64, ordered: bool },
+}
+/// The journal writer of a host's local intents (`local_intent_host::write_journals`). A journal
+/// write is a file written whole and synced, which a busy volume holds for seconds: on a thread of
+/// its own, no consensus owner waits on one. Bounded as the owner's own queue is (`bound`), it ends
+/// with the host's last handle. `None` without a thread.
+fn journal_writer(node: u64, bound: usize) -> Option<mpsc::SyncSender<Box<LocalIntentWrite>>> {
+    let (journals, writes) = mpsc::sync_channel(bound);
+    std::thread::Builder::new()
+        .name(format!("focal-journal-{node}"))
+        .spawn(move || local_intent_host::write_journals(&writes))
+        .ok()?;
+    Some(journals)
 }
 /// The most frames that wait for a write in flight (`waiting_frames`): what
 /// the resequencer may hold, every source's whole window.
@@ -843,6 +857,8 @@ impl ControlHost {
             failure: None,
             pace: pace.clone(),
         };
+        let journals =
+            journal_writer(status.node_id, config.queue_items).ok_or(ControlError::Capacity)?;
         let thread = std::thread::Builder::new()
             .name(format!("focal-control-{}", status.node_id))
             .spawn(move || owner.run(receiver, incoming))
@@ -851,6 +867,7 @@ impl ControlHost {
             Self {
                 sender,
                 peers,
+                journals,
                 progress: changes,
                 pace,
                 config,
@@ -1261,7 +1278,6 @@ impl<V: AuthorityVerifier> Owner<V> {
     }
     fn work(&mut self, work: Work) -> Result<bool, ControlError> {
         match work {
-            Work::PersistLocalIntent(write) => write.persist(),
             Work::RefreshDirectory {
                 permit,
                 response,

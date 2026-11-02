@@ -1,12 +1,13 @@
 use super::*;
 use std::{future::Future, task::Poll};
 
-fn queued_host(budget: MemoryBudget) -> (ControlHost, mpsc::Receiver<Work>) {
+fn queued_host(budget: MemoryBudget) -> (ControlHost, mpsc::Receiver<Box<LocalIntentWrite>>) {
     let namespace = LedgerId {
         tenant: focal_model::TenantId::from_u128(1),
         session: focal_model::SessionId::from_u128(1),
     };
-    let (sender, receiver) = mpsc::sync_channel(1);
+    let (sender, _owner) = mpsc::sync_channel(1);
+    let (journals, receiver) = mpsc::sync_channel(1);
     let (_progress, progress) = watch::channel(ControlProgressState {
         value: ControlProgress {
             identity: ControlIdentity {
@@ -40,6 +41,7 @@ fn queued_host(budget: MemoryBudget) -> (ControlHost, mpsc::Receiver<Work>) {
         ControlHost {
             peers: sender.clone(),
             sender,
+            journals,
             progress,
             config: ControlHostConfig::new(namespace),
             limits: ControlHost::wire_limits(),
@@ -87,8 +89,14 @@ fn rejected_journal_admission_returns_exact_ownership_and_never_changes_disk() {
         assert!(queue.try_recv().is_err());
         assert_eq!(budget.stats().used, 0);
 
-        let (reply, _reply) = hyper_rt::sync::oneshot().unwrap();
-        host.sender.try_send(Work::Campaign(reply)).ok().unwrap();
+        // The journal writer's queue holds one write: another journal's, admitted first and
+        // still waiting, takes it.
+        let other = directory.path().join("other");
+        let held =
+            PrivateJournal::open(&other, &focal_seal::test_keys_beside(&other).unwrap()).unwrap();
+        let mut first = Box::pin(host.persist_local_intent(held, b"first".to_vec()));
+        pending(first.as_mut()).await;
+        let queued = budget.stats().used;
         let Err(failure) = host.persist_local_intent(returned, secret.to_vec()).await else {
             panic!("full queue must reject")
         };
@@ -97,8 +105,11 @@ fn rejected_journal_admission_returns_exact_ownership_and_never_changes_disk() {
         assert!(!debug.contains(std::str::from_utf8(secret).unwrap()));
         let (returned, bytes) = *failure.rejected.unwrap();
         assert_eq!(bytes, secret);
-        assert_eq!(budget.stats().used, 0);
+        // Only the write admitted first is charged.
+        assert_eq!(budget.stats().used, queued);
+        drop(first);
         drop(queue);
+        assert_eq!(budget.stats().used, 0);
         let Err(failure) = host.persist_local_intent(returned, bytes).await else {
             panic!("disconnected queue must reject")
         };
@@ -144,9 +155,7 @@ fn canceled_queued_intent_retains_lock_and_charge_until_persistence_or_unknown_d
             if persist {
                 drop(save);
                 assert_eq!(budget.stats().used, admitted);
-                let Work::PersistLocalIntent(write) = queue.try_recv().unwrap() else {
-                    panic!("queued local intent")
-                };
+                let write = queue.try_recv().unwrap();
                 write.persist();
                 assert_eq!(budget.stats().used, 0);
             } else {
@@ -185,9 +194,7 @@ fn delivered_journal_reply_retains_charge_and_lock_until_consumed() {
         let mut save = Box::pin(host.persist_local_intent(journal, b"committed".to_vec()));
         pending(save.as_mut()).await;
         let charged = budget.stats().used;
-        let Work::PersistLocalIntent(write) = queue.try_recv().unwrap() else {
-            panic!("intent")
-        };
+        let write = queue.try_recv().unwrap();
         write.persist();
         assert_eq!(budget.stats().used, charged);
         assert!(matches!(
@@ -342,8 +349,8 @@ fn an_admitted_journal_write_is_waited_for_and_the_journal_comes_back() {
                     focal_rt::time::sleep(Duration::from_secs(6)).await.unwrap();
                     pending(save.as_mut()).await;
                 }
-                let Ok(Work::PersistLocalIntent(write)) = queue.try_recv() else {
-                    panic!("the write was admitted to the owner's queue")
+                let Ok(write) = queue.try_recv() else {
+                    panic!("the write was admitted to the journal writer's queue")
                 };
                 write.persist();
                 save.await.unwrap();
@@ -355,6 +362,47 @@ fn an_admitted_journal_write_is_waited_for_and_the_journal_comes_back() {
         }
         drop(slot);
         assert_eq!(budget.stats().used, 0);
+    })
+    .unwrap()
+}
+
+/// A local intent's journal is written on its host's journal writer, never by the control owner:
+/// on the root's owner, every placement intent's journal write held the owner in `fsync` while a
+/// busy volume took its time, and the root replica took no input meanwhile (fleet33 k29,
+/// 2026-11-02). Do: found a network, stop its root owner, save an intent through its host.
+/// Expect: the journal is written and reads back, the owner taking no part.
+#[test]
+fn a_local_intent_is_written_without_its_control_owner() {
+    focal_rt::block_on(async move {
+        let data = tempfile::tempdir().unwrap();
+        let mut settings = crate::config::Settings::default();
+        settings.node.data_dir = Some(data.path().into());
+        settings.node.advertise = Some("127.0.0.1:7443".into());
+        let network = crate::network_bootstrap::FoundingNetwork::open(&settings)
+            .await
+            .unwrap();
+        let namespace = network.state.genesis.root_namespace;
+        let (host, owner, _outgoing) = ControlHost::spawn(
+            network.control,
+            crate::cluster::NoDirectoryAuthority,
+            ControlHostConfig::new(namespace),
+            network.budget.clone(),
+        )
+        .unwrap();
+        host.stop().await.unwrap();
+        owner.0.join().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("intent");
+        let journal =
+            PrivateJournal::open(&path, &focal_seal::test_keys_beside(&path).unwrap()).unwrap();
+        let mut slot = Some(journal);
+        save_local_intent(&host, &mut slot, b"written-off-the-owner".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            slot.as_ref().unwrap().read().unwrap().unwrap().as_slice(),
+            b"written-off-the-owner"
+        );
     })
     .unwrap()
 }
