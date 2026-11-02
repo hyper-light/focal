@@ -10,7 +10,7 @@ every row names where it is recorded, and a gap is written as a gap.
 |---|---|---|
 | 1 | One binary and CLI, laptop to global, proven by records | partly shown |
 | 2 | More than a thousand agents doing claims, artifacts, testaments and validations | shown at 1,000; the Kubernetes build not attempted |
-| 3 | Delivery under heavy load, horrific networks, dozens of node failures | shown on three nodes and on 33 with twelve failing at once, confirmed on the fixed tree (six runs); the custody rule's decision pending; k28's and k29's `ingress_capacity` not root-caused (none in k30) |
+| 3 | Delivery under heavy load, horrific networks, dozens of node failures | shown on three nodes and on 33 with twelve failing at once, confirmed on the fixed tree (nine runs); the custody rule's decision pending; k28's and k29's `ingress_capacity` not root-caused (none in k30 to k33) |
 | 4 | p99s an order of magnitude beyond Kafka, Redis HA, NATS | plan of record; not shown across its conditions |
 | 5 | Post-quantum encryption in transit and at rest | in transit shown; at rest partly |
 | 6 | Adversarial batteries: bombs, tampering, misuse | partly shown |
@@ -104,6 +104,9 @@ Confirmed at 33 nodes on that tree (`focal:fleet-c17`), with the confirmation's 
 | k29-0135 | killed 30 s | 28,983 | 717 | 0 | 0 | 259.3 / 18,053.9 |
 | m8-0415 | as m6, with 832a0567 | 27,494 | 2,206 | 0 | 0 | 134.5 / 20,746.0 |
 | k30-0434 | killed 30 s, with 832a0567 | 29,102 | 598 | 0 | 0 | 319.1 / 40,423.8 |
+| k31-0454 | killed 30 s, with 832a0567 | 28,970 | 730 | 0 | 0 | 173.3 / 22,235.1 |
+| k32-0514 | killed 30 s, with 832a0567 | 29,219 | 481 | 0 | 0 | 296.3 / 15,605.8 |
+| k33-0529 | killed 30 s, with 832a0567 | 29,575 | 125 | 0 | 0 | 180.3 / 15,470.0 |
 
 The directory healed every session it could, two of them while the twelve were still down (m6;
 none in m5 before 01a2f923). No outcome stayed unknown and no lifecycle was abandoned where the
@@ -123,7 +126,7 @@ pending. A session whose quorum is down takes no write until its voters are back
 session to its clients from its log's cutover to its activation, 5.1 to 8.4 s in m8. In k28 and
 k29, one session that lost one voter stopped committing for 2.8 to 4 s about 13 s after the kill,
 its two live voters unstalled, and refused writes past its door's bound (`ingress_capacity`, 49 and
-40). k30 on the fixed tree had none, but the cause is not shown. A node's log syncs wait on its file
+40). k30 to k33, the same fault four times on the fixed tree, had none, but the cause is not shown. A node's log syncs wait on its file
 system's commits, up to 5.2 s on the host's btrfs volume, where the harness keeps every node's log
 (condition 10). Under 3% loss a write's p99 is 753
 to 2,244 ms against 462 to 574 without, its artifact steps held at the evidence door (the 2026-10-28

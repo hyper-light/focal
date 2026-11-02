@@ -1,4 +1,4 @@
-<!-- Qualification record: goal condition 3 at scale, a dozen of 33 focal nodes killed, partitioned and cut off under the work flow, 2026-10-31 to 2026-11-01, fedora (Linux x86-64), the final runs at fleet-run c606af7b (m4 with the harness at 902acac7), every fix the runs found at 6bb00314, confirmed at 33 nodes 2026-11-01 and 02 (m6, k28, m7, k29, m8, k30), with what the confirmation found fixed at 832a0567. -->
+<!-- Qualification record: goal condition 3 at scale, a dozen of 33 focal nodes killed, partitioned and cut off under the work flow, 2026-10-31 to 2026-11-01, fedora (Linux x86-64), the final runs at fleet-run c606af7b (m4 with the harness at 902acac7), every fix the runs found at 6bb00314, confirmed at 33 nodes 2026-11-01 and 02 (m6, k28, m7, k29, m8, k30, k31 to k33), with what the confirmation found fixed at 832a0567. -->
 
 # Condition 3 at scale: a dozen of 33 nodes killed, partitioned and cut off under the work flow
 
@@ -12,7 +12,8 @@ older than its client's sent the client back to it), baabea7d (focal-load: an ag
 read a lagging replica answered), c63c52c1 (the bootstrap asks an invitation again) and 6bb00314 (a
 join asks again a sponsor whose name did not resolve). Six runs at 33 nodes confirm them (m6 and
 k28 on that tree, m7 and k29 with b9f8a514, m8 and k30 with 832a0567). Those runs found two more
-defects, fixed at the cause in b9f8a514 and 832a0567 and confirmed in m8 and k30 (below). ab1630ba corrects two comments. The harness (`tools/compare/compose`) reads every
+defects, fixed at the cause in b9f8a514 and 832a0567 and confirmed in m8 and k30 (below). k31 to
+k33 ran k28's fault three more times on that tree. ab1630ba corrects two comments. The harness (`tools/compare/compose`) reads every
 node's replicas of the sessions its agent installed during the run as well (each run's
 `tree.txt`).
 
@@ -146,6 +147,9 @@ device-mapper delay on its own loop device (beside m8 and k30).
 | k29-0135 | fleet-c18 | twelve killed 30 s | 28,983 | 717 (`owner_bound` 28, `ingress_capacity` 40, `unavailable` 649) | 0 / 0 | 259.3 / 18,053.9 | 2 (15.6, 0.3 s), 1 in custody |
 | m8-0415 | fleet-c19 | twelve outside the control plane killed 60 s | 27,494 | 2,206 (`owner_bound` 11, `unavailable` 2,195) | 0 / 0 | 134.5 / 20,746.0 | 3 (5.7, 8.4, 5.1 s) |
 | k30-0434 | fleet-c19 | twelve killed 30 s (docker took 15.9 s to kill them) | 29,102 | 598 (`owner_bound` 234, `unavailable` 364) | 0 / 0 | 319.1 / 40,423.8 | none (the twelve back before a heal was planned) |
+| k31-0454 | fleet-c19 | twelve killed 30 s | 28,970 | 730 (`owner_bound` 69, `unavailable` 661) | 0 / 0 | 173.3 / 22,235.1 | 2 (placement not sampled) |
+| k32-0514 | fleet-c19 | twelve killed 30 s | 29,219 | 481 (`owner_bound` 34, `unavailable` 447) | 0 / 0 | 296.3 / 15,605.8 | 2 (placement not sampled) |
+| k33-0529 | fleet-c19 | twelve killed 30 s | 29,575 | 125 (`owner_bound` 42, `unavailable` 83) | 0 / 0 | 180.3 / 15,470.0 | none |
 
 Each session's longest window without a commit in the run, by what the fault took from it (one
 that moved after the fault has its move's window there):
@@ -157,13 +161,19 @@ that moved after the fault has its move's window there):
 | k29-0135 | 3, 39.9 to 43.2 s | 2, 1.2 to 2.5 s | 3, 0.7 to 15.6 s | 3, 0.7 to 0.9 s |
 | m8-0415 | 4, 65.6 to 70.6 s | none | 3, 0.8 to 5.7 s | 4, 0.2 to 0.9 s |
 | k30-0434 | 4, 51.0 to 52.9 s | 2, 2.0 to 2.7 s | 2, 3.4 to 3.6 s | 3, 1.9 to 4.5 s |
+| k31-0454 | 2, 41.1 to 42.0 s | 3, 1.6 to 2.4 s | 4, 0.4 to 10.8 s | 2, 0.4 to 0.6 s |
+| k32-0514 | 3, 36.7 to 39.4 s | 3, 4.1 to 7.3 s | 3, 7.7 to 13.3 s | 2, 5.6 to 6.6 s |
+| k33-0529 | 3, 38.3 to 40.6 s | 2, 1.5 to 2.4 s | 4, 0.4 to 0.5 s | 2, 0.4 to 0.5 s |
 
 k30's write p99 carries the load generator's own lateness: its schedule delay reached a p99 of
 7.5 s on a strained host (docker took 15.9 s to kill the twelve, against 1.4 to 3.0 s in the other
 runs), and its open loop times a write from when it was scheduled. m8's longest window with no
 commit in any ledger (15.9 s, 105 to 121 s after the kill) is one session's last steps. 79e8fb08
 moved and was activated by 104.2 s, and its last 11 writes committed at 121.3 s, after every other
-session had finished its work by 98 s.
+session had finished its work by 98 s. k32's sessions that lost nothing went 5.6 to 6.6 s without a
+commit from 50.6 s, every session at once, as the twelve came back. All 33 nodes' shared-log I/O
+threads were then blocked on disk: 1,350 of the 200 ms samples in those ten seconds, against 705
+from 18 nodes in a quiet ten seconds before the kill. That is the volume's commits (condition 10).
 
 What the runs confirm:
 
@@ -223,16 +233,17 @@ What the confirmation found, fixed at the cause:
 Open from the confirmation:
 
 - **`ingress_capacity` in the runs that kill the founder** (k28 49, k29 40, never in m6, m7 or m8,
-  and none in k30 on the tree with 832a0567).
+  and none in k30, k31, k32 or k33, four runs of the same fault on the tree with 832a0567).
   Each time it was one session that had lost one voter (k28: its leader, k29: a follower), about
   13 s after the kill. Its two remaining voters, both alive and neither stalled (their sessions'
   longest periods 158 and 785 ms), committed nothing for 2.8 s (k29) and about 4 s (k28, where the
   follower then ran an election its leader won again). The leader's door filled, and the writes
   past its bound were refused at once. The host's bridge and softnet dropped nothing then, and
-  every other session committed. k30, with the same fault and twelve on the fixed tree, had none.
-  Its all-node sampler of blocked threads kept no such window. Its absence from one run is no proof
-  that 832a0567 removed it: what held the two voters' replication in k28 and k29 is not in what
-  those runs kept, and the cause is not shown.
+  every other session committed. On the old tree it appeared in two of four runs of this fault
+  (k26 and k27 had none). On the fixed tree, k30 to k33 had none, with every node's blocked threads
+  sampled. That fits 832a0567 having removed it, since the intents of every node went through its
+  root's owner, but it does not prove it: what held the two voters' replication in k28 and k29 is
+  not in what those runs kept, and the cause is not shown.
 
 ## Found and fixed at the cause
 
@@ -508,7 +519,7 @@ focal3's containers every 200 ms, the root owner's, the hyper-log thread's and t
 thread's state, syscall and wait channel, and the file the owner was syncing
 (`syscalls-focal1.txt`, `syscalls-focal3.txt`). m8 keeps the founder's the same way, and k30
 keeps, per thread name, how many 200 ms samples of every node found a thread blocked on disk
-(`blocked-threads-summary.txt`). Each run's whole directory, every node's log,
+(`blocked-threads-summary.txt`), as k31 to k33 do. Each run's whole directory, every node's log,
 health, metrics and replicas among them, is on fedora under `~/s5/runs/<run>` (the intermediate
 runs' too), beside the run kit (`~/s5/campaign.sh`, `fleet-run.sh`, `killreport.py`, `agents.py`,
 `gaps.py`, `hostsample.sh`, `placesample.sh`, `btrfssample.sh`, `stallzoom.py`).

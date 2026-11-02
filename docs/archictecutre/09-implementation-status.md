@@ -18400,6 +18400,9 @@ k27, the founder among them. Each m run killed twelve of the nodes holding no co
 | k29-0135 | twelve killed 30 s | 28,983 | 717 (`owner_bound` 28, `ingress_capacity` 40, `unavailable` 649) | 0 / 0 | 259.3 / 18,053.9 |
 | m8-0415 | as m6 | 27,494 | 2,206 (`owner_bound` 11, `unavailable` 2,195) | 0 / 0 | 134.5 / 20,746.0 |
 | k30-0434 | twelve killed 30 s | 29,102 | 598 (`owner_bound` 234, `unavailable` 364) | 0 / 0 | 319.1 / 40,423.8 |
+| k31-0454 | twelve killed 30 s | 28,970 | 730 (`owner_bound` 69, `unavailable` 661) | 0 / 0 | 173.3 / 22,235.1 |
+| k32-0514 | twelve killed 30 s | 29,219 | 481 (`owner_bound` 34, `unavailable` 447) | 0 / 0 | 296.3 / 15,605.8 |
+| k33-0529 | twelve killed 30 s | 29,575 | 125 (`owner_bound` 42, `unavailable` 83) | 0 / 0 | 180.3 / 15,470.0 |
 
 k30's p99 carries its load generator's own lateness (schedule delay p99 7.5 s on a strained host,
 docker taking 15.9 s to kill the twelve). Sessions without their quorum committed again 37 to 71 s
@@ -18448,5 +18451,6 @@ finish well after its activation (m8's 79e8fb08, 17 s). The root's log write sti
 volume's commits: one 7.8 s stall in m8, the shared log's I/O thread in btrfs's `wait_for_commit`
 (condition 10). In k28 and k29, one session that lost one voter stopped committing for about 4 and
 2.8 s some 13 s after the kill, its two live voters unstalled, and refused the writes past its
-door's bound (`ingress_capacity`, 49 and 40). k30, the same fault on the fixed tree, had none, but
-its cause is not shown. The custody rule's decision is the user's, pending.
+door's bound (`ingress_capacity`, 49 and 40). k30 to k33, the same fault four times on the fixed
+tree, had none, every node's blocked threads sampled. That fits 832a0567 having removed it, but
+the cause is not shown. The custody rule's decision is the user's, pending.
