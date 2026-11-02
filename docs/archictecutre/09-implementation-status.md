@@ -18403,6 +18403,17 @@ k27, the founder among them. Each m run killed twelve of the nodes holding no co
 | k31-0454 | twelve killed 30 s | 28,970 | 730 (`owner_bound` 69, `unavailable` 661) | 0 / 0 | 173.3 / 22,235.1 |
 | k32-0514 | twelve killed 30 s | 29,219 | 481 (`owner_bound` 34, `unavailable` 447) | 0 / 0 | 296.3 / 15,605.8 |
 | k33-0529 | twelve killed 30 s | 29,575 | 125 (`owner_bound` 42, `unavailable` 83) | 0 / 0 | 180.3 / 15,470.0 |
+| c18-0648 | twelve cut off 12 s, past the QUIC idle timeout | 29,664 | 36 (`owner_bound` 24, `ingress_capacity` 12) | 0 / 0 | 84.7 / 930.9 |
+| p10-0707 | twelve partitioned 30 s | 29,610 | 90 (`owner_bound` 90) | 0 / 0 | 154.1 / 13,357.0 |
+
+On the tree with every fix (`focal:fleet-c19`), every fault kind ran: a dozen killed (m8, k30 to k33),
+cut off past the QUIC idle timeout so that their connections dropped (c18), and partitioned (p10).
+The record counts each run's writes by kind, its claims, artifacts, testaments and validations
+(`kinds.txt` beside each run). Testaments committed at 99.99 to 100 %, claims at 98.49 to 100 %,
+artifacts at 97.61 to 100 % and validations at 99.65 to 99.97 %, every write that did not commit
+refused with a typed cause. Uncommitted claims were sessions without their quorum and
+`ingress_capacity`. Uncommitted artifacts and validations were the all-copies custody rule's while a
+copy was down.
 
 k30's p99 carries its load generator's own lateness (schedule delay p99 7.5 s on a strained host,
 docker taking 15.9 s to kill the twelve). Sessions without their quorum committed again 37 to 71 s
@@ -18451,6 +18462,5 @@ finish well after its activation (m8's 79e8fb08, 17 s). The root's log write sti
 volume's commits: one 7.8 s stall in m8, the shared log's I/O thread in btrfs's `wait_for_commit`
 (condition 10). In k28 and k29, one session that lost one voter stopped committing for about 4 and
 2.8 s some 13 s after the kill, its two live voters unstalled, and refused the writes past its
-door's bound (`ingress_capacity`, 49 and 40). k30 to k33, the same fault four times on the fixed
-tree, had none, every node's blocked threads sampled. That fits 832a0567 having removed it, but
-the cause is not shown. The custody rule's decision is the user's, pending.
+door's bound (`ingress_capacity`, 49 and 40). c18, cut off on the tree with 832a0567, refused 12 the
+same way, so that fix did not remove it (k30 to k33, before c18, had none). Not root-caused. The custody rule's decision is the user's, pending.

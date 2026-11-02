@@ -1,0 +1,5 @@
+claims: asked 105780, committed 105780 (100.00 %), refused 0 {}, other {}
+artifacts: asked 26454, committed 26454 (100.00 %), refused 0 {}, other {}
+testaments: asked 79458, committed 79458 (100.00 %), refused 0 {}, other {}
+validations: asked 79592, committed 79518 (99.91 %), refused 74 {'owner_bound': 74}, other {}
+lifecycles: {'started': 29700, 'written': 29626, 'judged': 29626, 'refused': 74, 'unknown': 0, 'abandoned': 0}

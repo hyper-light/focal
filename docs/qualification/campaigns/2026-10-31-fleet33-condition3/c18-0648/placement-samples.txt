@@ -1,0 +1,47 @@
+1793631711395 dead[] | 08e92658 v[focal17,focal24,focal28] p2 ; 205cde29 v[focal7,focal23,focal30] p2 ; 2445fc26 v[focal1,focal5,focal15] p2 ; 3c11b8a3 v[focal16,focal18,focal20] p2 ; 53775e51 v[focal21,focal29,focal31] p2 ; 8a495b5d v[focal25,focal26,focal27] p2 ; 96bc77a5 v[focal2,focal10,focal33] p2 ; a33ce8cb v[focal4,focal6,focal11] p2 ; bf4763b0 v[focal8,focal9,focal22] p2 ; d6ceffcb v[focal12,focal13,focal14] p2 ; f57bf16e v[focal3,focal19,focal32] p2
+1793631722308 no answer
+1793631750739 dead[focal33] | 08e92658 v[focal17,focal24,focal28] p2 ; 205cde29 v[focal7,focal23,focal30] p2 ; 2445fc26 v[focal1,focal5,focal15] p2 ; 3c11b8a3 v[focal16,focal18,focal20] p2 ; 53775e51 v[focal21,focal29,focal31] p2 ; 8a495b5d v[focal25,focal26,focal27] p2 ; 96bc77a5 v[focal2,focal10,focal33] p2 blocked['DeadNode on node 17343169090574427143', 'DeadNode on node 17343169090574427143'] ; a33ce8cb v[focal4,focal6,focal11] p2 ; bf4763b0 v[focal8,focal9,focal22] p2 ; d6ceffcb v[focal12,focal13,focal14] p2 ; f57bf16e v[focal3,focal19,focal32] p2
+1793631752985 dead[] | 08e92658 v[focal17,focal24,focal28] p2 ; 205cde29 v[focal7,focal23,focal30] p2 ; 2445fc26 v[focal1,focal5,focal15] p2 ; 3c11b8a3 v[focal16,focal18,focal20] p2 ; 53775e51 v[focal21,focal29,focal31] p2 ; 8a495b5d v[focal25,focal26,focal27] p2 ; 96bc77a5 v[focal2,focal10,focal33] p2 PLAN Preparing -> [focal2,focal6,focal10] {focal2:Assigned focal6:Assigned focal10:Assigned} blocked['Assignment(Assigned) on node 17343169090574427112', 'Assignment(Assigned) on node 17343169090574427116', 'Assignment(Assigned) on node 17343169090574427120'] ; a33ce8cb v[focal4,focal6,focal11] p2 ; bf4763b0 v[focal8,focal9,focal22] p2 ; d6ceffcb v[focal12,focal13,focal14] p2 ; f57bf16e v[focal3,focal19,focal32] p2
+1793631755199 dead[] | 08e92658 v[focal17,focal24,focal28] p2 ; 205cde29 v[focal7,focal23,focal30] p2 ; 2445fc26 v[focal1,focal5,focal15] p2 ; 3c11b8a3 v[focal16,focal18,focal20] p2 ; 53775e51 v[focal21,focal29,focal31] p2 ; 8a495b5d v[focal25,focal26,focal27] p2 ; 96bc77a5 v[focal2,focal10,focal33] p2 PLAN Catchup -> [focal2,focal6,focal10] {focal2:CaughtUp focal6:Installed focal10:CaughtUp} blocked['Assignment(CaughtUp) on node 17343169090574427112', 'Assignment(Installed) on node 17343169090574427116', 'Assignment(CaughtUp) on node 17343169090574427120'] ; a33ce8cb v[focal4,focal6,focal11] p2 ; bf4763b0 v[focal8,focal9,focal22] p2 ; d6ceffcb v[focal12,focal13,focal14] p2 ; f57bf16e v[focal3,focal19,focal32] p2
+1793631758057 dead[] | 08e92658 v[focal17,focal24,focal28] p2 ; 205cde29 v[focal7,focal23,focal30] p2 ; 2445fc26 v[focal1,focal5,focal15] p2 ; 3c11b8a3 v[focal16,focal18,focal20] p2 ; 53775e51 v[focal21,focal29,focal31] p2 ; 8a495b5d v[focal25,focal26,focal27] p2 ; 96bc77a5 v[focal2,focal10,focal33] p2 PLAN Custody -> [focal2,focal6,focal10] {focal2:CaughtUp focal6:CaughtUp focal10:CaughtUp} blocked['Assignment(CaughtUp) on node 17343169090574427112', 'Assignment(CaughtUp) on node 17343169090574427116', 'Assignment(CaughtUp) on node 17343169090574427120'] ; a33ce8cb v[focal4,focal6,focal11] p2 ; bf4763b0 v[focal8,focal9,focal22] p2 ; d6ceffcb v[focal12,focal13,focal14] p2 ; f57bf16e v[focal3,focal19,focal32] p2
+1793631778578 dead[] | 08e92658 v[focal17,focal24,focal28] p2 ; 205cde29 v[focal7,focal23,focal30] p2 ; 2445fc26 v[focal1,focal5,focal15] p2 ; 3c11b8a3 v[focal16,focal18,focal20] p2 ; 53775e51 v[focal21,focal29,focal31] p2 ; 8a495b5d v[focal25,focal26,focal27] p2 ; 96bc77a5 v[focal2,focal10,focal33] p2 PLAN Custody -> [focal2,focal6,focal10] {focal2:CaughtUp focal6:Promoted focal10:CaughtUp} blocked['Assignment(CaughtUp) on node 17343169090574427112', 'Assignment(CaughtUp) on node 17343169090574427120'] ; a33ce8cb v[focal4,focal6,focal11] p2 ; bf4763b0 v[focal8,focal9,focal22] p2 ; d6ceffcb v[focal12,focal13,focal14] p2 ; f57bf16e v[focal3,focal19,focal32] p2
+1793631780831 dead[] | 08e92658 v[focal17,focal24,focal28] p2 ; 205cde29 v[focal7,focal23,focal30] p2 ; 2445fc26 v[focal1,focal5,focal15] p2 ; 3c11b8a3 v[focal16,focal18,focal20] p2 ; 53775e51 v[focal21,focal29,focal31] p2 ; 8a495b5d v[focal25,focal26,focal27] p2 ; 96bc77a5 v[focal2,focal10,focal33] p2 PLAN Promoting -> [focal2,focal6,focal10] {focal2:CustodyVerified focal6:Promoted focal10:Promoted} blocked['Assignment(CustodyVerified) on node 17343169090574427112'] ; a33ce8cb v[focal4,focal6,focal11] p2 ; bf4763b0 v[focal8,focal9,focal22] p2 ; d6ceffcb v[focal12,focal13,focal14] p2 ; f57bf16e v[focal3,focal19,focal32] p2
+1793631783107 dead[] | 08e92658 v[focal17,focal24,focal28] p2 ; 205cde29 v[focal7,focal23,focal30] p2 ; 2445fc26 v[focal1,focal5,focal15] p2 ; 3c11b8a3 v[focal16,focal18,focal20] p2 ; 53775e51 v[focal21,focal29,focal31] p2 ; 8a495b5d v[focal25,focal26,focal27] p2 ; 96bc77a5 v[focal2,focal6,focal10] p3 retiring[focal33] blocked['Draining on node 17343169090574427143'] ; a33ce8cb v[focal4,focal6,focal11] p2 ; bf4763b0 v[focal8,focal9,focal22] p2 ; d6ceffcb v[focal12,focal13,focal14] p2 ; f57bf16e v[focal3,focal19,focal32] p2
+1793631787760 dead[] | 08e92658 v[focal17,focal24,focal28] p2 ; 205cde29 v[focal7,focal23,focal30] p2 ; 2445fc26 v[focal1,focal5,focal15] p2 ; 3c11b8a3 v[focal16,focal18,focal20] p2 ; 53775e51 v[focal21,focal29,focal31] p2 ; 8a495b5d v[focal25,focal26,focal27] p2 ; 96bc77a5 v[focal2,focal6,focal10] p3 ; a33ce8cb v[focal4,focal6,focal11] p2 ; bf4763b0 v[focal8,focal9,focal22] p2 ; d6ceffcb v[focal12,focal13,focal14] p2 ; f57bf16e v[focal3,focal19,focal32] p2
+1793631817338 no answer
+1793631820843 no answer
+1793631822903 no answer
+1793631824960 no answer
+1793631827123 no answer
+1793631829300 no answer
+1793631831481 no answer
+1793631833654 no answer
+1793631835777 no answer
+1793631837896 no answer
+1793631840027 no answer
+1793631842144 no answer
+1793631844286 no answer
+1793631846413 no answer
+1793631848548 no answer
+1793631850690 no answer
+1793631852806 no answer
+1793631854975 no answer
+1793631857135 no answer
+1793631859259 no answer
+1793631861371 no answer
+1793631863591 no answer
+1793631865732 no answer
+1793631867877 no answer
+1793631870042 no answer
+1793631872730 no answer
+1793631874871 no answer
+1793631876985 no answer
+1793631881669 no answer
+1793631884352 no answer
+1793631886457 no answer
+1793631888567 no answer
+1793631890708 no answer
+1793631892827 no answer
+1793631894971 no answer
+1793631897081 no answer
+1793631899199 no answer

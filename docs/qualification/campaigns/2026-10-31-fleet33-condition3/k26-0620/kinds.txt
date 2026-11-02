@@ -1,0 +1,5 @@
+claims: asked 106237, committed 106235 (100.00 %), refused 2 {'unavailable': 2}, other {}
+artifacts: asked 26560, committed 26499 (99.77 %), refused 61 {'unavailable': 61}, other {}
+testaments: asked 79794, committed 79794 (100.00 %), refused 0 {}, other {}
+validations: asked 80309, committed 80265 (99.95 %), refused 44 {'owner_bound': 40, 'unavailable': 4}, other {}
+lifecycles: {'started': 29700, 'written': 29593, 'judged': 29593, 'refused': 107, 'unknown': 0, 'abandoned': 0}

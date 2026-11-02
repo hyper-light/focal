@@ -1,4 +1,4 @@
-<!-- Qualification record: goal condition 3 at scale, a dozen of 33 focal nodes killed, partitioned and cut off under the work flow, 2026-10-31 to 2026-11-01, fedora (Linux x86-64), the final runs at fleet-run c606af7b (m4 with the harness at 902acac7), every fix the runs found at 6bb00314, confirmed at 33 nodes 2026-11-01 and 02 (m6, k28, m7, k29, m8, k30, k31 to k33), with what the confirmation found fixed at 832a0567. -->
+<!-- Qualification record: goal condition 3 at scale, a dozen of 33 focal nodes killed, partitioned and cut off under the work flow, 2026-10-31 to 2026-11-01, fedora (Linux x86-64), the final runs at fleet-run c606af7b (m4 with the harness at 902acac7), every fix the runs found at 6bb00314, confirmed at 33 nodes 2026-11-01 and 02 (m6, k28, m7, k29, m8, k30 to k33, c18, p10), with what the confirmation found fixed at 832a0567. -->
 
 # Condition 3 at scale: a dozen of 33 nodes killed, partitioned and cut off under the work flow
 
@@ -13,7 +13,10 @@ read a lagging replica answered), c63c52c1 (the bootstrap asks an invitation aga
 join asks again a sponsor whose name did not resolve). Six runs at 33 nodes confirm them (m6 and
 k28 on that tree, m7 and k29 with b9f8a514, m8 and k30 with 832a0567). Those runs found two more
 defects, fixed at the cause in b9f8a514 and 832a0567 and confirmed in m8 and k30 (below). k31 to
-k33 ran k28's fault three more times on that tree. ab1630ba corrects two comments. The harness (`tools/compare/compose`) reads every
+k33 ran k28's fault three more times on that tree, c18 cut a dozen off past the QUIC idle timeout,
+and p10 partitioned a dozen for 30 s, so every fault kind ran on the tree with every fix. Every
+lifecycle in those runs was written and judged or refused with a typed error, and their claims,
+artifacts, testaments and validations are counted by kind (below). ab1630ba corrects two comments. The harness (`tools/compare/compose`) reads every
 node's replicas of the sessions its agent installed during the run as well (each run's
 `tree.txt`).
 
@@ -150,6 +153,8 @@ device-mapper delay on its own loop device (beside m8 and k30).
 | k31-0454 | fleet-c19 | twelve killed 30 s | 28,970 | 730 (`owner_bound` 69, `unavailable` 661) | 0 / 0 | 173.3 / 22,235.1 | 2 (placement not sampled) |
 | k32-0514 | fleet-c19 | twelve killed 30 s | 29,219 | 481 (`owner_bound` 34, `unavailable` 447) | 0 / 0 | 296.3 / 15,605.8 | 2 (placement not sampled) |
 | k33-0529 | fleet-c19 | twelve killed 30 s | 29,575 | 125 (`owner_bound` 42, `unavailable` 83) | 0 / 0 | 180.3 / 15,470.0 | none |
+| c18-0648 | fleet-c19 | twelve cut off 12 s, past the QUIC idle timeout | 29,664 | 36 (`owner_bound` 24, `ingress_capacity` 12) | 0 / 0 | 84.7 / 930.9 | 1 |
+| p10-0707 | fleet-c19 | twelve partitioned 30 s | 29,610 | 90 (`owner_bound` 90) | 0 / 0 | 154.1 / 13,357.0 | none |
 
 Each session's longest window without a commit in the run, by what the fault took from it (one
 that moved after the fault has its move's window there):
@@ -164,6 +169,8 @@ that moved after the fault has its move's window there):
 | k31-0454 | 2, 41.1 to 42.0 s | 3, 1.6 to 2.4 s | 4, 0.4 to 10.8 s | 2, 0.4 to 0.6 s |
 | k32-0514 | 3, 36.7 to 39.4 s | 3, 4.1 to 7.3 s | 3, 7.7 to 13.3 s | 2, 5.6 to 6.6 s |
 | k33-0529 | 3, 38.3 to 40.6 s | 2, 1.5 to 2.4 s | 4, 0.4 to 0.5 s | 2, 0.4 to 0.5 s |
+| c18-0648 | 3, 13.0 to 13.4 s | 3, 1.6 to 2.9 s | 3, 1.4 to 1.8 s | 2, 1.4 to 6.5 s |
+| p10-0707 | 4, 31.0 to 31.4 s | 2, 1.3 to 1.4 s | 2, 0.3 to 0.5 s | 3, 0.2 to 0.5 s |
 
 k30's write p99 carries the load generator's own lateness: its schedule delay reached a p99 of
 7.5 s on a strained host (docker took 15.9 s to kill the twelve, against 1.4 to 3.0 s in the other
@@ -195,7 +202,7 @@ What the runs confirm:
   asks an invitation again.
 - **Every refusal is typed.** Each is the custody rule's (`unavailable` at the client's 30 s clock
   on artifact steps, `owner_bound` at the custody check), a session's without its quorum, or
-  `ingress_capacity` (k28, k29, open below).
+  `ingress_capacity` (k28, k29 and c18, open below).
 
 What the confirmation found, fixed at the cause:
 
@@ -227,23 +234,63 @@ What the confirmation found, fixed at the cause:
   disk in 97 samples, where the journal writers took 801. No root election came from an owner's
   sync. One 7.8 s stall of m8's root remained, and it was the volume's: the shared log's I/O thread
   sat in `fdatasync` in btrfs's `wait_current_trans` and `wait_for_commit` (a full transaction
-  commit) while the root owner waited for its write (condition 10, below). k30 had no
-  `ingress_capacity` (below).
+  commit) while the root owner waited for its write (condition 10, below). It did not remove
+  `ingress_capacity` (c18, below).
 
 Open from the confirmation:
 
-- **`ingress_capacity` in the runs that kill the founder** (k28 49, k29 40, never in m6, m7 or m8,
-  and none in k30, k31, k32 or k33, four runs of the same fault on the tree with 832a0567).
+- **`ingress_capacity`** (k28 49, k29 40, and c18 12 on the tree with 832a0567; none in k26, k27,
+  m6, m7, m8, k30 to k33 or p10; the earlier campaigns' c9 and c14, cut off as c18 was, had 5 and
+  15). In c18 the twelve that were cut off included the founder, as in the k runs. Its 12 were one ledger's claim creations, refused at once.
   Each time it was one session that had lost one voter (k28: its leader, k29: a follower), about
   13 s after the kill. Its two remaining voters, both alive and neither stalled (their sessions'
   longest periods 158 and 785 ms), committed nothing for 2.8 s (k29) and about 4 s (k28, where the
   follower then ran an election its leader won again). The leader's door filled, and the writes
   past its bound were refused at once. The host's bridge and softnet dropped nothing then, and
-  every other session committed. On the old tree it appeared in two of four runs of this fault
-  (k26 and k27 had none). On the fixed tree, k30 to k33 had none, with every node's blocked threads
-  sampled. That fits 832a0567 having removed it, since the intents of every node went through its
-  root's owner, but it does not prove it: what held the two voters' replication in k28 and k29 is
-  not in what those runs kept, and the cause is not shown.
+  every other session committed. c18's 12, on the tree with 832a0567, show that the journal writer
+  did not remove it, so the four kill runs before it on that tree, which had none, showed no fix. Not root-caused: what held a session's two live voters is not in what the runs
+  kept.
+
+## Claims, artifacts, testaments and validations
+
+The writes of every 33-node run, by what they are. The kinds are focal-load's work lifecycle
+(`tools/load/src/driver.rs`): claims (its create, post, receipt acquire and release), artifacts
+(submit), testaments (submit, post and receive), and validations (enter, begin and report). Each
+write is counted once, as it ended. Every write that did not commit was refused with a typed cause
+and its client told, except the two of unknown outcome shown. The first seven are the final
+campaign (c606af7b, m4 with the harness at 902acac7). The rest are the confirmation, the last seven
+on the tree with every fix (`focal:fleet-c19`, 832a0567, its tip changing only tests and
+documents): a dozen killed (m8, k30 to k33), cut off for 12 s past the QUIC idle timeout so that
+every connection they held dropped (c18), and partitioned for 30 s (p10). Each run's measure is
+beside it (`kinds.txt`).
+
+| Run | Fault (twelve of 33) | Claims committed | Artifacts committed | Testaments committed | Validations committed |
+|---|---|---|---|---|---|
+| c16-0602 | cut off 12 s | 106,394 of 106,394 (100.00 %) | 26,581 of 26,581 (100.00 %) | 80,115 of 80,115 (100.00 %) | 80,629 of 80,697 (99.92 %) |
+| k26-0620 | killed 30 s | 106,235 of 106,237 (100.00 %) | 26,499 of 26,560 (99.77 %) | 79,794 of 79,794 (100.00 %) | 80,265 of 80,309 (99.95 %) |
+| p9-0647 | partitioned 30 s | 105,786 of 105,786 (100.00 %) | 26,435 of 26,462 (99.90 %) | 79,425 of 79,425 (100.00 %) | 79,490 of 79,569 (99.90 %) |
+| m3-0704 | killed, founder spared | 106,159 of 106,159 (100.00 %) | 26,500 of 26,531 (99.88 %) | 79,746 of 79,746 (100.00 %) | 80,145 of 80,180 (99.96 %) |
+| c17-0721 | cut off 12 s | 105,780 of 105,780 (100.00 %) | 26,454 of 26,454 (100.00 %) | 79,458 of 79,458 (100.00 %) | 79,518 of 79,592 (99.91 %) |
+| k27-0749 | killed, down 61 s | 104,250 of 104,422 (99.84 %), 1 unknown | 25,150 of 26,415 (95.21 %) | 75,829 of 75,829 (100.00 %) | 76,007 of 76,313 (99.60 %) |
+| m4-0816 | killed outside the control plane | 104,007 of 104,272 (99.75 %) | 25,416 of 26,200 (97.01 %) | 76,375 of 76,375 (100.00 %) | 76,531 of 76,587 (99.93 %) |
+| m6-2352 | outside control, 60 s | 100,777 of 101,793 (99.00 %) | 24,123 of 25,535 (94.47 %) | 72,627 of 72,631 (99.99 %) | 73,055 of 73,106 (99.93 %) |
+| k28-0012 | killed 30 s | 105,288 of 105,338 (99.95 %) | 26,080 of 26,413 (98.74 %) | 78,340 of 78,340 (100.00 %) | 78,454 of 78,500 (99.94 %) |
+| m7-0110 | outside control, to the end | 76,899 of 84,508 (91.00 %) | 18,971 of 19,194 (98.84 %) | 57,882 of 57,899 (99.97 %), 1 unknown | 59,263 of 59,299 (99.94 %) |
+| k29-0135 | killed 30 s | 104,946 of 105,018 (99.93 %) | 25,787 of 26,391 (97.71 %) | 77,463 of 77,463 (100.00 %) | 77,585 of 77,626 (99.95 %) |
+| m8-0415 | outside control, 60 s | 100,446 of 101,982 (98.49 %) | 24,675 of 25,278 (97.61 %) | 74,802 of 74,812 (99.99 %) | 75,699 of 75,756 (99.92 %) |
+| k30-0434 | killed 30 s | 104,800 of 104,946 (99.86 %) | 26,131 of 26,305 (99.34 %) | 78,482 of 78,482 (100.00 %) | 78,146 of 78,424 (99.65 %) |
+| k31-0454 | killed 30 s | 105,185 of 105,197 (99.99 %) | 25,846 of 26,463 (97.67 %) | 77,693 of 77,693 (100.00 %) | 77,782 of 77,883 (99.87 %) |
+| k32-0514 | killed 30 s | 105,200 of 105,270 (99.93 %) | 26,027 of 26,392 (98.62 %) | 78,214 of 78,214 (100.00 %) | 78,352 of 78,398 (99.94 %) |
+| k33-0529 | killed 30 s | 105,719 of 105,727 (99.99 %) | 26,376 of 26,450 (99.72 %) | 79,242 of 79,242 (100.00 %) | 79,359 of 79,402 (99.95 %) |
+| c18-0648 | cut off 12 s | 105,782 of 105,794 (99.99 %) | 26,444 of 26,444 (100.00 %) | 79,417 of 79,417 (100.00 %) | 79,575 of 79,599 (99.97 %) |
+| p10-0707 | partitioned 30 s | 106,461 of 106,461 (100.00 %) | 26,619 of 26,619 (100.00 %) | 80,249 of 80,249 (100.00 %) | 80,705 of 80,795 (99.89 %) |
+
+A testament committed whenever the fault ended within the run. Claims went uncommitted only in
+sessions without their quorum (refused `unavailable` at the client's 30 s clock), in k27's held
+syncs, and in k28's, k29's and c18's `ingress_capacity` (below). Artifacts and validations went
+uncommitted under the all-copies custody rule while a copy was down: an artifact refused
+`unavailable` at the client's 30 s clock, and a validation's begin refused `owner_bound` at the
+custody check. m7's twelve stayed down past its measured window.
 
 ## Found and fixed at the cause
 

@@ -10,7 +10,7 @@ every row names where it is recorded, and a gap is written as a gap.
 |---|---|---|
 | 1 | One binary and CLI, laptop to global, proven by records | partly shown |
 | 2 | More than a thousand agents doing claims, artifacts, testaments and validations | shown at 1,000; the Kubernetes build not attempted |
-| 3 | Delivery under heavy load, horrific networks, dozens of node failures | shown on three nodes and on 33 with twelve failing at once, confirmed on the fixed tree (nine runs); the custody rule's decision pending; k28's and k29's `ingress_capacity` not root-caused (none in k30 to k33) |
+| 3 | Delivery under heavy load, horrific networks, dozens of node failures | shown on three nodes and on 33 with twelve failing at once, confirmed on the fixed tree (eleven runs; every fault kind on the tree with every fix, claims, artifacts, testaments and validations counted by kind); the custody rule's decision pending; `ingress_capacity` (k28, k29, c18) not root-caused |
 | 4 | p99s an order of magnitude beyond Kafka, Redis HA, NATS | plan of record; not shown across its conditions |
 | 5 | Post-quantum encryption in transit and at rest | in transit shown; at rest partly |
 | 6 | Adversarial batteries: bombs, tampering, misuse | partly shown |
@@ -107,6 +107,21 @@ Confirmed at 33 nodes on that tree (`focal:fleet-c17`), with the confirmation's 
 | k31-0454 | killed 30 s, with 832a0567 | 28,970 | 730 | 0 | 0 | 173.3 / 22,235.1 |
 | k32-0514 | killed 30 s, with 832a0567 | 29,219 | 481 | 0 | 0 | 296.3 / 15,605.8 |
 | k33-0529 | killed 30 s, with 832a0567 | 29,575 | 125 | 0 | 0 | 180.3 / 15,470.0 |
+| c18-0648 | cut off 12 s, with 832a0567 | 29,664 | 36 | 0 | 0 | 84.7 / 930.9 |
+| p10-0707 | partitioned 30 s, with 832a0567 | 29,610 | 90 | 0 | 0 | 154.1 / 13,357.0 |
+
+On that tree, by kind ([the record](campaigns/2026-10-31-fleet33-condition3.md), "Claims, artifacts,
+testaments and validations"):
+
+| Kind | Committed, m8 and k30 to k33 (killed) | c18 (cut off, connections dropped) | p10 (partitioned) |
+|---|---|---|---|
+| Claims | 98.49 to 99.99 % | 99.99 % | 100 % |
+| Artifacts | 97.61 to 99.72 % | 100 % | 100 % |
+| Testaments | 99.99 to 100 % | 100 % | 100 % |
+| Validations | 99.65 to 99.95 % | 99.97 % | 99.89 % |
+
+Every write that did not commit was refused with a typed cause: claims by sessions without their
+quorum and by `ingress_capacity`, artifacts and validations by the all-copies custody rule.
 
 The directory healed every session it could, two of them while the twelve were still down (m6;
 none in m5 before 01a2f923). No outcome stayed unknown and no lifecycle was abandoned where the
@@ -126,7 +141,7 @@ pending. A session whose quorum is down takes no write until its voters are back
 session to its clients from its log's cutover to its activation, 5.1 to 8.4 s in m8. In k28 and
 k29, one session that lost one voter stopped committing for 2.8 to 4 s about 13 s after the kill,
 its two live voters unstalled, and refused writes past its door's bound (`ingress_capacity`, 49 and
-40). k30 to k33, the same fault four times on the fixed tree, had none, but the cause is not shown. A node's log syncs wait on its file
+40), and c18 refused 12 the same way on the tree with 832a0567: not root-caused. A node's log syncs wait on its file
 system's commits, up to 5.2 s on the host's btrfs volume, where the harness keeps every node's log
 (condition 10). Under 3% loss a write's p99 is 753
 to 2,244 ms against 462 to 574 without, its artifact steps held at the evidence door (the 2026-10-28

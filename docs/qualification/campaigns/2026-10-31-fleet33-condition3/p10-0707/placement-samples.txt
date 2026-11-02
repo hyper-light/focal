@@ -1,0 +1,31 @@
+1793633199175 dead[] | 0665d6c4 v[focal31,focal32,focal33] p2 ; 26824798 v[focal1,focal2,focal3] p2 ; 2d1613a5 v[focal6,focal11,focal16] p2 ; 435df300 v[focal7,focal8,focal18] p2 ; 4e4b92e2 v[focal9,focal13,focal17] p2 ; 758106c0 v[focal4,focal15,focal20] p2 ; 76c2c9c1 v[focal12,focal23,focal25] p2 ; a870df43 v[focal26,focal28,focal30] p2 ; cc7a3c15 v[focal5,focal19,focal24] p2 ; cef27ca3 v[focal21,focal22,focal29] p2 ; f3f92947 v[focal10,focal14,focal27] p2
+1793633221770 dead[focal7,focal8] | 0665d6c4 v[focal31,focal32,focal33] p2 ; 26824798 v[focal1,focal2,focal3] p2 ; 2d1613a5 v[focal6,focal11,focal16] p2 ; 435df300 v[focal7,focal8,focal18] p2 blocked['DeadNode on node 11535140759896851564', 'DeadNode on node 11535140759896851569', 'DeadNode on node 11535140759896851564', 'DeadNode on node 11535140759896851569', 'DeadNode on node 11535140759896851564'] ; 4e4b92e2 v[focal9,focal13,focal17] p2 ; 758106c0 v[focal4,focal15,focal20] p2 ; 76c2c9c1 v[focal12,focal23,focal25] p2 ; a870df43 v[focal26,focal28,focal30] p2 ; cc7a3c15 v[focal5,focal19,focal24] p2 ; cef27ca3 v[focal21,focal22,focal29] p2 ; f3f92947 v[focal10,focal14,focal27] p2
+1793633224027 dead[focal7,focal8,focal16,focal17] | 0665d6c4 v[focal31,focal32,focal33] p2 ; 26824798 v[focal1,focal2,focal3] p2 ; 2d1613a5 v[focal6,focal11,focal16] p2 blocked['DeadNode on node 11535140759896851576', 'DeadNode on node 11535140759896851576', 'DeadNode on node 11535140759896851576'] ; 435df300 v[focal7,focal8,focal18] p2 blocked['DeadNode on node 11535140759896851564', 'DeadNode on node 11535140759896851569', 'DeadNode on node 11535140759896851564', 'DeadNode on node 11535140759896851569', 'DeadNode on node 11535140759896851564'] ; 4e4b92e2 v[focal9,focal13,focal17] p2 blocked['DeadNode on node 11535140759896851578', 'DeadNode on node 11535140759896851578'] ; 758106c0 v[focal4,focal15,focal20] p2 ; 76c2c9c1 v[focal12,focal23,focal25] p2 ; a870df43 v[focal26,focal28,focal30] p2 ; cc7a3c15 v[focal5,focal19,focal24] p2 ; cef27ca3 v[focal21,focal22,focal29] p2 ; f3f92947 v[focal10,focal14,focal27] p2
+1793633232986 dead[focal8,focal16,focal17] | 0665d6c4 v[focal31,focal32,focal33] p2 ; 26824798 v[focal1,focal2,focal3] p2 ; 2d1613a5 v[focal6,focal11,focal16] p2 blocked['DeadNode on node 11535140759896851576', 'DeadNode on node 11535140759896851576', 'DeadNode on node 11535140759896851576'] ; 435df300 v[focal7,focal8,focal18] p2 blocked['DeadNode on node 11535140759896851569', 'DeadNode on node 11535140759896851569'] ; 4e4b92e2 v[focal9,focal13,focal17] p2 blocked['DeadNode on node 11535140759896851578', 'DeadNode on node 11535140759896851578'] ; 758106c0 v[focal4,focal15,focal20] p2 ; 76c2c9c1 v[focal12,focal23,focal25] p2 ; a870df43 v[focal26,focal28,focal30] p2 ; cc7a3c15 v[focal5,focal19,focal24] p2 ; cef27ca3 v[focal21,focal22,focal29] p2 ; f3f92947 v[focal10,focal14,focal27] p2
+1793633235405 dead[focal16,focal17] | 0665d6c4 v[focal31,focal32,focal33] p2 ; 26824798 v[focal1,focal2,focal3] p2 ; 2d1613a5 v[focal6,focal11,focal16] p2 blocked['DeadNode on node 11535140759896851576', 'DeadNode on node 11535140759896851576', 'DeadNode on node 11535140759896851576'] ; 435df300 v[focal7,focal8,focal18] p2 ; 4e4b92e2 v[focal9,focal13,focal17] p2 blocked['DeadNode on node 11535140759896851578', 'DeadNode on node 11535140759896851578'] ; 758106c0 v[focal4,focal15,focal20] p2 ; 76c2c9c1 v[focal12,focal23,focal25] p2 ; a870df43 v[focal26,focal28,focal30] p2 ; cc7a3c15 v[focal5,focal19,focal24] p2 ; cef27ca3 v[focal21,focal22,focal29] p2 ; f3f92947 v[focal10,focal14,focal27] p2
+1793633237699 dead[] | 0665d6c4 v[focal31,focal32,focal33] p2 ; 26824798 v[focal1,focal2,focal3] p2 ; 2d1613a5 v[focal6,focal11,focal16] p2 ; 435df300 v[focal7,focal8,focal18] p2 ; 4e4b92e2 v[focal9,focal13,focal17] p2 ; 758106c0 v[focal4,focal15,focal20] p2 ; 76c2c9c1 v[focal12,focal23,focal25] p2 ; a870df43 v[focal26,focal28,focal30] p2 ; cc7a3c15 v[focal5,focal19,focal24] p2 ; cef27ca3 v[focal21,focal22,focal29] p2 ; f3f92947 v[focal10,focal14,focal27] p2
+1793633312287 no answer
+1793633322047 no answer
+1793633324099 no answer
+1793633326660 no answer
+1793633328712 no answer
+1793633330757 no answer
+1793633332826 no answer
+1793633334882 no answer
+1793633336932 no answer
+1793633338986 no answer
+1793633341040 no answer
+1793633343092 no answer
+1793633345156 no answer
+1793633347208 no answer
+1793633349262 no answer
+1793633351317 no answer
+1793633353367 no answer
+1793633355420 no answer
+1793633357479 no answer
+1793633359528 no answer
+1793633361580 no answer
+1793633363658 no answer
+1793633365717 no answer
+1793633367773 no answer
+1793633369830 no answer
