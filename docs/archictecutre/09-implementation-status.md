@@ -18388,9 +18388,9 @@ btrfs a node's log syncs wait on the volume's commits (condition 10).
 ### 2026-11-02 — Condition 3 confirmed at 33 nodes; the confirmation's two defects fixed
 
 The previous entry's fixes, run at 33 nodes on fedora with the final campaign's fault seed (1029):
-m6 and k28 on `focal:fleet-c17` (e558cefa), m7 and k29 on `focal:fleet-c18` (b9f8a514, below).
-k28 and k29 killed the same twelve as k26 and k27, the founder among them. Each m run killed twelve
-of the nodes holding no control vote.
+m6 and k28 on `focal:fleet-c17` (e558cefa), m7 and k29 on `focal:fleet-c18` (b9f8a514, below), m8
+and k30 on `focal:fleet-c19` (832a0567, below). k28, k29 and k30 killed the same twelve as k26 and
+k27, the founder among them. Each m run killed twelve of the nodes holding no control vote.
 
 | fedora run | Fault | Written, of 29,700 | Refused (by cause) | Unknown / abandoned | Write p50 / p99 (ms) |
 |---|---|---|---|---|---|
@@ -18398,14 +18398,19 @@ of the nodes holding no control vote.
 | k28-0012 | twelve killed 30 s | 29,271 | 429 (`owner_bound` 33, `ingress_capacity` 49, `unavailable` 347) | 0 / 0 | 143.6 / 20,027.0 |
 | m7-0110 | as m6; down to the run's end | 21,724 | 7,884 (`owner_bound` 20, `unavailable` 7,864) | 1 / 91 | 256.3 / 14,357.4 |
 | k29-0135 | twelve killed 30 s | 28,983 | 717 (`owner_bound` 28, `ingress_capacity` 40, `unavailable` 649) | 0 / 0 | 259.3 / 18,053.9 |
+| m8-0415 | as m6 | 27,494 | 2,206 (`owner_bound` 11, `unavailable` 2,195) | 0 / 0 | 134.5 / 20,746.0 |
+| k30-0434 | twelve killed 30 s | 29,102 | 598 (`owner_bound` 234, `unavailable` 364) | 0 / 0 | 319.1 / 40,423.8 |
 
-Sessions without their quorum committed again 37 to 70 s after the kill, as their voters came back.
+k30's p99 carries its load generator's own lateness (schedule delay p99 7.5 s on a strained host,
+docker taking 15.9 s to kill the twelve). Sessions without their quorum committed again 37 to 71 s
+after the kill, as their voters came back.
 Those that lost a follower or nothing went at most 0.4 to 1 s without a commit, outside a move or a
 stall below, and those that lost their leader 1.2 to 2.7 s. Confirmed:
 
 - **Heals reach every session they can (01a2f923).** m6 activated two sessions on new voters while
   the twelve were still down (by 52.3 and 59.0 s) and two more after; m5, before the fix, none.
-  k28, k29 and m7 moved four, two and three.
+  k28, k29, m7 and m8 moved four, two, three and three. k30's twelve were back before a heal was
+  planned.
 - **No outcome stayed unknown and no lifecycle was abandoned** where the fault ended within the run
   (22132325, baabea7d). m7's twelve stayed down past the measured window: docker took 186 s to kill
   them, the host's disk saturated throughout. Its 1 unknown and 91 abandoned are all in the four
@@ -18419,7 +18424,8 @@ Found by the confirmation and fixed at the cause:
   doc 24 §9). A controller pass takes one step, the first session with one taking it, and sessions
   were served in ledger order. So a session whose log had committed its cutover waited through every
   step of a session before it that was still serving: m6's windows were 5.2, 8.1, 15.9 and 19.6 s.
-  `focal_directory::by_move_stage` now serves sessions nearest their activation first.
+  `focal_directory::by_move_stage` now serves sessions nearest their activation first. With the next
+  fix as well, m8's windows were 5.7, 8.4 and 5.1 s.
 - **The root group stalled while its owner synced node-local journals** (832a0567). Every node's
   placement intents, and its network controller's, were written by the root's control owner, which
   synced the journal's file and its directory itself. Sampled inside the nodes every 200 ms in k29
@@ -18431,13 +18437,16 @@ Found by the confirmation and fixed at the cause:
   is p9-0639's stop, which c63c52c1's retry got m7 past. A journal writer of each control host's own
   (`focal-journal-<node>`) now makes them, bounded as the owner's queue is, a write not admitted
   handing its journal back. `a_local_intent_is_written_without_its_control_owner` fails without it.
-  Its own run at 33 nodes (m8, k30 on `focal:fleet-c19`) is under way.
+  Confirmed in m8 and k30: the founder's root owner was in a sync in 3 of m8's 2,984 samples, and
+  across k30's every node control owners were blocked on disk in 97 samples, where the journal
+  writers took 801. Each copy of a moving session verified its custody one to three times (two by
+  design), where m7's existing voters took six to eight.
 
-**Open.** A move's window still holds each existing voter's custody, verified again on every pass
-until its readiness was taken (six to eight times, 0.5 to 0.8 s each, in m7), and the directory's
-steps from promotion to activation: 7.5 to 17.4 s in m7, on a saturated host; the readiness intents
-waited on the root's owner, so m8 and k30 measure it again. In the runs that kill the founder, one
-session that lost one voter stopped committing for 2.8 s (k29) and about 4 s (k28) some 13 s after
-the kill, its two live voters unstalled and the host's network dropping nothing. Its door then
-refused the writes past its bound (`ingress_capacity`, 40 and 49): not root-caused. The custody
-rule's decision is the user's, pending.
+**Open.** A move closes its session from its log's cutover to its activation, 5.1 to 8.4 s in m8,
+custody verification and the directory's steps among it; a moved session's last steps can still
+finish well after its activation (m8's 79e8fb08, 17 s). The root's log write still waits on the
+volume's commits: one 7.8 s stall in m8, the shared log's I/O thread in btrfs's `wait_for_commit`
+(condition 10). In k28 and k29, one session that lost one voter stopped committing for about 4 and
+2.8 s some 13 s after the kill, its two live voters unstalled, and refused the writes past its
+door's bound (`ingress_capacity`, 49 and 40). k30, the same fault on the fixed tree, had none, but
+its cause is not shown. The custody rule's decision is the user's, pending.
