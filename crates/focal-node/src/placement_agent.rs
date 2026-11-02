@@ -1243,7 +1243,11 @@ impl PlacementAgent {
             {
                 return Ok(step);
             }
-            for descriptor in directory.sessions.values() {
+            // Nearest its activation first: a session its move closed to its clients is served
+            // before any still serving (`focal_directory::by_move_stage`).
+            let sessions = focal_directory::by_move_stage(&directory.sessions)
+                .map_err(|_| AgentError::Capacity)?;
+            for descriptor in sessions.iter().copied() {
                 let ledger = descriptor.ledger;
                 self.step = Some(("members", ledger));
                 Self::sync_members(handles, descriptor, directory).await?;
@@ -1288,7 +1292,7 @@ impl PlacementAgent {
                 {
                     return Ok(step);
                 }
-                for descriptor in directory.sessions.values() {
+                for descriptor in sessions.iter().copied() {
                     self.step = Some(("control", descriptor.ledger));
                     let controlled = self
                         .control(

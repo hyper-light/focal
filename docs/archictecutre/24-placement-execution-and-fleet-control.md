@@ -450,7 +450,16 @@ checkpoint, the session's applied membership and latest configuration
 receipt (`registration_facts`), the root authority grant, and the session's
 placement fences, so a restarted or newly elected controller resumes at the
 same step, and every command goes through the agent's exact-retry journals
-(§7). One tick performs at most one step per session.
+(§7). One tick performs at most one step: the first session with a step
+to take takes it. Sessions are served nearest their activation first
+(`focal_directory::by_move_stage`: a recorded cutover, then custody verified
+everywhere, custody, catch-up, preparation, a plan not begun, no move), in
+ledger order among equals, because from the log's cutover a session is closed
+to its clients until its activation (§3). Served in ledger order alone, a
+session closed to its clients waited through every step of a session before
+it that was still serving: in fleet33 m6 (2026-11-02), four moves' sessions
+went 5.2 s without a commit for the first in ledger order and 19.6 s for one
+whose three promotions waited behind another session's move.
 
 **The controller drives a session through its leader (2026-09-10, R9.3).**
 The session's log is changed by the node that leads it. When this node

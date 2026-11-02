@@ -387,3 +387,42 @@ pub fn majority_alive(placement: &Placement, nodes: &BTreeMap<u64, NodeRecord>) 
         .count();
     alive.saturating_mul(2) > placement.voters.len()
 }
+
+/// How near a session's pending move is to its activation: no move, or a
+/// failed one, is 0, and each phase a move passes through one more, a
+/// recorded cutover the most. From custody on, the session's log may have
+/// committed its cutover record, after which the session is closed to its
+/// clients until the activation (24 §3).
+pub fn move_stage(descriptor: &SessionDescriptor) -> u8 {
+    match descriptor.pending.as_ref().map(|plan| plan.phase) {
+        None | Some(PlacementPhase::Failed) => 0,
+        Some(PlacementPhase::Planned) => 1,
+        Some(PlacementPhase::Preparing) => 2,
+        Some(PlacementPhase::Catchup) => 3,
+        Some(PlacementPhase::Custody) => 4,
+        Some(PlacementPhase::Promoting) => 5,
+        Some(PlacementPhase::Cutover) => 6,
+    }
+}
+
+/// The sessions in the order a controller serves them: nearest their
+/// activation first ([`move_stage`]), in ledger order among equals. A
+/// controller's pass takes one step, and the first session that has one
+/// takes it. So a session closed to its clients but served after one still
+/// serving stayed closed through every step that one took (fleet33 m6,
+/// 2026-11-02: four moves went without a commit for longer the later their
+/// session came in ledger order, from 5.2 s for the first to 19.6 s for one
+/// whose promotions waited behind another session's move).
+pub fn by_move_stage(
+    sessions: &BTreeMap<LedgerId, SessionDescriptor>,
+) -> Result<Vec<&SessionDescriptor>, DirectoryError> {
+    let mut ordered = Vec::new();
+    ordered
+        .try_reserve_exact(sessions.len())
+        .map_err(|_| DirectoryError::Capacity)?;
+    ordered.extend(sessions.values());
+    ordered.sort_unstable_by_key(|descriptor| {
+        (std::cmp::Reverse(move_stage(descriptor)), descriptor.ledger)
+    });
+    Ok(ordered)
+}

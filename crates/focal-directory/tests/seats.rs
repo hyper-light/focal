@@ -761,3 +761,50 @@ fn a_session_can_change_its_voters_only_while_most_of_them_live() {
     assert!(!majority_alive(&sitting(&[1, 2, 5, 6], &[1, 2], 1), &nodes));
     assert!(majority_alive(&sitting(&[1, 2, 3, 5], &[1, 2], 1), &nodes));
 }
+
+#[test]
+fn a_session_nearer_its_activation_is_served_first() {
+    // A controller's pass takes one step, the first session with one taking it: a session its
+    // move closed to its clients comes before one still serving, whatever its ledger
+    // (fleet33 m6, 2026-11-02).
+    let desired = sitting(&[1, 2, 3], &[1, 2], 1);
+    let phases = [
+        (1, None),
+        (2, Some(PlacementPhase::Preparing)),
+        (3, Some(PlacementPhase::Promoting)),
+        (4, Some(PlacementPhase::Custody)),
+        (5, Some(PlacementPhase::Cutover)),
+        (6, Some(PlacementPhase::Promoting)),
+        (7, Some(PlacementPhase::Failed)),
+        (8, Some(PlacementPhase::Catchup)),
+        (9, Some(PlacementPhase::Planned)),
+    ];
+    let mut sessions = BTreeMap::new();
+    for (k, phase) in phases {
+        let mut session = planned(k, 1, &desired);
+        match phase {
+            None => session.pending = None,
+            Some(phase) => session.pending.as_mut().unwrap().phase = phase,
+        }
+        sessions.insert(session.ledger, session);
+    }
+    let ledger = |k: u128| LedgerId {
+        tenant: TenantId::from_u128(1),
+        session: SessionId::from_u128(k),
+    };
+    let order: Vec<LedgerId> = by_move_stage(&sessions)
+        .unwrap()
+        .iter()
+        .map(|session| session.ledger)
+        .collect();
+    // A recorded cutover, then custody verified everywhere (in ledger order), custody, catch-up,
+    // preparation, a plan not begun, and last no move and a failed one, in ledger order.
+    let expected: Vec<LedgerId> = [5, 3, 6, 4, 8, 2, 9, 1, 7]
+        .into_iter()
+        .map(ledger)
+        .collect();
+    assert_eq!(order, expected);
+    assert_eq!(move_stage(&sessions[&ledger(5)]), 6);
+    assert_eq!(move_stage(&sessions[&ledger(1)]), 0);
+    assert_eq!(move_stage(&sessions[&ledger(7)]), 0);
+}
