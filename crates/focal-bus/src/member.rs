@@ -723,6 +723,11 @@ pub struct Member {
     /// admits, what the publishers can have unacknowledged.
     owed_bound: usize,
     parked: VecDeque<Parked>,
+    /// Bound on a publish's wait before proposal; its owner may shorten the transport's idle
+    /// bound to its callers' delivery deadline (CP-T2.2, publisher-after-kill step 2).
+    publish_wait: Duration,
+    /// The clock its owner last supplied, also used by parked publishes in simulations.
+    told: Instant,
     /// Answers to publishes whose publisher's lane had no room, each publisher's in the order they
     /// were made: sent as its lane makes room (`Event::LaneRoom`), never dropped, the publisher's
     /// publishes held meanwhile so it sends nothing more to be answered (Kafka's network layer
@@ -1068,6 +1073,8 @@ impl Member {
             stages: Box::new(Stages::new(clients.saturating_mul(lane_window))),
             owed_bound: clients.saturating_mul(lane_window),
             parked: VecDeque::new(),
+            publish_wait: limits::IDLE_TIMEOUT,
+            told: now,
             answers: HashMap::new(),
             fenced: false,
             seen_term: 0,
@@ -1094,6 +1101,13 @@ impl Member {
     /// The node's id.
     pub const fn id(&self) -> u64 {
         self.id
+    }
+
+    /// Bounds a batch's wait before proposal, from its first arrival. Expiry answers unavailable,
+    /// never acknowledged; the publisher still bounds its own delivery wait independently. The
+    /// transport's idle timeout is the outer bound when an owner asks for a longer one.
+    pub fn set_publish_wait(&mut self, wait: Duration) {
+        self.publish_wait = wait.min(limits::IDLE_TIMEOUT);
     }
 
     /// What the node did, its log's writes as the log counts them now.
@@ -1241,6 +1255,7 @@ impl Member {
         B: Budget<<Bus as Classes>::Class>,
         D: Directory<Role = <Bus as Classes>::Role>,
     {
+        self.told = now;
         match event {
             Event::Frame {
                 kind: Kind::Raft,
@@ -1372,7 +1387,13 @@ impl Member {
         };
         let key = (batch.stream(), batch.producer(), batch.sequence());
         if !self.replica.is_leader() {
-            self.redirect(endpoint, peer, key);
+            if self.replica.leader() == self.id {
+                // A leadership hint is not permission to propose. Hold the publisher until the
+                // core can serve, a different leader is known, or this batch's deadline passes.
+                self.park(endpoint, peer, lane, bytes);
+            } else {
+                self.redirect(endpoint, peer, key);
+            }
             return;
         }
         if self.owed.contains_key(&(peer, key)) {
@@ -1466,11 +1487,12 @@ impl Member {
         D: Directory<Role = <Bus as Classes>::Role>,
     {
         // The transport reads nothing more from a held lane, but what it read before the hold
-        // still comes: it parks behind, in order, never dropped. A publish the node cannot keep
-        // (no memory, or a lane it cannot hold) is answered with the leader, sent again by its
-        // publisher.
+        // still comes: it parks behind, in order. A publish the node cannot keep is answered
+        // unavailable, never with this node's own name. The same admitted client/window bound
+        // that caps owed acknowledgements caps parked batches, even across reconnects.
         let mut batch = Vec::new();
-        if batch.try_reserve_exact(bytes.len()).is_err()
+        if self.parked.len() >= self.owed_bound
+            || batch.try_reserve_exact(bytes.len()).is_err()
             || self.parked.try_reserve(1).is_err()
             || endpoint.hold_lane(peer, lane).is_err()
         {
@@ -1485,7 +1507,7 @@ impl Member {
             peer,
             lane,
             batch,
-            parked_at: Instant::now(),
+            parked_at: self.told,
         });
         self.stats.parked = self.stats.parked.saturating_add(1);
     }
@@ -1496,6 +1518,23 @@ impl Member {
         B: Budget<<Bus as Classes>::Class>,
         D: Directory<Role = <Bus as Classes>::Role>,
     {
+        // Expiry cannot depend on proposal room: that was the reason for parking. Arrivals are
+        // ordered, so each pass removes the oldest expired batch or stops.
+        while self.parked.front().is_some_and(|parked| {
+            self.told.saturating_duration_since(parked.parked_at) >= self.publish_wait
+        }) {
+            let Some(parked) = self.parked.pop_front() else {
+                break;
+            };
+            if let Ok(batch) = Batch::parse_verified(&parked.batch, parked.batch.len()) {
+                self.redirect(
+                    endpoint,
+                    parked.peer,
+                    (batch.stream(), batch.producer(), batch.sequence()),
+                );
+            }
+            self.release_publisher(endpoint, parked.peer, parked.lane);
+        }
         // Bounded: each turn takes one parked publish out, or stops.
         while self.owed.len() < self.owed_bound {
             let Some(parked) = self.parked.front() else {
@@ -1519,9 +1558,12 @@ impl Member {
                         // The group has yet to commit enough: the publisher waits on.
                         break;
                     }
-                    self.stages.parked.record(nanos(parked_at.elapsed()));
+                    self.stages
+                        .parked
+                        .record(nanos(self.told.saturating_duration_since(parked_at)));
                     true
                 }
+                Some(_) if self.replica.leader() == self.id => break,
                 Some(key) => {
                     self.redirect(endpoint, peer, key);
                     true
@@ -1530,11 +1572,58 @@ impl Member {
             };
             if taken {
                 self.parked.pop_front();
-                let answered = self.answers.get(&peer).is_none_or(VecDeque::is_empty);
-                let parked = self.parked.iter().any(|p| p.peer == peer && p.lane == lane);
-                if answered && !parked {
-                    let _ = endpoint.release_lane(peer, lane);
-                }
+                self.release_publisher(endpoint, peer, lane);
+            }
+        }
+    }
+
+    /// A lane waits until both its queued answers and its parked batches have left.
+    fn release_publisher<B, D>(
+        &self,
+        endpoint: &mut Endpoint<Bus, B, D>,
+        peer: PeerId,
+        lane: LaneId,
+    ) where
+        B: Budget<<Bus as Classes>::Class>,
+        D: Directory<Role = <Bus as Classes>::Role>,
+    {
+        let answered = self.answers.get(&peer).is_none_or(VecDeque::is_empty);
+        let parked = self.parked.iter().any(|p| p.peer == peer && p.lane == lane);
+        if answered && !parked {
+            let _ = endpoint.release_lane(peer, lane);
+        }
+    }
+
+    /// A fenced member will be replaced while its endpoint may live on. Release its lane holds
+    /// before its queues and deadlines disappear, and close each affected connection so its
+    /// publisher learns to resend what was never acknowledged (CP-T2.2).
+    fn release_for_reopen<B, D>(&mut self, endpoint: &mut Endpoint<Bus, B, D>, now: Instant)
+    where
+        B: Budget<<Bus as Classes>::Class>,
+        D: Directory<Role = <Bus as Classes>::Role>,
+    {
+        // Bounded by the admitted publishers and their lane windows. Hash-map order must not
+        // order connection closes: the deterministic simulator replays every resulting frame.
+        let mut held: Vec<(PeerId, LaneId)> = self
+            .parked
+            .iter()
+            .map(|p| (p.peer, p.lane))
+            .chain(self.answers.keys().map(|peer| (*peer, LANE)))
+            .chain(self.owed.keys().map(|(peer, _)| (*peer, LANE)))
+            .collect();
+        held.sort_unstable();
+        held.dedup();
+        self.parked.clear();
+        self.answers.clear();
+        self.owed.clear();
+        for &(peer, lane) in &held {
+            let _ = endpoint.release_lane(peer, lane);
+        }
+        let mut previous = None;
+        for (peer, _) in held {
+            if previous != Some(peer) {
+                endpoint.disconnect(now, peer);
+                previous = Some(peer);
             }
         }
     }
@@ -1546,11 +1635,17 @@ impl Member {
         D: Directory<Role = <Bus as Classes>::Role>,
     {
         let (stream, producer, sequence) = key;
+        let mut leader = self.leader();
+        // No usable leader is the protocol's existing wait response. Naming this node after it
+        // refused the batch makes a publisher resend forever to the same unavailable target.
+        if leader.node == Some(self.id) {
+            leader.node = None;
+        }
         let redirect = Redirect {
             stream,
             producer,
             sequence,
-            leader: self.leader(),
+            leader,
         };
         self.answer(endpoint, peer, Answer::Redirect(redirect.encode()));
         self.stats.redirected = self.stats.redirected.saturating_add(1);
@@ -1862,6 +1957,7 @@ impl Member {
         B: Budget<<Bus as Classes>::Class>,
         D: Directory<Role = <Bus as Classes>::Role>,
     {
+        self.told = now;
         self.redial(endpoint, now);
         self.written(now);
         self.pairs();
@@ -1915,6 +2011,12 @@ impl Member {
             self.stages.observe(leads, last, reached, Instant::now());
         }
         self.compact_behind_window(waker, clock);
+        // Compaction can fence too: clean up after the last fence-capable stage, before the
+        // owner can replace this member while retaining its endpoint (CP-T2.2).
+        if self.fenced {
+            self.release_for_reopen(endpoint, now);
+            return;
+        }
         self.settle_leadership(endpoint);
         self.unpark(endpoint);
         let term = self.replica.term();
@@ -2092,13 +2194,359 @@ impl Member {
         let replica = self.replica.deadline().and_then(at);
         let stream = self.liveness.wake().and_then(at);
         let dial = self.links.iter().filter_map(|link| link.next).min();
-        [replica, stream, dial].into_iter().flatten().min()
+        let publish = self.parked.front().map(|parked| {
+            parked
+                .parked_at
+                .checked_add(self.publish_wait)
+                .unwrap_or(parked.parked_at)
+        });
+        [replica, stream, dial, publish].into_iter().flatten().min()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Written(std::sync::mpsc::SyncSender<()>);
+
+    impl std::task::Wake for Written {
+        fn wake(self: std::sync::Arc<Self>) {
+            let _ = self.0.try_send(());
+        }
+
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            let _ = self.0.try_send(());
+        }
+    }
+
+    fn publisher_rig(
+        dir: &Path,
+    ) -> (
+        Member,
+        Endpoint<Bus, crate::budget::BusBudget, crate::directory::BusDirectory>,
+    ) {
+        let memory = 96 << 20;
+        let budget = limits::group_budget(memory).unwrap();
+        let node = Node::new(
+            crate::node::NodeConfig {
+                segment_bytes: crate::node::NodeConfig::SEGMENT_BYTES,
+                streams: 4,
+                subscriptions: 4,
+                producers: 4,
+            },
+            budget.clone(),
+        )
+        .unwrap();
+        let mut member = Member::open(
+            MemberSettings {
+                id: 1,
+                peers: vec![
+                    (2, "127.0.0.1:2".parse().unwrap()),
+                    (3, "127.0.0.1:3".parse().unwrap()),
+                ],
+                data: dir.join("node"),
+                key_file: dir.join("node.key"),
+                memory_bytes: memory as u64,
+                fates: Vec::new(),
+                spanning: 2,
+            },
+            node,
+            vec![1],
+            1,
+            4,
+            budget.clone(),
+            Instant::now(),
+        )
+        .unwrap();
+        member.replica.campaign().unwrap();
+        // R-7 counts the candidate's own vote only once its hard state is durable. Wait for
+        // that actual log completion, rather than treating campaign() as synchronous election.
+        let (written, completions) = std::sync::mpsc::sync_channel(1);
+        let waker = Waker::from(std::sync::Arc::new(Written(written)));
+        let mut output = Output::default();
+        for _ in 0..16 {
+            output.clear();
+            let driven = member
+                .replica
+                .drive(member.now_ns(Instant::now()), &waker, &mut output)
+                .unwrap();
+            if member.is_leader() {
+                break;
+            }
+            if !driven.more {
+                completions
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("the candidate's vote write completed");
+            }
+        }
+        assert!(member.is_leader());
+        assert_eq!(member.leader().node, Some(1));
+        let ids =
+            crate::pki::load_or_make(&dir.join("ids"), Some(&dir.join("ids.key")), 3, 1).unwrap();
+        let own = ids.node(1).unwrap();
+        let mut directory = crate::directory::BusDirectory::new(4);
+        directory
+            .enroll(
+                &ids.clients[0].certificate,
+                4,
+                crate::wire::Role::Client,
+                "focal-bus-client-1",
+            )
+            .unwrap();
+        let credentials = hyper_transport::tls::Credentials {
+            chain: vec![hyper_transport::tls::CertificateDer::from(
+                own.certificate.clone(),
+            )],
+            key: hyper_transport::tls::PrivateKeyDer::Pkcs8(
+                hyper_transport::tls::PrivatePkcs8KeyDer::from(own.key.clone()),
+            ),
+            roots: vec![hyper_transport::tls::CertificateDer::from(ids.root)],
+        };
+        let endpoint = Endpoint::new(
+            hyper_transport::Config {
+                tls: hyper_transport::tls::Tls::mutual(&credentials, true).unwrap(),
+                role: crate::wire::Role::Node,
+                limits: limits::node(1, 2).unwrap(),
+                congestion: Default::default(),
+            },
+            crate::budget::BusBudget::new(budget),
+            directory,
+            Instant::now(),
+        )
+        .unwrap();
+        (member, endpoint)
+    }
+
+    /// CP-T2.2 / publisher-after-kill step 2: a leader that cannot hold a publisher's lane
+    /// answers unavailable, preserving the batch's identity and term, never naming itself as
+    /// somewhere the publisher should send the same refused batch again.
+    #[test]
+    fn cp_t2_2_a_leader_that_cannot_park_never_redirects_the_publisher_to_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut member, mut endpoint) = publisher_rig(dir.path());
+        let mut builder = crate::batch::BatchBuilder::new();
+        builder.begin(&crate::batch::Producing {
+            stream: 5,
+            producer: 7,
+            sequence: 0,
+            flags: 0,
+            timestamp: 0,
+        });
+        builder.push(0, b"after-kill").unwrap();
+        let batch = builder.finish().unwrap().to_vec();
+        // The connection disappeared after its frame arrived. An answer already queued keeps
+        // the next answer observable without sockets or a wall-clock wait.
+        member.answers.insert(
+            4,
+            VecDeque::from([Answer::Ack(
+                Ack {
+                    stream: 5,
+                    producer: 7,
+                    sequence: 9,
+                    base: 0,
+                    count: 1,
+                    class: member.class.code(),
+                }
+                .encode(),
+            )]),
+        );
+        member.park(&mut endpoint, 4, LANE, &batch);
+        assert!(member.parked.is_empty());
+        let answer = member.answers.get(&4).unwrap().back().unwrap();
+        assert!(matches!(answer, Answer::Redirect(_)));
+        let redirect = Redirect::decode(answer.bytes()).unwrap();
+        assert_eq!(
+            (redirect.stream, redirect.producer, redirect.sequence),
+            (5, 7, 0)
+        );
+        assert_eq!(redirect.leader.term, member.term());
+        assert_eq!(
+            redirect.leader.node, None,
+            "a refused publish must not be sent back to the node that just refused it"
+        );
+    }
+
+    /// CP-T2.2 / publisher-after-kill step 2: room for proposals may stay exhausted. A parked
+    /// batch still ends at the member's wait bound, even with no room to owe another proposal.
+    #[test]
+    fn cp_t2_2_a_parked_publish_expires_even_when_no_more_proposals_can_be_owed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut member, mut endpoint) = publisher_rig(dir.path());
+        let mut builder = crate::batch::BatchBuilder::new();
+        builder.begin(&crate::batch::Producing {
+            stream: 5,
+            producer: 7,
+            sequence: 0,
+            flags: 0,
+            timestamp: 0,
+        });
+        builder.push(0, b"after-kill").unwrap();
+        let batch = builder.finish().unwrap().to_vec();
+        member.parked.push_back(Parked {
+            peer: 4,
+            lane: LANE,
+            batch,
+            parked_at: member.told - limits::IDLE_TIMEOUT,
+        });
+        member.owed_bound = 0;
+        member.unpark(&mut endpoint);
+        assert!(
+            member.parked.is_empty(),
+            "the deadline must not depend on proposal room"
+        );
+    }
+
+    /// CP-T2.2: a stale self hint holds the same batch until its configured deadline, without
+    /// proposing it or turning it into a fresh self-redirect. Expiry keeps its original identity.
+    #[test]
+    fn cp_t2_2_a_member_that_cannot_serve_holds_a_batch_until_its_delivery_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut member, mut endpoint) = publisher_rig(dir.path());
+        // Fault injection: a stale hint after the core stopped serving this term.
+        member
+            .replica
+            .step(Message {
+                msg_type: hyper_raft::proto::MessageType::MsgHeartbeat,
+                from: 1,
+                to: 1,
+                term: member.term() + 1,
+                ..Message::default()
+            })
+            .unwrap();
+        assert!(!member.is_leader());
+        let mut builder = crate::batch::BatchBuilder::new();
+        builder.begin(&crate::batch::Producing {
+            stream: 5,
+            producer: 7,
+            sequence: 0,
+            flags: 0,
+            timestamp: 0,
+        });
+        builder.push(0, b"after-kill").unwrap();
+        let batch = builder.finish().unwrap().to_vec();
+        let began = member.told;
+        member.set_publish_wait(Duration::from_secs(10));
+        member.parked.push_back(Parked {
+            peer: 4,
+            lane: LANE,
+            batch,
+            parked_at: began,
+        });
+        member.told = began + Duration::from_secs(9);
+        member.unpark(&mut endpoint);
+        assert_eq!(member.parked.len(), 1);
+        assert_eq!(member.stats.proposed, 0);
+        assert_eq!(member.stats.redirected, 0);
+        assert!(member.deadline().unwrap() <= began + Duration::from_secs(10));
+        member.answers.insert(
+            4,
+            VecDeque::from([Answer::Ack(
+                Ack {
+                    stream: 5,
+                    producer: 7,
+                    sequence: 9,
+                    base: 0,
+                    count: 1,
+                    class: member.class.code(),
+                }
+                .encode(),
+            )]),
+        );
+        member.told = began + Duration::from_secs(10);
+        member.unpark(&mut endpoint);
+        assert!(member.parked.is_empty());
+        let answer = member.answers.get(&4).unwrap().back().unwrap();
+        let redirect = Redirect::decode(answer.bytes()).unwrap();
+        assert_eq!(
+            (redirect.stream, redirect.producer, redirect.sequence),
+            (5, 7, 0)
+        );
+        assert_eq!(redirect.leader.node, None);
+        assert_eq!(member.stats.proposed, 0);
+        // Learning another leader still redirects to that node, at its newer term.
+        member
+            .replica
+            .step(Message {
+                msg_type: hyper_raft::proto::MessageType::MsgHeartbeat,
+                from: 2,
+                to: 1,
+                term: 2,
+                ..Message::default()
+            })
+            .unwrap();
+        member.publish(&mut endpoint, 4, LANE, builder.finish().unwrap());
+        let redirect =
+            Redirect::decode(member.answers.get(&4).unwrap().back().unwrap().bytes()).unwrap();
+        assert_eq!(
+            redirect.leader,
+            Leader {
+                node: Some(2),
+                term: 2
+            }
+        );
+    }
+
+    /// CP-T2.2: replacing a fenced member retains the endpoint. Its unexpired parked batch and
+    /// queued answers must leave no hold behind for that endpoint's next publisher connection.
+    #[test]
+    fn cp_t2_2_reopening_a_fenced_member_releases_its_publishers_lanes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut member, mut endpoint) = publisher_rig(dir.path());
+        let now = Instant::now();
+        let address = "127.0.0.1:4".parse().unwrap();
+        endpoint.connect(now, 4, address).unwrap();
+        endpoint.hold_lane(4, LANE).unwrap();
+        let mut builder = crate::batch::BatchBuilder::new();
+        builder.begin(&crate::batch::Producing {
+            stream: 5,
+            producer: 7,
+            sequence: 0,
+            flags: 0,
+            timestamp: 0,
+        });
+        builder.push(0, b"after-kill").unwrap();
+        member.parked.push_back(Parked {
+            peer: 4,
+            lane: LANE,
+            batch: builder.finish().unwrap().to_vec(),
+            parked_at: now,
+        });
+        member.owed_bound = 0;
+        member.fenced = true;
+        member.answers.insert(
+            4,
+            VecDeque::from([Answer::Ack(
+                Ack {
+                    stream: 5,
+                    producer: 7,
+                    sequence: 8,
+                    base: 8,
+                    count: 1,
+                    class: member.class.code(),
+                }
+                .encode(),
+            )]),
+        );
+        member.owed.insert((4, (5, 7, 9)), now);
+        assert!(!member.answers.is_empty() && !member.owed.is_empty());
+        member.turn(&mut endpoint, Waker::noop(), now, &mut |_| {});
+        assert!(
+            member.parked.is_empty(),
+            "a fenced member must release its unexpired batches before replacement"
+        );
+        assert!(member.answers.is_empty() && member.owed.is_empty());
+        drop(member);
+        let (replacement, _) = publisher_rig(dir.path());
+        assert!(replacement.parked.is_empty());
+        endpoint.connect(now, 4, address).unwrap();
+        // A hold lives in the endpoint's peer table, across connections. Every place is free:
+        // retaining LANE from the old member would refuse the last one here as Lanes.
+        let lanes = limits::node(1, 2).unwrap().lanes_per_peer;
+        for lane in 100..100 + lanes {
+            endpoint.hold_lane(4, lane).unwrap();
+        }
+    }
 
     /// The pair's dialer dials again at once after a connection that lasted its back-off, and after
     /// dials that gave none lasting, one back-off from the last dial's start, doubling from

@@ -168,6 +168,24 @@ Found on the way, each root-caused:
   bare-metal machine, every count matching). Every publish is now answered: an answer that finds its
   publisher's lane full waits, in order, its publisher's publishes held until it goes; the client
   sends in its session's order, and sends again what goes unanswered for a serve period.
+- **An unavailable node redirected a publish to itself.** Quiver's kill lab (CP-T2.2,
+  publisher-after-kill step 2) found a node whose leader hint still named itself while it could
+  not serve, and the unkept-publish path also answered with its own name. A publish in the first
+  case now parks until the node serves, another leader is known, or its wait expires. The parked
+  queue is capped by the admitted clients' lane windows; a batch it cannot keep, or whose wait
+  expires, gets the existing redirect with no available leader rather than a self-redirect.
+  `Member::set_publish_wait` lets its owner use its caller's delivery bound (Quiver uses its
+  quorum wait); the transport's idle timeout is the outer bound. Expiry runs even while no more
+  proposals can be owed, and its deadline wakes an otherwise quiet member. The publisher must
+  still enforce its own deadline independently: an unavailable answer is no acknowledgement,
+  and an earlier copy of the same batch may yet commit. The batch's producer and sequence make
+  its resend safe (P6). A member fenced by its drive or compaction releases the lanes it held and
+  closes the affected publishers' connections in peer order before its owner replaces it; the
+  endpoint may survive that replacement, while the old queues and their deadlines do not. The
+  four `member::tests::cp_t2_2_*` tests check the stale hint, unkept batch, expiry without proposal
+  room, a redirect to a different leader, and the retained endpoint's holds across reopening.
+  The unkept, expiry and reopen reproductions fail on the preceding code. No wire layout or kind
+  changed.
 - **A shared disk's stall elects.** The same run's step-down: each node's log flush took 584 to
   587 ms in the same second, the bare-metal machine's one disk stalling under all three nodes, so
   no node's heartbeat was proved for 0.6 s and each node suspected both others; the leader, left no
