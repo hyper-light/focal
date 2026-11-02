@@ -18382,7 +18382,8 @@ decision is the user's, pending); a session without its quorum takes no write un
 back; a move closes its session to clients from its cutover to its activation (k27's three moves
 came with 4.1 to 22.2 s without a commit in their sessions, the window from cutover to activation
 alone not yet separated); one bootstrap in 69 stopped at an admin call the founder could not answer,
-the root group having elected a leader the founder and one other node never heard of, not
-root-caused, the nodes saying nothing of the group's elections; on btrfs a node's log syncs wait on
+through whose 20 s the founder led the root group and committed nothing, another leader elected
+only as the call ended (not root-caused; a failed bootstrap now keeps each node's metrics and its
+container's pressure); on btrfs a node's log syncs wait on
 the volume's commits (condition 10); the confirmation at 33 nodes of what these runs found (m6, k28
 on `focal:fleet-c17`) waits on the host.

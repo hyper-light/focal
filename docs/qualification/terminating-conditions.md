@@ -99,9 +99,9 @@ while a copy is down its artifact steps wait or are refused (`unavailable` at th
 clock, `owner_bound` at the custody check): every refusal at 33 nodes that is not a session without
 its quorum is this rule's, and whether a quorum of copies (f+1) suffices is the user's decision,
 pending. A session whose quorum is down takes no write until its voters are back. One bootstrap in
-69 stopped at an admin call the founder could not answer, the root group having elected another
-leader the founder never heard of: not root-caused, the nodes saying nothing of the group's
-elections. A node's log syncs wait on its file system's commits, up to 5.2 s on the host's btrfs
+69 stopped at an admin call the founder could not answer: through the call's 20 s the founder led
+the root group and committed nothing, another leader elected only as the call ended. Not
+root-caused; a failed bootstrap now keeps each node's metrics and its container's pressure. A node's log syncs wait on its file system's commits, up to 5.2 s on the host's btrfs
 volume, where the harness keeps every node's log (condition 10). Under 3% loss a write's p99 is 753
 to 2,244 ms against 462 to 574 without, its artifact steps held at the evidence door (the 2026-10-28
 entry's open items).

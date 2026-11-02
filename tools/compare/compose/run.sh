@@ -710,6 +710,10 @@ case "$system" in
     # root owner held behind its own write (`focal_root_periods_refused_total`), its longest stall
     # (`focal_root_period_longest_ms`) and the frames it held and let go (p9-0639, 2026-11-01: the
     # founder answered no admin call while its root group led elsewhere, and nothing said why).
+    # What held a stalled owner is in its container's cgroup: the time its tasks waited on the CPU,
+    # the disk and memory (`*.pressure`, totals in microseconds since the container started) and
+    # whether it reached its memory limit (`memory.events`); and the host's, beside the commits of
+    # the volume Docker keeps the nodes' data on where it is btrfs (whose commits held every sync).
     bash focal-bootstrap.sh || {
       status=$?
       for n in "${focal_nodes[@]}"; do
@@ -717,8 +721,19 @@ case "$system" in
           > "$out/bootstrap.$n.health.json" 2>/dev/null || true
         timeout 30 "${compose[@]}" --profile focal exec -T "$n" focal --data-dir /data inspect node --metrics \
           > "$out/bootstrap.$n.metrics.txt" 2>/dev/null || true
+        timeout 30 "${compose[@]}" --profile focal exec -T "$n" sh -c \
+          'for f in cpu.pressure io.pressure memory.pressure memory.events memory.current memory.max io.stat; do echo "== $f"; cat "/sys/fs/cgroup/$f"; done' \
+          > "$out/bootstrap.$n.cgroup.txt" 2>&1 || true
         timeout 30 "${compose[@]}" --profile focal logs --no-color --tail 300 "$n" > "$out/bootstrap.$n.log" 2>&1 || true
       done
+      {
+        date -Is
+        for f in cpu io memory; do echo "== /proc/pressure/$f"; cat "/proc/pressure/$f"; done
+        uuid=$(findmnt -no UUID -T "$(docker info -f '{{.DockerRootDir}}')" 2>/dev/null)
+        if [ -n "$uuid" ] && [ -r "/sys/fs/btrfs/$uuid/commit_stats" ]; then
+          echo "== btrfs $uuid commit_stats"; cat "/sys/fs/btrfs/$uuid/commit_stats"
+        fi
+      } > "$out/bootstrap.host.txt" 2>&1 || true
       exit "$status"
     }
     # The cluster the run measured: its nodes as written (their addresses, zones and limits), the
