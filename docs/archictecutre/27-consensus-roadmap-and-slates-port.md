@@ -507,6 +507,19 @@ election timeout at the pace the group runs at (`retirement_hold`): two seconds 
 network, forty across the planet at the ceiling of the pace. A member that is back
 within it keeps its seat. What an operator asks for is not held.
 
+*A heal whose cause is gone is withdrawn* (2026-11-03). A move ran to its activation
+whatever became of the death it answered: a node never cut off, held dead for about
+2.2 s as a dozen others rejoined, kept its seat only after its session was closed 6.5 s
+for the move's window, and two heals of a run with twelve nodes down for 66 s cut over
+after their voters were back. The controller now aborts its own heal (the plan whose
+operation it derives for the session's authority, `placement_controller::heal_operation`)
+once the active placement verifies against the registry again, every voter it would
+have replaced alive, while no cutover barrier is committed (`withdraws`). The partition
+hands every copy the plan brought that the active placement does not keep to
+retirement, so a learner or a voter promoted before the cutover leaves the group's
+membership as an activation's leftover copies do (`SessionChange::Abort`). After the
+barrier the move completes. A plan an operator or a policy asked for is not withdrawn.
+
 *Every session has its turn.* The partition's leader controls its sessions in ledger
 order, and one it cannot act on leaves the sessions after it theirs: a session most of
 whose voters the directory holds dead is passed over until enough are back, since

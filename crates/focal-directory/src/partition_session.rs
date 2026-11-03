@@ -370,7 +370,33 @@ pub(crate) fn apply_session(
             if pending(session, *operation)?.barrier.is_some() {
                 return Err(DirectoryError::Phase);
             }
-            session.pending = None;
+            let plan = session.pending.take().ok_or(DirectoryError::Phase)?;
+            // A copy the plan brought that the active placement does not keep is drained and
+            // retired as an activation's leftover copies are: one that joined the group's
+            // membership (a learner, or a voter promoted before the cutover) leaves it, then is
+            // forgotten. Each is a node of the plan's placement, so the copies retiring stay within
+            // the placement's bound.
+            let kept = session.active.placement.nodes();
+            for (node, progress) in &plan.progress {
+                if kept.contains(node) || session.retiring.contains_key(node) {
+                    continue;
+                }
+                session.retiring.insert(
+                    *node,
+                    AssignmentProgress {
+                        node: *node,
+                        node_generation: progress.node_generation,
+                        roles: progress.roles.clone(),
+                        phase: AssignmentPhase::Active,
+                        attempt: 1,
+                        through: progress.through,
+                        // What the copy verified, if it got that far: the plan's placement, never
+                        // activated, or nothing.
+                        custody_epoch: progress.custody_epoch,
+                        refusal: None,
+                    },
+                );
+            }
         }
         SessionChange::Drain { operation, node } => {
             if session.authority.operation != *operation {

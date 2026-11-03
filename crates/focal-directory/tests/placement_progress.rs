@@ -883,6 +883,35 @@ fn refusals_fail_one_attempt_and_the_record_stays_bounded() {
     );
     change(&mut directory, SessionChange::Abort { operation: OP });
     assert!(session(&directory).pending.is_none());
+    // The copies the plan brought that the active placement does not keep are drained and retired
+    // as an activation's leftover copies are, so a withdrawn heal leaves none of them behind in
+    // the group's membership.
+    let retiring = &session(&directory).retiring;
+    assert_eq!(retiring.keys().copied().collect::<Vec<_>>(), vec![2, 3]);
+    assert!(
+        retiring
+            .values()
+            .all(|copy| copy.phase == AssignmentPhase::Active)
+    );
+    // Until they are retired the guarantee names them draining; then they are gone.
+    let authority = session(&directory).authority.operation;
+    for node in [2, 3] {
+        change(
+            &mut directory,
+            SessionChange::Drain {
+                operation: authority,
+                node,
+            },
+        );
+        change(
+            &mut directory,
+            SessionChange::Retire {
+                operation: authority,
+                node,
+            },
+        );
+    }
+    assert!(session(&directory).retiring.is_empty());
     // The aborted plan's refusals stay on record, but the active placement
     // is whole and provides its level: they are history, not blockers.
     let guarantee =
@@ -1697,5 +1726,56 @@ fn a_keyed_operation_is_compared_against_what_it_changes_alone() {
     assert_eq!(
         attempt_at(&mut directory, at, enroll(true, None)),
         Err(DirectoryError::CompareFailed)
+    );
+}
+
+/// What the controller's withdrawal of a heal stands on (focal-node `placement_controller::
+/// withdraws`): an active placement whose voter the registry holds dead no longer verifies, so the
+/// controller heals it; once the voter is back alive at a newer incarnation it verifies again, the
+/// heal's cause gone; and the plan, aborted before its cutover, hands every copy it brought that the
+/// active placement does not keep to retirement, so none is left in the group's membership.
+#[test]
+fn a_placement_whose_dead_voter_is_back_verifies_again_and_an_aborted_plan_retires_its_copies() {
+    let config = PartitionConfig::default();
+    let mut directory = partition(config);
+    let desired = regional();
+    planned(&mut directory, &desired);
+    change(
+        &mut directory,
+        SessionChange::BeginPreparation { operation: OP },
+    );
+    let verifies = |directory: &DirectoryPartition| {
+        verify_placement(
+            &session(directory).active,
+            &directory.checkpoint().nodes,
+            config.max_members,
+        )
+        .is_ok()
+    };
+    assert!(verifies(&directory));
+    let held = |alive: bool, incarnation: u64, witness: u64| PartitionOperation::Liveness {
+        node: 1,
+        generation: 1,
+        alive,
+        incarnation,
+        witness,
+        decided_at: 200,
+    };
+    apply(&mut directory, held(false, 1, 2));
+    assert!(!verifies(&directory), "a dead voter is stale");
+    apply(&mut directory, held(true, 2, 3));
+    assert!(
+        verifies(&directory),
+        "back alive, the placement holds again"
+    );
+    change(&mut directory, SessionChange::Abort { operation: OP });
+    assert!(session(&directory).pending.is_none());
+    assert_eq!(
+        session(&directory)
+            .retiring
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![2, 3]
     );
 }

@@ -468,6 +468,28 @@ impl PlacementAgent {
             }
         }
         match &descriptor.pending {
+            // A heal whose cause has gone is withdrawn before its cutover ([`withdraws`]): its
+            // copies are drained and retired, and the session keeps the voters it had.
+            Some(plan)
+                if withdraws(
+                    descriptor,
+                    plan,
+                    &directory.nodes,
+                    self.partition_config().max_members,
+                ) =>
+            {
+                let command = self.session_command(
+                    descriptor,
+                    snapshot,
+                    installed,
+                    now,
+                    SessionChange::Abort {
+                        operation: plan.operation,
+                    },
+                    None,
+                )?;
+                self.intend_partition(handles, command).await.map(Some)
+            }
             Some(plan) => {
                 self.drive_plan(
                     handles,
@@ -1341,17 +1363,7 @@ impl PlacementAgent {
         {
             return Ok(None);
         }
-        let operation = OperationId({
-            let mut hasher = blake3::Hasher::new_derive_key("focal.placement.heal.v1");
-            hasher.update(&descriptor.ledger.tenant.0);
-            hasher.update(&descriptor.ledger.session.0);
-            hasher.update(&descriptor.authority.record_hash.0);
-            let mut id = [0; 16];
-            for (target, source) in id.iter_mut().zip(hasher.finalize().as_bytes()) {
-                *target = *source;
-            }
-            id
-        });
+        let operation = heal_operation(descriptor);
         let leading = self.take_leading(directory);
         let proposal = focal_directory::heal_placement(
             &directory.nodes,
@@ -1586,6 +1598,39 @@ pub(crate) fn retirement_hold(period: Duration, election_periods: u64) -> i64 {
     i64::try_from(window.div_ceil(1_000))
         .unwrap_or(i64::MAX)
         .max(1)
+}
+/// The operation of the controller's heal of a session under its current authority: one heal per
+/// authority, so a heal planned again after a withdrawal is the same operation, and a pending plan
+/// is told apart as the controller's own heal ([`withdraws`]).
+pub(crate) fn heal_operation(descriptor: &SessionDescriptor) -> OperationId {
+    let mut hasher = blake3::Hasher::new_derive_key("focal.placement.heal.v1");
+    hasher.update(&descriptor.ledger.tenant.0);
+    hasher.update(&descriptor.ledger.session.0);
+    hasher.update(&descriptor.authority.record_hash.0);
+    let mut id = [0; 16];
+    for (target, source) in id.iter_mut().zip(hasher.finalize().as_bytes()) {
+        *target = *source;
+    }
+    OperationId(id)
+}
+/// Whether the controller withdraws a session's pending plan: its own heal ([`heal_operation`])
+/// whose cause has gone, before its cutover. The heal was planned because a voter of the active
+/// placement was held dead past an election window; once the active placement verifies against the
+/// registry as it stands again (every voter it would have replaced back alive), the heal would close
+/// the session for a move's window and move its seat for nothing. A move runs to its activation
+/// however its cause changes otherwise: a false death of a node never cut off (fleet33 c18, held
+/// dead about 2.2 s) closed its session 6.5 s, and two heals of m9 cut over after their voters were
+/// back. After the cutover (a barrier committed) the move completes, as the partition refuses an
+/// abort then. Only the controller's heals are withdrawn: an operator's or a policy's plan stands.
+pub(crate) fn withdraws(
+    descriptor: &SessionDescriptor,
+    plan: &focal_directory::PendingPlacement,
+    nodes: &std::collections::BTreeMap<u64, focal_directory::NodeRecord>,
+    max_members: usize,
+) -> bool {
+    plan.barrier.is_none()
+        && plan.operation == heal_operation(descriptor)
+        && focal_directory::verify_placement(&descriptor.active, nodes, max_members).is_ok()
 }
 /// What the controller would do next for one session, from the committed
 /// directory alone: the operator's `plan placement`. Never executes anything.
