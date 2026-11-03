@@ -18463,4 +18463,69 @@ volume's commits: one 7.8 s stall in m8, the shared log's I/O thread in btrfs's 
 (condition 10). In k28 and k29, one session that lost one voter stopped committing for about 4 and
 2.8 s some 13 s after the kill, its two live voters unstalled, and refused the writes past its
 door's bound (`ingress_capacity`, 49 and 40). c18, cut off on the tree with 832a0567, refused 12 the
-same way, so that fix did not remove it (k30 to k33, before c18, had none). Not root-caused. The custody rule's decision is the user's, pending.
+same way, so that fix did not remove it (k30 to k33, before c18, had none). Not root-caused (since
+found, the next entry). The custody rule's decision is the user's, pending.
+
+### 2026-11-02 — Every lifecycle completed at 33 nodes with a dozen failing at once: agents that retry as focal's contract says
+
+The runs before ended a lifecycle at its first refused write, as focal-load did: a client that
+reports a refusal and gives up. focal's agent contract says an agent sends it again: "A `capacity`
+refusal admitted nothing; the reference stays `Pending` for a later retry", and `request.retry`
+resends the exact frame (`skills/*/references/workflow-contract.md`). Every refusal of those runs
+admitted nothing: a session's door full (`ingress_capacity`), no leader or quorum within the
+client's 30 s clock (`unavailable`), a required copy short of custody (`owner_bound`, refused at
+eligibility before the owner admits the frame). 905cafba gives focal-load `refused: retry`
+(run.sh `REFUSED=retry`): the same request, its identity, bytes and generation, sent again after the
+client's longest pause between resends (500 ms) until its ledger commits it or a hand-off's wait
+(120 s) has passed since it was first sent, its first refusal counted under `retried` by cause (the
+report, the write CSV's `retried` column, the summary on stderr). `end` stays the default, the
+comparison's measure of an overload. `only_a_refusal_that_admitted_nothing_is_sent_again` holds
+which answers are sent again and which stand, and `a_run_that_retries_refusals_commits_every_write_once`
+a work run that retries.
+
+Four runs at 33 nodes on fedora on `focal:fleet-c20` (905cafba: the nodes are `focal:fleet-c19`'s,
+832a0567), the final campaign's seed (1029: the same twelve, the founder among them; m9's twelve
+drawn outside the control plane), one of each fault kind, 500 agents at 220 claims a second over 11
+sessions ([the record](../qualification/campaigns/2026-10-31-fleet33-condition3.md), "Every lifecycle
+completed"):
+
+| fedora run | Fault | Written and judged, of 29,700 | Refused | Unknown / abandoned | Writes sent again (first refusal) | Write p50 / p99 (ms) |
+|---|---|---|---|---|---|---|
+| k34-1444 | twelve killed 30 s | 29,700 | 0 | 0 / 0 | 166 (`unavailable` 149, `owner_bound` 17) | 36.0 / 18,985.9 |
+| m9-1459 | twelve outside the control plane killed 60 s | 29,700 | 0 | 0 / 0 | 2,563 (`unavailable` 2,471, `owner_bound` 92) | 332.2 / 47,605.1 |
+| c19-1544 | twelve cut off 12 s, past the QUIC idle timeout | 29,700 | 0 | 0 / 0 | 32 (`owner_bound`) | 40.3 / 1,661.5 |
+| p11-1611 | twelve partitioned 30 s | 29,700 | 0 | 0 / 0 | 27 (`owner_bound` 26, `unavailable` 1) | 37.1 / 9,443.1 |
+
+Every claim, artifact, testament and validation committed in each: claims 105,858 to 106,716,
+artifacts 26,457 to 26,657, testaments 79,478 to 80,642 and validations 79,670 to 81,315 a run, all
+of them. A write sent again took, from its first send to its commit, a median of 25.9 to 32.0 s in
+k34 (the four sessions without their quorum, until their voters served again at 34.6 to 40.5 s, and
+custody), 46.4 to 67.0 s in m9 (its twelve down 66.4 s: artifacts waited for their copies, median
+50.6 s, and in the four sessions that had lost a copy the waiting artifact steps filled every
+caller's 1,024 places for 16.9 to 20.5 s), and 9.8 s (c19) and 24.2 s (p11) for validations at the
+custody check. No write ran past the 120 s wait. A write's latency now carries its wait, so these
+p99s are not comparable with the runs before, which counted committed writes only.
+
+**`ingress_capacity`, root-caused.** It is a session's door full while its voters' syncs are held.
+In c18, every node's log I/O thread sampled every 200 ms, no session committed from 11.7 to 13.0 s
+after the isolation began, the two that had lost nothing among them, and the log I/O threads of the
+same sixteen live nodes were in uninterruptible disk waits in every sample from 11.8 to 12.8 s: the
+one btrfs volume every node's log is on stalled (condition 10). Ledger 6, which had lost a follower,
+had its two live voters' syncs held often from 10 s, its writes under way growing from 135 to 231;
+once the volume stopped, the client's three capacity resends were spent in 50 to 320 ms and its 12
+creations reported `ingress_capacity`. k28's and k29's were each one session with two live voters,
+each voter holding every commit, the other sessions committing; those runs kept no thread samples, so
+a voter's held sync is what fits them. None came in the four runs above, where every window without
+a commit, read against every node's log I/O thread and the volume's commits (k34, m9 and c19), was a
+session without its quorum, an election (1.3 to 2.5 s), artifacts waiting on a copy, or a move's
+cutover.
+
+**Open.** The all-copies custody rule decides how long an artifact waits while a copy is down
+(k34 median 31.3 s, m9 50.6 s), not whether it completes; whether a quorum of the voters (f+1)
+suffices is the user's decision, pending. A heal outlives its cause: in c18 focal33, never cut off,
+was held dead for about 2.2 s and 96bc77a5's move off it still ran to its activation (6.5 s without a
+commit in a session that lost nothing; a stale death verdict from the rejoining twelve, taken at the
+accused's own incarnation as SWIM's override takes it, is the likely way, not shown), and in m9 two
+of the three heals cut over after their voter was back (46fe3614's 9.6 s window, ab05c879's); a heal
+withdrawn before its cutover once its voter is alive again is not done. The volume's commits
+holding every node's syncs are condition 10's.

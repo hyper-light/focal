@@ -1,0 +1,10 @@
+/home/adalundhe/s5/runs/c19-1544: 11 ledgers, fault from 1793663768745; windows of >= 1000 ms with writes under way and none committed
+  ledger  0: 0.1-1.6 s (1.5 s, 27 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 4% full 4%; log threads in D at once up to 8 nodes
+  ledger  2: 0.1-13.6 s (13.4 s, 136 under way): btrfs commit in progress up to 0 ms, 1 ended; io some 6% full 5%; log threads in D at once up to 20 nodes
+  ledger  3: 0.1-13.0 s (12.9 s, 133 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 6% full 5%; log threads in D at once up to 17 nodes
+  ledger  5: 0.1-12.8 s (12.7 s, 135 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 6% full 5%; log threads in D at once up to 17 nodes
+  ledger  8: 0.1-14.5 s (14.4 s, 150 under way): btrfs commit in progress up to 0 ms, 1 ended; io some 6% full 5%; log threads in D at once up to 21 nodes
+  ledger  9: 0.1-1.5 s (1.5 s, 30 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 5% full 4%; log threads in D at once up to 8 nodes
+  ledger 10: 0.1-2.6 s (2.5 s, 34 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 5% full 4%; log threads in D at once up to 8 nodes
+retried (first refusal cause, final outcome): {('owner_bound', 'committed'): 32}
+  owner_bound by second from the fault: {0: 4, 1: 1, 2: 2, 3: 7, 4: 4, 5: 1, 6: 4, 7: 1, 10: 2, 11: 1, 12: 5}

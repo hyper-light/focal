@@ -1,0 +1,9 @@
+claims: asked 106716, committed 106716 (100.00 %), refused 0 {}, other {}
+  claims retried after a refusal: {'(then committed)': 384, 'unavailable': 384}; first send to answer p50 46.4 s, max 67.1 s
+artifacts: asked 26657, committed 26657 (100.00 %), refused 0 {}, other {}
+  artifacts retried after a refusal: {'(then committed)': 1883, 'unavailable': 1883}; first send to answer p50 50.6 s, max 70.8 s
+testaments: asked 80642, committed 80642 (100.00 %), refused 0 {}, other {}
+  testaments retried after a refusal: {'(then committed)': 7, 'unavailable': 7}; first send to answer p50 67.0 s, max 67.2 s
+validations: asked 81315, committed 81315 (100.00 %), refused 0 {}, other {}
+  validations retried after a refusal: {'(then committed)': 289, 'owner_bound': 92, 'unavailable': 197}; first send to answer p50 63.9 s, max 70.9 s
+lifecycles: {'started': 29700, 'written': 29700, 'judged': 29700, 'refused': 0, 'unknown': 0, 'abandoned': 0, 'retried': 2563}

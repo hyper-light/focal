@@ -10,7 +10,7 @@ every row names where it is recorded, and a gap is written as a gap.
 |---|---|---|
 | 1 | One binary and CLI, laptop to global, proven by records | partly shown |
 | 2 | More than a thousand agents doing claims, artifacts, testaments and validations | shown at 1,000; the Kubernetes build not attempted |
-| 3 | Delivery under heavy load, horrific networks, dozens of node failures | shown on three nodes and on 33 with twelve failing at once, confirmed on the fixed tree (eleven runs; every fault kind on the tree with every fix, claims, artifacts, testaments and validations counted by kind); the custody rule's decision pending; `ingress_capacity` (k28, k29, c18) not root-caused |
+| 3 | Delivery under heavy load, horrific networks, dozens of node failures | shown on three nodes and on 33 with twelve failing at once, confirmed on the fixed tree; every lifecycle completed, every claim, artifact, testament and validation committed, in a run of each fault kind (killed, killed outside the control plane, cut off with every connection dropped, partitioned) with agents that retry as focal's contract says; `ingress_capacity` root-caused (a session's door while the shared volume held its voters' syncs); the custody rule's decision pending (it sets an artifact's wait, not its completion); a heal outlives its cause (open) |
 | 4 | p99s an order of magnitude beyond Kafka, Redis HA, NATS | plan of record; not shown across its conditions |
 | 5 | Post-quantum encryption in transit and at rest | in transit shown; at rest partly |
 | 6 | Adversarial batteries: bombs, tampering, misuse | partly shown |
@@ -123,6 +123,31 @@ testaments and validations"):
 Every write that did not commit was refused with a typed cause: claims by sessions without their
 quorum and by `ingress_capacity`, artifacts and validations by the all-copies custody rule.
 
+Every lifecycle completed once focal-load's agents sent a refused write again as focal's agent
+contract says ("A `capacity` refusal admitted nothing; the reference stays `Pending` for a later
+retry", `skills/*/references/workflow-contract.md`; focal-load `refused: retry`, 905cafba, run.sh
+`REFUSED=retry`): the same request until its ledger commits it or a hand-off's wait (120 s) passes,
+its first refusal counted by cause. One run of each fault kind on `focal:fleet-c20` (the nodes as
+`focal:fleet-c19`), the same seed ("2026-11-02 — Every lifecycle completed at 33 nodes with a dozen
+failing at once"; [the record](campaigns/2026-10-31-fleet33-condition3.md), "Every lifecycle
+completed"):
+
+| fedora run | Fault | Written and judged, of 29,700 | Refused / unknown / abandoned | Claims | Artifacts | Testaments | Validations | Sent again (first refusal) | Write p50 / p99 (ms) |
+|---|---|---|---|---|---|---|---|---|---|
+| k34-1444 | killed 30 s | 29,700 | 0 / 0 / 0 | 105,930 of 105,930 | 26,483 of 26,483 | 79,559 of 79,559 | 79,723 of 79,723 | 166 (`unavailable` 149, `owner_bound` 17) | 36.0 / 18,985.9 |
+| m9-1459 | outside the control plane, killed 60 s | 29,700 | 0 / 0 / 0 | 106,716 of 106,716 | 26,657 of 26,657 | 80,642 of 80,642 | 81,315 of 81,315 | 2,563 (`unavailable` 2,471, `owner_bound` 92) | 332.2 / 47,605.1 |
+| c19-1544 | cut off 12 s, every connection dropped | 29,700 | 0 / 0 / 0 | 105,891 of 105,891 | 26,459 of 26,459 | 79,504 of 79,504 | 79,730 of 79,730 | 32 (`owner_bound`) | 40.3 / 1,661.5 |
+| p11-1611 | partitioned 30 s | 29,700 | 0 / 0 / 0 | 105,858 of 105,858 | 26,457 of 26,457 | 79,478 of 79,478 | 79,670 of 79,670 | 27 (`owner_bound` 26, `unavailable` 1) | 37.1 / 9,443.1 |
+
+A write sent again committed a median of 25.9 to 32.0 s after its first send in k34 (sessions
+without their quorum until their voters served again, and custody), 46.4 to 67.0 s in m9 (its
+twelve down 66.4 s, artifacts waiting for their copies), 9.8 s in c19 and 24.2 s in p11; none ran
+past the wait. A write's latency now carries its wait, so these p99s are not comparable with the
+runs above. No write was refused `ingress_capacity`, and every window in which a session committed
+nothing, read against every node's log I/O thread and the volume's commits sampled every 200 ms
+(k34, m9, c19), was a session without its quorum, an election, artifacts waiting on a copy, or a
+move's cutover.
+
 The directory healed every session it could, two of them while the twelve were still down (m6;
 none in m5 before 01a2f923). No outcome stayed unknown and no lifecycle was abandoned where the
 fault ended within the run. m7's were all in sessions without a quorum to the run's end. A session
@@ -136,12 +161,21 @@ move windows were 5.1 to 8.4 s.
 **Open.** An artifact's acknowledgement waits on every content copy of its session (doc 26 §1), so
 while a copy is down its artifact steps wait or are refused (`unavailable` at the client's 30 s
 clock, `owner_bound` at the custody check): every refusal at 33 nodes that is not a session without
-its quorum is this rule's, and whether a quorum of copies (f+1) suffices is the user's decision,
+its quorum is this rule's. With agents that retry, every artifact committed under it: the rule
+sets how long an artifact waits while a copy is down (median 31.3 s in k34, 50.6 s in m9), not
+whether it completes, and whether a quorum of copies (f+1) suffices is the user's decision,
 pending. A session whose quorum is down takes no write until its voters are back. A move closes its
-session to its clients from its log's cutover to its activation, 5.1 to 8.4 s in m8. In k28 and
-k29, one session that lost one voter stopped committing for 2.8 to 4 s about 13 s after the kill,
-its two live voters unstalled, and refused writes past its door's bound (`ingress_capacity`, 49 and
-40), and c18 refused 12 the same way on the tree with 832a0567: not root-caused. A node's log syncs wait on its file
+session to its clients from its log's cutover to its activation, 5.1 to 8.4 s in m8. `ingress_capacity`
+(k28 49, k29 40, c18 12) is a session's door full while its voters' syncs are held, root-caused in
+c18: no session committed from 11.7 to 13.0 s after the cut began, and the log I/O threads of the
+same sixteen live nodes sat in disk waits in every 200 ms sample from 11.8 to 12.8 s, the one btrfs
+volume every node's log is on stalled; the session that had lost a follower, its two live voters
+holding every commit and 231 writes under way, refused its next 12 once the client's three capacity
+resends were spent. k28's and k29's were each one such two-voter session, which a voter's held
+sync fits (no thread samples then). A heal outlives its cause: a move runs to its activation after
+its voter is alive again (c18's focal33, never cut off, held dead about 2.2 s, a session that lost
+nothing then closed 6.5 s; two of m9's three heals cut over after their voter was back), and a heal
+withdrawn before its cutover is not done. A node's log syncs wait on its file
 system's commits, up to 5.2 s on the host's btrfs volume, where the harness keeps every node's log
 (condition 10). Under 3% loss a write's p99 is 753
 to 2,244 ms against 462 to 574 without, its artifact steps held at the evidence door (the 2026-10-28

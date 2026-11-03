@@ -1,4 +1,4 @@
-<!-- Qualification record: goal condition 3 at scale, a dozen of 33 focal nodes killed, partitioned and cut off under the work flow, 2026-10-31 to 2026-11-01, fedora (Linux x86-64), the final runs at fleet-run c606af7b (m4 with the harness at 902acac7), every fix the runs found at 6bb00314, confirmed at 33 nodes 2026-11-01 and 02 (m6, k28, m7, k29, m8, k30 to k33, c18, p10), with what the confirmation found fixed at 832a0567. -->
+<!-- Qualification record: goal condition 3 at scale, a dozen of 33 focal nodes killed, partitioned and cut off under the work flow, 2026-10-31 to 2026-11-01, fedora (Linux x86-64), the final runs at fleet-run c606af7b (m4 with the harness at 902acac7), every fix the runs found at 6bb00314, confirmed at 33 nodes 2026-11-01 and 02 (m6, k28, m7, k29, m8, k30 to k33, c18, p10), with what the confirmation found fixed at 832a0567; every lifecycle completed with agents that retry as focal's contract says, 2026-11-02 (905cafba: k34, m9, c19, p11). -->
 
 # Condition 3 at scale: a dozen of 33 nodes killed, partitioned and cut off under the work flow
 
@@ -16,7 +16,11 @@ defects, fixed at the cause in b9f8a514 and 832a0567 and confirmed in m8 and k30
 k33 ran k28's fault three more times on that tree, c18 cut a dozen off past the QUIC idle timeout,
 and p10 partitioned a dozen for 30 s, so every fault kind ran on the tree with every fix. Every
 lifecycle in those runs was written and judged or refused with a typed error, and their claims,
-artifacts, testaments and validations are counted by kind (below). ab1630ba corrects two comments. The harness (`tools/compare/compose`) reads every
+artifacts, testaments and validations are counted by kind (below). With focal-load's agents
+sending a refused write again as focal's agent contract says (905cafba), four more runs on that
+tree's nodes completed every lifecycle, one of each fault kind: a dozen killed for 30 s and, drawn
+outside the control plane, for 60 s, cut off for 12 s and partitioned for 30 s, every claim,
+artifact, testament and validation committed (below). ab1630ba corrects two comments. The harness (`tools/compare/compose`) reads every
 node's replicas of the sessions its agent installed during the run as well (each run's
 `tree.txt`).
 
@@ -202,7 +206,7 @@ What the runs confirm:
   asks an invitation again.
 - **Every refusal is typed.** Each is the custody rule's (`unavailable` at the client's 30 s clock
   on artifact steps, `owner_bound` at the custody check), a session's without its quorum, or
-  `ingress_capacity` (k28, k29 and c18, open below).
+  `ingress_capacity` (k28, k29 and c18: a session's door while its voters' syncs were held, below).
 
 What the confirmation found, fixed at the cause:
 
@@ -237,19 +241,26 @@ What the confirmation found, fixed at the cause:
   commit) while the root owner waited for its write (condition 10, below). It did not remove
   `ingress_capacity` (c18, below).
 
-Open from the confirmation:
+What the confirmation left, its cause since found:
 
-- **`ingress_capacity`** (k28 49, k29 40, and c18 12 on the tree with 832a0567; none in k26, k27,
-  m6, m7, m8, k30 to k33 or p10; the earlier campaigns' c9 and c14, cut off as c18 was, had 5 and
-  15). In c18 the twelve that were cut off included the founder, as in the k runs. Its 12 were one ledger's claim creations, refused at once.
-  Each time it was one session that had lost one voter (k28: its leader, k29: a follower), about
-  13 s after the kill. Its two remaining voters, both alive and neither stalled (their sessions'
-  longest periods 158 and 785 ms), committed nothing for 2.8 s (k29) and about 4 s (k28, where the
-  follower then ran an election its leader won again). The leader's door filled, and the writes
-  past its bound were refused at once. The host's bridge and softnet dropped nothing then, and
-  every other session committed. c18's 12, on the tree with 832a0567, show that the journal writer
-  did not remove it, so the four kill runs before it on that tree, which had none, showed no fix. Not root-caused: what held a session's two live voters is not in what the runs
-  kept.
+- **`ingress_capacity` is a session's door full while its voters' syncs are held** (k28 49, k29 40,
+  and c18 12 on the tree with 832a0567; none in k26, k27, m6, m7, m8, k30 to k33, p10 or the four
+  runs with retrying agents; the earlier campaigns' c9 and c14, cut off as c18 was, had 5 and 15).
+  Shown in c18, where every node's log I/O thread was sampled every 200 ms: from 11.7 to 13.0 s
+  after the isolation began no session committed at all, the two that had lost nothing among them,
+  and from 11.8 to 12.8 s the log I/O threads of the same sixteen live nodes were in uninterruptible
+  disk waits in every sample: a stall of the one btrfs volume every node's log is on (condition 10,
+  below). Ledger 6, which had lost a follower, is the one whose door filled: its two live voters'
+  syncs had been held often from 10 s (their log I/O threads in D in most samples), its writes under
+  way grew from 135 to 231, and once the volume stopped, the client's three capacity resends,
+  throttled as gRPC throttles retries, were spent in 50 to 320 ms and its 12 claim creations
+  reported `ingress_capacity`. k28's and k29's were each one session that had lost a voter, the
+  others committing, so that its two live voters each held every commit: k28's ledger 5 committed
+  nothing for 2.7 s from 16.0 s (an election its leader won again), k29's ledger 7 for 2.8 s from
+  12.8 s. Those runs kept no thread samples, and a node's flush metrics keep no maximum (k28's
+  focal2: p99 27 ms, p99.9 84 ms), so a voter's held sync is what fits them, not what they show. The
+  door's refusal is its bound doing its work: what it refuses admitted nothing, and an agent that
+  retries as the contract says commits it once the stall passes (above).
 
 ## Claims, artifacts, testaments and validations
 
@@ -291,6 +302,76 @@ syncs, and in k28's, k29's and c18's `ingress_capacity` (below). Artifacts and v
 uncommitted under the all-copies custody rule while a copy was down: an artifact refused
 `unavailable` at the client's 30 s clock, and a validation's begin refused `owner_bound` at the
 custody check. m7's twelve stayed down past its measured window.
+
+## Every lifecycle completed: agents that retry as focal's contract says
+
+The runs above ended a lifecycle at its first refused write, as focal-load then did: they measured
+a client that reports a refusal and gives up. focal's agent contract says what an agent does
+instead: "A `capacity` refusal admitted nothing; the reference stays `Pending` for a later retry",
+and `request.retry` resends the exact frame (`skills/*/references/workflow-contract.md`). Every
+refusal of those runs admitted nothing: a session's door full (`ingress_capacity`), no leader or
+quorum within the client's 30 s clock (`unavailable`), or a required copy short of custody
+(`owner_bound`, which the node refuses at eligibility, before the owner admits the frame).
+905cafba gives focal-load `refused: retry` (run.sh `REFUSED=retry`): the same request, its
+identity, bytes and generation, is sent again after the client's longest pause between resends
+(500 ms) until its ledger commits it or a hand-off's wait (120 s) has passed since it was first
+sent, and its first refusal is counted under `retried` by its cause (the report, and the write
+CSV's `retried` column), so a run says what its agents met as well as what they completed. `end`
+stays focal-load's default, the comparison's measure of an overload. Four runs on
+`focal:fleet-c20` (905cafba, whose nodes are `focal:fleet-c19`'s: 832a0567, the commits since
+changing only tests, documents and focal-load), the same seed (the same twelve, the founder among
+them, for the kill, the cut and the partition; m9's twelve drawn outside the control plane), one
+of each fault kind:
+
+| Run | Fault (twelve of 33) | Written and judged, of 29,700 | Refused | Unknown | Abandoned | Writes sent again after a refusal (first refusal) | Write p50 / p99 / max (ms) |
+|---|---|---|---|---|---|---|---|
+| k34-1444 | killed 30 s, the founder among them | 29,700 | 0 | 0 | 0 | 166 (`unavailable` 149, `owner_bound` 17) | 36.0 / 18,985.9 / 38,523.7 |
+| m9-1459 | outside the control plane, killed 60 s | 29,700 | 0 | 0 | 0 | 2,563 (`unavailable` 2,471, `owner_bound` 92) | 332.2 / 47,605.1 / 70,875.3 |
+| c19-1544 | cut off 12 s, past the QUIC idle timeout: every connection dropped | 29,700 | 0 | 0 | 0 | 32 (`owner_bound`) | 40.3 / 1,661.5 / 15,726.5 |
+| p11-1611 | partitioned 30 s | 29,700 | 0 | 0 | 0 | 27 (`owner_bound` 26, `unavailable` 1) | 37.1 / 9,443.1 / 37,180.4 |
+
+By kind (`kinds.txt` beside each run), every write of every kind committed:
+
+| Run | Claims | Artifacts | Testaments | Validations |
+|---|---|---|---|---|
+| k34-1444 | 105,930 of 105,930 | 26,483 of 26,483 | 79,559 of 79,559 | 79,723 of 79,723 |
+| m9-1459 | 106,716 of 106,716 | 26,657 of 26,657 | 80,642 of 80,642 | 81,315 of 81,315 |
+| c19-1544 | 105,891 of 105,891 | 26,459 of 26,459 | 79,504 of 79,504 | 79,730 of 79,730 |
+| p11-1611 | 105,858 of 105,858 | 26,457 of 26,457 | 79,478 of 79,478 | 79,670 of 79,670 |
+
+The writes sent again, by kind, and how long each took from its first send to its commit (median /
+longest):
+
+| Run | Claims | Artifacts | Testaments | Validations |
+|---|---|---|---|---|
+| k34-1444 | 53: 32.0 / 34.4 s | 92: 31.3 / 33.2 s | none | 21: 25.9 / 38.1 s |
+| m9-1459 | 384: 46.4 / 67.1 s | 1,883: 50.6 / 70.8 s | 7: 67.0 / 67.2 s | 289: 63.9 / 70.9 s |
+| c19-1544 | none | none | none | 32: 9.8 / 15.7 s |
+| p11-1611 | none | 1: 31.6 s | none | 26: 24.2 / 36.0 s |
+
+What a write waited for is what refused it first. In k34 the claims and artifacts were in the four
+sessions without their quorum (first sent 2 to 8 s into the kill) and committed once the voters
+served again (34.6 to 40.5 s), and the validations waited on a copy's custody. In m9 the twelve
+were down for 66.4 s: an artifact waited for its copy's return (median 50.6 s), and in the four
+sessions that had lost a content copy (2, 3, 5 and 9) the waiting artifact steps filled every one
+of their callers' 1,024 places, so nothing more was sent in those sessions for 16.9 to 20.5 s (the
+generator's schedule delay p99 12.4 s). c19's and p11's were validations refused at the custody
+check while a copy was cut off. A write's latency now carries its wait (from its place on the
+schedule to its commit), where the runs above counted committed writes only, so these p99s are not
+comparable with theirs. No write ran past the 120 s wait.
+
+Every window in which a session committed nothing while writes were under way (`stallio.txt`,
+read against every node's log I/O thread sampled every 200 ms and the volume's btrfs commits, in
+k34, m9 and c19; p11's samplers were cut by a restart of fedora's kiln runner) was a session
+without its quorum until its voters were back, one that had lost its leader through its election
+(1.3 to 2.5 s), one whose artifact steps waited on a copy (m9), or a move's cutover (m9, below). No
+session stopped on the disk, and no write was refused `ingress_capacity`. The death verdicts named
+only the faulted nodes in k34, m9 and c19.
+
+So the all-copies custody rule decides how long an artifact waits while a copy is down, not whether
+it completes: every artifact of the four committed under it. Acknowledging at a quorum of the
+voters (f+1), each of which holds every artifact's object once it has applied the artifact, would
+have committed m9's 1,883 without their down copies; that decision is the user's (Open, below).
 
 ## Found and fixed at the cause
 
@@ -500,9 +581,13 @@ behind it (015a5835).
   (`owner_bound` at `validation.begin`); every refusal of the runs above that is not a session without
   its quorum is this rule's. A phase that evaluates an artifact asks every copy again where its
   leader is new, receipts being each leader's own, so in a cut the refusals fall in the sessions
-  whose leader was cut off. Whether an acknowledgement needs a quorum of the voters (f+1) instead,
-  each of which holds every artifact's object once it has applied the artifact, is the user's
-  decision, pending; receipts that outlive their leader would let these begin under either rule.
+  whose leader was cut off. With agents that retry as the contract says, every artifact committed
+  under it (k34, m9, c19 and p11, above): the rule decides how long an artifact waits while a copy
+  is down (k34: median 31.3 s; m9, its copies down 66 s: median 50.6 s, four sessions' agents held
+  for 17 to 20 s), not whether it completes. Whether an acknowledgement needs a quorum of the voters
+  (f+1) instead, each of which holds every artifact's object once it has applied the artifact, is
+  the user's decision, pending; receipts that outlive their leader would let these begin under
+  either rule.
 - **A session without its quorum takes no write** until its voters are back: killed, until they serve
   again after their restart; cut off, until the heal. Its writes begun meanwhile are refused at their
   clocks (`claim.create`) or resent and answered once.
@@ -514,6 +599,20 @@ behind it (015a5835).
   directory's steps from promotion to activation. With 832a0567 the windows were 5.1 to 8.4 s (m8),
   and a moved session's last steps can still finish well after its activation: m8's 79e8fb08
   committed its last 11 writes 17 s after it.
+- **A heal outlives its cause.** The controller heals a session once the directory holds one of its
+  voters dead (24, "Committed outcomes") and carries the move to its activation whatever the voter
+  does after. In c18 focal33, never cut off, was held dead (seen at 40.2 s, the sampler having read
+  the cut-off founder until then) and alive again 2.2 s later, but 96bc77a5's move off it ran to its
+  activation: 6.5 s without a commit (66.0 to 72.5 s) in a session that had lost nothing. A gossiped
+  death at a member's own incarnation is taken at once (SWIM's override, `liveness/driver.rs`
+  `on_update`), and the twelve rejoined from a cut in which they had held the others suspect, so a
+  stale verdict reaching the partition's leader before the accused's refutation is the likely way;
+  not shown, since no other run with its placement sampled (twelve, c19's cut among them) held dead
+  a node its fault had not hit. In m9 two of the three heals reached their cutover after their dead
+  voter was back: 46fe3614's at 90.3 to 92.6 s (focal33 alive by 72.9 s; 9.6 s without a commit,
+  83.5 to 93.1 s) and ab05c879's at 108.6 to 110.9 s (focal8 alive by 70.7 s). A heal withdrawn
+  before its cutover once its voter is alive again, a controller reconciling to the directory as it
+  stands, is not done: it costs a session a move's window, never a write.
 - **A readiness verifies a session within one export** (10 s): the copies of the sessions k27 healed
   verified 1,543 to 5,039 artifacts and their objects (54 KB to 4.4 MB) in 0.2 to 2.5 s on this
   host, so a session some ten times larger than these runs leave would need its verification
@@ -566,7 +665,15 @@ focal3's containers every 200 ms, the root owner's, the hyper-log thread's and t
 thread's state, syscall and wait channel, and the file the owner was syncing
 (`syscalls-focal1.txt`, `syscalls-focal3.txt`). m8 keeps the founder's the same way, and k30
 keeps, per thread name, how many 200 ms samples of every node found a thread blocked on disk
-(`blocked-threads-summary.txt`), as k31 to k33 do. Each run's whole directory, every node's log,
+(`blocked-threads-summary.txt`), as k31 to k33 do. The four runs with retrying agents name it in their report
+(`focal-220-128-work-agents500-nodes33-retry-faults.json`) and keep each kind's writes and what was
+sent again (`kinds.txt`), every window without a commit read against the disk (`stallio.txt`), and,
+for k34, m9 and c19, the volume's btrfs commits and the host's I/O pressure every 200 ms
+(`volume-samples.txt`) and how many nodes' log I/O threads were blocked on disk at each 200 ms
+sample (`blocked-threads.txt`); p11's samplers were cut by a restart of fedora's kiln runner.
+Each run's whole directory, every node's log,
 health, metrics and replicas among them, is on fedora under `~/s5/runs/<run>` (the intermediate
 runs' too), beside the run kit (`~/s5/campaign.sh`, `fleet-run.sh`, `killreport.py`, `agents.py`,
-`gaps.py`, `hostsample.sh`, `placesample.sh`, `btrfssample.sh`, `stallzoom.py`).
+`gaps.py`, `hostsample.sh`, `placesample.sh`, `btrfssample.sh`, `stallzoom.py`, and for the
+retrying runs `samplers.sh`, `dsample.py`, `iosample.py`, `dsum.py`, `stallio.py` and `kinds.py`),
+with every node's per-thread samples (`~/s5/dsample-<run>.txt`, c18's among them).

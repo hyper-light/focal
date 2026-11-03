@@ -1,0 +1,32 @@
+1793660263041 dead[] | 16783d4e v[focal8,focal31,focal33] p2 ; 262abad3 v[focal17,focal18,focal28] p2 ; 2ff57ccd v[focal5,focal12,focal22] p2 ; 4e5f478e v[focal25,focal26,focal30] p2 ; 60412dbd v[focal6,focal13,focal20] p2 ; 70c5c53a v[focal1,focal2,focal3] p2 ; 76dddc4c v[focal4,focal9,focal29] p2 ; 91354d7b v[focal14,focal15,focal16] p2 ; cea6215e v[focal10,focal11,focal21] p2 ; d1e26d3a v[focal7,focal23,focal24] p2 ; ef31115f v[focal19,focal27,focal32] p2
+1793660289754 dead[focal6] | 16783d4e v[focal8,focal31,focal33] p2 ; 262abad3 v[focal17,focal18,focal28] p2 ; 2ff57ccd v[focal5,focal12,focal22] p2 ; 4e5f478e v[focal25,focal26,focal30] p2 ; 60412dbd v[focal6,focal13,focal20] p2 blocked['DeadNode on node 2687556919442882164', 'DeadNode on node 2687556919442882164', 'DeadNode on node 2687556919442882164'] ; 70c5c53a v[focal1,focal2,focal3] p2 ; 76dddc4c v[focal4,focal9,focal29] p2 ; 91354d7b v[focal14,focal15,focal16] p2 ; cea6215e v[focal10,focal11,focal21] p2 ; d1e26d3a v[focal7,focal23,focal24] p2 ; ef31115f v[focal19,focal27,focal32] p2
+1793660291959 dead[focal6,focal7,focal23,focal27,focal28] | 16783d4e v[focal8,focal31,focal33] p2 ; 262abad3 v[focal17,focal18,focal28] p2 blocked['DeadNode on node 2687556919442882185', 'DeadNode on node 2687556919442882185', 'DeadNode on node 2687556919442882185'] ; 2ff57ccd v[focal5,focal12,focal22] p2 ; 4e5f478e v[focal25,focal26,focal30] p2 ; 60412dbd v[focal6,focal13,focal20] p2 blocked['DeadNode on node 2687556919442882164', 'DeadNode on node 2687556919442882164', 'DeadNode on node 2687556919442882164'] ; 70c5c53a v[focal1,focal2,focal3] p2 ; 76dddc4c v[focal4,focal9,focal29] p2 ; 91354d7b v[focal14,focal15,focal16] p2 ; cea6215e v[focal10,focal11,focal21] p2 ; d1e26d3a v[focal7,focal23,focal24] p2 blocked['DeadNode on node 2687556919442882165', 'DeadNode on node 2687556919442882180', 'DeadNode on node 2687556919442882165', 'DeadNode on node 2687556919442882180', 'DeadNode on node 2687556919442882165', 'DeadNode on node 2687556919442882180'] ; ef31115f v[focal19,focal27,focal32] p2 blocked['DeadNode on node 2687556919442882186', 'DeadNode on node 2687556919442882186', 'DeadNode on node 2687556919442882186']
+1793660294159 dead[focal6,focal7,focal9,focal23,focal27,focal28] | 16783d4e v[focal8,focal31,focal33] p2 ; 262abad3 v[focal17,focal18,focal28] p2 blocked['DeadNode on node 2687556919442882185', 'DeadNode on node 2687556919442882185', 'DeadNode on node 2687556919442882185'] ; 2ff57ccd v[focal5,focal12,focal22] p2 ; 4e5f478e v[focal25,focal26,focal30] p2 ; 60412dbd v[focal6,focal13,focal20] p2 blocked['DeadNode on node 2687556919442882164', 'DeadNode on node 2687556919442882164', 'DeadNode on node 2687556919442882164'] ; 70c5c53a v[focal1,focal2,focal3] p2 ; 76dddc4c v[focal4,focal9,focal29] p2 blocked['DeadNode on node 2687556919442882166', 'DeadNode on node 2687556919442882166', 'DeadNode on node 2687556919442882166'] ; 91354d7b v[focal14,focal15,focal16] p2 ; cea6215e v[focal10,focal11,focal21] p2 ; d1e26d3a v[focal7,focal23,focal24] p2 blocked['DeadNode on node 2687556919442882165', 'DeadNode on node 2687556919442882180', 'DeadNode on node 2687556919442882165', 'DeadNode on node 2687556919442882180', 'DeadNode on node 2687556919442882165', 'DeadNode on node 2687556919442882180'] ; ef31115f v[focal19,focal27,focal32] p2 blocked['DeadNode on node 2687556919442882186', 'DeadNode on node 2687556919442882186', 'DeadNode on node 2687556919442882186']
+1793660300892 dead[focal23,focal27,focal28] | 16783d4e v[focal8,focal31,focal33] p2 ; 262abad3 v[focal17,focal18,focal28] p2 blocked['DeadNode on node 2687556919442882185', 'DeadNode on node 2687556919442882185', 'DeadNode on node 2687556919442882185'] ; 2ff57ccd v[focal5,focal12,focal22] p2 ; 4e5f478e v[focal25,focal26,focal30] p2 ; 60412dbd v[focal6,focal13,focal20] p2 ; 70c5c53a v[focal1,focal2,focal3] p2 ; 76dddc4c v[focal4,focal9,focal29] p2 ; 91354d7b v[focal14,focal15,focal16] p2 ; cea6215e v[focal10,focal11,focal21] p2 ; d1e26d3a v[focal7,focal23,focal24] p2 blocked['DeadNode on node 2687556919442882180', 'DeadNode on node 2687556919442882180', 'DeadNode on node 2687556919442882180'] ; ef31115f v[focal19,focal27,focal32] p2 blocked['DeadNode on node 2687556919442882186', 'DeadNode on node 2687556919442882186', 'DeadNode on node 2687556919442882186']
+1793660303359 dead[focal27] | 16783d4e v[focal8,focal31,focal33] p2 ; 262abad3 v[focal17,focal18,focal28] p2 ; 2ff57ccd v[focal5,focal12,focal22] p2 ; 4e5f478e v[focal25,focal26,focal30] p2 ; 60412dbd v[focal6,focal13,focal20] p2 ; 70c5c53a v[focal1,focal2,focal3] p2 ; 76dddc4c v[focal4,focal9,focal29] p2 ; 91354d7b v[focal14,focal15,focal16] p2 ; cea6215e v[focal10,focal11,focal21] p2 ; d1e26d3a v[focal7,focal23,focal24] p2 ; ef31115f v[focal19,focal27,focal32] p2 blocked['DeadNode on node 2687556919442882186', 'DeadNode on node 2687556919442882186', 'DeadNode on node 2687556919442882186']
+1793660305661 dead[] | 16783d4e v[focal8,focal31,focal33] p2 ; 262abad3 v[focal17,focal18,focal28] p2 ; 2ff57ccd v[focal5,focal12,focal22] p2 ; 4e5f478e v[focal25,focal26,focal30] p2 ; 60412dbd v[focal6,focal13,focal20] p2 ; 70c5c53a v[focal1,focal2,focal3] p2 ; 76dddc4c v[focal4,focal9,focal29] p2 ; 91354d7b v[focal14,focal15,focal16] p2 ; cea6215e v[focal10,focal11,focal21] p2 ; d1e26d3a v[focal7,focal23,focal24] p2 ; ef31115f v[focal19,focal27,focal32] p2
+1793660365638 no answer
+1793660367695 no answer
+1793660369748 no answer
+1793660371792 no answer
+1793660373843 no answer
+1793660375894 no answer
+1793660378093 no answer
+1793660380143 no answer
+1793660382192 no answer
+1793660384237 no answer
+1793660386287 no answer
+1793660388337 no answer
+1793660390387 no answer
+1793660392438 no answer
+1793660394483 no answer
+1793660396529 no answer
+1793660398575 no answer
+1793660400625 no answer
+1793660402671 no answer
+1793660404721 no answer
+1793660406775 no answer
+1793660408902 no answer
+1793660411020 no answer
+1793660413125 dead[] | 
+1793660428010 dead[] | ae78e1ed v[focal1] p1

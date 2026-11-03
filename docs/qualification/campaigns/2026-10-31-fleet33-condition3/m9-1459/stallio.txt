@@ -1,0 +1,15 @@
+/home/adalundhe/s5/runs/m9-1459: 11 ledgers, fault from 1793661040213; windows of >= 1000 ms with writes under way and none committed
+  ledger  1: 83.5-93.1 s (9.6 s, 203 under way): btrfs commit in progress up to 276 ms, 1 ended; io some 7% full 3%; log threads in D at once up to 28 nodes
+  ledger  2: 49.2-69.7 s (20.5 s, 1024 under way): btrfs commit in progress up to 0 ms, 1 ended; io some 5% full 1%; log threads in D at once up to 18 nodes
+  ledger  3: 0.2-1.4 s (1.2 s, 73 under way): btrfs commit in progress up to 42 ms, 2 ended; io some 6% full 3%; log threads in D at once up to 18 nodes
+  ledger  3: 49.1-66.8 s (17.7 s, 1024 under way): btrfs commit in progress up to 0 ms, 1 ended; io some 5% full 1%; log threads in D at once up to 13 nodes
+  ledger  3: 81.2-82.4 s (1.3 s, 745 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 5% full 1%; log threads in D at once up to 23 nodes
+  ledger  5: 49.3-67.5 s (18.2 s, 1024 under way): btrfs commit in progress up to 0 ms, 1 ended; io some 5% full 1%; log threads in D at once up to 15 nodes
+  ledger  6: 0.2-66.4 s (66.2 s, 705 under way): btrfs commit in progress up to 42 ms, 10 ended; io some 5% full 1%; log threads in D at once up to 20 nodes
+  ledger  8: 51.7-57.0 s (5.4 s, 135 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 5% full 2%; log threads in D at once up to 11 nodes
+  ledger  9: 41.7-49.5 s (7.9 s, 996 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 5% full 0%; log threads in D at once up to 17 nodes
+  ledger  9: 52.4-69.3 s (16.9 s, 1024 under way): btrfs commit in progress up to 0 ms, 1 ended; io some 5% full 1%; log threads in D at once up to 18 nodes
+  ledger 10: 0.2-68.4 s (68.2 s, 733 under way): btrfs commit in progress up to 42 ms, 10 ended; io some 5% full 1%; log threads in D at once up to 20 nodes
+retried (first refusal cause, final outcome): {('owner_bound', 'committed'): 92, ('unavailable', 'committed'): 2471}
+  owner_bound by second from the fault: {0: 11, 1: 4, 2: 5, 3: 7, 4: 1, 5: 1, 10: 1, 11: 13, 12: 14, 13: 13, 66: 2, 67: 9, 68: 9, 69: 2}
+  unavailable by second from the fault: {0: 77, 1: 55, 2: 43, 3: 82, 4: 104, 5: 83, 6: 31, 7: 48, 8: 40, 9: 55, 10: 30, 11: 225, 12: 86, 13: 81, 14: 55, 15: 43, 16: 48, 17: 140, 18: 32, 19: 29, 20: 127, 21: 24, 22: 79, 23: 112, 24: 22, 25: 74, 26: 45, 27: 100, 28: 43, 29: 17, 30: 14, 31: 63, 32: 41, 33: 90, 34: 95, 35: 65, 36: 10, 37: 54, 38: 6, 39: 3}
