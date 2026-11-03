@@ -1353,7 +1353,25 @@ impl<T: ClientTransport> Client<T> {
         let mut last_refusal: Option<AccessError> = None;
         let mut attempt = 0u32;
         let mut backoffs = 0u32;
-        while attempt < self.policy.max_attempts {
+        // The attempts bound the sends that went unanswered or were sent elsewhere. A write whose
+        // outcome is uncertain is sent again under its own identity for as long as the clock holds
+        // instead, its ledger answering the identity once whichever send reaches it, so its caller,
+        // an agent among them, need not settle it: Kafka retries a send until its
+        // `delivery.timeout.ms` whatever its `retries`, which is unbounded by default ("Users should
+        // generally prefer to leave this config unset and instead use delivery.timeout.ms to control
+        // retry behavior", ProducerConfig.java). A read changed nothing and ends at the attempts.
+        // A policy with no backoff resends no more than it attempts, as with its availability
+        // resends ([`RetryPolicy::availability_resends`]): nothing paces it.
+        let mutation = request.operation.is_mutation();
+        let paced = !self.policy.max_backoff.is_zero();
+        let max_attempts = self.policy.max_attempts;
+        let exhausted = |attempt: u32, uncertain: bool| {
+            attempt >= max_attempts && !(uncertain && mutation && paced)
+        };
+        loop {
+            if exhausted(attempt, uncertain) {
+                break;
+            }
             let remaining = self.policy.max_elapsed.saturating_sub(start.elapsed());
             if remaining.is_zero() {
                 break;
@@ -1565,7 +1583,7 @@ impl<T: ClientTransport> Client<T> {
             }
             if !refused {
                 attempt = attempt.saturating_add(1);
-                if attempt >= self.policy.max_attempts {
+                if exhausted(attempt, uncertain) {
                     break;
                 }
             }

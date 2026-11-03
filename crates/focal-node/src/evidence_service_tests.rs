@@ -1232,8 +1232,10 @@ fn a_copy_the_liveness_view_holds_dead_is_not_asked_and_its_job_is_refused_at_on
 
 /// A custody obligation asks no copy the liveness view holds dead and waits for none it comes to
 /// hold so: the copy is excused from it at once (26 §1, the user's rule for artifacts, 2026-11-03),
-/// with no dial to the copy and nothing waiting out the pool's request time, and one copy of two is
-/// still short of the majority the obligation needs. Each such ask held its job's place in the driver's window while the
+/// with no dial to the copy and nothing waiting out the pool's request time. A committed native
+/// artifact's bytes are held by a quorum of its session's voters in the log, so the copy up that
+/// holds it satisfies the obligation ([`CustodyRule::LiveCopies`]): a phase that evaluates it begins
+/// while the other copy is down, where the every-copy rule refused it until the copy came back. Each such ask held its job's place in the driver's window while the
 /// jobs behind it waited at the door; a leader new to its session holds none of the receipts its
 /// predecessor recorded, so every phase that evaluated an artifact asked the dead copy again (a
 /// run of 33 nodes with 12 killed: 271 jobs ran out of time at one leader's door, and 36 writes
@@ -1308,7 +1310,8 @@ fn an_obligation_asks_no_copy_the_liveness_view_holds_dead_and_waits_for_none_it
             assert_eq!(obligation.held, BTreeSet::from([1]));
             assert_eq!(obligation.excused, BTreeSet::from([2]));
             assert_eq!(obligation.missing().count(), 0);
-            assert!(!obligation.satisfied(), "one of two copies is no majority");
+            assert_eq!(obligation.least, 1);
+            assert!(obligation.satisfied(), "every copy up holds it");
             let stats = coordinator.door_stats();
             assert_eq!((stats.copies_unavailable, stats.copies_given_up), (1, 0));
             assert_eq!(pool.stats().dials, 0);
@@ -1356,7 +1359,7 @@ fn an_obligation_asks_no_copy_the_liveness_view_holds_dead_and_waits_for_none_it
                 .unwrap();
                 assert_eq!(obligation.held, BTreeSet::from([1]));
                 assert_eq!(obligation.excused, BTreeSet::from([2]));
-                assert!(!obligation.satisfied(), "one of two copies is no majority");
+                assert!(obligation.satisfied(), "every copy up holds it");
                 let stats = coordinator.door_stats();
                 assert_eq!((stats.copies_unavailable, stats.copies_given_up), (1, 1));
                 // An obligation short of a copy is an answer, not a refusal of its job.
@@ -1859,53 +1862,58 @@ fn far() -> focal_rt::time::Instant {
     focal_rt::time::Instant::now().saturating_add(std::time::Duration::from_secs(600))
 }
 
-/// An artifact's custody holds once every required copy the liveness view holds up and a majority
-/// of the required copies hold it (26 §1, the user's rule, 2026-11-03): a dead copy is excused, and
-/// the obligation is satisfied without it where the copies up are a majority; never with fewer.
+/// An object's custody holds once every required copy the liveness view holds up holds it and at
+/// least as many required copies as its rule asks (26 §1, the user's rule, 2026-11-03): a native
+/// artifact, whose bytes a quorum of voters hold once its frame commits, needs one copy up holding
+/// it; an object only its copies hold (a sealed upload) needs a majority of them; an archive bundle
+/// needs every copy. A dead copy is excused under the first two, never under the last.
 #[test]
-fn an_obligation_is_satisfied_by_every_copy_up_and_a_majority_a_dead_copy_excused() {
-    let obligation = |held: &[u64], excused: &[u64]| CustodyObligation {
-        scope: scope(1),
-        required: BTreeSet::from([1, 2, 3]),
-        held: held.iter().copied().collect(),
-        excused: excused.iter().copied().collect(),
+fn an_obligation_is_satisfied_by_every_copy_up_and_as_many_as_its_rule_asks() {
+    let obligation = |copies: &[u64], held: &[u64], excused: &[u64], rule: CustodyRule| {
+        let required: BTreeSet<u64> = copies.iter().copied().collect();
+        CustodyObligation {
+            scope: scope(1),
+            least: rule.least(required.len()),
+            required,
+            held: held.iter().copied().collect(),
+            excused: excused.iter().copied().collect(),
+        }
     };
-    // Three of three, as the every-copy rule had it.
-    assert!(obligation(&[1, 2, 3], &[]).satisfied());
-    // One dead and excused, the other two holding: a majority, and every copy up holds it.
-    let one_down = obligation(&[1, 3], &[2]);
-    assert!(one_down.satisfied());
-    assert_eq!(one_down.missing().count(), 0);
-    // A copy up that lacks it is missing, whatever the majority.
-    let lacking = obligation(&[1, 3], &[]);
+    use CustodyRule::{EveryCopy, LiveCopies, LiveMajority};
+    // Two copies, the fleet's f+1 for one failure: one dead and excused, the other holding.
+    assert!(obligation(&[1, 2], &[1], &[2], LiveCopies).satisfied());
+    assert!(!obligation(&[1, 2], &[1], &[2], LiveMajority).satisfied());
+    assert!(!obligation(&[1, 2], &[1], &[], EveryCopy).satisfied());
+    // A copy up that lacks it is missing under every rule.
+    let lacking = obligation(&[1, 2], &[1], &[], LiveCopies);
     assert!(!lacking.satisfied());
     assert_eq!(lacking.missing().collect::<Vec<_>>(), vec![2]);
-    // Two dead: every copy up holds it, but one of three is no majority.
-    let two_down = obligation(&[1], &[2, 3]);
-    assert!(!two_down.satisfied());
-    assert_eq!(two_down.missing().count(), 0);
-    // A placement of one copy is its own majority; of none, nothing is owed.
-    let single = CustodyObligation {
-        scope: scope(1),
-        required: BTreeSet::from([1]),
-        held: BTreeSet::from([1]),
-        excused: BTreeSet::new(),
-    };
-    assert!(single.satisfied());
-    let none = CustodyObligation {
-        scope: scope(1),
-        required: BTreeSet::new(),
-        held: BTreeSet::new(),
-        excused: BTreeSet::new(),
-    };
-    assert!(none.satisfied());
-    // A replication acknowledges at a majority of the required copies, every copy it asked holding.
-    assert_eq!(acknowledged(2, 3), Ok(()));
-    assert_eq!(acknowledged(1, 3), Err(AccessError::Unavailable));
-    assert_eq!(acknowledged(1, 2), Err(AccessError::Unavailable));
-    assert_eq!(acknowledged(3, 5), Ok(()));
-    assert_eq!(acknowledged(2, 5), Err(AccessError::Unavailable));
-    assert_eq!(acknowledged(1, 1), Ok(()));
+    // Both copies dead: every copy up holds it, but none does.
+    let none_up = obligation(&[1, 2], &[], &[1, 2], LiveCopies);
+    assert!(!none_up.satisfied());
+    assert_eq!(none_up.missing().count(), 0);
+    // Three copies: one dead, two holding, a majority.
+    assert!(obligation(&[1, 2, 3], &[1, 3], &[2], LiveMajority).satisfied());
+    assert!(!obligation(&[1, 2, 3], &[1], &[2, 3], LiveMajority).satisfied());
+    assert!(obligation(&[1, 2, 3], &[1, 2, 3], &[], EveryCopy).satisfied());
+    // None required, nothing owed.
+    assert!(obligation(&[], &[], &[], EveryCopy).satisfied());
+    // What a replication needs holding to acknowledge, by rule.
+    assert_eq!(LiveCopies.least(2), 1);
+    assert_eq!(LiveMajority.least(2), 2);
+    assert_eq!(LiveMajority.least(3), 2);
+    assert_eq!(EveryCopy.least(3), 3);
+    assert_eq!(LiveCopies.least(0), 0);
+    assert_eq!(acknowledged(1, LiveCopies.least(2)), Ok(()));
+    assert_eq!(
+        acknowledged(0, LiveCopies.least(2)),
+        Err(AccessError::Unavailable)
+    );
+    assert_eq!(
+        acknowledged(1, LiveMajority.least(2)),
+        Err(AccessError::Unavailable)
+    );
+    assert_eq!(acknowledged(2, LiveMajority.least(3)), Ok(()));
 }
 
 /// Of three required copies, one the liveness view holds dead is excused, and the obligation is

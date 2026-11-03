@@ -41,21 +41,22 @@ pub struct CustodyObligation {
     pub scope: CustodyScope,
     pub required: BTreeSet<u64>,
     pub held: BTreeSet<u64>,
-    /// Required copies not waited for under [`CustodyRule::LiveMajority`]: held suspect or dead by
-    /// the liveness view when the obligation was taken, or while one was waited for. Empty under
-    /// [`CustodyRule::EveryCopy`].
+    /// Required copies not waited for under a rule that excuses them ([`CustodyRule`]): held
+    /// suspect or dead by the liveness view when the obligation was taken, or while one was waited
+    /// for. Empty under [`CustodyRule::EveryCopy`].
     pub excused: BTreeSet<u64>,
+    /// The fewest required copies that must hold the object under its rule ([`CustodyRule::least`]).
+    pub least: usize,
 }
 impl CustodyObligation {
-    /// Every required copy not excused holds the object, and a majority of the required copies do:
-    /// f+1 of 2f+1, so an acknowledged object outlives any f of its copies. With none required,
-    /// nothing is owed.
+    /// Every required copy not excused holds the object, and at least as many of the required
+    /// copies as its rule asks ([`Self::least`]). With none required, nothing is owed.
     pub fn satisfied(&self) -> bool {
         if self.required.is_empty() {
             return true;
         }
         let holding = self.required.intersection(&self.held).count();
-        holding >= majority(self.required.len())
+        holding >= self.least
             && self
                 .required
                 .iter()
@@ -77,22 +78,37 @@ fn majority(copies: usize) -> usize {
         .and_then(|half| half.checked_add(1))
         .unwrap_or(usize::MAX)
 }
-/// Which of its required copies an object's custody must reach before it is acknowledged.
+/// Which of its required copies an object's custody must reach before it is acknowledged (26 §1).
+/// The user's rule for artifacts (2026-11-03): every copy up, and a quorum of the session's voters
+/// (f+1 of 2f+1), as Kafka acknowledges a produce sent with `acks=all` once every replica of the
+/// partition's in-sync set has it, refusing while that set is smaller than `min.insync.replicas`; a
+/// replica leaves the set when it falls behind and rejoins once caught up. The liveness view stands
+/// for the in-sync set here: a copy it holds suspect or dead is not waited for, and is brought the
+/// object the next time the object's custody is asked once it is up again ([`bring`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CustodyRule {
     /// Every required copy, however the liveness view holds them. An archive bundle is held by
     /// every copy of its session before its rows leave memory (26 §4): a copy that came back
     /// without it could not serve what was archived.
     EveryCopy,
-    /// Every required copy the liveness view holds up, and a majority of the required copies
-    /// (26 §1): an artifact. A copy held suspect or dead is not waited for, and is brought the
-    /// object the next time the object's custody is asked once it is up again ([`bring`]). Kafka
-    /// acknowledges a produce sent with `acks=all` once every replica of the partition's in-sync
-    /// set has it, refusing while that set is smaller than `min.insync.replicas`; a replica leaves
-    /// the set when it falls behind and rejoins once it has caught up. The liveness view stands
-    /// for the in-sync set here, and a majority for `min.insync.replicas` (the user's rule for
-    /// artifacts, 2026-11-03).
+    /// Every required copy up, and a majority of the required copies: an object a session's frame
+    /// names by reference (a sealed upload, a managed artifact's content), whose bytes only its
+    /// copies hold, so they keep the quorum themselves.
     LiveMajority,
+    /// Every required copy up, and at least one of them: an artifact a session's frame carries
+    /// inline (a native artifact), whose bytes a quorum of the session's voters hold in its log once
+    /// the frame commits, so the log keeps the quorum and a copy the content's reads.
+    LiveCopies,
+}
+impl CustodyRule {
+    /// The fewest of `copies` required copies that must hold the object under this rule.
+    fn least(self, copies: usize) -> usize {
+        match self {
+            Self::EveryCopy => copies,
+            Self::LiveMajority => majority(copies),
+            Self::LiveCopies => copies.min(1),
+        }
+    }
 }
 /// What became of one copy's part of a job that waits for several: its own outcome, or that the
 /// liveness view came to hold the copy suspect or dead while it was waited for.
@@ -707,19 +723,24 @@ impl CopyHealth<'_> {
             .fetch_add(u64::try_from(down).unwrap_or(u64::MAX), Ordering::Relaxed);
         Err(AccessError::Unavailable)
     }
-    /// Refuses a job that replicates under [`CustodyRule::LiveMajority`] where the required copies
-    /// the view holds up, this node among them where it is one, are fewer than a majority: no
-    /// acknowledgement could follow, so its seal would be work for nothing ([`Self::all_up`]). The
+    /// Refuses a job that replicates under `rule` where the required copies the view holds up,
+    /// this node among them where it is one, are fewer than the rule's least ([`CustodyRule::least`]):
+    /// no acknowledgement could follow, so its seal would be work for nothing ([`Self::all_up`]). The
     /// copies held down are counted not asked here only where the job is refused; one that goes on
     /// counts those it does not ask itself ([`replicate`]).
-    fn enough_up(&self, node: u64, placement: &EvidencePlacement) -> Result<(), AccessError> {
+    fn enough_up(
+        &self,
+        node: u64,
+        placement: &EvidencePlacement,
+        rule: CustodyRule,
+    ) -> Result<(), AccessError> {
         let down = placement
             .copies
             .iter()
             .filter(|peer| **peer != node && self.held_down(**peer))
             .count();
         let up = placement.copies.len().saturating_sub(down);
-        if up >= majority(placement.copies.len()) {
+        if up >= rule.least(placement.copies.len()) {
             return Ok(());
         }
         self.not_asked
@@ -1493,7 +1514,7 @@ async fn process(
                     node,
                     &row.placement,
                     &reference,
-                    CustodyRule::LiveMajority,
+                    CustodyRule::LiveCopies,
                 )
                 .await
                 .map(|obligation| (obligation, request)),
@@ -2164,10 +2185,11 @@ async fn obligation(
     let mut excused = BTreeSet::new();
     let request = RequestId(reference.root.0[..16].try_into().unwrap_or([0; 16]));
     let transfer = transfer_id(scope, request, reference);
-    // A copy the rule does not wait for is excused under [`CustodyRule::LiveMajority`] and simply
-    // not held under [`CustodyRule::EveryCopy`].
+    // A copy the rule does not wait for is excused under a rule that excuses copies held down
+    // ([`CustodyRule::LiveMajority`], [`CustodyRule::LiveCopies`]) and simply not held under
+    // [`CustodyRule::EveryCopy`].
     let unwaited = |peer: u64| match rule {
-        CustodyRule::LiveMajority => Custody::Excused(peer),
+        CustodyRule::LiveMajority | CustodyRule::LiveCopies => Custody::Excused(peer),
         CustodyRule::EveryCopy => Custody::NotHeld,
     };
     // The copies without a receipt are asked at once: one that answers
@@ -2205,8 +2227,8 @@ async fn obligation(
                     }
                     Watched::Done(true) => true,
                     // A copy up that lacks the object was held down when it was acknowledged:
-                    // under [`CustodyRule::LiveMajority`] it is brought it now ([`bring`]).
-                    Watched::Done(false) if rule == CustodyRule::LiveMajority => {
+                    // under a rule that excuses copies held down it is brought it now ([`bring`]).
+                    Watched::Done(false) if rule != CustodyRule::EveryCopy => {
                         let brought = bring(
                             content, pool, health, node, placement, request, reference, peer,
                         );
@@ -2252,14 +2274,17 @@ async fn obligation(
     if let Some(error) = failed {
         return Err(error);
     }
+    let least = rule.least(required.len());
     Ok(CustodyObligation {
         scope,
         required,
         held,
         excused,
+        least,
     })
 }
-/// Brings an object to `peer`, a required copy up that lacks it ([`CustodyRule::LiveMajority`]): a
+/// Brings an object to `peer`, a required copy up that lacks it, under a rule that excuses copies held
+/// down ([`CustodyRule`]): a
 /// copy the liveness view held down while the object was acknowledged comes back without it, and
 /// is brought it the next time the object's custody is asked. This node first holds the object,
 /// from its own store or pulled from a copy the view holds up ([`ensure_local`]), then moves to the
@@ -2281,10 +2306,11 @@ async fn bring(
     replicate_to(content, pool, placement.scope, transfer, peer, reference).await
 }
 /// Seal and verify an artifact-bearing native frame's inline payload, then replicate the sealed
-/// bytes to the other required copies of the current placement, exactly as a sealed upload is:
-/// every copy the liveness view holds up, and a majority of them ([`CustodyRule::LiveMajority`]).
-/// Fewer refuse the frame before admission; a follower that later leads or serves reads therefore
-/// holds the payload under its own custody, or is brought it when its custody is next asked.
+/// bytes to the other required copies of the current placement: every copy the liveness view holds
+/// up, and at least one of them, the frame's commit keeping the payload on a quorum of the session's
+/// voters ([`CustodyRule::LiveCopies`]). With no copy up the frame is refused before admission; a
+/// follower that later leads or serves reads holds the payload under its own custody, or is brought
+/// it when its custody is next asked.
 async fn attest_native(
     content: &ContentHost,
     pool: &PeerConnectionPool,
@@ -2310,7 +2336,7 @@ async fn attest_native(
     {
         return Err(AccessError::Unauthorized);
     }
-    health.enough_up(node, placement)?;
+    health.enough_up(node, placement, CustodyRule::LiveCopies)?;
     let evidence = content
         .verify_native(crate::content_host::NativeVerification {
             scope: placement.scope,
@@ -2334,7 +2360,7 @@ async fn attest_native(
         placement,
         key.id,
         &reference,
-        CustodyRule::LiveMajority,
+        CustodyRule::LiveCopies,
     )
     .await?;
     content.check_policy(placement.scope).await?;
@@ -2348,7 +2374,7 @@ async fn seal(
     placement: &EvidencePlacement,
     request: &VerifiedRequest,
 ) -> Result<ContentRef, AccessError> {
-    health.enough_up(node, placement)?;
+    health.enough_up(node, placement, CustodyRule::LiveMajority)?;
     let reference = content
         .seal_upload(placement.scope, request.clone())
         .await?;
@@ -2429,7 +2455,7 @@ async fn attest(
             if reference.length > u64::try_from(maximum).map_err(|_| AccessError::Capacity)? {
                 return Err(AccessError::Capacity);
             }
-            health.enough_up(node, placement)?;
+            health.enough_up(node, placement, CustodyRule::LiveMajority)?;
             ensure_local(
                 content, pool, health, node, placement, custody_id, reference,
             )
@@ -2680,9 +2706,10 @@ async fn replicate(
     // is not asked, and one it comes to hold so while it is waited for is waited for no longer
     // ([`CopyHealth`]). Under [`CustodyRule::EveryCopy`] either fails the replication, at once for
     // one waited for, the others left where they are (a copy keeps the chunks it took, and the job
-    // asked again moves only what it lacks). Under [`CustodyRule::LiveMajority`] it is excused: the
-    // replication holds once every copy up holds the object and a majority of the required copies
-    // do, and the excused copy is brought it when its custody is next asked ([`bring`]).
+    // asked again moves only what it lacks). Under a rule that excuses copies held down it is
+    // excused: the replication holds once every copy up holds the object and as many required copies
+    // as the rule asks do ([`CustodyRule::least`]), and the excused copy is brought it when its
+    // custody is next asked ([`bring`]).
     let mut copies = Concurrent::new(placement.copies.len()).map_err(|_| AccessError::Capacity)?;
     let mut failed = None;
     for peer in placement
@@ -2725,13 +2752,13 @@ async fn replicate(
     if let Some(error) = failed {
         return Err(error);
     }
-    acknowledged(holding, placement.copies.len())
+    acknowledged(holding, rule.least(placement.copies.len()))
 }
-/// Whether a replication that left `holding` of `copies` required copies holding the object, every
-/// copy it asked among them, may acknowledge it: once a majority hold it ([`CustodyRule`]); fewer, it
+/// Whether a replication that left `holding` required copies holding the object, every copy it asked
+/// among them, may acknowledge it: once at least `least` hold it ([`CustodyRule::least`]); fewer, it
 /// is refused as unavailable, an outcome its participant knows and asks again on.
-fn acknowledged(holding: usize, copies: usize) -> Result<(), AccessError> {
-    if copies == 0 || holding >= majority(copies) {
+fn acknowledged(holding: usize, least: usize) -> Result<(), AccessError> {
+    if holding >= least {
         Ok(())
     } else {
         Err(AccessError::Unavailable)
@@ -3001,29 +3028,23 @@ pub struct FleetService {
     pub content: ContentHost,
     pub evidence: EvidenceCoordinator,
 }
-enum Eligibility {
-    Refused(NativeRefusal),
-    Failed(AccessError),
-}
 impl FleetService {
-    /// A phase that evaluates an artifact begins only when every required
-    /// copy holds it (doc 04 §7, R8 instruction 1): the artifact's pointer
-    /// is read from the committed prefix and its obligation asked of the
-    /// evidence coordinator; a copy short of custody refuses the frame as a
-    /// retryable capacity condition naming the copies, and an artifact the
-    /// prefix does not hold is left for the owner to refuse.
+    /// A phase that evaluates an artifact begins only when its custody is satisfied (doc 04 §7, R8
+    /// instruction 1; 26 §1): the artifact's pointer is read from the committed prefix and its
+    /// obligation asked of the evidence coordinator; custody short refuses the frame `Unavailable`,
+    /// which its client sends again for its delivery bound, and an artifact the prefix does not
+    /// hold is left for the owner to refuse.
     async fn eligible(
         &self,
         request: VerifiedRequest,
         deadline: focal_rt::time::Instant,
-    ) -> Result<VerifiedRequest, Eligibility> {
+    ) -> Result<VerifiedRequest, AccessError> {
         let Operation::Native { frame } = &request.request().operation else {
             return Ok(request);
         };
         let ledger = request.request().ledger;
         let limits = focal_ledger::NativeSessionLimits::standard(ContentDomainId(ledger.tenant.0));
-        let artifact = crate::native_ingress::evaluation_artifact_of_frame(&limits, frame)
-            .map_err(Eligibility::Failed)?;
+        let artifact = crate::native_ingress::evaluation_artifact_of_frame(&limits, frame)?;
         let Some(artifact) = artifact else {
             return Ok(request);
         };
@@ -3031,7 +3052,7 @@ impl FleetService {
             .replica
             .artifact_pointer(artifact)
             .await
-            .map_err(|error| Eligibility::Failed(crate::host::access(error)))?;
+            .map_err(crate::host::access)?;
         let Some(pointer) = pointer else {
             return Ok(request);
         };
@@ -3044,28 +3065,17 @@ impl FleetService {
         let (obligation, request) = self
             .evidence
             .obligation(request, reference, deadline)
-            .await
-            .map_err(Eligibility::Failed)?;
+            .await?;
         if obligation.satisfied() {
             return Ok(request);
         }
-        let missing: Vec<String> = obligation.missing().map(|node| node.to_string()).collect();
-        let excused: Vec<String> = obligation
-            .excused
-            .iter()
-            .map(|node| node.to_string())
-            .collect();
-        Err(Eligibility::Refused(NativeRefusal {
-            kind: NativeRefusalKind::Capacity,
-            detail: format!(
-                "custody: {} of {} required copies hold the artifact, every copy up and a majority \
-                 needed; missing nodes {}; down nodes {}",
-                obligation.held.len(),
-                obligation.required.len(),
-                missing.join(","),
-                excused.join(",")
-            ),
-        }))
+        // Short of custody, no copy up holds the artifact or one up lacks it and could not be
+        // brought it: a copy not reachable now, which is availability, not the owner's capacity.
+        // Refused `Unavailable`, the frame is sent again by its client for the client's delivery
+        // bound, as a leader not reached is, so its agent need not; refused as the owner's
+        // capacity, the client reported it at once and the agent had to send it again (24 in a
+        // 33-node run with twelve nodes killed, fleet33 k35, 2026-11-03).
+        Err(AccessError::Unavailable)
     }
 }
 impl RequestHandler for FleetService {
@@ -3150,11 +3160,7 @@ impl RequestHandler for FleetService {
             {
                 match self.eligible(request, deadline).await {
                     Ok(request) => self.replica.handle_accounted(&request).await,
-                    Err(Eligibility::Refused(refusal)) => {
-                        response.result = Response::Native(NativeMutationReply::Refused(refusal));
-                        OwnedResponse::new(response)
-                    }
-                    Err(Eligibility::Failed(error)) => {
+                    Err(error) => {
                         response.result = Response::Error(error);
                         OwnedResponse::new(response)
                     }
