@@ -670,7 +670,9 @@ keeps, per thread name, how many 200 ms samples of every node found a thread blo
 sent again (`kinds.txt`), every window without a commit read against the disk (`stallio.txt`), and,
 for k34, m9 and c19, the volume's btrfs commits and the host's I/O pressure every 200 ms
 (`volume-samples.txt`) and how many nodes' log I/O threads were blocked on disk at each 200 ms
-sample (`blocked-threads.txt`); p11's samplers were cut by a restart of fedora's kiln runner.
+sample (`blocked-threads.txt`); p11's samplers were cut by a restart of fedora's kiln runner. c18
+keeps the same count (`blocked-threads.txt`), its volume stall in it: sixteen nodes' log I/O
+threads in disk waits at every sample from 11.8 s after the isolation began, twenty-three by 12.8 s.
 Each run's whole directory, every node's log,
 health, metrics and replicas among them, is on fedora under `~/s5/runs/<run>` (the intermediate
 runs' too), beside the run kit (`~/s5/campaign.sh`, `fleet-run.sh`, `killreport.py`, `agents.py`,
