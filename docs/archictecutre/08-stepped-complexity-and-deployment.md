@@ -85,6 +85,7 @@ must show the missing independent capacity and keep the existing guarantee uncha
 | `durability.max_failures` | Number of simultaneous independent failures in that class to tolerate |
 | `placement.home_regions` | Regions eligible to host the session's normal ordering authority; introduced when geography matters |
 | `placement.residency` | Allowed regions for scoped data, including log replicas, artifact bytes, snapshots, archives, and derived persistent copies |
+| `client.delivery_timeout_ms` | How long this host's clients (the CLI, the MCP adapter, code mode) keep delivering a request their ledger cannot take yet — a leader or quorum not reached, a door full, a required copy short — before reporting the refusal: within it the client sends the request again itself, so an agent spends nothing re-sending through an outage. Unset, 120,000, Kafka's producer default for the same bound (`delivery.timeout.ms`, "an upper bound on the time to report success or failure"); from 500 (the client's longest pause between resends) to 3,600,000. Host-local, never a cluster fact |
 
 The default local contract is `survive: node, max_failures: 0`: acknowledged commits
 survive process crash and power loss, followed by restart on the same intact,
@@ -92,7 +93,7 @@ durability-capable storage. It is durable, not replicated.
 No ordinary deployment command enables memory-only acknowledgments. Test-only volatile
 adapters must be structurally separate from production startup and visibly identified.
 
-`node` and `topology` are local deployment facts; `durability` and `placement` are
+`node`, `topology` and `client` are local deployment facts; `durability` and `placement` are
 cluster/session policy intent. They share a schema but have different authorities.
 An operator may keep local facts in `node.yaml` and policy in `deployment.yaml`.
 `start` can bootstrap a new store from combined input; on an initialized store it

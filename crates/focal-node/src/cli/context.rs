@@ -864,7 +864,7 @@ pub(super) fn connect(
                 adoption: Some(adoption),
                 fence: Mutex::new(learn),
             }));
-            let client = Client::new(transport, RetryPolicy::default(), limits, 1)?;
+            let client = Client::new(transport, settings.client.retry_policy(), limits, 1)?;
             let client = match super::trace::sink() {
                 Some(sink) => client.with_trace(sink),
                 None => client,
@@ -953,7 +953,7 @@ pub(super) fn connect(
                 adoption: None,
                 fence: Mutex::new(learn),
             }));
-            let client = Client::new(transport, RetryPolicy::default(), limits, 1)?;
+            let client = Client::new(transport, settings.client.retry_policy(), limits, 1)?;
             let client = match super::trace::sink() {
                 Some(sink) => client.with_trace(sink),
                 None => client,

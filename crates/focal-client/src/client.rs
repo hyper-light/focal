@@ -7,6 +7,11 @@ use std::{collections::BTreeMap, sync::Mutex, time::Duration};
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
     pub max_attempts: u32,
+    /// How long the client keeps delivering a request whose ledger cannot take it yet before it
+    /// reports what it was last told: refusals that admitted nothing (a leader or quorum not
+    /// reached, a door full, a required copy short) are sent again within it, so the caller, an
+    /// agent among them, need not send the request again itself. [`DELIVERY_TIMEOUT`] unless
+    /// configured (`client.delivery_timeout_ms` in focal's configuration).
     pub max_elapsed: Duration,
     pub base_backoff: Duration,
     pub max_backoff: Duration,
@@ -62,13 +67,30 @@ impl RetryBudget {
         self.0.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
+/// How long a client keeps delivering a request its ledger cannot take yet, unless configured:
+/// Kafka's producer default for the same bound, `delivery.timeout.ms`, "an upper bound on the time
+/// to report success or failure", covering "the time allowed for retriable send failures"
+/// (`ProducerConfig.java`, `.define(DELIVERY_TIMEOUT_MS_CONFIG, Type.INT, 120 * 1000, ...)`, read
+/// upstream 2026-11-03). It outlasts what a session without its quorum waits for its voters when a
+/// dozen of 33 nodes are killed for 30 to 60 s (34 to 70 s, 2026-11-02), where the 30 s it replaced,
+/// which nothing had measured or cited for a write, left those writes to their callers.
+pub const DELIVERY_TIMEOUT: Duration = Duration::from_secs(120);
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
             max_attempts: 4,
-            max_elapsed: Duration::from_secs(30),
+            max_elapsed: DELIVERY_TIMEOUT,
             base_backoff: Duration::from_millis(20),
             max_backoff: Duration::from_millis(500),
+        }
+    }
+}
+impl RetryPolicy {
+    /// The default policy delivering for `delivery`: a configured delivery bound.
+    pub fn delivering_for(delivery: Duration) -> Self {
+        Self {
+            max_elapsed: delivery,
+            ..Self::default()
         }
     }
 }

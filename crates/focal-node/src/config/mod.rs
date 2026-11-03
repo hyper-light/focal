@@ -36,6 +36,8 @@ pub struct Settings {
     pub durability: Durability,
     #[serde(default)]
     pub placement: Placement,
+    #[serde(default)]
+    pub client: ClientSettings,
 }
 
 impl Default for Settings {
@@ -46,6 +48,39 @@ impl Default for Settings {
             topology: Topology::default(),
             durability: Durability::default(),
             placement: Placement::default(),
+            client: ClientSettings::default(),
+        }
+    }
+}
+
+/// How this host's clients (the CLI, the MCP adapter, code mode) deliver what they send. Host-local,
+/// never a cluster fact.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClientSettings {
+    /// How long a client keeps delivering a request its ledger cannot take yet (a leader or quorum
+    /// not reached, a door full, a required copy short) before it reports the refusal, in
+    /// milliseconds: within it the client sends the request again itself, so an agent need not.
+    /// Unset, `focal_client::DELIVERY_TIMEOUT` (Kafka's producer default for `delivery.timeout.ms`,
+    /// 120,000). At least the client's longest pause between resends (500), at most an hour (the
+    /// client's own bound on a policy).
+    pub delivery_timeout_ms: Option<u64>,
+}
+
+/// The least delivery bound a client takes: its longest pause between resends, so that a pause
+/// never outlasts the bound (`focal_client::Client::new` refuses such a policy).
+const MIN_DELIVERY_TIMEOUT_MS: u64 = 500;
+/// The most a client takes: its own bound on a policy's clock.
+const MAX_DELIVERY_TIMEOUT_MS: u64 = 3_600_000;
+
+impl ClientSettings {
+    /// The retry policy this host's clients deliver with: the configured bound, or the default.
+    pub fn retry_policy(&self) -> focal_client::RetryPolicy {
+        match self.delivery_timeout_ms {
+            Some(ms) => {
+                focal_client::RetryPolicy::delivering_for(std::time::Duration::from_millis(ms))
+            }
+            None => focal_client::RetryPolicy::default(),
         }
     }
 }
@@ -183,6 +218,16 @@ impl Settings {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.version != CONFIG_VERSION {
             return Err(ConfigError::Version(self.version));
+        }
+        if self
+            .client
+            .delivery_timeout_ms
+            .is_some_and(|ms| !(MIN_DELIVERY_TIMEOUT_MS..=MAX_DELIVERY_TIMEOUT_MS).contains(&ms))
+        {
+            return Err(ConfigError::Invalid {
+                field: "client.delivery_timeout_ms",
+                reason: "must be 500 to 3600000 milliseconds",
+            });
         }
         if self
             .node

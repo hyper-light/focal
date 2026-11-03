@@ -421,12 +421,13 @@ async fn availability_refusals_are_resent_within_the_clock_and_reported_as_refus
 /// An availability refusal is resent for the policy's clock: as many resends as the clock holds
 /// at the pauses' expected length, half of each step, which doubles from the base to the cap. The
 /// default policy's steps are 20, 40, 80, 160 and 320 ms, then the cap's 500 ms: sixteen pauses
-/// expected to take 3.06 s, and 108 more at 250 ms for the clock's other 26.94 s. A fixed 64,
-/// drawn over their steps, spanned about 16 s of its 30 s. A policy with no backoff resends as
-/// many times as it attempts.
+/// expected to take 3.06 s, and 468 more at 250 ms for the default delivery bound's other
+/// 116.94 s (`DELIVERY_TIMEOUT`, 120 s). A fixed 64, drawn over their steps, spanned about 16 s of
+/// the 30 s clock it had then. A policy with no backoff resends as many times as it attempts.
 #[test]
 fn availability_resends_span_the_policys_clock_at_their_expected_pause() {
-    assert_eq!(RetryPolicy::default().availability_resends(), 16 + 108);
+    assert_eq!(RetryPolicy::default().max_elapsed, DELIVERY_TIMEOUT);
+    assert_eq!(RetryPolicy::default().availability_resends(), 16 + 468);
     assert_eq!(policy().availability_resends(), policy().max_attempts);
     let one = RetryPolicy {
         max_attempts: 4,

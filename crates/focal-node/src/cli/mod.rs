@@ -37,7 +37,7 @@ pub(super) use args::{Commands, RequestArgs, RequestCommand};
 pub(super) fn check_request_file(path: &std::path::Path) -> Result<()> {
     request_files::check(path)
 }
-use focal_client::{Client, ClientError, LocalTransport, RetryPolicy, input::*, pending::*};
+use focal_client::{Client, ClientError, LocalTransport, input::*, pending::*};
 use focal_model::*;
 use focal_node::config::Settings;
 use focal_wire::*;
@@ -202,7 +202,7 @@ impl Context {
         .map_err(|e| CliError::Other(Box::new(e)))?;
         let client = Client::new(
             context::Transport::Unix(transport),
-            RetryPolicy::default(),
+            settings.client.retry_policy(),
             limits,
             1,
         )?;

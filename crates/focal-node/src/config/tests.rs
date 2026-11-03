@@ -29,7 +29,7 @@ fn the_schema_and_the_typed_settings_declare_the_same_fields() {
     let default = serde_json::to_value(Settings::default()).unwrap();
     let root: Vec<String> = default.as_object().unwrap().keys().cloned().collect();
     assert_eq!(schema::properties(&[]).unwrap(), root);
-    for section in ["node", "topology", "durability", "placement"] {
+    for section in ["node", "topology", "durability", "placement", "client"] {
         let fields: Vec<String> = default[section]
             .as_object()
             .unwrap()
@@ -192,4 +192,44 @@ fn the_committed_policy_file_keeps_its_original_form_and_advances_by_revision() 
 fn metrics_listen_is_loopback_only() {
     assert!(Settings::from_yaml("version: 1\nnode:\n  metrics_listen: 127.0.0.1:9100").is_ok());
     assert!(Settings::from_yaml("version: 1\nnode:\n  metrics_listen: 0.0.0.0:9100").is_err());
+}
+
+/// A host's clients deliver for the configured bound (`client.delivery_timeout_ms`), or for
+/// Kafka's producer default where it is unset; the bound is checked against the client's own:
+/// no shorter than its longest pause between resends, no longer than an hour. The key is known to
+/// the schema, and a key beside it is refused by its full path.
+#[test]
+fn a_hosts_clients_deliver_for_the_configured_bound_or_kafkas_default() {
+    let unset = Settings::from_yaml("version: 1").unwrap();
+    assert_eq!(unset.client.delivery_timeout_ms, None);
+    assert_eq!(
+        unset.client.retry_policy().max_elapsed,
+        focal_client::DELIVERY_TIMEOUT
+    );
+    assert_eq!(
+        focal_client::DELIVERY_TIMEOUT,
+        std::time::Duration::from_secs(120)
+    );
+    let set = Settings::from_yaml("version: 1\nclient:\n  delivery_timeout_ms: 90000").unwrap();
+    assert_eq!(
+        set.client.retry_policy().max_elapsed,
+        std::time::Duration::from_millis(90_000)
+    );
+    assert_eq!(
+        set.client.retry_policy().max_backoff,
+        focal_client::RetryPolicy::default().max_backoff
+    );
+    for bad in [0, 499, 3_600_001] {
+        assert!(
+            Settings::from_yaml(&format!("version: 1\nclient:\n  delivery_timeout_ms: {bad}"))
+                .is_err(),
+            "{bad}"
+        );
+    }
+    assert!(Settings::from_yaml("version: 1\nclient:\n  delivery_timeout_ms: 500").is_ok());
+    assert!(check_unknown_keys("version: 1\nclient:\n  delivery_timeout_ms: 90000").is_ok());
+    match check_unknown_keys("version: 1\nclient:\n  retries: 3") {
+        Err(ConfigError::UnknownKey { path }) => assert_eq!(path, "client.retries"),
+        other => panic!("{other:?}"),
+    }
 }

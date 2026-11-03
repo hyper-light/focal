@@ -73,7 +73,8 @@ const POLICY_FIELDS: [&str; 4] = [
     "placement.home_regions",
     "placement.residency",
 ];
-const LOCAL_FIELDS: [&str; 10] = [
+const LOCAL_FIELDS: [&str; 11] = [
+    "client.delivery_timeout_ms",
     "node.data_dir",
     "node.listen",
     "node.advertise",

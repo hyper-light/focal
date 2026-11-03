@@ -36,6 +36,15 @@
         "home_regions": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
         "residency": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true }
       }
+    },
+    "client": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "delivery_timeout_ms": {
+          "type": ["integer", "null"], "minimum": 500, "maximum": 3600000,
+          "description": "How long this host's clients keep delivering a request their ledger cannot take yet before reporting the refusal, in milliseconds. Unset, Kafka's producer default for delivery.timeout.ms, 120000. At least the client's longest pause between resends (500), at most an hour."
+        }
+      }
     }
   }
 }

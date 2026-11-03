@@ -7,7 +7,6 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     pin::pin,
     task::Poll,
-    time::Duration,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -81,7 +80,9 @@ impl<T: ClientTransport> Client<T> {
             }
             _ => return Err(ClaimGetError::InvalidRequest),
         };
-        let duration = self.retry_timeout().min(Duration::from_secs(30));
+        // The client's own delivery bound ([`crate::DELIVERY_TIMEOUT`] unless configured), as every
+        // request it delivers: a fixed 30 s here had no source of its own.
+        let duration = self.retry_timeout();
         let deadline = crate::time::Instant::now()
             .checked_add(duration)
             .ok_or(ClientError::Transport)?;
