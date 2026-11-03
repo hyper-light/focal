@@ -1231,8 +1231,9 @@ fn a_copy_the_liveness_view_holds_dead_is_not_asked_and_its_job_is_refused_at_on
 }
 
 /// A custody obligation asks no copy the liveness view holds dead and waits for none it comes to
-/// hold so: the copy is missing from it at once, with no dial to the copy and nothing waiting out
-/// the pool's request time. Each such ask held its job's place in the driver's window while the
+/// hold so: the copy is excused from it at once (26 §1, the user's rule for artifacts, 2026-11-03),
+/// with no dial to the copy and nothing waiting out the pool's request time, and one copy of two is
+/// still short of the majority the obligation needs. Each such ask held its job's place in the driver's window while the
 /// jobs behind it waited at the door; a leader new to its session holds none of the receipts its
 /// predecessor recorded, so every phase that evaluated an artifact asked the dead copy again (a
 /// run of 33 nodes with 12 killed: 271 jobs ran out of time at one leader's door, and 36 writes
@@ -1305,7 +1306,9 @@ fn an_obligation_asks_no_copy_the_liveness_view_holds_dead_and_waits_for_none_it
                 .await
                 .unwrap();
             assert_eq!(obligation.held, BTreeSet::from([1]));
-            assert_eq!(obligation.missing().collect::<Vec<_>>(), vec![2]);
+            assert_eq!(obligation.excused, BTreeSet::from([2]));
+            assert_eq!(obligation.missing().count(), 0);
+            assert!(!obligation.satisfied(), "one of two copies is no majority");
             let stats = coordinator.door_stats();
             assert_eq!((stats.copies_unavailable, stats.copies_given_up), (1, 0));
             assert_eq!(pool.stats().dials, 0);
@@ -1340,7 +1343,7 @@ fn an_obligation_asks_no_copy_the_liveness_view_holds_dead_and_waits_for_none_it
                 .await
                 .unwrap();
                 // The copy dies while it is asked: the obligation is answered once the view says
-                // so, the copy missing, its wait bounded by the frozen window alone.
+                // so, the copy excused, its wait bounded by the frozen window alone.
                 publisher.publish_view(held_as(crate::liveness::MemberStatus::Dead));
                 let (obligation, _) = crate::test_waits::charged(
                     Vec::new,
@@ -1352,7 +1355,8 @@ fn an_obligation_asks_no_copy_the_liveness_view_holds_dead_and_waits_for_none_it
                 .unwrap()
                 .unwrap();
                 assert_eq!(obligation.held, BTreeSet::from([1]));
-                assert_eq!(obligation.missing().collect::<Vec<_>>(), vec![2]);
+                assert_eq!(obligation.excused, BTreeSet::from([2]));
+                assert!(!obligation.satisfied(), "one of two copies is no majority");
                 let stats = coordinator.door_stats();
                 assert_eq!((stats.copies_unavailable, stats.copies_given_up), (1, 1));
                 // An obligation short of a copy is an answer, not a refusal of its job.
@@ -1853,4 +1857,132 @@ fn a_transfer_goes_by_as_many_streams_as_the_path_holds_when_a_chunk_is_begun() 
 /// A deadline no test waits out: a participant job's request time, far off.
 fn far() -> focal_rt::time::Instant {
     focal_rt::time::Instant::now().saturating_add(std::time::Duration::from_secs(600))
+}
+
+/// An artifact's custody holds once every required copy the liveness view holds up and a majority
+/// of the required copies hold it (26 §1, the user's rule, 2026-11-03): a dead copy is excused, and
+/// the obligation is satisfied without it where the copies up are a majority; never with fewer.
+#[test]
+fn an_obligation_is_satisfied_by_every_copy_up_and_a_majority_a_dead_copy_excused() {
+    let obligation = |held: &[u64], excused: &[u64]| CustodyObligation {
+        scope: scope(1),
+        required: BTreeSet::from([1, 2, 3]),
+        held: held.iter().copied().collect(),
+        excused: excused.iter().copied().collect(),
+    };
+    // Three of three, as the every-copy rule had it.
+    assert!(obligation(&[1, 2, 3], &[]).satisfied());
+    // One dead and excused, the other two holding: a majority, and every copy up holds it.
+    let one_down = obligation(&[1, 3], &[2]);
+    assert!(one_down.satisfied());
+    assert_eq!(one_down.missing().count(), 0);
+    // A copy up that lacks it is missing, whatever the majority.
+    let lacking = obligation(&[1, 3], &[]);
+    assert!(!lacking.satisfied());
+    assert_eq!(lacking.missing().collect::<Vec<_>>(), vec![2]);
+    // Two dead: every copy up holds it, but one of three is no majority.
+    let two_down = obligation(&[1], &[2, 3]);
+    assert!(!two_down.satisfied());
+    assert_eq!(two_down.missing().count(), 0);
+    // A placement of one copy is its own majority; of none, nothing is owed.
+    let single = CustodyObligation {
+        scope: scope(1),
+        required: BTreeSet::from([1]),
+        held: BTreeSet::from([1]),
+        excused: BTreeSet::new(),
+    };
+    assert!(single.satisfied());
+    let none = CustodyObligation {
+        scope: scope(1),
+        required: BTreeSet::new(),
+        held: BTreeSet::new(),
+        excused: BTreeSet::new(),
+    };
+    assert!(none.satisfied());
+    // A replication acknowledges at a majority of the required copies, every copy it asked holding.
+    assert_eq!(acknowledged(2, 3), Ok(()));
+    assert_eq!(acknowledged(1, 3), Err(AccessError::Unavailable));
+    assert_eq!(acknowledged(1, 2), Err(AccessError::Unavailable));
+    assert_eq!(acknowledged(3, 5), Ok(()));
+    assert_eq!(acknowledged(2, 5), Err(AccessError::Unavailable));
+    assert_eq!(acknowledged(1, 1), Ok(()));
+}
+
+/// Of three required copies, one the liveness view holds dead is excused, and the obligation is
+/// satisfied by this node's own copy and a third copy's receipt, with no dial to the dead copy: a
+/// phase that evaluates an artifact begins while a copy is down (the 33-node runs refused these at
+/// `validation.begin` under the every-copy rule: c18's 24, p10's 90, `owner_bound`).
+#[test]
+fn an_obligation_of_three_copies_is_satisfied_with_one_dead_and_two_holding() {
+    focal_rt::block_on(async move {
+        let fixture = Fixture::new();
+        let held = placement(1, &[1, 2, 3]);
+        fixture
+            .host
+            .install_policy(held.custody_policy())
+            .await
+            .unwrap();
+        // The third copy's receipt, as a replication to it recorded it.
+        fixture
+            .host
+            .record_receipt(
+                held.scope(),
+                receipt_for(held.scope(), 3, &fixture.reference),
+            )
+            .await
+            .unwrap();
+        let (coordinator, driver) = EvidenceCoordinator::channel(
+            fixture.host.clone(),
+            1,
+            vec![held],
+            fixture.budget.clone(),
+            1,
+        )
+        .unwrap();
+        let pool = pool();
+        let (liveness, publisher) = crate::liveness::LivenessHandle::channel(
+            &fixture.budget,
+            crate::liveness::LivenessConfig::default(),
+            1,
+            ledger(),
+        )
+        .unwrap();
+        let mut view = liveness.view();
+        view.members.insert(
+            2,
+            crate::liveness::MemberView {
+                generation: 1,
+                status: crate::liveness::MemberStatus::Dead,
+                incarnation: 1,
+                confirmed: true,
+                decided_at_ms: 0,
+                suspected_by: None,
+                confirmations: 0,
+                extensions: 0,
+                extended_ms: 0,
+                timeout_ms: 0,
+                rtt_ms: None,
+            },
+        );
+        publisher.publish_view(view);
+        let exercise = async {
+            let (obligation, _) = coordinator
+                .obligation(seal_request(), fixture.reference.clone(), far())
+                .await
+                .unwrap();
+            assert_eq!(obligation.held, BTreeSet::from([1, 3]));
+            assert_eq!(obligation.excused, BTreeSet::from([2]));
+            assert!(obligation.satisfied());
+            assert_eq!(pool.stats().dials, 0);
+            assert_eq!(coordinator.door_stats().copies_unavailable, 1);
+            drop(coordinator);
+        };
+        let (result, ()) =
+            hyper_rt::combine::join2(driver.run(&pool, Some(&liveness)), exercise).await;
+        result.unwrap();
+        drop(liveness);
+        drop(publisher);
+        fixture.close().await;
+    })
+    .unwrap()
 }

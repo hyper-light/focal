@@ -295,6 +295,9 @@ Implemented (2026-09-10, [26](26-custody-archive-retention-and-restore.md) §1):
 copy's verified `Durable` answer is kept as a custody receipt named by ledger, object and
 copy, and a phase that evaluates an artifact begins only when every required copy of the
 current placement holds a receipt at the current scope or answers the verification now.
+Since 2026-11-03 "every required copy" is every one the node's liveness view holds up, and
+a majority of them (26 §1, the rule Kafka keeps for `acks=all` over its in-sync set with
+`min.insync.replicas`): a copy held down is excused and brought the object once it is up.
 
 ## 8. Watermarks, reads, and atomic visibility
 

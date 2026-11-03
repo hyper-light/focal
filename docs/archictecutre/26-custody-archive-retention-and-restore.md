@@ -14,13 +14,34 @@ batch that implemented it; evidence is in [09](09-implementation-status.md).
 
 **The fact.** A copy's custody of an object is a fact the copy states after
 it has verified the whole object, never something inferred from a transfer
-request, an install intent or a manifest. The evidence coordinator already
-acknowledges an artifact only after every required copy of the current
-placement answers `Durable` to the sealed object's replication
-([04](04-storage-and-distribution.md) §7; `evidence_service::replicate`),
-and a copy answers `Durable` only after `complete_import` recomputed the
-stream digest over every chunk it holds. What R8.2 adds is that the fact is
-kept and read.
+request, an install intent or a manifest. The evidence coordinator
+acknowledges an artifact once every required copy of the current placement
+that the node's liveness view holds up, and a majority of the required
+copies, answer `Durable` to the sealed object's replication
+([04](04-storage-and-distribution.md) §7; `evidence_service::replicate`,
+`CustodyRule::LiveMajority`), and a copy answers `Durable` only after
+`complete_import` recomputed the stream digest over every chunk it holds.
+What R8.2 adds is that the fact is kept and read.
+
+**The rule (2026-11-03).** Until then the coordinator waited for every
+required copy, so while one copy was down a session's artifacts waited for
+it: in a 33-node run with twelve nodes down for 66 s, 1,883 artifacts waited
+a median of 51 s for a copy to return, and phases that evaluated an artifact
+were refused while a copy was cut off. The user chose instead the rule Kafka
+keeps for a produce sent with `acks=all`: acknowledged once every replica of
+the partition's in-sync set has it, refused while that set is smaller than
+`min.insync.replicas`, a replica leaving the set when it falls behind and
+rejoining once caught up. Here the liveness view stands for the in-sync set
+and a majority of the required copies (f+1 of 2f+1) for
+`min.insync.replicas`: a copy the view holds suspect or dead is excused, not
+waited for; fewer copies up than a majority refuse the artifact before its
+seal (`CopyHealth::enough_up`), retryably. An excused copy is brought what it
+missed the next time the object's custody is asked once it is up again: the
+obligation finds it lacking the object, and the coordinator moves the object
+to it from its own store or from a copy up (`evidence_service::bring`). An
+archive bundle (§4) keeps the every-copy rule (`CustodyRule::EveryCopy`):
+its rows leave memory once it is sealed, so a copy that came back without it
+could not serve them.
 
 **The receipt.** `focal_evidence::CustodyReceipt` (`FCCRCPT1`, 160 bytes,
 fixed width): the ledger, the object's domain, root and length, the copy's
@@ -35,12 +56,16 @@ node when it seals or verifies an object it holds, and one per copy when
 that copy answers `Durable` — from the verify shortcut or the sealed
 transfer. Receipts ride the disk envelope like every other record.
 
-**The obligation.** `CustodyObligation { scope, required, held }`: the
-copies the current placement requires and those with a receipt at the
-current route epoch and policy revision. A required copy without one is
-asked over its authenticated connection (`CustodyRequest::Verify`; this
-node through its own store) and its `Durable` answer is recorded; a copy
-that cannot answer is simply not held. A placement change therefore never
+**The obligation.** `CustodyObligation { scope, required, held, excused }`:
+the copies the current placement requires, those with a receipt at the
+current route epoch and policy revision, and those the rule excused (held
+suspect or dead by the liveness view when the obligation was taken, or while
+one was waited for). A required copy without a receipt is asked over its
+authenticated connection (`CustodyRequest::Verify`; this node through its
+own store) and its `Durable` answer is recorded; a copy that cannot answer
+is simply not held, and one up that lacks the object is brought it. The
+obligation is satisfied once every required copy not excused holds the
+object and a majority of the required copies do. A placement change therefore never
 inherits an older placement's receipts, and the obligation of an object
 after an expansion is re-established from the copies themselves.
 
@@ -53,7 +78,8 @@ session's own limits (`into_evaluation_artifact`, a fixed-plan decode that
 never builds an artifact), reads the artifact's content pointer from the
 replica's committed prefix (`ReplicaHost::artifact_pointer`), asks the
 coordinator for the obligation, and refuses a frame whose copies fall
-short as a retryable capacity refusal naming the missing nodes; an artifact
+short as a retryable capacity refusal naming the missing and the excused
+nodes; an artifact
 the prefix does not hold is left to the owner, which refuses it by the
 model's own rules. Frames that carry an artifact keep their existing path
 (sealed, verified and replicated before admission).
@@ -64,7 +90,11 @@ a store keeps one receipt per copy across reopen, a newer scope replaces
 the older, a corrupt record is an error. `evidence_service::tests`:
 sealing records this node's receipt and the obligation reads it; a second
 required copy nobody can reach holds none and is named missing while this
-node's receipt is renewed at the new scope; the receipt survives the
+node's receipt is renewed at the new scope; a copy the liveness view holds
+dead is excused and not asked, one of two copies falling short of the
+majority; of three copies, one dead and two holding satisfy the obligation
+(`an_obligation_of_three_copies_is_satisfied_with_one_dead_and_two_holding`),
+and the rule's truth table, a replication's acknowledgement among it; the receipt survives the
 store's reopen; a phase-beginning frame names its artifact (work slot and
 increment) and other frames do not. The real-binary A1 cycle runs
 `BeginWork` through the eligibility check on a single copy.

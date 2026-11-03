@@ -32,22 +32,91 @@ const NATIVE_JOB_PLACE_BYTES: usize = size_of::<Job>()
         Result<(CustodyObligation, VerifiedRequest), AccessError>,
     >());
 
-/// The custody an object owes under a placement (doc 04 §7, R8): the copies
-/// the placement requires and those with a verified receipt at the current
-/// scope. A phase that evaluates the object begins only when the two agree.
+/// The custody an object owes under a placement (doc 04 §7, R8; 26 §1): the copies the placement
+/// requires, those with a verified receipt at the current scope, and those its rule excused, the
+/// liveness view holding them suspect or dead ([`CustodyRule`]). A phase that evaluates the object
+/// begins only once every required copy not excused holds it and a majority of them do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CustodyObligation {
     pub scope: CustodyScope,
     pub required: BTreeSet<u64>,
     pub held: BTreeSet<u64>,
+    /// Required copies not waited for under [`CustodyRule::LiveMajority`]: held suspect or dead by
+    /// the liveness view when the obligation was taken, or while one was waited for. Empty under
+    /// [`CustodyRule::EveryCopy`].
+    pub excused: BTreeSet<u64>,
 }
 impl CustodyObligation {
+    /// Every required copy not excused holds the object, and a majority of the required copies do:
+    /// f+1 of 2f+1, so an acknowledged object outlives any f of its copies. With none required,
+    /// nothing is owed.
     pub fn satisfied(&self) -> bool {
-        self.required.is_subset(&self.held)
+        if self.required.is_empty() {
+            return true;
+        }
+        let holding = self.required.intersection(&self.held).count();
+        holding >= majority(self.required.len())
+            && self
+                .required
+                .iter()
+                .all(|copy| self.held.contains(copy) || self.excused.contains(copy))
     }
+    /// The required copies that neither hold the object nor were excused.
     pub fn missing(&self) -> impl Iterator<Item = u64> + '_ {
-        self.required.difference(&self.held).copied()
+        self.required
+            .iter()
+            .copied()
+            .filter(|copy| !self.held.contains(copy) && !self.excused.contains(copy))
     }
+}
+/// The least number of a placement's required copies that is a majority of them: f+1 of 2f+1, and
+/// every one of one or two.
+fn majority(copies: usize) -> usize {
+    copies
+        .checked_div(2)
+        .and_then(|half| half.checked_add(1))
+        .unwrap_or(usize::MAX)
+}
+/// Which of its required copies an object's custody must reach before it is acknowledged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CustodyRule {
+    /// Every required copy, however the liveness view holds them. An archive bundle is held by
+    /// every copy of its session before its rows leave memory (26 §4): a copy that came back
+    /// without it could not serve what was archived.
+    EveryCopy,
+    /// Every required copy the liveness view holds up, and a majority of the required copies
+    /// (26 §1): an artifact. A copy held suspect or dead is not waited for, and is brought the
+    /// object the next time the object's custody is asked once it is up again ([`bring`]). Kafka
+    /// acknowledges a produce sent with `acks=all` once every replica of the partition's in-sync
+    /// set has it, refusing while that set is smaller than `min.insync.replicas`; a replica leaves
+    /// the set when it falls behind and rejoins once it has caught up. The liveness view stands
+    /// for the in-sync set here, and a majority for `min.insync.replicas` (the user's rule for
+    /// artifacts, 2026-11-03).
+    LiveMajority,
+}
+/// What became of one copy's part of a job that waits for several: its own outcome, or that the
+/// liveness view came to hold the copy suspect or dead while it was waited for.
+enum Watched<T> {
+    Done(T),
+    Excused,
+}
+/// `job` for `peer`, ended as [`Watched::Excused`] once the liveness view holds the peer down:
+/// polled on each of the driver's wakes, a change of the view among them ([`CopyHealth`]).
+async fn watched<F: Future>(health: &CopyHealth<'_>, peer: u64, job: F) -> Watched<F::Output> {
+    let mut job = pin!(job);
+    std::future::poll_fn(|cx| {
+        if health.held_down(peer) {
+            return Poll::Ready(Watched::Excused);
+        }
+        job.as_mut().poll(cx).map(Watched::Done)
+    })
+    .await
+}
+/// What one copy said of an object's custody, as an obligation counts it.
+enum Custody {
+    Held(u64),
+    Excused(u64),
+    NotHeld,
 }
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
@@ -632,6 +701,25 @@ impl CopyHealth<'_> {
             .filter(|peer| **peer != node && self.held_down(**peer))
             .count();
         if down == 0 {
+            return Ok(());
+        }
+        self.not_asked
+            .fetch_add(u64::try_from(down).unwrap_or(u64::MAX), Ordering::Relaxed);
+        Err(AccessError::Unavailable)
+    }
+    /// Refuses a job that replicates under [`CustodyRule::LiveMajority`] where the required copies
+    /// the view holds up, this node among them where it is one, are fewer than a majority: no
+    /// acknowledgement could follow, so its seal would be work for nothing ([`Self::all_up`]). The
+    /// copies held down are counted not asked here only where the job is refused; one that goes on
+    /// counts those it does not ask itself ([`replicate`]).
+    fn enough_up(&self, node: u64, placement: &EvidencePlacement) -> Result<(), AccessError> {
+        let down = placement
+            .copies
+            .iter()
+            .filter(|peer| **peer != node && self.held_down(**peer))
+            .count();
+        let up = placement.copies.len().saturating_sub(down);
+        if up >= majority(placement.copies.len()) {
             return Ok(());
         }
         self.not_asked
@@ -1398,11 +1486,17 @@ async fn process(
         }
         JobKind::Obligation(reference, response) => {
             let result = match (&placement, job.request) {
-                (Ok(row), Some(request)) => {
-                    obligation(content, pool, health, node, &row.placement, &reference)
-                        .await
-                        .map(|obligation| (obligation, request))
-                }
+                (Ok(row), Some(request)) => obligation(
+                    content,
+                    pool,
+                    health,
+                    node,
+                    &row.placement,
+                    &reference,
+                    CustodyRule::LiveMajority,
+                )
+                .await
+                .map(|obligation| (obligation, request)),
                 (Err(error), _) => Err(error.clone()),
                 (Ok(_), None) => Err(AccessError::InvalidRequest),
             };
@@ -2013,8 +2107,27 @@ async fn archive(
             .and_then(|bytes| bytes.try_into().ok())
             .ok_or(AccessError::InvalidRequest)?,
     );
-    replicate(content, pool, health, node, placement, request, &reference).await?;
-    let obligation = obligation(content, pool, health, node, placement, &reference).await?;
+    replicate(
+        content,
+        pool,
+        health,
+        node,
+        placement,
+        request,
+        &reference,
+        CustodyRule::EveryCopy,
+    )
+    .await?;
+    let obligation = obligation(
+        content,
+        pool,
+        health,
+        node,
+        placement,
+        &reference,
+        CustodyRule::EveryCopy,
+    )
+    .await?;
     Ok(ArchiveOutcome {
         reference,
         obligation,
@@ -2035,6 +2148,7 @@ async fn archive(
 /// artifact jobs behind them (each refused at once for that copy) waited at the
 /// door, and 271 there and 218 at another leader ran out of time
 /// (`ingress_capacity` to 36 writes; fleet33-kill12 k11, 2026-10-29).
+#[allow(clippy::too_many_arguments)] // The job's inputs, each its own owner's, and the rule it keeps.
 async fn obligation(
     content: &ContentHost,
     pool: &PeerConnectionPool,
@@ -2042,15 +2156,20 @@ async fn obligation(
     node: u64,
     placement: &EvidencePlacement,
     reference: &ContentRef,
+    rule: CustodyRule,
 ) -> Result<CustodyObligation, AccessError> {
     let scope = placement.scope;
     let required = placement.copies.clone();
     let mut held = BTreeSet::new();
-    let transfer = transfer_id(
-        scope,
-        RequestId(reference.root.0[..16].try_into().unwrap_or([0; 16])),
-        reference,
-    );
+    let mut excused = BTreeSet::new();
+    let request = RequestId(reference.root.0[..16].try_into().unwrap_or([0; 16]));
+    let transfer = transfer_id(scope, request, reference);
+    // A copy the rule does not wait for is excused under [`CustodyRule::LiveMajority`] and simply
+    // not held under [`CustodyRule::EveryCopy`].
+    let unwaited = |peer: u64| match rule {
+        CustodyRule::LiveMajority => Custody::Excused(peer),
+        CustodyRule::EveryCopy => Custody::NotHeld,
+    };
     // The copies without a receipt are asked at once: one that answers
     // late or not at all delays no other.
     let mut copies = Concurrent::new(required.len()).map_err(|_| AccessError::Capacity)?;
@@ -2068,7 +2187,7 @@ async fn obligation(
                         && receipt.length == reference.length
                 })
             {
-                return Ok(Some(peer));
+                return Ok(Custody::Held(peer));
             }
             let durable = if peer == node {
                 content
@@ -2077,29 +2196,39 @@ async fn obligation(
                     .is_ok()
             } else if health.held_down(peer) {
                 health.not_asked.fetch_add(1, Ordering::Relaxed);
-                false
+                return Ok(unwaited(peer));
             } else {
-                let asked = holds(pool, peer, scope, transfer, reference);
-                let mut asked = pin!(asked);
-                // Polled on each of the driver's wakes, a change of the view among them.
-                let answered = std::future::poll_fn(|cx| {
-                    if health.held_down(peer) {
-                        return Poll::Ready(None);
+                match watched(health, peer, holds(pool, peer, scope, transfer, reference)).await {
+                    Watched::Excused => {
+                        health.given_up.fetch_add(1, Ordering::Relaxed);
+                        return Ok(unwaited(peer));
                     }
-                    asked.as_mut().poll(cx).map(Some)
-                })
-                .await;
-                answered.unwrap_or_else(|| {
-                    health.given_up.fetch_add(1, Ordering::Relaxed);
-                    false
-                })
+                    Watched::Done(true) => true,
+                    // A copy up that lacks the object was held down when it was acknowledged:
+                    // under [`CustodyRule::LiveMajority`] it is brought it now ([`bring`]).
+                    Watched::Done(false) if rule == CustodyRule::LiveMajority => {
+                        let brought = bring(
+                            content, pool, health, node, placement, request, reference, peer,
+                        );
+                        return Ok(match watched(health, peer, brought).await {
+                            Watched::Excused => {
+                                health.given_up.fetch_add(1, Ordering::Relaxed);
+                                Custody::Excused(peer)
+                            }
+                            Watched::Done(Ok(())) => Custody::Held(peer),
+                            Watched::Done(Err(_)) => Custody::NotHeld,
+                        });
+                    }
+                    Watched::Done(false) => false,
+                }
             };
             if durable {
                 content
                     .record_receipt(scope, receipt_for(scope, peer, reference))
                     .await?;
+                return Ok(Custody::Held(peer));
             }
-            Ok::<_, AccessError>(durable.then_some(peer))
+            Ok::<_, AccessError>(Custody::NotHeld)
         });
         // One for each copy: within the set's bound.
         asked.map_err(|_| AccessError::Capacity)?;
@@ -2107,10 +2236,13 @@ async fn obligation(
     let mut failed = None;
     while let Some(answered) = copies.join_next().await {
         match answered {
-            Ok(Some(peer)) => {
+            Ok(Custody::Held(peer)) => {
                 held.insert(peer);
             }
-            Ok(None) => {}
+            Ok(Custody::Excused(peer)) => {
+                excused.insert(peer);
+            }
+            Ok(Custody::NotHeld) => {}
             Err(error) => {
                 failed.get_or_insert(error);
             }
@@ -2124,13 +2256,35 @@ async fn obligation(
         scope,
         required,
         held,
+        excused,
     })
 }
-/// Seal and verify an artifact-bearing native frame's inline payload, then
-/// replicate the sealed bytes to every other required copy of the current
-/// placement, exactly as a sealed upload is. A missing required copy refuses
-/// the frame before admission; a follower that later leads or serves reads
-/// therefore holds the payload under its own custody.
+/// Brings an object to `peer`, a required copy up that lacks it ([`CustodyRule::LiveMajority`]): a
+/// copy the liveness view held down while the object was acknowledged comes back without it, and
+/// is brought it the next time the object's custody is asked. This node first holds the object,
+/// from its own store or pulled from a copy the view holds up ([`ensure_local`]), then moves to the
+/// copy only the chunks it lacks, the copy saying so durably before its receipt is recorded
+/// ([`replicate_to`]).
+#[allow(clippy::too_many_arguments)] // The job's inputs, each its own owner's, and the copy it serves.
+async fn bring(
+    content: &ContentHost,
+    pool: &PeerConnectionPool,
+    health: &CopyHealth<'_>,
+    node: u64,
+    placement: &EvidencePlacement,
+    request: RequestId,
+    reference: &ContentRef,
+    peer: u64,
+) -> Result<(), AccessError> {
+    ensure_local(content, pool, health, node, placement, request, reference).await?;
+    let transfer = transfer_id(placement.scope, request, reference);
+    replicate_to(content, pool, placement.scope, transfer, peer, reference).await
+}
+/// Seal and verify an artifact-bearing native frame's inline payload, then replicate the sealed
+/// bytes to the other required copies of the current placement, exactly as a sealed upload is:
+/// every copy the liveness view holds up, and a majority of them ([`CustodyRule::LiveMajority`]).
+/// Fewer refuse the frame before admission; a follower that later leads or serves reads therefore
+/// holds the payload under its own custody, or is brought it when its custody is next asked.
 async fn attest_native(
     content: &ContentHost,
     pool: &PeerConnectionPool,
@@ -2156,7 +2310,7 @@ async fn attest_native(
     {
         return Err(AccessError::Unauthorized);
     }
-    health.all_up(node, placement)?;
+    health.enough_up(node, placement)?;
     let evidence = content
         .verify_native(crate::content_host::NativeVerification {
             scope: placement.scope,
@@ -2172,7 +2326,17 @@ async fn attest_native(
         length: payload.length,
         class: payload.class,
     };
-    replicate(content, pool, health, node, placement, key.id, &reference).await?;
+    replicate(
+        content,
+        pool,
+        health,
+        node,
+        placement,
+        key.id,
+        &reference,
+        CustodyRule::LiveMajority,
+    )
+    .await?;
     content.check_policy(placement.scope).await?;
     Ok(NativeEvidencedRequest { request, evidence })
 }
@@ -2184,7 +2348,7 @@ async fn seal(
     placement: &EvidencePlacement,
     request: &VerifiedRequest,
 ) -> Result<ContentRef, AccessError> {
-    health.all_up(node, placement)?;
+    health.enough_up(node, placement)?;
     let reference = content
         .seal_upload(placement.scope, request.clone())
         .await?;
@@ -2196,6 +2360,7 @@ async fn seal(
         placement,
         request.request().request_id,
         &reference,
+        CustodyRule::LiveMajority,
     )
     .await?;
     content.check_policy(placement.scope).await?;
@@ -2264,10 +2429,20 @@ async fn attest(
             if reference.length > u64::try_from(maximum).map_err(|_| AccessError::Capacity)? {
                 return Err(AccessError::Capacity);
             }
-            health.all_up(node, placement)?;
-            ensure_local(content, pool, node, placement, custody_id, reference).await?;
-            replicate(
+            health.enough_up(node, placement)?;
+            ensure_local(
                 content, pool, health, node, placement, custody_id, reference,
+            )
+            .await?;
+            replicate(
+                content,
+                pool,
+                health,
+                node,
+                placement,
+                custody_id,
+                reference,
+                CustodyRule::LiveMajority,
             )
             .await?;
             let bytes = content
@@ -2478,6 +2653,7 @@ async fn local(
         _ => Err(AccessError::InvalidRequest),
     }
 }
+#[allow(clippy::too_many_arguments)] // The job's inputs, each its own owner's, and the rule it keeps.
 async fn replicate(
     content: &ContentHost,
     pool: &PeerConnectionPool,
@@ -2486,28 +2662,28 @@ async fn replicate(
     placement: &EvidencePlacement,
     request: RequestId,
     reference: &ContentRef,
+    rule: CustodyRule,
 ) -> Result<(), AccessError> {
     let scope = placement.scope;
     let transfer = transfer_id(scope, request, reference);
     // This node's own sealed object is its own receipt.
+    let mut holding = 0usize;
     if placement.copies.contains(&node) {
         content
             .record_receipt(scope, receipt_for(scope, node, reference))
             .await?;
+        holding = 1;
     }
-    // Every copy is asked at once, and every one of them to the end: a
-    // copy that fails or answers late delays no other, and what the others
-    // took they hold whatever became of it. The first failure is what the
-    // replication failed with. A copy the liveness view holds suspect or
-    // dead is not asked and fails the replication, and one it comes to hold
-    // so while it is waited for ends the wait: the replication fails at once,
-    // the others left where they are (a copy keeps the chunks it took, and
-    // the job asked again moves only what it lacks) ([`CopyHealth`]).
+    // Every copy is asked at once, and every one of them to the end: a copy that fails or answers
+    // late delays no other, and what the others took they hold whatever became of it. The first
+    // failure is what the replication failed with. A copy the liveness view holds suspect or dead
+    // is not asked, and one it comes to hold so while it is waited for is waited for no longer
+    // ([`CopyHealth`]). Under [`CustodyRule::EveryCopy`] either fails the replication, at once for
+    // one waited for, the others left where they are (a copy keeps the chunks it took, and the job
+    // asked again moves only what it lacks). Under [`CustodyRule::LiveMajority`] it is excused: the
+    // replication holds once every copy up holds the object and a majority of the required copies
+    // do, and the excused copy is brought it when its custody is next asked ([`bring`]).
     let mut copies = Concurrent::new(placement.copies.len()).map_err(|_| AccessError::Capacity)?;
-    let mut waiting = Vec::new();
-    waiting
-        .try_reserve_exact(placement.copies.len())
-        .map_err(|_| AccessError::Capacity)?;
     let mut failed = None;
     for peer in placement
         .copies
@@ -2518,54 +2694,48 @@ async fn replicate(
         placement.admits(peer)?;
         if health.held_down(peer) {
             health.not_asked.fetch_add(1, Ordering::Relaxed);
-            failed.get_or_insert(AccessError::Unavailable);
+            if rule == CustodyRule::EveryCopy {
+                failed.get_or_insert(AccessError::Unavailable);
+            }
             continue;
         }
-        // One for each copy: within the set's and the list's bound.
+        // One for each copy: within the set's bound.
         copies
-            .push(replicate_one(
-                content, pool, scope, transfer, peer, reference,
-            ))
+            .push(async move {
+                let replicated = replicate_to(content, pool, scope, transfer, peer, reference);
+                watched(health, peer, replicated).await
+            })
             .map_err(|_| AccessError::Capacity)?;
-        waiting.push(peer);
     }
-    loop {
-        let next = std::future::poll_fn(|cx| {
-            if waiting.iter().any(|peer| health.held_down(*peer)) {
-                return Poll::Ready(None);
-            }
-            copies.poll_next(cx).map(Some)
-        })
-        .await;
-        match next {
-            None => {
+    while let Some(outcome) = copies.join_next().await {
+        match outcome {
+            Watched::Excused => {
                 health.given_up.fetch_add(1, Ordering::Relaxed);
-                return Err(AccessError::Unavailable);
-            }
-            Some(None) => break,
-            Some(Some((peer, replicated))) => {
-                waiting.retain(|waited| *waited != peer);
-                if let Err(error) = replicated {
-                    failed.get_or_insert(error);
+                if rule == CustodyRule::EveryCopy {
+                    return Err(AccessError::Unavailable);
                 }
+            }
+            Watched::Done(Ok(())) => holding = holding.saturating_add(1),
+            Watched::Done(Err(error)) => {
+                failed.get_or_insert(error);
             }
         }
     }
-    failed.map_or(Ok(()), Err)
+    drop(copies);
+    if let Some(error) = failed {
+        return Err(error);
+    }
+    acknowledged(holding, placement.copies.len())
 }
-/// [`replicate_to`], its copy named with what became of it.
-async fn replicate_one(
-    content: &ContentHost,
-    pool: &PeerConnectionPool,
-    scope: CustodyScope,
-    transfer: [u8; 16],
-    peer: u64,
-    reference: &ContentRef,
-) -> (u64, Result<(), AccessError>) {
-    (
-        peer,
-        replicate_to(content, pool, scope, transfer, peer, reference).await,
-    )
+/// Whether a replication that left `holding` of `copies` required copies holding the object, every
+/// copy it asked among them, may acknowledge it: once a majority hold it ([`CustodyRule`]); fewer, it
+/// is refused as unavailable, an outcome its participant knows and asks again on.
+fn acknowledged(holding: usize, copies: usize) -> Result<(), AccessError> {
+    if copies == 0 || holding >= majority(copies) {
+        Ok(())
+    } else {
+        Err(AccessError::Unavailable)
+    }
 }
 /// One copy of [`replicate`]: nothing is sent to a copy that holds the
 /// object, and a copy that took it says so durably before its receipt is
@@ -2588,6 +2758,7 @@ async fn replicate_to(
 async fn ensure_local(
     content: &ContentHost,
     pool: &PeerConnectionPool,
+    health: &CopyHealth<'_>,
     node: u64,
     placement: &EvidencePlacement,
     request: RequestId,
@@ -2611,8 +2782,9 @@ async fn ensure_local(
     ) {
         return Ok(());
     }
+    // A copy the liveness view holds down is not asked: its answer would not come ([`CopyHealth`]).
     for peer in placement.copies.iter().filter(|peer| **peer != node) {
-        if !placement.fence.admits(*peer) {
+        if !placement.fence.admits(*peer) || health.held_down(*peer) {
             continue;
         }
         let result = pull(content, pool, node, *peer, scope, transfer, reference).await;
@@ -2878,13 +3050,20 @@ impl FleetService {
             return Ok(request);
         }
         let missing: Vec<String> = obligation.missing().map(|node| node.to_string()).collect();
+        let excused: Vec<String> = obligation
+            .excused
+            .iter()
+            .map(|node| node.to_string())
+            .collect();
         Err(Eligibility::Refused(NativeRefusal {
             kind: NativeRefusalKind::Capacity,
             detail: format!(
-                "custody: {} of {} required copies hold the artifact; missing nodes {}",
+                "custody: {} of {} required copies hold the artifact, every copy up and a majority \
+                 needed; missing nodes {}; down nodes {}",
                 obligation.held.len(),
                 obligation.required.len(),
-                missing.join(",")
+                missing.join(","),
+                excused.join(",")
             ),
         }))
     }
