@@ -514,11 +514,21 @@ for the move's window, and two heals of a run with twelve nodes down for 66 s cu
 after their voters were back. The controller now aborts its own heal (the plan whose
 operation it derives for the session's authority, `placement_controller::heal_operation`)
 once the active placement verifies against the registry again, every voter it would
-have replaced alive, while no cutover barrier is committed (`withdraws`). The partition
-hands every copy the plan brought that the active placement does not keep to
-retirement, so a learner or a voter promoted before the cutover leaves the group's
-membership as an activation's leftover copies do (`SessionChange::Abort`). After the
-barrier the move completes. A plan an operator or a policy asked for is not withdrawn.
+have replaced alive, while none of the copies the heal brings has begun to join the
+session's group (`withdraws`, `joining`): the log's configuration names none of them
+and the directory records each as assigned, not yet installed. From a copy's install
+the controller adds it to the log as a learner, promotes it once it has caught up, and
+once every desired voter votes it commits the cutover record, which closes the
+session's serving until activation; the directory learns of that record only later,
+as the plan's barrier. A first version withdrew any heal without a barrier, and in a
+run with twelve nodes down for 60 s it withdrew one after its cutover record had
+committed, leaving the session closed under a placement the directory no longer planned
+(753 of one ledger's writes refused `Unavailable`). Before a copy joins no cutover can
+be under way, since it needs every desired voter voting in the log. The partition hands
+every copy the plan brought that the active placement does not keep to retirement
+(`SessionChange::Abort`); one the group's membership names leaves it, as an
+activation's leftover copies do. Once a copy has begun to join, the move completes. A
+plan an operator or a policy asked for is not withdrawn.
 
 *Every session has its turn.* The partition's leader controls its sessions in ledger
 order, and one it cannot act on leaves the sessions after it theirs: a session most of

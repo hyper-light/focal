@@ -1947,3 +1947,62 @@ fn a_session_the_controller_cannot_act_on_leaves_the_others_their_turn() {
     assert_eq!(round.turn(ledger(1), Ok(None)), None);
     assert!(round.failure().is_none());
 }
+
+/// A heal is withdrawn only while none of the copies it brings has begun to join the session's
+/// group: once the log's configuration names one, or the directory records one installed or
+/// further (or failed), the move may already have closed the session for its cutover, which only
+/// its activation reopens (fleet33 m12).
+#[test]
+fn a_heal_is_withdrawn_only_before_a_copy_it_brings_joins_the_group() {
+    use crate::placement_agent::controller::joining;
+    use focal_consensus::MembershipConfiguration;
+    use focal_directory::{AssignmentPhase, AssignmentProgress, AssignmentRole, Placement};
+    // Voters 1, 2 and 3, the first two also holding content; the heal keeps 1 and 2 and brings 4
+    // into the seat of 3.
+    let active = Placement {
+        voters: BTreeMap::from([(1, 1), (2, 1), (3, 1)]),
+        materializers: BTreeMap::new(),
+        content_copies: BTreeMap::from([(1, 1), (2, 1)]),
+        preferred_leader: 1,
+    };
+    let copy = |node: u64, phase: AssignmentPhase| {
+        let mut copy =
+            AssignmentProgress::assigned(node, 1, BTreeSet::from([AssignmentRole::Voter]));
+        copy.phase = phase;
+        (node, copy)
+    };
+    let heal = |phase: AssignmentPhase| {
+        BTreeMap::from([
+            copy(1, AssignmentPhase::CaughtUp),
+            copy(2, AssignmentPhase::CaughtUp),
+            copy(4, phase),
+        ])
+    };
+    let group = |voters: Vec<u64>, learners: Vec<u64>| MembershipConfiguration {
+        voters,
+        learners,
+        ..MembershipConfiguration::default()
+    };
+    let before = group(vec![1, 2, 3], vec![]);
+    // Assigned and outside the log: nothing of the move has reached the group. The copies the
+    // active placement keeps are members and climb the ladder too; they are no newcomers.
+    assert!(!joining(&active, &heal(AssignmentPhase::Assigned), &before));
+    // From its install the controller adds the copy as a learner; a failed copy may have been.
+    for phase in [
+        AssignmentPhase::Installed,
+        AssignmentPhase::CaughtUp,
+        AssignmentPhase::CustodyVerified,
+        AssignmentPhase::Promoted,
+        AssignmentPhase::Failed,
+    ] {
+        assert!(joining(&active, &heal(phase), &before), "{phase:?}");
+    }
+    // Named by the log's configuration, whatever the directory records: a learner or a voter.
+    let assigned = heal(AssignmentPhase::Assigned);
+    assert!(joining(&active, &assigned, &group(vec![1, 2, 3], vec![4])));
+    assert!(joining(
+        &active,
+        &assigned,
+        &group(vec![1, 2, 3, 4], vec![])
+    ));
+}

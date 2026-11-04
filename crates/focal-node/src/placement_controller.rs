@@ -468,12 +468,13 @@ impl PlacementAgent {
             }
         }
         match &descriptor.pending {
-            // A heal whose cause has gone is withdrawn before its cutover ([`withdraws`]): its
-            // copies are drained and retired, and the session keeps the voters it had.
+            // A heal whose cause has gone is withdrawn before any copy it brings joins the group
+            // ([`withdraws`]): its copies are retired, and the session keeps the voters it had.
             Some(plan)
                 if withdraws(
                     descriptor,
                     plan,
+                    configuration,
                     &directory.nodes,
                     self.partition_config().max_members,
                 ) =>
@@ -1614,23 +1615,46 @@ pub(crate) fn heal_operation(descriptor: &SessionDescriptor) -> OperationId {
     OperationId(id)
 }
 /// Whether the controller withdraws a session's pending plan: its own heal ([`heal_operation`])
-/// whose cause has gone, before its cutover. The heal was planned because a voter of the active
-/// placement was held dead past an election window; once the active placement verifies against the
-/// registry as it stands again (every voter it would have replaced back alive), the heal would close
-/// the session for a move's window and move its seat for nothing. A move runs to its activation
-/// however its cause changes otherwise: a false death of a node never cut off (fleet33 c18, held
-/// dead about 2.2 s) closed its session 6.5 s, and two heals of m9 cut over after their voters were
-/// back. After the cutover (a barrier committed) the move completes, as the partition refuses an
-/// abort then. Only the controller's heals are withdrawn: an operator's or a policy's plan stands.
+/// whose cause has gone, while none of the copies it brings has begun to join the session's group.
+/// The heal was planned because a voter of the active placement was held dead past an election
+/// window; once the active placement verifies against the registry as it stands again (every voter
+/// it would have replaced back alive), the heal would close the session for a move's window and
+/// move its seat for nothing: a false death of a node never cut off (fleet33 c18, held dead about
+/// 2.2 s) closed its session 6.5 s.
+///
+/// Once a copy the heal brings begins to join ([`joining`]) the move runs to its activation. From a
+/// copy's install the controller adds it to the log as a learner, promotes it once caught up and,
+/// once every desired voter votes, commits the cutover record, which closes the session's serving
+/// until activation (`serves_route`). The directory learns of that record only later, as the plan's
+/// barrier, so a heal withdrawn between the two left its session closed under a placement the
+/// directory no longer planned (fleet33 m12: ledger 8 refused 753 writes `Unavailable`). Before a
+/// copy joins, no cutover can be under way: it needs every desired voter voting in the log. Only the
+/// controller's heals are withdrawn: an operator's or a policy's plan stands.
 pub(crate) fn withdraws(
     descriptor: &SessionDescriptor,
     plan: &focal_directory::PendingPlacement,
+    configuration: &focal_consensus::MembershipConfiguration,
     nodes: &std::collections::BTreeMap<u64, focal_directory::NodeRecord>,
     max_members: usize,
 ) -> bool {
     plan.barrier.is_none()
         && plan.operation == heal_operation(descriptor)
+        && !joining(&descriptor.active.placement, &plan.progress, configuration)
         && focal_directory::verify_placement(&descriptor.active, nodes, max_members).is_ok()
+}
+/// Whether a copy a plan brings has begun to join the session's group: the log's configuration
+/// names it (a learner or a voter), or the directory records it past its assignment (installed or
+/// further, from which the controller adds it to the log, or failed, after which it may have been
+/// added). A copy the active placement keeps is no newcomer.
+pub(crate) fn joining(
+    active: &focal_directory::Placement,
+    progress: &BTreeMap<u64, focal_directory::AssignmentProgress>,
+    configuration: &focal_consensus::MembershipConfiguration,
+) -> bool {
+    progress.iter().any(|(node, copy)| {
+        active.generation(*node).is_none()
+            && (configuration.contains(*node) || copy.phase != AssignmentPhase::Assigned)
+    })
 }
 /// What the controller would do next for one session, from the committed
 /// directory alone: the operator's `plan placement`. Never executes anything.
