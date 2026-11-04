@@ -1,0 +1,5 @@
+claims: asked 105816, committed 105816 (100.00 %), refused 0 {}, other {}
+artifacts: asked 26446, committed 26446 (100.00 %), refused 0 {}, other {}
+testaments: asked 79428, committed 79428 (100.00 %), refused 0 {}, other {}
+validations: asked 79594, committed 79594 (100.00 %), refused 0 {}, other {}
+lifecycles: {'started': 29700, 'written': 29700, 'judged': 29700, 'refused': 0, 'unknown': 0, 'abandoned': 0, 'retried': 0}

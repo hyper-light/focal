@@ -1,0 +1,23 @@
+1793778037805 dead[] | 09ffdb42 v[focal28,focal32,focal33] p2 ; 118f512c v[focal5,focal13,focal30] p2 ; 36ea0fea v[focal3,focal8,focal25] p2 ; 4210b178 v[focal4,focal9,focal14] p2 ; 462a63c2 v[focal15,focal20,focal22] p2 ; 4746690a v[focal12,focal23,focal31] p2 ; 774a4927 v[focal7,focal17,focal21] p2 ; 8c585a46 v[focal19,focal24,focal26] p2 ; b12e6656 v[focal10,focal18,focal29] p2 ; c734f89a v[focal1,focal2,focal6] p2 ; d2008b4a v[focal11,focal16,focal27] p2
+1793778055296 dead[focal16] | 09ffdb42 v[focal28,focal32,focal33] p2 ; 118f512c v[focal5,focal13,focal30] p2 ; 36ea0fea v[focal3,focal8,focal25] p2 ; 4210b178 v[focal4,focal9,focal14] p2 ; 462a63c2 v[focal15,focal20,focal22] p2 ; 4746690a v[focal12,focal23,focal31] p2 ; 774a4927 v[focal7,focal17,focal21] p2 ; 8c585a46 v[focal19,focal24,focal26] p2 ; b12e6656 v[focal10,focal18,focal29] p2 ; c734f89a v[focal1,focal2,focal6] p2 ; d2008b4a v[focal11,focal16,focal27] p2 blocked['DeadNode on node 15774711574821388815', 'DeadNode on node 15774711574821388815', 'DeadNode on node 15774711574821388815']
+1793778057547 dead[] | 09ffdb42 v[focal28,focal32,focal33] p2 ; 118f512c v[focal5,focal13,focal30] p2 ; 36ea0fea v[focal3,focal8,focal25] p2 ; 4210b178 v[focal4,focal9,focal14] p2 ; 462a63c2 v[focal15,focal20,focal22] p2 ; 4746690a v[focal12,focal23,focal31] p2 ; 774a4927 v[focal7,focal17,focal21] p2 ; 8c585a46 v[focal19,focal24,focal26] p2 ; b12e6656 v[focal10,focal18,focal29] p2 ; c734f89a v[focal1,focal2,focal6] p2 ; d2008b4a v[focal11,focal16,focal27] p2
+1793778140066 no answer
+1793778142135 no answer
+1793778144181 no answer
+1793778146236 no answer
+1793778148287 no answer
+1793778150338 no answer
+1793778152524 no answer
+1793778154573 no answer
+1793778156619 no answer
+1793778158685 no answer
+1793778160737 no answer
+1793778162861 no answer
+1793778164993 no answer
+1793778167115 no answer
+1793778169244 dead[] | 
+1793778177813 dead[] | 83f55741 v[focal1] p1
+1793778197176 dead[] | 83f55741 v[focal1] p1 PLAN Preparing -> [focal1,focal2,focal3] {focal1:Installed focal2:Assigned focal3:Assigned} blocked['Assignment(Installed) on node 17576194843764414949', 'Assignment(Assigned) on node 17576194843764414950', 'Assignment(Assigned) on node 17576194843764414951']
+1793778199346 dead[] | 83f55741 v[focal1] p1 PLAN Catchup -> [focal1,focal2,focal3] {focal1:CaughtUp focal2:CaughtUp focal3:Installed} blocked['Assignment(CaughtUp) on node 17576194843764414949', 'Assignment(CaughtUp) on node 17576194843764414950', 'Assignment(Installed) on node 17576194843764414951']
+1793778201523 dead[] | 83f55741 v[focal1] p1 PLAN Custody -> [focal1,focal2,focal3] {focal1:CaughtUp focal2:CaughtUp focal3:CaughtUp} blocked['Assignment(CaughtUp) on node 17576194843764414949', 'Assignment(CaughtUp) on node 17576194843764414950', 'Assignment(CaughtUp) on node 17576194843764414951']
+1793778203666 dead[] | 83f55741 v[focal1] p1 PLAN Promoting -> [focal1,focal2,focal3] {focal1:Promoted focal2:Promoted focal3:CustodyVerified} blocked['Assignment(CustodyVerified) on node 17576194843764414951']

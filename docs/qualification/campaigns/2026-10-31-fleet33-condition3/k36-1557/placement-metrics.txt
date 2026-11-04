@@ -1,0 +1,75 @@
+1793750937938 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 0 focal_liveness_deaths_total 0 focal_placement_partition_intents_total 24 
+1793750940349 focal_liveness_members{status="alive"} 26 focal_liveness_members{status="suspect"} 6 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 6 focal_liveness_deaths_total 0 focal_placement_partition_intents_total 24 
+1793750945622 focal_liveness_members{status="alive"} 26 focal_liveness_members{status="suspect"} 6 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 6 focal_liveness_deaths_total 0 focal_placement_partition_intents_total 24 
+1793750947848 focal_liveness_members{status="alive"} 21 focal_liveness_members{status="suspect"} 11 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 11 focal_liveness_deaths_total 0 focal_placement_partition_intents_total 24 
+1793750950091 focal_liveness_members{status="alive"} 21 focal_liveness_members{status="suspect"} 11 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 11 focal_liveness_deaths_total 0 focal_placement_partition_intents_total 24 
+1793750952330 focal_liveness_members{status="alive"} 20 focal_liveness_members{status="suspect"} 12 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 0 focal_placement_partition_intents_total 24 
+1793750954573 focal_liveness_members{status="alive"} 20 focal_liveness_members{status="suspect"} 12 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 0 focal_placement_partition_intents_total 24 
+1793750956833 focal_liveness_members{status="alive"} 20 focal_liveness_members{status="suspect"} 12 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 0 focal_placement_partition_intents_total 24 
+1793750959065 focal_liveness_members{status="alive"} 20 focal_liveness_members{status="suspect"} 11 focal_liveness_members{status="dead"} 1 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 1 focal_placement_partition_intents_total 24 
+1793750961325 focal_liveness_members{status="alive"} 20 focal_liveness_members{status="suspect"} 11 focal_liveness_members{status="dead"} 1 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 1 focal_placement_partition_intents_total 24 
+1793750963577 focal_liveness_members{status="alive"} 20 focal_liveness_members{status="suspect"} 7 focal_liveness_members{status="dead"} 5 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 5 focal_placement_partition_intents_total 24 
+1793750965846 focal_liveness_members{status="alive"} 20 focal_liveness_members{status="suspect"} 7 focal_liveness_members{status="dead"} 5 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 5 focal_placement_partition_intents_total 24 
+1793750968127 focal_liveness_members{status="alive"} 20 focal_liveness_members{status="suspect"} 6 focal_liveness_members{status="dead"} 6 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 6 focal_placement_partition_intents_total 24 
+1793750970392 focal_liveness_members{status="alive"} 20 focal_liveness_members{status="suspect"} 6 focal_liveness_members{status="dead"} 6 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 6 focal_placement_partition_intents_total 24 
+1793750972720 focal_liveness_members{status="alive"} 20 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 12 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 24 
+1793750975030 focal_liveness_members{status="alive"} 20 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 12 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 24 
+1793750977379 focal_liveness_members{status="alive"} 22 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 10 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 24 
+1793750979671 focal_liveness_members{status="alive"} 22 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 10 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 24 
+1793750981975 focal_liveness_members{status="alive"} 22 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 10 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 24 
+1793750984295 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 24 
+1793750986799 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 24 
+1793750989097 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 25 
+1793750991414 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 25 
+1793750993739 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 25 
+1793750996024 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 25 
+1793750998302 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 25 
+1793751000574 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 25 
+1793751002852 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 25 
+1793751005151 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 25 
+1793751007452 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 25 
+1793751009752 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 25 
+1793751012030 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 25 
+1793751014267 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 25 
+1793751016594 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 25 
+1793751018870 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 26 
+1793751021162 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 26 
+1793751023449 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 26 
+1793751025749 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 26 
+1793751028131 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 26 
+1793751030423 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 26 
+1793751032675 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 26 
+1793751034914 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 26 
+1793751037158 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 26 
+1793751039430 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 26 
+1793751041679 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 26 
+1793751043949 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 26 
+1793751046370 focal_liveness_members{status="alive"} 32 focal_liveness_members{status="suspect"} 0 focal_liveness_members{status="dead"} 0 focal_liveness_suspicions_total 12 focal_liveness_deaths_total 12 focal_placement_partition_intents_total 26 
+1793751048649 
+1793751050740 
+1793751052826 
+1793751054897 
+1793751056967 
+1793751059034 
+1793751061220 
+1793751063350 
+1793751065431 
+1793751067507 
+1793751069589 
+1793751071672 
+1793751073759 
+1793751075837 
+1793751077911 
+1793751079980 
+1793751082047 
+1793751084113 
+1793751086179 
+1793751088244 
+1793751090308 
+1793751092373 
+1793751094437 
+1793751096506 
+1793751098612 
+1793751100728 
+1793751102801 
+1793751104908 

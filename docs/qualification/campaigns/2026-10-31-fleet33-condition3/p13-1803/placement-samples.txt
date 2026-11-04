@@ -1,0 +1,47 @@
+1793758409371 dead[] | 206e5ad9 v[focal25,focal27,focal29] p2 ; 25571b31 v[focal7,focal30,focal32] p2 ; 3115eef4 v[focal1,focal2,focal3] p2 ; 506f6289 v[focal5,focal10,focal33] p2 ; 61d05c55 v[focal6,focal8,focal22] p2 ; 78370291 v[focal12,focal23,focal28] p2 ; 9f931dbb v[focal9,focal19,focal26] p2 ; c90d843b v[focal11,focal13,focal21] p2 ; d31a4a5c v[focal17,focal24,focal31] p2 ; d6335958 v[focal4,focal14,focal15] p2 ; f4759399 v[focal16,focal18,focal20] p2
+1793758416458 no answer
+1793758432517 dead[focal9,focal16] | 206e5ad9 v[focal25,focal27,focal29] p2 ; 25571b31 v[focal7,focal30,focal32] p2 ; 3115eef4 v[focal1,focal2,focal3] p2 ; 506f6289 v[focal5,focal10,focal33] p2 ; 61d05c55 v[focal6,focal8,focal22] p2 ; 78370291 v[focal12,focal23,focal28] p2 ; 9f931dbb v[focal9,focal19,focal26] p2 blocked['DeadNode on node 3190241872652947945', 'DeadNode on node 3190241872652947945'] ; c90d843b v[focal11,focal13,focal21] p2 ; d31a4a5c v[focal17,focal24,focal31] p2 ; d6335958 v[focal4,focal14,focal15] p2 ; f4759399 v[focal16,focal18,focal20] p2 blocked['DeadNode on node 3190241872652947952', 'DeadNode on node 3190241872652947952', 'DeadNode on node 3190241872652947952']
+1793758434716 dead[focal9,focal16,focal17,focal32] | 206e5ad9 v[focal25,focal27,focal29] p2 ; 25571b31 v[focal7,focal30,focal32] p2 blocked['DeadNode on node 3190241872652947968', 'DeadNode on node 3190241872652947968'] ; 3115eef4 v[focal1,focal2,focal3] p2 ; 506f6289 v[focal5,focal10,focal33] p2 ; 61d05c55 v[focal6,focal8,focal22] p2 ; 78370291 v[focal12,focal23,focal28] p2 ; 9f931dbb v[focal9,focal19,focal26] p2 blocked['DeadNode on node 3190241872652947945', 'DeadNode on node 3190241872652947945'] ; c90d843b v[focal11,focal13,focal21] p2 ; d31a4a5c v[focal17,focal24,focal31] p2 blocked['DeadNode on node 3190241872652947954', 'DeadNode on node 3190241872652947954', 'DeadNode on node 3190241872652947954'] ; d6335958 v[focal4,focal14,focal15] p2 ; f4759399 v[focal16,focal18,focal20] p2 blocked['DeadNode on node 3190241872652947952', 'DeadNode on node 3190241872652947952', 'DeadNode on node 3190241872652947952']
+1793758441824 dead[focal1,focal9,focal13,focal16,focal17,focal32] | 206e5ad9 v[focal25,focal27,focal29] p2 ; 25571b31 v[focal7,focal30,focal32] p2 blocked['DeadNode on node 3190241872652947968', 'DeadNode on node 3190241872652947968'] ; 3115eef4 v[focal1,focal2,focal3] p2 blocked['DeadNode on node 3190241872652947937', 'DeadNode on node 3190241872652947937', 'DeadNode on node 3190241872652947937'] ; 506f6289 v[focal5,focal10,focal33] p2 ; 61d05c55 v[focal6,focal8,focal22] p2 ; 78370291 v[focal12,focal23,focal28] p2 ; 9f931dbb v[focal9,focal19,focal26] p2 blocked['DeadNode on node 3190241872652947945', 'DeadNode on node 3190241872652947945'] ; c90d843b v[focal11,focal13,focal21] p2 blocked['DeadNode on node 3190241872652947949', 'DeadNode on node 3190241872652947949', 'DeadNode on node 3190241872652947949'] ; d31a4a5c v[focal17,focal24,focal31] p2 blocked['DeadNode on node 3190241872652947954', 'DeadNode on node 3190241872652947954', 'DeadNode on node 3190241872652947954'] ; d6335958 v[focal4,focal14,focal15] p2 ; f4759399 v[focal16,focal18,focal20] p2 blocked['DeadNode on node 3190241872652947952', 'DeadNode on node 3190241872652947952', 'DeadNode on node 3190241872652947952']
+1793758444105 dead[focal9,focal16,focal17,focal23,focal32] | 206e5ad9 v[focal25,focal27,focal29] p2 ; 25571b31 v[focal7,focal30,focal32] p2 blocked['DeadNode on node 3190241872652947968', 'DeadNode on node 3190241872652947968'] ; 3115eef4 v[focal1,focal2,focal3] p2 PLAN Planned -> [focal2,focal3,focal28] {} blocked['AwaitingActivation'] ; 506f6289 v[focal5,focal10,focal33] p2 ; 61d05c55 v[focal6,focal8,focal22] p2 ; 78370291 v[focal12,focal23,focal28] p2 blocked['DeadNode on node 3190241872652947957', 'DeadNode on node 3190241872652947957'] ; 9f931dbb v[focal9,focal19,focal26] p2 blocked['DeadNode on node 3190241872652947945', 'DeadNode on node 3190241872652947945'] ; c90d843b v[focal11,focal13,focal21] p2 ; d31a4a5c v[focal17,focal24,focal31] p2 blocked['DeadNode on node 3190241872652947954', 'DeadNode on node 3190241872652947954', 'DeadNode on node 3190241872652947954'] ; d6335958 v[focal4,focal14,focal15] p2 ; f4759399 v[focal16,focal18,focal20] p2 blocked['DeadNode on node 3190241872652947952', 'DeadNode on node 3190241872652947952', 'DeadNode on node 3190241872652947952']
+1793758446325 dead[focal16,focal17,focal20] | 206e5ad9 v[focal25,focal27,focal29] p2 ; 25571b31 v[focal7,focal30,focal32] p2 ; 3115eef4 v[focal1,focal2,focal3] p2 PLAN Planned -> [focal2,focal3,focal28] {} blocked['AwaitingActivation'] ; 506f6289 v[focal5,focal10,focal33] p2 ; 61d05c55 v[focal6,focal8,focal22] p2 ; 78370291 v[focal12,focal23,focal28] p2 ; 9f931dbb v[focal9,focal19,focal26] p2 ; c90d843b v[focal11,focal13,focal21] p2 ; d31a4a5c v[focal17,focal24,focal31] p2 blocked['DeadNode on node 3190241872652947954', 'DeadNode on node 3190241872652947954', 'DeadNode on node 3190241872652947954'] ; d6335958 v[focal4,focal14,focal15] p2 ; f4759399 v[focal16,focal18,focal20] p2 blocked['DeadNode on node 3190241872652947952', 'DeadNode on node 3190241872652947956', 'DeadNode on node 3190241872652947952', 'DeadNode on node 3190241872652947956', 'DeadNode on node 3190241872652947952', 'DeadNode on node 3190241872652947956']
+1793758448618 dead[focal16] | 206e5ad9 v[focal25,focal27,focal29] p2 ; 25571b31 v[focal7,focal30,focal32] p2 ; 3115eef4 v[focal1,focal2,focal3] p2 ; 506f6289 v[focal5,focal10,focal33] p2 ; 61d05c55 v[focal6,focal8,focal22] p2 ; 78370291 v[focal12,focal23,focal28] p2 ; 9f931dbb v[focal9,focal19,focal26] p2 ; c90d843b v[focal11,focal13,focal21] p2 ; d31a4a5c v[focal17,focal24,focal31] p2 ; d6335958 v[focal4,focal14,focal15] p2 ; f4759399 v[focal16,focal18,focal20] p2 PLAN Planned -> [focal7,focal18,focal20] {} blocked['DeadNode on node 3190241872652947952', 'DeadNode on node 3190241872652947952', 'DeadNode on node 3190241872652947952', 'AwaitingActivation']
+1793758450896 dead[] | 206e5ad9 v[focal25,focal27,focal29] p2 ; 25571b31 v[focal7,focal30,focal32] p2 ; 3115eef4 v[focal1,focal2,focal3] p2 ; 506f6289 v[focal5,focal10,focal33] p2 ; 61d05c55 v[focal6,focal8,focal22] p2 ; 78370291 v[focal12,focal23,focal28] p2 ; 9f931dbb v[focal9,focal19,focal26] p2 ; c90d843b v[focal11,focal13,focal21] p2 ; d31a4a5c v[focal17,focal24,focal31] p2 ; d6335958 v[focal4,focal14,focal15] p2 ; f4759399 v[focal16,focal18,focal20] p2
+1793758515237 no answer
+1793758517283 no answer
+1793758519329 no answer
+1793758521372 no answer
+1793758523422 no answer
+1793758525476 no answer
+1793758527522 no answer
+1793758529566 no answer
+1793758531609 no answer
+1793758533650 no answer
+1793758535697 no answer
+1793758537745 no answer
+1793758539789 no answer
+1793758541837 no answer
+1793758543883 no answer
+1793758545930 no answer
+1793758547974 no answer
+1793758550019 no answer
+1793758552068 no answer
+1793758554118 no answer
+1793758556167 no answer
+1793758558211 no answer
+1793758560260 no answer
+1793758562303 no answer
+1793758564353 no answer
+1793758566397 no answer
+1793758568447 no answer
+1793758570499 no answer
+1793758572544 no answer
+1793758574591 no answer
+1793758576642 no answer
+1793758578690 no answer
+1793758580733 no answer
+1793758582782 no answer
+1793758584828 no answer
+1793758586878 no answer
+1793758588929 no answer
+1793758590971 no answer

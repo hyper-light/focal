@@ -1,0 +1,15 @@
+k37-2318: 11 ledgers, fault from 1793777290122; windows of >= 1000 ms with writes under way and none committed
+  ledger  0: 0.2-37.6 s (37.4 s, 384 under way): btrfs commit in progress up to 99 ms, 9 ended; io some 25% full 18%; log threads in D at once up to 22 nodes
+  ledger  0: 38.8-39.9 s (1.1 s, 797 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 14% full 6%; log threads in D at once up to 18 nodes
+  ledger  2: 0.2-35.3 s (35.1 s, 360 under way): btrfs commit in progress up to 99 ms, 9 ended; io some 25% full 19%; log threads in D at once up to 18 nodes
+  ledger  4: 0.2-36.0 s (35.8 s, 365 under way): btrfs commit in progress up to 99 ms, 9 ended; io some 25% full 19%; log threads in D at once up to 18 nodes
+  ledger  5: 0.2-35.3 s (35.1 s, 353 under way): btrfs commit in progress up to 99 ms, 9 ended; io some 25% full 19%; log threads in D at once up to 18 nodes
+  ledger  5: 38.2-40.0 s (1.8 s, 792 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 15% full 6%; log threads in D at once up to 27 nodes
+  ledger  9: 0.2-2.7 s (2.5 s, 31 under way): btrfs commit in progress up to 99 ms, 8 ended; io some 31% full 27%; log threads in D at once up to 10 nodes
+  ledger  9: 25.1-26.5 s (1.4 s, 526 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 24% full 18%; log threads in D at once up to 15 nodes
+  ledger  9: 27.3-28.7 s (1.4 s, 571 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 23% full 18%; log threads in D at once up to 13 nodes
+  ledger  9: 29.9-31.0 s (1.1 s, 619 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 23% full 18%; log threads in D at once up to 14 nodes
+  ledger  9: 34.4-35.5 s (1.1 s, 709 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 23% full 14%; log threads in D at once up to 15 nodes
+  ledger 10: 0.2-2.7 s (2.5 s, 39 under way): btrfs commit in progress up to 99 ms, 8 ended; io some 31% full 27%; log threads in D at once up to 10 nodes
+  ledger 10: 27.3-28.4 s (1.2 s, 527 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 24% full 18%; log threads in D at once up to 13 nodes
+retried (first refusal cause, final outcome): {}

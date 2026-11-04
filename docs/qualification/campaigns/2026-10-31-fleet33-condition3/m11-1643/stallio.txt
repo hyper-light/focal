@@ -1,0 +1,10 @@
+m11-1643: 11 ledgers, fault from 1793753614652; windows of >= 1000 ms with writes under way and none committed
+  ledger  1: 1.0-72.4 s (71.4 s, 822 under way): no io samples
+  ledger  2: 1.0-71.1 s (70.1 s, 807 under way): no io samples
+  ledger  3: 1.0-3.1 s (2.2 s, 210 under way): no io samples
+  ledger  3: 47.1-60.1 s (13.0 s, 196 under way): no io samples
+  ledger  6: 1.0-2.8 s (1.9 s, 198 under way): no io samples
+  ledger  6: 64.6-318.1 s (253.5 s, 469 under way, none committed after): no io samples
+  ledger  7: 52.0-53.7 s (1.7 s, 87 under way): no io samples
+  ledger 10: 0.7-76.3 s (75.6 s, 874 under way): no io samples
+retried (first refusal cause, final outcome): {}

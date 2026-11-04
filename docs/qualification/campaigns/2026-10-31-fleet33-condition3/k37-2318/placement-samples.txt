@@ -1,0 +1,29 @@
+1793777290482 dead[] | 00d0006c v[focal4,focal29,focal33] p2 ; 2685294d v[focal16,focal30,focal32] p2 ; 3fe5a421 v[focal2,focal3,focal19] p2 ; 48b11fa5 v[focal5,focal12,focal28] p2 ; 4d2acf70 v[focal8,focal15,focal25] p2 ; 80336751 v[focal10,focal11,focal24] p2 ; 88679e1e v[focal1,focal6,focal17] p2 ; 94228123 v[focal20,focal21,focal22] p2 ; 9efb9c3a v[focal9,focal13,focal23] p2 ; baa4b44e v[focal14,focal18,focal31] p2 ; c01b5f51 v[focal7,focal26,focal27] p2
+1793777393585 no answer
+1793777397177 no answer
+1793777399223 no answer
+1793777401267 no answer
+1793777403313 no answer
+1793777405362 no answer
+1793777407406 no answer
+1793777409452 no answer
+1793777411502 no answer
+1793777413547 no answer
+1793777415595 no answer
+1793777417645 no answer
+1793777419698 no answer
+1793777421740 no answer
+1793777423790 no answer
+1793777425832 no answer
+1793777427878 no answer
+1793777429925 no answer
+1793777431974 no answer
+1793777434026 no answer
+1793777436076 no answer
+1793777438125 no answer
+1793777440246 no answer
+1793777442364 no answer
+1793777444480 no answer
+1793777446595 no answer
+1793777448729 dead[] | 
+1793777467818 dead[] | c734f89a v[focal1] p1

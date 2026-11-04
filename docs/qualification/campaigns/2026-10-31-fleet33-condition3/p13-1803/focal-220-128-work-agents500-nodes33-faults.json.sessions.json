@@ -1,0 +1,322 @@
+{
+ "count": {
+  "most_replicas_a_node": 1,
+  "nodes": 33,
+  "nodes_holding_no_replica": 0,
+  "sessions": 11,
+  "sessions_not_placed_in_three_zones": 0,
+  "sessions_wanted": 11
+ },
+ "nodes": {
+  "focal1": [
+   "3115eef427ec9184b35f6b82c4a0ab9d"
+  ],
+  "focal10": [
+   "506f62894bddfdf22b36781955770475"
+  ],
+  "focal11": [
+   "c90d843b2b5302946d9df26048604071"
+  ],
+  "focal12": [
+   "7837029161462926fa730518e97a64cb"
+  ],
+  "focal13": [
+   "c90d843b2b5302946d9df26048604071"
+  ],
+  "focal14": [
+   "d6335958903c875832d00e170fa260cd"
+  ],
+  "focal15": [
+   "d6335958903c875832d00e170fa260cd"
+  ],
+  "focal16": [
+   "f47593999506a66279fb0023c40cb22b"
+  ],
+  "focal17": [
+   "d31a4a5c6ca746d88651aba45b1e7223"
+  ],
+  "focal18": [
+   "f47593999506a66279fb0023c40cb22b"
+  ],
+  "focal19": [
+   "9f931dbb561b85f1264dbdb4e49e101e"
+  ],
+  "focal2": [
+   "3115eef427ec9184b35f6b82c4a0ab9d"
+  ],
+  "focal20": [
+   "f47593999506a66279fb0023c40cb22b"
+  ],
+  "focal21": [
+   "c90d843b2b5302946d9df26048604071"
+  ],
+  "focal22": [
+   "61d05c55d551bd5d7a96d8e2db731922"
+  ],
+  "focal23": [
+   "7837029161462926fa730518e97a64cb"
+  ],
+  "focal24": [
+   "d31a4a5c6ca746d88651aba45b1e7223"
+  ],
+  "focal25": [
+   "206e5ad9989eb3da167f696e5fed1636"
+  ],
+  "focal26": [
+   "9f931dbb561b85f1264dbdb4e49e101e"
+  ],
+  "focal27": [
+   "206e5ad9989eb3da167f696e5fed1636"
+  ],
+  "focal28": [
+   "7837029161462926fa730518e97a64cb"
+  ],
+  "focal29": [
+   "206e5ad9989eb3da167f696e5fed1636"
+  ],
+  "focal3": [
+   "3115eef427ec9184b35f6b82c4a0ab9d"
+  ],
+  "focal30": [
+   "25571b310c3b31e70083eb56115c8d98"
+  ],
+  "focal31": [
+   "d31a4a5c6ca746d88651aba45b1e7223"
+  ],
+  "focal32": [
+   "25571b310c3b31e70083eb56115c8d98"
+  ],
+  "focal33": [
+   "506f62894bddfdf22b36781955770475"
+  ],
+  "focal4": [
+   "d6335958903c875832d00e170fa260cd"
+  ],
+  "focal5": [
+   "506f62894bddfdf22b36781955770475"
+  ],
+  "focal6": [
+   "61d05c55d551bd5d7a96d8e2db731922"
+  ],
+  "focal7": [
+   "25571b310c3b31e70083eb56115c8d98"
+  ],
+  "focal8": [
+   "61d05c55d551bd5d7a96d8e2db731922"
+  ],
+  "focal9": [
+   "9f931dbb561b85f1264dbdb4e49e101e"
+  ]
+ },
+ "sessions": [
+  {
+   "achieved_max_failures": 1,
+   "achieved_survive": "Zone",
+   "founder": "focal25",
+   "pending": false,
+   "preferred_leader": "focal25",
+   "session": "206e5ad9989eb3da167f696e5fed1636",
+   "tenant": "af9a543dd9c1cacc8665a1beb73a5698",
+   "voters": [
+    "focal25",
+    "focal29",
+    "focal27"
+   ],
+   "zones": [
+    "a",
+    "b",
+    "c"
+   ]
+  },
+  {
+   "achieved_max_failures": 1,
+   "achieved_survive": "Zone",
+   "founder": "focal7",
+   "pending": false,
+   "preferred_leader": "focal7",
+   "session": "25571b310c3b31e70083eb56115c8d98",
+   "tenant": "af9a543dd9c1cacc8665a1beb73a5698",
+   "voters": [
+    "focal7",
+    "focal30",
+    "focal32"
+   ],
+   "zones": [
+    "a",
+    "b",
+    "c"
+   ]
+  },
+  {
+   "achieved_max_failures": 1,
+   "achieved_survive": "Zone",
+   "founder": "focal1",
+   "pending": false,
+   "preferred_leader": "focal1",
+   "session": "3115eef427ec9184b35f6b82c4a0ab9d",
+   "tenant": "af9a543dd9c1cacc8665a1beb73a5698",
+   "voters": [
+    "focal1",
+    "focal2",
+    "focal3"
+   ],
+   "zones": [
+    "a",
+    "b",
+    "c"
+   ]
+  },
+  {
+   "achieved_max_failures": 1,
+   "achieved_survive": "Zone",
+   "founder": "focal10",
+   "pending": false,
+   "preferred_leader": "focal10",
+   "session": "506f62894bddfdf22b36781955770475",
+   "tenant": "af9a543dd9c1cacc8665a1beb73a5698",
+   "voters": [
+    "focal5",
+    "focal10",
+    "focal33"
+   ],
+   "zones": [
+    "a",
+    "b",
+    "c"
+   ]
+  },
+  {
+   "achieved_max_failures": 1,
+   "achieved_survive": "Zone",
+   "founder": "focal22",
+   "pending": false,
+   "preferred_leader": "focal22",
+   "session": "61d05c55d551bd5d7a96d8e2db731922",
+   "tenant": "af9a543dd9c1cacc8665a1beb73a5698",
+   "voters": [
+    "focal6",
+    "focal8",
+    "focal22"
+   ],
+   "zones": [
+    "a",
+    "b",
+    "c"
+   ]
+  },
+  {
+   "achieved_max_failures": 1,
+   "achieved_survive": "Zone",
+   "founder": "focal28",
+   "pending": false,
+   "preferred_leader": "focal28",
+   "session": "7837029161462926fa730518e97a64cb",
+   "tenant": "af9a543dd9c1cacc8665a1beb73a5698",
+   "voters": [
+    "focal12",
+    "focal23",
+    "focal28"
+   ],
+   "zones": [
+    "a",
+    "b",
+    "c"
+   ]
+  },
+  {
+   "achieved_max_failures": 1,
+   "achieved_survive": "Zone",
+   "founder": "focal19",
+   "pending": false,
+   "preferred_leader": "focal19",
+   "session": "9f931dbb561b85f1264dbdb4e49e101e",
+   "tenant": "af9a543dd9c1cacc8665a1beb73a5698",
+   "voters": [
+    "focal9",
+    "focal19",
+    "focal26"
+   ],
+   "zones": [
+    "a",
+    "b",
+    "c"
+   ]
+  },
+  {
+   "achieved_max_failures": 1,
+   "achieved_survive": "Zone",
+   "founder": "focal13",
+   "pending": false,
+   "preferred_leader": "focal13",
+   "session": "c90d843b2b5302946d9df26048604071",
+   "tenant": "af9a543dd9c1cacc8665a1beb73a5698",
+   "voters": [
+    "focal11",
+    "focal13",
+    "focal21"
+   ],
+   "zones": [
+    "a",
+    "b",
+    "c"
+   ]
+  },
+  {
+   "achieved_max_failures": 1,
+   "achieved_survive": "Zone",
+   "founder": "focal31",
+   "pending": false,
+   "preferred_leader": "focal31",
+   "session": "d31a4a5c6ca746d88651aba45b1e7223",
+   "tenant": "af9a543dd9c1cacc8665a1beb73a5698",
+   "voters": [
+    "focal17",
+    "focal24",
+    "focal31"
+   ],
+   "zones": [
+    "a",
+    "b",
+    "c"
+   ]
+  },
+  {
+   "achieved_max_failures": 1,
+   "achieved_survive": "Zone",
+   "founder": "focal4",
+   "pending": false,
+   "preferred_leader": "focal4",
+   "session": "d6335958903c875832d00e170fa260cd",
+   "tenant": "af9a543dd9c1cacc8665a1beb73a5698",
+   "voters": [
+    "focal4",
+    "focal15",
+    "focal14"
+   ],
+   "zones": [
+    "a",
+    "b",
+    "c"
+   ]
+  },
+  {
+   "achieved_max_failures": 1,
+   "achieved_survive": "Zone",
+   "founder": "focal16",
+   "pending": false,
+   "preferred_leader": "focal16",
+   "session": "f47593999506a66279fb0023c40cb22b",
+   "tenant": "af9a543dd9c1cacc8665a1beb73a5698",
+   "voters": [
+    "focal16",
+    "focal18",
+    "focal20"
+   ],
+   "zones": [
+    "a",
+    "b",
+    "c"
+   ]
+  }
+ ]
+}

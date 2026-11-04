@@ -10,7 +10,7 @@ every row names where it is recorded, and a gap is written as a gap.
 |---|---|---|
 | 1 | One binary and CLI, laptop to global, proven by records | partly shown |
 | 2 | More than a thousand agents doing claims, artifacts, testaments and validations | shown at 1,000; the Kubernetes build not attempted |
-| 3 | Delivery under heavy load, horrific networks, dozens of node failures | shown on three nodes and on 33 with twelve failing at once, confirmed on the fixed tree; every lifecycle completed, every claim, artifact, testament and validation committed, in a run of each fault kind (killed, killed outside the control plane, cut off with every connection dropped, partitioned) with agents that retry as focal's contract says; `ingress_capacity` root-caused (a session's door while the shared volume held its voters' syncs); the custody rule's decision pending (it sets an artifact's wait, not its completion); a heal outlives its cause (open) |
+| 3 | Delivery under heavy load, horrific networks, dozens of node failures | shown on three nodes and on 33 with twelve failing at once, confirmed on the fixed tree; every lifecycle completed, every claim, artifact, testament and validation committed, in a run of each fault kind (killed, killed outside the control plane, cut off with every connection dropped, partitioned) with agents that send each write once, focal carrying each write through the outage (the client's delivery bound, the custody rule by kind of object, a heal withdrawn only before its copies join); a copy its session no longer places stays on its node and serves (open: m13's ledger 10 waited 97 s for hand-offs, every lifecycle still completing) |
 | 4 | p99s an order of magnitude beyond Kafka, Redis HA, NATS | plan of record; not shown across its conditions |
 | 5 | Post-quantum encryption in transit and at rest | in transit shown; at rest partly |
 | 6 | Adversarial batteries: bombs, tampering, misuse | partly shown |
@@ -158,13 +158,39 @@ synced every node-local intent journal itself. That stalled the root group for u
 bootstrap, which is p9-0639's stop (832a0567). In m8 and k30 the owners' syncs were gone, and the
 move windows were 5.1 to 8.4 s.
 
-**Open.** An artifact's acknowledgement waits on every content copy of its session (doc 26 §1), so
-while a copy is down its artifact steps wait or are refused (`unavailable` at the client's 30 s
-clock, `owner_bound` at the custody check): every refusal at 33 nodes that is not a session without
-its quorum is this rule's. With agents that retry, every artifact committed under it: the rule
-sets how long an artifact waits while a copy is down (median 31.3 s in k34, 50.6 s in m9), not
-whether it completes, and whether a quorum of copies (f+1) suffices is the user's decision,
-pending. A session whose quorum is down takes no write until its voters are back. A move closes its
+Every lifecycle completed again with focal-load's agents sending each write once (`refused: end`,
+the default), focal carrying each write through the outage itself, as the user decided on
+2026-11-03 ("Every lifecycle completed: agents that send each write once" in [the
+record](campaigns/2026-10-31-fleet33-condition3.md); "2026-11-03 — Every lifecycle completed at 33
+nodes with agents that send each write once" in doc 09). A client delivers a write its ledger cannot
+take yet for `client.delivery_timeout_ms`, unset Kafka's `delivery.timeout.ms` default of 120 s
+(8cc84355). An artifact is acknowledged once every live copy and a quorum of the voters (f+1) hold it
+(0388d9b2). A heal is withdrawn only while none of its copies has begun to join, since a withdrawal
+after its cutover record had committed left one session closed to the end in m11 and in m12
+(feba1336). One run of each fault kind on `focal:fleet-c23` (feba1336), the same seed:
+
+| fedora run | Fault | Written and judged, of 29,700 | Refused / unknown / abandoned | Claims | Artifacts | Testaments | Validations | Sent again by an agent | Write p50 / p99 (ms) |
+|---|---|---|---|---|---|---|---|---|---|
+| m13-2254 | outside the control plane, killed 60 s | 29,700 | 0 / 0 / 0 | 105,880 of 105,880 | 26,455 of 26,455 | 79,495 of 79,495 | 79,722 of 79,722 | 0 | 52.3 / 7,216.5 |
+| k37-2318 | killed 30 s | 29,700 | 0 / 0 / 0 | 105,822 of 105,822 | 26,445 of 26,445 | 79,436 of 79,436 | 79,600 of 79,600 | 0 | 39.1 / 14,960.6 |
+| c23-2330 | cut off 12 s, every connection dropped | 29,700 | 0 / 0 / 0 | 105,816 of 105,816 | 26,446 of 26,446 | 79,428 of 79,428 | 79,594 of 79,594 | 0 | 31.1 / 216.4 |
+| p14-2342 | partitioned 30 s | 29,700 | 0 / 0 / 0 | 105,820 of 105,820 | 26,447 of 26,447 | 79,433 of 79,433 | 79,600 of 79,600 | 0 | 51.3 / 831.5 |
+
+A session without its quorum held its writes inside their clients and committed them once its
+voters served again (35.1 to 37.4 s in k37, 12.4 to 13.8 s in c23, 31.3 to 34.9 s in p14, 65.6 and
+66.3 s in m13). The runs on the trees before found what these close: k35's 24 validations refused
+`owner_bound` (a majority of two copies was both) and 341 writes an agent sent again (their client
+reported them unknown at its attempts), closed by 0388d9b2; m11's and m12's session left closed
+by a heal withdrawn after its cutover, closed by feba1336.
+
+**Open.** A copy its session no longer places stays on its node, and serves: no node releases a
+copy its directory has retired (`ReplicaFleet::remove` exists, and nothing calls it), a restarted
+node reopens every copy it ever installed, and a node's record of copies is capped at 1,024 for its
+life. A copy that left its group while its node was down serves inbox reads from where it stopped,
+so m13's ledger 10, whose agents were homed in part on the replaced voter, sent no write for 97 s
+while its hand-offs waited, every lifecycle still completing. Every run in which a heal activated
+ends with such copies. A session whose quorum is down takes no write until its voters are back; its
+writes wait inside their clients for the delivery bound. A move closes its
 session to its clients from its log's cutover to its activation, 5.1 to 8.4 s in m8. `ingress_capacity`
 (k28 49, k29 40, c18 12) is a session's door full while its voters' syncs are held, root-caused in
 c18: no session committed from 11.7 to 13.0 s after the cut began, and the log I/O threads of the
@@ -172,10 +198,9 @@ same sixteen live nodes sat in disk waits in every 200 ms sample from 11.8 to 12
 volume every node's log is on stalled; the session that had lost a follower, its two live voters
 holding every commit and 231 writes under way, refused its next 12 once the client's three capacity
 resends were spent. k28's and k29's were each one such two-voter session, which a voter's held
-sync fits (no thread samples then). A heal outlives its cause: a move runs to its activation after
-its voter is alive again (c18's focal33, never cut off, held dead about 2.2 s, a session that lost
-nothing then closed 6.5 s; two of m9's three heals cut over after their voter was back), and a heal
-withdrawn before its cutover is not done. A node's log syncs wait on its file
+sync fits (no thread samples then). A node never cut off was held dead (c18's focal33, about 2.2 s),
+and its session, which had lost nothing, closed 6.5 s for a move: a heal whose cause has gone is
+now withdrawn while none of its copies has begun to join, and runs to its activation once one has. A node's log syncs wait on its file
 system's commits, up to 5.2 s on the host's btrfs volume, where the harness keeps every node's log
 (condition 10). Under 3% loss a write's p99 is 753
 to 2,244 ms against 462 to 574 without, its artifact steps held at the evidence door (the 2026-10-28

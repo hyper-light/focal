@@ -1,0 +1,7 @@
+p14-2342: 11 ledgers, fault from 1793778771375; windows of >= 1000 ms with writes under way and none committed
+  ledger  0: 0.4-2.9 s (2.4 s, 35 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 15% full 9%; log threads in D at once up to 10 nodes
+  ledger  2: 0.4-31.7 s (31.3 s, 324 under way): btrfs commit in progress up to 12 ms, 1 ended; io some 14% full 5%; log threads in D at once up to 18 nodes
+  ledger  5: 0.4-32.3 s (31.9 s, 332 under way): btrfs commit in progress up to 12 ms, 1 ended; io some 14% full 5%; log threads in D at once up to 19 nodes
+  ledger  9: 0.4-32.9 s (32.5 s, 336 under way): btrfs commit in progress up to 12 ms, 1 ended; io some 14% full 5%; log threads in D at once up to 21 nodes
+  ledger 10: 0.4-35.3 s (34.9 s, 357 under way): btrfs commit in progress up to 12 ms, 1 ended; io some 14% full 5%; log threads in D at once up to 24 nodes
+retried (first refusal cause, final outcome): {}

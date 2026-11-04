@@ -18529,3 +18529,53 @@ accused's own incarnation as SWIM's override takes it, is the likely way, not sh
 of the three heals cut over after their voter was back (46fe3614's 9.6 s window, ab05c879's); a heal
 withdrawn before its cutover once its voter is alive again is not done. The volume's commits
 holding every node's syncs are condition 10's.
+
+### 2026-11-03 — Every lifecycle completed at 33 nodes with agents that send each write once
+
+The runs of 2026-11-02 completed every lifecycle because focal-load's agents sent a refused write
+again: the agent carried the outage. The user decided on 2026-11-03 that focal carries it, without a
+longer fixed clock, and that an artifact is acknowledged once every live content copy and a quorum
+of the voters (f+1) hold it. 8cc84355: a client delivers a write its ledger cannot take yet for
+`client.delivery_timeout_ms` (the CLI, the MCP adapter and code mode read it; doc 08), unset Kafka's
+producer default for the same bound, `delivery.timeout.ms` = 120,000 ms, sending again within it
+every refusal that admitted nothing, in place of a fixed 30 s that nothing had measured for a
+write. 0388d9b2: the custody rule by kind of object (doc 26 §1): a native artifact, which a quorum of
+the voters holds once it commits, needs every copy up and at least one (`LiveCopies`); an object a
+frame names by reference a majority of its copies; an archive bundle every copy; custody short is
+refused `unavailable`, which the client sends again; a write whose outcome its client could not learn
+is sent again under its identity within the bound. a5ef9aca withdraws a heal whose cause has gone,
+and feba1336 allows that only while none of the heal's copies has begun to join the session's group
+(`joining`: the log's configuration names none of them and the directory records each as assigned).
+With twelve outside the control plane down for 60 s, a5ef9aca withdrew a heal after its cutover
+record had committed, which closes a session's serving until activation, and the session stayed
+closed to the run's end (m12's ledger 8: 753 writes refused `unavailable`, 60 lifecycles abandoned;
+m11's ledger 6 the same, 618 and 101). `a_heal_is_withdrawn_only_before_a_copy_it_brings_joins_the_group`
+holds the rule; 6d2480a5 gives the CLI path cases the least delivery bound.
+
+Four runs at 33 nodes on fedora on `focal:fleet-c23` (feba1336), focal-load's agents sending each
+write once (`refused: end`), the seed and faults of the runs before ([the
+record](../qualification/campaigns/2026-10-31-fleet33-condition3.md), "Every lifecycle completed:
+agents that send each write once"):
+
+| fedora run | Fault | Written and judged, of 29,700 | Refused / unknown / abandoned | Sent again by an agent | Write p50 / p99 (ms) |
+|---|---|---|---|---|---|
+| m13-2254 | twelve outside the control plane killed 60 s | 29,700 | 0 / 0 / 0 | 0 | 52.3 / 7,216.5 |
+| k37-2318 | twelve killed 30 s | 29,700 | 0 / 0 / 0 | 0 | 39.1 / 14,960.6 |
+| c23-2330 | twelve cut off 12 s, every connection dropped | 29,700 | 0 / 0 / 0 | 0 | 31.1 / 216.4 |
+| p14-2342 | twelve partitioned 30 s | 29,700 | 0 / 0 / 0 | 0 | 51.3 / 831.5 |
+
+Every claim, artifact, testament and validation committed in each: claims 105,816 to 105,880,
+artifacts 26,445 to 26,455, testaments 79,428 to 79,495 and validations 79,594 to 79,722 a run. A
+session without its quorum held its writes inside their clients and committed them once its voters
+served again (12.4 to 66.3 s). The report and `stallio.txt` measured a ledger's windows only between
+two commits, so a session closed to the run's end showed none; both now count a window from a
+ledger's last commit to the end of a write still unanswered after it.
+
+Open: a copy its session no longer places stays on its node, and serves. No node releases a copy
+its directory has retired (`ReplicaFleet::remove` exists, nothing calls it), a restarted node reopens
+every copy it ever installed (`reopen_installed`), and the record of a node's copies is capped at
+1,024 for its life. A copy that left its group while its node was down serves inbox reads from where
+it stopped (`serves_all_members` reads its own last configuration), and in m13 ledger 10's agents,
+homed in part on the replaced voter focal31, sent no write for 97 s while their hand-offs waited,
+then completed every lifecycle. Every run in which a heal activated ends with such copies (m9, m10,
+m12, m13).

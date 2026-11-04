@@ -1,0 +1,9 @@
+k35-1423: 11 ledgers, fault from 1793745243431; windows of >= 1000 ms with writes under way and none committed
+  ledger  0: 0.2-35.1 s (34.9 s, 357 under way): btrfs commit in progress up to 16 ms, 49 ended; io some 14% full 4%; log threads in D at once up to 19 nodes
+  ledger  2: 0.2-37.9 s (37.7 s, 381 under way): btrfs commit in progress up to 16 ms, 49 ended; io some 14% full 4%; log threads in D at once up to 19 nodes
+  ledger  2: 38.9-40.9 s (2.1 s, 798 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 14% full 3%; log threads in D at once up to 23 nodes
+  ledger  5: 0.2-1.9 s (1.8 s, 24 under way): btrfs commit in progress up to 9 ms, 14 ended; io some 22% full 12%; log threads in D at once up to 9 nodes
+  ledger  8: 0.2-35.5 s (35.4 s, 358 under way): btrfs commit in progress up to 16 ms, 49 ended; io some 14% full 4%; log threads in D at once up to 19 nodes
+  ledger  9: 0.2-1.9 s (1.7 s, 25 under way): btrfs commit in progress up to 9 ms, 11 ended; io some 22% full 12%; log threads in D at once up to 9 nodes
+  ledger 10: 0.2-1.7 s (1.5 s, 17 under way): btrfs commit in progress up to 9 ms, 11 ended; io some 22% full 12%; log threads in D at once up to 9 nodes
+retried (first refusal cause, final outcome): {}

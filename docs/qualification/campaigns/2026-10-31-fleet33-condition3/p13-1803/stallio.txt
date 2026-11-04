@@ -1,0 +1,8 @@
+p13-1803: 11 ledgers, fault from 1793758409232; windows of >= 1000 ms with writes under way and none committed
+  ledger  0: 0.1-1.6 s (1.5 s, 27 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 26% full 23%; log threads in D at once up to 10 nodes
+  ledger  2: 0.1-32.6 s (32.4 s, 331 under way): btrfs commit in progress up to 45 ms, 1 ended; io some 21% full 16%; log threads in D at once up to 24 nodes
+  ledger  5: 0.1-1.6 s (1.5 s, 21 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 26% full 23%; log threads in D at once up to 10 nodes
+  ledger  7: 0.1-30.8 s (30.7 s, 310 under way): btrfs commit in progress up to 45 ms, 1 ended; io some 22% full 16%; log threads in D at once up to 17 nodes
+  ledger  9: 0.1-31.1 s (31.0 s, 320 under way): btrfs commit in progress up to 45 ms, 1 ended; io some 22% full 16%; log threads in D at once up to 24 nodes
+  ledger 10: 0.1-31.0 s (30.9 s, 314 under way): btrfs commit in progress up to 45 ms, 1 ended; io some 22% full 16%; log threads in D at once up to 17 nodes
+retried (first refusal cause, final outcome): {}

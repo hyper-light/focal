@@ -1,0 +1,7 @@
+c23-2330: 11 ledgers, fault from 1793778037112; windows of >= 1000 ms with writes under way and none committed
+  ledger  0: 0.1-12.8 s (12.6 s, 134 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 25% full 20%; log threads in D at once up to 15 nodes
+  ledger  2: 0.1-13.9 s (13.8 s, 146 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 25% full 19%; log threads in D at once up to 22 nodes
+  ledger  5: 0.1-13.8 s (13.8 s, 144 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 25% full 19%; log threads in D at once up to 26 nodes
+  ledger  9: 0.1-13.1 s (13.0 s, 136 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 25% full 20%; log threads in D at once up to 20 nodes
+  ledger 10: 0.1-12.5 s (12.4 s, 129 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 25% full 20%; log threads in D at once up to 15 nodes
+retried (first refusal cause, final outcome): {}

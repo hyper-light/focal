@@ -1,0 +1,8 @@
+c21-1751: 11 ledgers, fault from 1793757689869; windows of >= 1000 ms with writes under way and none committed
+  ledger  0: 0.1-2.6 s (2.5 s, 36 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 16% full 8%; log threads in D at once up to 12 nodes
+  ledger  2: 0.1-13.9 s (13.8 s, 149 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 16% full 7%; log threads in D at once up to 24 nodes
+  ledger  3: 0.2-13.6 s (13.5 s, 143 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 16% full 7%; log threads in D at once up to 16 nodes
+  ledger  5: 0.2-1.6 s (1.5 s, 23 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 17% full 8%; log threads in D at once up to 12 nodes
+  ledger  9: 0.1-12.8 s (12.7 s, 130 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 17% full 8%; log threads in D at once up to 16 nodes
+  ledger 10: 0.2-13.7 s (13.5 s, 143 under way): btrfs commit in progress up to 0 ms, 0 ended; io some 16% full 7%; log threads in D at once up to 16 nodes
+retried (first refusal cause, final outcome): {}
