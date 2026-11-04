@@ -21,8 +21,19 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn execute(root: &Path, args: &[&OsStr]) -> Output {
+/// The configuration every CLI call here runs with, written in `directory` (one of its own, so the
+/// directories the cases count hold only what the CLI wrote): the client's delivery bound at its
+/// least, so a write to the stopped node is reported pending within the call's bound below, where
+/// the default delivery bound (two minutes, Kafka's `delivery.timeout.ms`) would hold it longer.
+fn configuration(directory: &Path) -> std::path::PathBuf {
+    let config = directory.join("focal.yaml");
+    fs::write(&config, "version: 1\nclient:\n  delivery_timeout_ms: 500\n").unwrap();
+    config
+}
+fn execute(config: &Path, root: &Path, args: &[&OsStr]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_focal"))
+        .arg("--config")
+        .arg(config)
         .arg("--data-dir")
         .arg(root)
         .args(args)
@@ -63,6 +74,8 @@ fn structured(output: &Output, code: i32) -> Value {
 fn case(name: OsString) {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("node data with spaces");
+    let settings_directory = tempfile::tempdir().unwrap();
+    let config = configuration(settings_directory.path());
     let mut settings = Settings::default();
     settings.node.data_dir = Some(root.clone());
     let node = EmbeddedNode::open(&settings).unwrap();
@@ -74,6 +87,7 @@ fn case(name: OsString) {
         r#"{"kind":"receipt","phase":"whole_work","mode":"required","description":"Receipt of testament","evaluator":"self"}"#,
     );
     let output = execute(
+        &config,
         &root,
         &[
             OsStr::new("submit"),
@@ -139,6 +153,7 @@ fn case(name: OsString) {
     // works when the JSON string path is null due to non-UTF-8 bytes.
     let inspected = structured(
         &execute(
+            &config,
             &root,
             &[
                 OsStr::new("inspect"),
@@ -161,6 +176,7 @@ fn case(name: OsString) {
 
     let retried = structured(
         &execute(
+            &config,
             &root,
             &[
                 OsStr::new("retry"),
