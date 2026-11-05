@@ -43,6 +43,26 @@ use deadline::progress;
 fn address() -> String {
     ports::address()
 }
+/// How long a node is given to publish its readiness ([`start`]), and so how long an adapter's
+/// client keeps delivering a request no node answers yet (`client.delivery_timeout_ms`): a retry
+/// after a restart rides through the node's catch-up, and a call the test cuts or refuses reports
+/// its outcome within the call's wait ([`Mcp::rpc`]), which the client's default bound (two
+/// minutes, Kafka's `delivery.timeout.ms`) does not end within.
+const READINESS: Duration = Duration::from_secs(25);
+/// The configuration the adapters run with, written in `directory`, one of its own: the delivery
+/// bound [`READINESS`].
+fn configuration(directory: &Path) -> std::path::PathBuf {
+    let config = directory.join("focal.yaml");
+    std::fs::write(
+        &config,
+        format!(
+            "version: 1\nclient:\n  delivery_timeout_ms: {}\n",
+            READINESS.as_millis()
+        ),
+    )
+    .unwrap();
+    config
+}
 fn start(root: &Path, advertise: &str) -> Server {
     progress::admit();
     deadline::observe(root);
@@ -74,7 +94,7 @@ fn start(root: &Path, advertise: &str) -> Server {
         }
     });
     let mut server = Server(child);
-    let status = progress::reported(&receive, &mut server.0, root, Duration::from_secs(25))
+    let status = progress::reported(&receive, &mut server.0, root, READINESS)
         .expect("server did not publish readiness");
     assert!(
         matches!(status["condition"].as_str(), Some("Ready" | "CatchingUp")),
@@ -114,8 +134,9 @@ struct Mcp {
     next: u64,
 }
 impl Mcp {
-    fn open(root: &Path, context: Option<&str>) -> Self {
+    fn open(root: &Path, context: Option<&str>, config: &Path) -> Self {
         let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
+        command.arg("--config").arg(config);
         command.args(["--data-dir", root.to_str().unwrap()]);
         if let Some(context) = context {
             command.args(["--client-context", context]);
@@ -252,7 +273,7 @@ fn start_with(root: &Path, advertise: &str, env: &[(&str, &str)]) -> Server {
         }
     });
     let mut server = Server(child);
-    let status = progress::reported(&receive, &mut server.0, root, Duration::from_secs(25))
+    let status = progress::reported(&receive, &mut server.0, root, READINESS)
         .expect("server did not publish readiness");
     assert!(
         matches!(status["condition"].as_str(), Some("Ready" | "CatchingUp")),
@@ -353,8 +374,13 @@ fn concurrent_adapters_cancelled_calls_lost_replies_and_exhausted_capacity_recon
         String::from_utf8_lossy(&enrolled.stderr),
         String::from_utf8_lossy(&enrolled.stdout)
     );
-    let mut issuer = Mcp::open(root, None);
-    let mut alice = Mcp::open(client.path(), Some("alice"));
+    let settings = tempfile::Builder::new()
+        .prefix("focal-native-mcp-a4-settings-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let config = configuration(settings.path());
+    let mut issuer = Mcp::open(root, None, &config);
+    let mut alice = Mcp::open(client.path(), Some("alice"), &config);
     let issuer_id =
         hex_hash(&objects(&issuer.read("ledger.standing", json!({})))[0]["Standing"]["principal"]);
     let alice_id =
