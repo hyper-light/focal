@@ -13,7 +13,7 @@ every row names where it is recorded, and a gap is written as a gap.
 | 3 | Delivery under heavy load, horrific networks, dozens of node failures | shown on three nodes and on 33 with twelve failing at once, confirmed on the fixed tree; every lifecycle completed, every claim, artifact, testament and validation committed, in a run of each fault kind (killed, killed outside the control plane, cut off with every connection dropped, partitioned) with agents that send each write once, focal carrying each write through the outage (the client's delivery bound, the custody rule by kind of object, a heal withdrawn only before its copies join); a copy its session no longer places stays on its node and serves (open: m13's ledger 10 waited 97 s for hand-offs, every lifecycle still completing) |
 | 4 | p99s an order of magnitude beyond Kafka, Redis HA, NATS | plan of record; not shown across its conditions |
 | 5 | Post-quantum encryption in transit and at rest | in transit shown; at rest partly |
-| 6 | Adversarial batteries: bombs, tampering, misuse | partly shown |
+| 6 | Adversarial batteries: bombs, tampering, misuse | shown: one battery runs every case of a threat-model coverage table (49 threats, 117 cases: decompression and size bombs, tampering, misuse, protocol abuse), green in CI on Linux and macOS; building it found and turned off pre-authentication certificate decompression |
 | 7 | Meta scale by default when distributed | an envelope, not a result |
 | 8 | Spec-compliant MCP with code mode and skills | shown for the spec versions named |
 | 9 | Cross-OS and cross-architecture | shown in CI and release lanes |
@@ -261,14 +261,25 @@ left in the clear is listed there clear by design, with its reason.
 
 ## 6. Adversarial batteries
 
-**Recorded.** "2026-10-05 — Every YAML document under a stated budget, held by a contract rule"
-(alias-expansion bombs refused; `check-contracts.py` refuses the default budget in production);
-focal compresses nothing, and its wire, record and input codecs refuse a declared length before
-allocating (R11 §3); tampering with sealed records and acknowledged frames is refused and reported
-(the seal and log entries; hyper-log's `damage_to_any_field_of_an_acknowledged_frame_is_reported`).
+**Recorded.** One battery runs every adversarial case together beside a threat-model coverage
+table ("2026-11-05 — One adversarial battery runs every case of a threat-model coverage table";
+[the battery](adversarial-battery.md)). It states who attacks and where, and 49 threats in the
+condition's classes: decompression bombs 2, size bombs 11, tampering 13, misuse 11, protocol abuse
+12, each with the surface it reaches, the attack, the defense and the tests that drive the attack,
+117 cases. `python3 scripts/adversarial_battery.py run` runs them on the workspace's test
+executables and prints the table with each threat's cases passed. CI runs it on Linux and macOS
+after the workspace's tests: on d5fa7265, 117 of 117 passed on Linux in 104.7 s and on macOS in 118.9 s. The
+contracts hold the table to the source. Building it found that focal decompressed peers'
+certificates (RFC 8879, brotli and zlib, during the handshake, before the chain was verified).
+No TLS configuration focal holds takes certificate compression now, a contract rule holds the
+builders to that, and a test of the resolved dependency graph fails if another decompressor comes
+in. The earlier records stand within it: YAML under a stated budget (2026-10-05), codecs that
+refuse a declared length before allocating (R11 §3), seals and acknowledged frames whose tampering
+is refused and reported.
 
-**Open.** One battery that runs every adversarial case together, and a statement of its coverage
-against a threat list, does not exist yet.
+**Open.** The battery runs on Linux and macOS. The Windows workflow runs its platform suites (the
+wire, enrollment, evidence and node library tests among them, both decompression tests with them)
+but not the battery as one: many of its cases drive Unix sockets and processes.
 
 ## 7. Meta scale by default
 

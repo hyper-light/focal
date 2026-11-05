@@ -18579,3 +18579,42 @@ it stopped (`serves_all_members` reads its own last configuration), and in m13 l
 homed in part on the replaced voter focal31, sent no write for 97 s while their hand-offs waited,
 then completed every lifecycle. Every run in which a heal activated ends with such copies (m9, m10,
 m12, m13).
+
+### 2026-11-05 — One adversarial battery runs every case of a threat-model coverage table
+
+Terminating condition 6. [The battery](../qualification/adversarial-battery.md) states who attacks
+and where (a peer node before and after its handshake, a participant within its grant, an agent
+through MCP or code mode, an operator's inputs, whoever can write a disk) and 49 threats in the
+condition's classes: decompression bombs 2, size bombs 11, tampering 13, misuse 11, protocol abuse
+12. Each names the surface it reaches, the attack, the defense focal holds and the tests that drive
+the attack itself, 117 cases in all, chosen from the workspace's 3,834 tests by what each test
+does. `python3 scripts/adversarial_battery.py run` takes the test executables the workspace build
+made (`cargo test --workspace --locked --no-run --message-format=json`) and runs each once with its
+cases as filters, in its package's directory; every case must match exactly one test and pass, and
+it prints the table with each threat's cases passed. CI runs it on Linux and macOS after the
+workspace's tests (`ci.yml`, "Adversarial battery"). `check` holds the table to the source without a
+build (a case renamed or removed, a threat with no case, a class with no threat;
+`scripts/check-contracts.py` runs it), shown refusing each of the three on a copy of the table.
+
+Found while building it: focal decompressed peers' certificates. The record of 2026-10-05 said focal
+compresses nothing, true then; the TLS stack vendored since (`hyper-tls`) brought RFC 8879
+certificate compression with brotli and zlib, on by default, so a peer's compressed chain was
+decompressed during the handshake, before the chain was verified, into the length the peer declared
+(64 KiB at most, which the stack checks before allocating). `ServerTls` and `ClientTls` now take no
+certificate compression either way, as does the listener's client side; every configuration focal's
+endpoints hold passes through them, and check-contracts refuses a new file that builds a TLS
+configuration until it is seen to hand it to them (DB-1,
+`no_tls_configuration_focal_holds_decompresses_a_certificate`, which also asserts the stack's
+defaults offer decompressors). The decompressors the binary links are the TLS stack's alone
+(`only_the_tls_stack_reaches_a_decompressor_in_what_focal_ships`, on the resolved graph of the
+platform it runs on: brotli, brotli-decompressor and zlib-rs through `hyper-tls` and nothing else;
+zstd is the comparison harness's and a dev-dependency of the bus's benchmarks; DB-2).
+
+CI on d5fa7265 (a512b146's decompressor check resolved every platform offline, and Windows had not
+fetched a crate only another platform needs; it now resolves its own platform's graph): Rust
+contracts green on Linux and macOS, the battery 117 of 117 on Linux in 104.7 s and on macOS in 118.9 s, and the
+Windows build green, both decompression tests among its wire tests. On this Mac focal-wire's suite
+passed, and its 28 battery cases ran three times: all passed in two, and in the other
+`an_enrollment_kind_is_refused_where_the_protocol_is_not_served` failed, its group taking 39.8 s
+where it takes 1.3 s, with the host's one-minute load at 150 on 18 cores just after. It passed
+alone three times and in its group since; its output was not kept, so it is not root-caused.
