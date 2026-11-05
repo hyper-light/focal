@@ -456,6 +456,9 @@ pub struct MetricsSnapshot {
     /// full, and those whose request time ran out there.
     pub evidence: crate::evidence_service::EvidenceDoorStats,
     pub storage: Option<StorageMetrics>,
+    /// The medium under the data directory as its system described it; none while the
+    /// description is being made. The storage view reads it from here (`inspect node --storage`).
+    pub medium: Option<focal_platform::medium::Medium>,
     pub fleet: FleetStatus,
     pub root: RootMetrics,
     pub peers: PeerPoolStats,
@@ -829,6 +832,11 @@ impl MetricsSnapshot {
             )?
             .checked_add(size_of::<PeerRtt>().checked_mul(self.peer_rtts.len())?)?
             .checked_add(size_of::<crate::admission::TenantReport>().checked_mul(tenants)?)?
+            .checked_add(
+                self.medium
+                    .as_ref()
+                    .map_or(0, focal_platform::medium::Medium::heap_bytes),
+            )?
             .checked_add(focal_memory::ALLOCATOR_OVERHEAD.checked_mul(4)?)
     }
     /// The snapshot as Prometheus text, written into `out`.
@@ -2338,6 +2346,7 @@ mod tests {
             content_timed_out: 0,
             evidence: Default::default(),
             storage: None,
+            medium: None,
             fleet: FleetStatus {
                 latest_sequence: 1,
                 installed: 1,
@@ -2416,6 +2425,7 @@ mod tests {
             write: timed,
             commit_wait: LogLatency::default(),
             flushing_ns: Some(250),
+            ..LogMetrics::default()
         }));
         let text = sample.render();
         for line in [

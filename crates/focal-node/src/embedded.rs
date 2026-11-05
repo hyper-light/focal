@@ -273,6 +273,7 @@ impl EmbeddedNode {
             cache,
             // The store keys beside the log, wiped as they drop (29 §8).
             keys: _,
+            write_path: _,
         } = storage;
         drop(storage);
         let closed = log.map(focal_consensus::ShellLog::close).transpose();

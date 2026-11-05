@@ -126,6 +126,24 @@ fn admin(root: &Path, args: &[&str]) -> Value {
         )
     })
 }
+/// The storage view once it names the medium under `root`. The node's sampler holds the medium's
+/// description from its first round on Linux and Windows, where the system answers at once, and
+/// from its next round on macOS, where a system tool answers in a fraction of a second: within
+/// two rounds of the node's time.
+fn medium_view(root: &Path) -> Value {
+    let mut deadline = deadline::Deadline::after(focal_node::metrics::SAMPLE_INTERVAL * 2);
+    loop {
+        let shown = admin(root, &["inspect", "node", "--storage"]);
+        let storage = shown["result"]["storage"].clone();
+        if !storage["medium"].is_null() {
+            return storage;
+        }
+        assert!(
+            deadline.open(),
+            "the storage view never named the medium: {storage}"
+        );
+    }
+}
 fn committed(value: &Value) -> (String, Value) {
     assert_eq!(value["condition"], "Committed", "{value}");
     assert_eq!(value["result"]["kind"], "native");
@@ -351,6 +369,42 @@ fn a_backup_holds_the_prefix_and_its_proof_and_verifies_without_the_node() {
     assert_eq!(listed["authoritative"], true, "{listed}");
     assert!(listed["retention"]["floor"].as_u64().is_some(), "{listed}");
     assert_eq!(storage["truncated"], false);
+    // It names the medium under the data directory as the system describes it, and what the
+    // node's log took on it and has written there (terminating condition 10).
+    let storage = medium_view(root);
+    let medium = &storage["medium"];
+    for field in ["class", "interconnect", "file_system", "write_cache"] {
+        assert!(medium[field].is_string(), "{field}: {medium}");
+    }
+    assert_ne!(medium["file_system"], "unknown", "{medium}");
+    assert!(medium["file_system_name"].is_string(), "{medium}");
+    assert!(medium["notes"].is_array(), "{medium}");
+    assert!(
+        medium["flushes_reach_stable_media"].is_boolean(),
+        "{medium}"
+    );
+    #[cfg(target_os = "macos")]
+    assert_eq!(medium["file_system"], "apfs", "{medium}");
+    let path = &storage["write_path"];
+    assert!(path["direct"].is_boolean(), "{path}");
+    assert!(path["zero_fill"].is_boolean(), "{path}");
+    assert!(
+        path["layout_block"]
+            .as_u64()
+            .is_some_and(|block| block >= 512),
+        "{path}"
+    );
+    let counts = &path["counts"];
+    assert!(
+        counts["updates"]
+            .as_u64()
+            .is_some_and(|updates| updates > 0),
+        "{path}"
+    );
+    assert!(
+        counts["bytes"].as_u64().is_some_and(|bytes| bytes > 0),
+        "{path}"
+    );
     assert_eq!(verified["decoder_supported"], true);
     assert_eq!(verified["objects_verified"], 1);
     assert_eq!(verified["problems"].as_array().unwrap().len(), 0);

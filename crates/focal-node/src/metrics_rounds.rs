@@ -669,6 +669,7 @@ impl MetricsSnapshot {
             storage: Some(crate::metrics::StorageMetrics::Wal(
                 focal_log::WalWriterStats::default(),
             )),
+            medium: None,
             fleet: FleetStatus {
                 latest_sequence: wide,
                 installed: usize::MAX,

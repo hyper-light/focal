@@ -63,9 +63,19 @@ use std::{
     time::Duration,
 };
 
-/// Seconds between routine load reports; a report is also due whenever the
-/// node's enrollment generation changes or no report exists.
-const LOAD_INTERVAL: i64 = 30;
+/// Seconds between refreshes of a load report's measured values (free memory, free disk) where
+/// nothing the planner decides by changed: Kubernetes' `nodeStatusReportFrequency`, "the frequency
+/// that kubelet posts node status to the API server if node status does not change. Kubelet will
+/// ignore this frequency and post node status immediately if any change is detected", 5 minutes
+/// by default (KubeletConfiguration v1beta1). A report is a committed directory write, a frame the
+/// node's log makes durable on every replica of the partition; refreshed every 30 seconds, as it
+/// was, it was the only write an idle node made, one frame and two flushes each (2,880 a day,
+/// measured 2026-11-05): a disk whose heads unload when it rests loaded them that often, where its
+/// rating allows 600,000 cycles over a 5-year warranty (329 a day; mantle
+/// `docs/research/29-device-classes.md` §1, finding 8). What the planner decides by is due at once
+/// (`load_due`); Kafka's controller likewise logs a broker's registration and fencing, and takes
+/// its heartbeats as requests (KIP-631).
+const LOAD_REFRESH: i64 = 300;
 /// Proof lifetime for self-signed readiness and session facts.
 const PROOF_WINDOW: i64 = 60;
 const EVIDENCE_TTL: Duration = Duration::from_secs(10);
@@ -3200,16 +3210,26 @@ impl PlacementAgent {
         let generation = record.enrollment.generation;
         let partition = self.current_partition.ok_or(AgentError::Identity)?;
         let capability = crate::upgrade::announced_level();
+        let stats = self.node_budget.stats();
+        let fresh = LoadFacts {
+            generation,
+            capability,
+            active_weight: u64::try_from(handles.fleet.status().installed).unwrap_or(u64::MAX),
+            available_memory: u64::try_from(stats.limit.saturating_sub(stats.used))
+                .unwrap_or(u64::MAX),
+            // Free bytes of the data volume that no queued durable write has
+            // been promised, as the disk envelope estimates them.
+            disk_available: self.storage.available_bytes().unwrap_or(0),
+        };
         if !load_due(
             self.last_load.get(&partition).copied(),
             record.load,
-            generation,
-            capability,
+            fresh,
+            self.partition_config().min_disk_available,
             now,
         ) {
             return Ok(None);
         }
-        let stats = self.node_budget.stats();
         let report = record
             .load
             .map_or(0, |load| load.report)
@@ -3220,12 +3240,9 @@ impl PlacementAgent {
             node,
             generation,
             report,
-            available_memory: u64::try_from(stats.limit.saturating_sub(stats.used))
-                .unwrap_or(u64::MAX),
-            active_weight: u64::try_from(handles.fleet.status().installed).unwrap_or(u64::MAX),
-            // Free bytes of the data volume that no queued durable write has
-            // been promised, as the disk envelope estimates them.
-            disk_available: self.storage.available_bytes().unwrap_or(0),
+            available_memory: fresh.available_memory,
+            active_weight: fresh.active_weight,
+            disk_available: fresh.disk_available,
             capability,
         };
         let command = ControlCommand::VerifiedPartition(VerifiedPartitionCommand {
@@ -4049,27 +4066,45 @@ fn planned_session_of(
         desired.placement.voters.keys().copied().collect(),
     ))
 }
-/// Whether this node's load report to a partition is due: `last` is the
-/// time and generation of its last committed report there, `committed` the
-/// load the directory holds. The facts the cluster gates on — the
-/// generation, the level the upgrade fence waits for (24 §21) — are due
-/// until the directory holds this node's own; the rest refresh once an
-/// interval. A report the previous process journaled may commit after a
-/// restart with the level that process announced, and is followed at once.
+/// What a node's next load report would say beside its identity: the facts its due is judged by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LoadFacts {
+    generation: u64,
+    capability: u32,
+    active_weight: u64,
+    available_memory: u64,
+    disk_available: u64,
+}
+/// Whether this node's load report to a partition is due: `last` is the time and generation of
+/// its last committed report there, `committed` the load the directory holds, `fresh` what a
+/// report would say now, and `min_disk_available` the headroom the planner places by. What the
+/// cluster gates on (the generation, the level the upgrade fence waits for, 24 §21) and what the
+/// planner decides by (the sessions the node holds, its first key after home and incumbency, and
+/// its disk falling below the planner's headroom, which stops placements on it) are due as soon
+/// as they differ from the directory's; the measured values the planner only breaks ties by, and
+/// a disk that rose past the headroom again, refresh once `LOAD_REFRESH` has passed, and only
+/// where they changed, so a disk hovering at the headroom reports its fall at most once an
+/// interval. A report the previous process journaled may commit after a restart with the level
+/// that process announced, and is followed at once.
 fn load_due(
     last: Option<(i64, u64)>,
     committed: Option<NodeLoad>,
-    generation: u64,
-    capability: u32,
+    fresh: LoadFacts,
+    min_disk_available: u64,
     now: i64,
 ) -> bool {
     match (last, committed) {
         (_, None) | (None, Some(_)) => true,
         (Some((at, reported)), Some(load)) => {
-            reported != generation
-                || load.generation != generation
-                || load.capability != capability
-                || now.saturating_sub(at) >= LOAD_INTERVAL
+            reported != fresh.generation
+                || load.generation != fresh.generation
+                || load.capability != fresh.capability
+                || load.active_weight != fresh.active_weight
+                || (load.disk_available >= min_disk_available
+                    && fresh.disk_available < min_disk_available)
+                || (now.saturating_sub(at) >= LOAD_REFRESH
+                    && (load.available_memory != fresh.available_memory
+                        || load.disk_available != fresh.disk_available))
         }
     }
 }

@@ -442,3 +442,323 @@ pub(crate) fn hard_link_count_open(file: &File) -> io::Result<u64> {
         info_from_handle(file.as_raw_handle() as HANDLE)?.nNumberOfLinks,
     ))
 }
+
+/// What Windows says of the volume that holds a path and of the device under it (mantle
+/// docs/research/02-os-storage-apis.md §4), each query's answer or why it gave none: the
+/// file system's name, the drive's type and the volume's sector sizes and flags, which any caller
+/// may ask, and the device's descriptor and write cache, which Windows answers on a handle to the
+/// volume opened for no access, where it answers at all (02 §4.3 leaves unprivileged success
+/// UNVERIFIED: a refusal is an unknown, never a failure).
+pub(crate) struct StorageFacts {
+    /// The volume's file system's name (`GetVolumeInformationW`).
+    pub(crate) file_system: io::Result<String>,
+    /// The volume's drive type (`GetDriveTypeW`: `DRIVE_REMOVABLE` 2, `DRIVE_FIXED` 3,
+    /// `DRIVE_REMOTE` 4, `DRIVE_CDROM` 5, `DRIVE_RAMDISK` 6).
+    pub(crate) drive_type: io::Result<u32>,
+    /// The volume's sectors and flags (`NtQueryVolumeInformationFile`,
+    /// `FileFsSectorSizeInformation`), asked through a handle to the path itself.
+    pub(crate) sectors: io::Result<SectorFacts>,
+    /// The device's descriptor (`IOCTL_STORAGE_QUERY_PROPERTY`, `StorageDeviceProperty`).
+    pub(crate) device: io::Result<DeviceFacts>,
+    /// The device's write cache (`IOCTL_STORAGE_QUERY_PROPERTY`,
+    /// `StorageDeviceWriteCacheProperty`).
+    pub(crate) cache: io::Result<CacheFacts>,
+}
+
+/// `FILE_FS_SECTOR_SIZE_INFORMATION`'s sizes and flags.
+pub(crate) struct SectorFacts {
+    pub(crate) logical: u32,
+    pub(crate) atomic: u32,
+    pub(crate) performance: u32,
+    /// `SSINFO_FLAGS_*`: `NO_SEEK_PENALTY` 0x4, `TRIM_ENABLED` 0x8.
+    pub(crate) flags: u32,
+}
+
+/// `STORAGE_DEVICE_DESCRIPTOR`'s bus, media and identification.
+pub(crate) struct DeviceFacts {
+    /// `STORAGE_BUS_TYPE`.
+    pub(crate) bus: i32,
+    pub(crate) removable_media: bool,
+    pub(crate) product: Option<String>,
+}
+
+/// `STORAGE_WRITE_CACHE_PROPERTY`'s cache and write-through answers.
+pub(crate) struct CacheFacts {
+    /// `WRITE_CACHE_ENABLE`: `WriteCacheDisabled` 1, `WriteCacheEnabled` 2.
+    pub(crate) enabled: i32,
+    /// `WRITE_THROUGH`: `WriteThroughNotSupported` 1, `WriteThroughSupported` 2.
+    pub(crate) write_through: i32,
+}
+
+/// The bytes of a device descriptor read: one memory page (`memory_page_bytes`), which holds the
+/// descriptor and its identification strings (an NVMe controller's model is 40 bytes, Identify
+/// Controller `MN`); a descriptor longer than a page is read to the page.
+const DESCRIPTOR_BYTES: usize = 4096;
+
+pub(crate) fn storage_facts(path: &Path) -> StorageFacts {
+    let root = volume_root(path);
+    let again = |error: &io::Error| io::Error::new(error.kind(), error.to_string());
+    StorageFacts {
+        file_system: root
+            .as_ref()
+            .map_err(again)
+            .and_then(|root| file_system_name(root)),
+        drive_type: root.as_ref().map_err(again).map(|root| {
+            // SAFETY: `root` is a NUL-terminated wide string that outlives the call, which reads
+            // it and keeps no pointer to it.
+            unsafe { windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(root.as_ptr()) }
+        }),
+        sectors: sector_facts(path),
+        device: root
+            .as_ref()
+            .map_err(again)
+            .and_then(|root| volume_handle(root))
+            .and_then(|volume| device_facts(&volume)),
+        cache: root
+            .as_ref()
+            .map_err(again)
+            .and_then(|root| volume_handle(root))
+            .and_then(|volume| cache_facts(&volume)),
+    }
+}
+
+/// The root of the volume that holds `path` (`C:\`, or the folder a volume is mounted at), NUL
+/// terminated: a prefix of the path, so no longer than it.
+fn volume_root(path: &Path) -> io::Result<Vec<u16>> {
+    let wide = wide(path);
+    let mut root = vec![
+        0u16;
+        wide.len()
+            .max(windows_sys::Win32::Foundation::MAX_PATH as usize)
+    ];
+    let len =
+        u32::try_from(root.len()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: `wide` is NUL-terminated and `root` is `len` writable u16s; both outlive the call,
+    // which writes at most `len` units (its NUL included) and keeps no pointer to either.
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetVolumePathNameW(
+            wide.as_ptr(),
+            root.as_mut_ptr(),
+            len,
+        )
+    };
+    if ok == 0 {
+        return Err(last_error());
+    }
+    let end = root
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(root.len());
+    root.truncate(end);
+    root.push(0);
+    Ok(root)
+}
+
+/// The name of the file system of the volume at `root`.
+fn file_system_name(root: &[u16]) -> io::Result<String> {
+    // "The maximum buffer size is MAX_PATH+1" (GetVolumeInformationW, lpFileSystemNameBuffer).
+    let mut name = [0u16; windows_sys::Win32::Foundation::MAX_PATH as usize + 1];
+    let len =
+        u32::try_from(name.len()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: `root` is NUL-terminated (volume_root) and outlives the call; `name` is `len`
+    // writable u16s; every other output is null, which the function takes as "not wanted".
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetVolumeInformationW(
+            root.as_ptr(),
+            ptr::null_mut(),
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            name.as_mut_ptr(),
+            len,
+        )
+    };
+    if ok == 0 {
+        return Err(last_error());
+    }
+    let end = name
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(name.len());
+    Ok(String::from_utf16_lossy(
+        name.get(..end).unwrap_or_default(),
+    ))
+}
+
+/// The volume's sectors and flags, through a handle to `path` opened for no access: "No specific
+/// access rights are required to query this information" (FILE_FS_SECTOR_SIZE_INFORMATION).
+fn sector_facts(path: &Path) -> io::Result<SectorFacts> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    let mut info =
+        windows_sys::Wdk::Storage::FileSystem::FILE_FS_SECTOR_SIZE_INFORMATION::default();
+    let mut status_block = windows_sys::Win32::System::IO::IO_STATUS_BLOCK::default();
+    let len = u32::try_from(mem::size_of_val(&info))
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: `file` is an open handle for the call's length; `status_block` and `info` are live,
+    // writable and of the sizes passed, and the call writes within them and keeps no pointer.
+    let status = unsafe {
+        windows_sys::Wdk::Storage::FileSystem::NtQueryVolumeInformationFile(
+            file.as_raw_handle() as HANDLE,
+            &mut status_block,
+            (&raw mut info).cast(),
+            len,
+            windows_sys::Wdk::Storage::FileSystem::FileFsSectorSizeInformation,
+        )
+    };
+    if status < 0 {
+        return Err(io::Error::other(format!("NTSTATUS {status:#010x}")));
+    }
+    Ok(SectorFacts {
+        logical: info.LogicalBytesPerSector,
+        atomic: info.PhysicalBytesPerSectorForAtomicity,
+        performance: info.PhysicalBytesPerSectorForPerformance,
+        flags: info.Flags,
+    })
+}
+
+/// A handle to the volume at `root`, opened for no access: enough to ask the device's properties
+/// ("the application can query certain metadata such as file, directory, or device attributes
+/// without accessing that file or device", CreateFileW).
+fn volume_handle(root: &[u16]) -> io::Result<File> {
+    use std::os::windows::{ffi::OsStringExt, fs::OpenOptionsExt};
+    // "A reasonable size for the buffer to accommodate the largest possible volume GUID path is
+    // 50 characters" (GetVolumeNameForVolumeMountPointW).
+    let mut name = [0u16; 50];
+    let len =
+        u32::try_from(name.len()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: `root` is NUL-terminated and ends in a backslash, as GetVolumePathNameW returns
+    // it; `name` is `len` writable u16s; neither pointer is kept past the call.
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetVolumeNameForVolumeMountPointW(
+            root.as_ptr(),
+            name.as_mut_ptr(),
+            len,
+        )
+    };
+    if ok == 0 {
+        return Err(last_error());
+    }
+    // `\\?\Volume{GUID}\` names the volume's root directory; without its last backslash, the
+    // volume.
+    let end = name
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(name.len());
+    let volume = name.get(..end).unwrap_or_default();
+    let volume = volume.strip_suffix(&[u16::from(b'\\')]).unwrap_or(volume);
+    std::fs::OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(std::ffi::OsString::from_wide(volume))
+}
+
+/// One storage property of the device under `volume` into `out`, `Ok` with the bytes written.
+fn query_property(volume: &File, property: i32, out: &mut [u8]) -> io::Result<usize> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Ioctl::{
+        IOCTL_STORAGE_QUERY_PROPERTY, PropertyStandardQuery, STORAGE_PROPERTY_QUERY,
+    };
+    let query = STORAGE_PROPERTY_QUERY {
+        PropertyId: property,
+        QueryType: PropertyStandardQuery,
+        AdditionalParameters: [0],
+    };
+    let query_len = u32::try_from(mem::size_of_val(&query))
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let out_len =
+        u32::try_from(out.len()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let mut returned: u32 = 0;
+    // SAFETY: `volume` is an open handle; `query` is a live STORAGE_PROPERTY_QUERY of the length
+    // passed; `out` is `out_len` writable bytes and `returned` a live u32; the call is synchronous
+    // (no OVERLAPPED), writes within `out`, and keeps no pointer past its return.
+    let ok = unsafe {
+        windows_sys::Win32::System::IO::DeviceIoControl(
+            volume.as_raw_handle() as HANDLE,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            (&raw const query).cast(),
+            query_len,
+            out.as_mut_ptr().cast(),
+            out_len,
+            &mut returned,
+            ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(last_error());
+    }
+    Ok(usize::try_from(returned).unwrap_or(0).min(out.len()))
+}
+
+/// The device's descriptor, read from its bytes: `STORAGE_DEVICE_DESCRIPTOR`'s fields at their
+/// offsets, and its product string at the offset it names (zero for none), NUL-terminated within
+/// what the device returned.
+fn device_facts(volume: &File) -> io::Result<DeviceFacts> {
+    use windows_sys::Win32::System::Ioctl::{STORAGE_DEVICE_DESCRIPTOR, StorageDeviceProperty};
+    let mut bytes = vec![0u8; DESCRIPTOR_BYTES];
+    let returned = query_property(volume, StorageDeviceProperty, &mut bytes)?;
+    let bytes = bytes.get(..returned).unwrap_or_default();
+    let short = || io::Error::new(io::ErrorKind::InvalidData, "a short device descriptor");
+    let word = |offset: usize| -> io::Result<u32> {
+        let end = offset.checked_add(4).ok_or_else(short)?;
+        let field: [u8; 4] = bytes
+            .get(offset..end)
+            .ok_or_else(short)?
+            .try_into()
+            .map_err(|_| short())?;
+        Ok(u32::from_le_bytes(field))
+    };
+    let removable_media = mem::offset_of!(STORAGE_DEVICE_DESCRIPTOR, RemovableMedia);
+    let product = mem::offset_of!(STORAGE_DEVICE_DESCRIPTOR, ProductIdOffset);
+    let bus = mem::offset_of!(STORAGE_DEVICE_DESCRIPTOR, BusType);
+    let text = |offset: u32| -> Option<String> {
+        let start = usize::try_from(offset).ok().filter(|start| *start != 0)?;
+        let tail = bytes.get(start..)?;
+        let end = tail
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(tail.len());
+        let text = String::from_utf8_lossy(tail.get(..end)?).trim().to_owned();
+        (!text.is_empty()).then_some(text)
+    };
+    Ok(DeviceFacts {
+        bus: i32::from_le_bytes(word(bus)?.to_le_bytes()),
+        removable_media: bytes.get(removable_media).copied().ok_or_else(short)? != 0,
+        product: text(word(product)?),
+    })
+}
+
+/// The device's write cache, where it reports one.
+fn cache_facts(volume: &File) -> io::Result<CacheFacts> {
+    use windows_sys::Win32::System::Ioctl::{
+        STORAGE_WRITE_CACHE_PROPERTY, StorageDeviceWriteCacheProperty,
+    };
+    let mut bytes = [0u8; mem::size_of::<STORAGE_WRITE_CACHE_PROPERTY>()];
+    let returned = query_property(volume, StorageDeviceWriteCacheProperty, &mut bytes)?;
+    let bytes = bytes.get(..returned).unwrap_or_default();
+    let short = || io::Error::new(io::ErrorKind::InvalidData, "a short write cache property");
+    let word = |offset: usize| -> io::Result<i32> {
+        let end = offset.checked_add(4).ok_or_else(short)?;
+        let field: [u8; 4] = bytes
+            .get(offset..end)
+            .ok_or_else(short)?
+            .try_into()
+            .map_err(|_| short())?;
+        Ok(i32::from_le_bytes(field))
+    };
+    Ok(CacheFacts {
+        enabled: word(mem::offset_of!(
+            STORAGE_WRITE_CACHE_PROPERTY,
+            WriteCacheEnabled
+        ))?,
+        write_through: word(mem::offset_of!(
+            STORAGE_WRITE_CACHE_PROPERTY,
+            WriteThroughSupported
+        ))?,
+    })
+}

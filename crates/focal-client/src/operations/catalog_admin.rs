@@ -211,7 +211,7 @@ const CLUSTER_BACKUP_VERIFY: OperationDescriptor = OperationDescriptor {
 const CLUSTER_STORAGE_SHOW: OperationDescriptor = OperationDescriptor {
     name: "diagnose.node.storage",
     version: 1,
-    description: "The storage view of this node: the volume envelope every durable owner promises its bytes to (free bytes at the last sample, bytes outstanding by kind, the headroom never spent and the completion reserve), uploads staged, the archive agent's settings and progress, the collector's settings, and for every hosted native session whether this node is its authority, the log kept beyond its checkpoint and its retention floor with what holds it there. No reclamation is initiated.",
+    description: "The storage view of this node: the volume envelope every durable owner promises its bytes to (free bytes at the last sample, bytes outstanding by kind, the headroom never spent and the completion reserve), uploads staged, the archive agent's settings and progress, the collector's settings, for every hosted native session whether this node is its authority, the log kept beyond its checkpoint and its retention floor with what holds it there, the medium under the data directory as its system describes it (class, interconnect, file system, block sizes, cache, whether a flush reaches stable media), and what the node's log took on it with its counts. No reclamation is initiated.",
     capability: Capability::Node,
     mutation: false,
     destructive: false,

@@ -447,6 +447,7 @@ impl OwnerGate {
                         // The store keys beside the log are taken by the stores sealed next
                         // (29 §8); until then they are wiped here.
                         keys: _,
+                        write_path: _,
                     } = opened;
                     drop(storage);
                     if let Some(log) = log
@@ -535,6 +536,10 @@ pub struct NetworkService {
     metrics: focal_rt::watch::Sender<Option<crate::metrics::MetricsPage>>,
     /// The loopback endpoint bound at open when `node.metrics_listen` names one.
     metrics_listener: Option<hyper_rt::tcp::TcpListener>,
+    /// The description of the medium under the data directory, started as the node opened and
+    /// taken by the sampler, which polls it each round until it answers and puts it in the samples
+    /// the storage view reads.
+    medium: std::sync::Mutex<Option<focal_platform::medium::Probe>>,
     // All service handles and futures drop before registration closes. The
     // reaper retains LOCK even if a caller cancels run_until or keeps a handle.
     owners: Option<OwnerGate>,
@@ -709,6 +714,11 @@ impl NetworkService {
         }
         let identity = prepared.directory.identity().clone();
         let root = prepared.directory.root().to_path_buf();
+        // The medium's description starts as the node opens, before the tasks that dial its peers
+        // run: on macOS it runs a system tool, which can hold a descriptor another thread opens
+        // while it starts for as long as the tool runs, a fraction of a second
+        // (`focal_platform::medium`).
+        let medium = focal_platform::medium::Probe::start(&root);
         let admin_handler = Some(LocalNetworkAdmin::for_node(
             &prepared.directory,
             prepared.state.genesis.root,
@@ -739,6 +749,7 @@ impl NetworkService {
         // Every owner of the node's groups opens them through one handle (27 §15.11); the
         // registry holds what was opened, and closes the shell's log after every owner.
         let storage = opened.storage.clone();
+        let write_path = opened.write_path;
         // The node's small files, sealed from the at-rest level, as the directory opened them
         // (29 §12.10); the directory itself goes to the owners, who let its lock go last.
         let files = directory.files().clone();
@@ -1253,7 +1264,8 @@ impl NetworkService {
                     .with_gc(gc_handle.clone())
                     .with_archive(archive_handle.clone())
                     .with_evidence(coordinator.clone())
-                    .with_metrics(metrics_view.clone()),
+                    .with_metrics(metrics_view.clone())
+                    .with_write_path(write_path),
             ));
         }
         let data = DataService {
@@ -1317,6 +1329,7 @@ impl NetworkService {
             metrics_labels,
             metrics,
             metrics_listener,
+            medium: std::sync::Mutex::new(Some(medium)),
             owners: Some(owners),
         })
     }
@@ -1327,6 +1340,7 @@ impl NetworkService {
         &self,
         started: Instant,
         rounds: &mut crate::metrics::rounds::Rounds,
+        medium: Option<&focal_platform::medium::Medium>,
     ) -> Result<crate::metrics::MetricsSnapshot, MemoryError> {
         fn count(value: usize) -> u64 {
             u64::try_from(value).unwrap_or(u64::MAX)
@@ -1695,6 +1709,7 @@ impl NetworkService {
                     crate::metrics::StorageMetrics::Log(focal_consensus::LogMetrics::of(&stats))
                 }),
             },
+            medium: medium.cloned(),
             fleet: self.handles.fleet.status(),
             root: RootMetrics {
                 peer_aggregates: members,
@@ -2123,7 +2138,16 @@ impl NetworkService {
         // family, and then no page is published.
         let mut rounds =
             crate::metrics::rounds::Rounds::new(&self.metrics_labels, self.budget.clone());
+        // The medium's description, polled each round until it answers; a sampler that ends
+        // before then ends the probe with it.
+        let mut probe = self.medium.lock().ok().and_then(|mut probe| probe.take());
+        let mut medium = None;
         loop {
+            if let Some(answered) = probe.as_mut().and_then(|probe| probe.poll().cloned()) {
+                crate::medium_report::announce(&answered);
+                medium = Some(answered);
+                probe = None;
+            }
             // A round has the cadence to observe its sessions: a slow
             // or stuck owner costs its entry, never the round, and the
             // next round starts on the cadence whatever this one took
@@ -2132,10 +2156,15 @@ impl NetworkService {
             // time says its age, and the next page counts it.
             let started = Instant::now();
             if let Some(rounds) = rounds.as_mut() {
-                let page = match focal_rt::boxed(|| self.sample_metrics(started, rounds)).await {
-                    Ok(snapshot) => crate::metrics::MetricsPage::new(snapshot, &self.budget).ok(),
-                    Err(_) => None,
-                };
+                let page =
+                    match focal_rt::boxed(|| self.sample_metrics(started, rounds, medium.as_ref()))
+                        .await
+                    {
+                        Ok(snapshot) => {
+                            crate::metrics::MetricsPage::new(snapshot, &self.budget).ok()
+                        }
+                        Err(_) => None,
+                    };
                 match page {
                     Some(page) => {
                         self.metrics.send_replace(Some(page));

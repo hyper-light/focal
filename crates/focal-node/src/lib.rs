@@ -44,6 +44,7 @@ pub mod liveness;
 #[cfg(test)]
 mod liveness_tests;
 pub mod managed_service;
+pub(crate) mod medium_report;
 pub(crate) mod memory_envelope;
 pub mod metrics;
 pub mod network_admin;

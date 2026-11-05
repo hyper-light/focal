@@ -252,6 +252,7 @@ pub fn sync_dir(path: &std::path::Path) -> io::Result<()> {
 
 mod files;
 pub mod fs;
+pub mod medium;
 mod memory;
 pub use files::{open_files_limit, raise_open_files};
 pub use memory::{

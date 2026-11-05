@@ -49,6 +49,22 @@ pub struct OpenedStorage {
     pub cache: Option<Allocation>,
     /// The keys of the stores sealed beside the log, where the node runs on the shell (29 §3).
     pub keys: Option<focal_seal::StoreKeys>,
+    /// What the log's file took on its medium, where the node runs on the shell.
+    pub write_path: Option<WritePath>,
+}
+
+/// What the node log's file took on the medium it is on, as its device layer opened it
+/// (`hyper_block::file::DeviceFile`): whether the file system took direct transfers, the block the
+/// file is laid out in, whether new slots are written with zeros ahead of their first frames (a
+/// direct file on a file system that commits its allocation in its journal: ext2-4, XFS), and on
+/// btrfs whether the file is written in place rather than copied on write (`FS_NOCOW_FL`, asked
+/// as the file is made); `None` where every file is written in place or the system cannot say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WritePath {
+    pub direct: bool,
+    pub layout_block: usize,
+    pub zero_fill: bool,
+    pub written_in_place: Option<bool>,
 }
 
 impl std::fmt::Debug for OpenedStorage {
@@ -143,6 +159,7 @@ pub fn open_node_storage(
                 log: None,
                 cache: None,
                 keys: None,
+                write_path: None,
             })
         }
         start => {
@@ -191,6 +208,12 @@ fn open_shell(
         hyper_block::file::CachingRequest::PreferDirect,
         plan.align,
     )?;
+    let write_path = WritePath {
+        direct: file.caching() == hyper_block::file::Caching::Direct,
+        layout_block: file.layout_block().get(),
+        zero_fill: file.fills_new_space(),
+        written_in_place: file.written_in_place(),
+    };
     let ((parent, auth), keys) = focal_seal::open_or_create(root, &plan.key_file)?.split();
     let with = hyper_log::With {
         sealing: Some(hyper_log::Sealing { parent, auth }),
@@ -217,6 +240,7 @@ fn open_shell(
         log: Some(log),
         cache: Some(cache),
         keys: Some(keys),
+        write_path: Some(write_path),
     })
 }
 

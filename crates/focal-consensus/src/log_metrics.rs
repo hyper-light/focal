@@ -35,6 +35,19 @@ pub struct LogMetrics {
     /// How long the flush now in progress has run, if one is: a stalled device shows here before
     /// any histogram hears of it.
     pub flushing_ns: Option<u64>,
+    /// Confirmations the device made durable on their own (a FUA write where it has FUA), each
+    /// without a flush of its cache.
+    pub durable_writes: u64,
+    /// Durable writes made with a write and a flush instead: a file that is not direct, off Linux,
+    /// or a kernel without `RWF_DSYNC`.
+    pub durable_fallbacks: u64,
+    /// Confirmations written and flushed where the device measured that cheaper than its durable
+    /// write.
+    pub flushed_confirmations: u64,
+    /// Bytes of zeros written over new slots ahead of their first frames.
+    pub zeroed_bytes: u64,
+    /// Bytes sweeps copied a second time to free the log's tail.
+    pub swept_bytes: u64,
 }
 
 impl LogMetrics {
@@ -67,6 +80,11 @@ impl LogMetrics {
                 u64::try_from(stats.at.saturating_duration_since(since).as_nanos())
                     .unwrap_or(u64::MAX)
             }),
+            durable_writes: stats.durable_writes,
+            durable_fallbacks: stats.durable_fallbacks,
+            flushed_confirmations: stats.flushed_confirmations,
+            zeroed_bytes: stats.zeroed_bytes,
+            swept_bytes: stats.swept_bytes,
         }
     }
 }

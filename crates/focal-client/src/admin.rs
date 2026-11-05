@@ -604,6 +604,69 @@ pub struct AdminSessionRetention {
     pub log_entries_since_checkpoint: u64,
     pub retention: Option<AdminRetention>,
 }
+/// The medium under a node's data directory as its operating system describes it
+/// (`focal_platform::medium`): every field is the system's claim, `None` or `unknown` where it
+/// said nothing, and `notes` the queries that did not answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminMedium {
+    /// `nvme`, `ssd`, `hdd`, `memory`, `network` or `unknown`.
+    pub class: String,
+    /// `nvme`, `sata`, `scsi`, `usb`, `virtual`, `mmc`, `apple-fabric`, `composite`, `network`,
+    /// `memory`, `other` or `unknown`.
+    pub interconnect: String,
+    pub rotational: Option<bool>,
+    /// The file system's kind (`ext`, `xfs`, `btrfs`, `apfs`, `ntfs`, `tmpfs`, ...) and the
+    /// system's own name for it.
+    pub file_system: String,
+    pub file_system_name: Option<String>,
+    pub logical_block: Option<u32>,
+    pub physical_block: Option<u32>,
+    /// The device's preferred write granularity (an NVMe namespace's NPWG on Linux).
+    pub preferred_write: Option<u32>,
+    pub optimal_io: Option<u32>,
+    /// `write-back`, `write-through` or `unknown`.
+    pub write_cache: String,
+    pub fua: Option<bool>,
+    pub discard: Option<bool>,
+    pub removable: Option<bool>,
+    pub device: Option<String>,
+    pub model: Option<String>,
+    pub notes: Vec<String>,
+    /// Whether a flush the node issues can be taken to reach stable media: not on memory, on
+    /// another host's storage, or through USB.
+    pub flushes_reach_stable_media: bool,
+}
+/// What the node's log chose on its medium and what its writes cost there: whether the file system
+/// took direct transfers, the block the log is laid out in, whether new slots are zero-filled
+/// ahead of their first frames, and the log's counts since the node started (frames, updates,
+/// bytes and flushes; confirmations the device made durable on their own, those made with a write
+/// and a flush, and those the device measured cheaper flushed; zeros written ahead; bytes swept a
+/// second time). The counts are the last metrics sample's; `None` before one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminWritePath {
+    pub direct: bool,
+    pub layout_block: u64,
+    pub zero_fill: bool,
+    /// On btrfs, whether the log's file is written in place rather than copied on write; `None`
+    /// where every file is written in place, or the system cannot say.
+    pub written_in_place: Option<bool>,
+    pub counts: Option<AdminLogCounts>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminLogCounts {
+    pub frames: u64,
+    pub updates: u64,
+    pub bytes: u64,
+    pub flushes: u64,
+    pub durable_writes: u64,
+    pub durable_fallbacks: u64,
+    pub flushed_confirmations: u64,
+    pub zeroed_bytes: u64,
+    pub swept_bytes: u64,
+}
 /// The storage view of one node (26 §7): the volume's pressure, what is
 /// staged, the agents' settings and progress, and every hosted session's
 /// oldest retained prefix.
@@ -612,6 +675,10 @@ pub struct AdminSessionRetention {
 pub struct AdminStorage {
     pub node: u64,
     pub disk: AdminDiskStats,
+    /// The medium under the data directory; `None` while its description is still being made.
+    pub medium: Option<Box<AdminMedium>>,
+    /// What the node's log chose on it; `None` for a node on focal-log's WAL.
+    pub write_path: Option<Box<AdminWritePath>>,
     /// Uploads in progress and the bytes they have staged.
     pub staged_uploads: u64,
     pub staged_bytes: u64,

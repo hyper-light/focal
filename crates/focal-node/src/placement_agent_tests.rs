@@ -1812,18 +1812,33 @@ fn a_plan_is_answered_by_its_commit_or_its_refusal_and_not_before() {
 /// interval; and the level the upgrade fence waits for (24 §21) is due until
 /// the directory holds this binary's, even when a report the previous
 /// process journaled commits after the restart with its own.
+/// A load report is due when what the cluster gates on or the planner decides by changed, and the
+/// measured values it only breaks ties by refresh once an interval has passed, and only where they
+/// changed: an idle node writes no report. Do: judge a report against a restart, a refusal, an
+/// undecided and a committed intent, then against each fact changed alone. Expect: a restart and a
+/// refusal due at once; within the interval a committed report stands unless the generation, the
+/// level, the sessions held or the disk's clearance of the planner's headroom changed; past it, a
+/// changed memory or disk is due and an unchanged report still stands.
 #[test]
-fn a_refused_load_report_is_due_at_the_next_pass_and_a_committed_one_waits_its_interval() {
+fn a_load_report_is_due_on_what_placement_decides_by_and_refreshes_only_what_changed() {
     use crate::placement_journal::IntentOutcome;
+    const MIN_DISK: u64 = 64;
     let partition = PartitionId([3; 16]);
     let load = |generation, capability, report| NodeLoad {
         node: 7,
         generation,
         report,
-        available_memory: 1,
+        available_memory: 1_000,
         active_weight: 0,
-        disk_available: 1,
+        disk_available: 1_000,
         capability,
+    };
+    let same = LoadFacts {
+        generation: 1,
+        capability: 2,
+        active_weight: 0,
+        available_memory: 1_000,
+        disk_available: 1_000,
     };
     let receipt = focal_control::ControlReceipt {
         request: ControlRequestId {
@@ -1837,7 +1852,7 @@ fn a_refused_load_report_is_due_at_the_next_pass_and_a_committed_one_waits_its_i
     };
     let mut last = BTreeMap::new();
     // A restarted agent reports at its first pass.
-    assert!(load_due(None, Some(load(1, 1, 10)), 1, 2, 100));
+    assert!(load_due(None, Some(load(1, 1, 10)), same, MIN_DISK, 100));
     // Refused on a stale compare: due again at the next pass.
     note_load(
         &mut last,
@@ -1849,8 +1864,8 @@ fn a_refused_load_report_is_due_at_the_next_pass_and_a_committed_one_waits_its_i
     assert!(load_due(
         last.get(&partition).copied(),
         Some(load(1, 1, 10)),
-        1,
-        2,
+        same,
+        MIN_DISK,
         100
     ));
     // Undecided: asked again by the journal, nothing noted.
@@ -1872,35 +1887,104 @@ fn a_refused_load_report_is_due_at_the_next_pass_and_a_committed_one_waits_its_i
     );
     assert_eq!(last.get(&partition), Some(&(101, 1)));
     let committed = Some(load(1, 2, 102));
+    let due = |fresh: LoadFacts, now: i64| {
+        load_due(
+            last.get(&partition).copied(),
+            committed,
+            fresh,
+            MIN_DISK,
+            now,
+        )
+    };
+    // Nothing changed: never due, within the interval or past it.
+    assert!(!due(same, 101 + LOAD_REFRESH - 1));
+    assert!(!due(same, 101 + LOAD_REFRESH));
+    assert!(!due(same, 101 + 100 * LOAD_REFRESH));
+    // A measured value changed: due once the interval has passed, not before.
+    let memory = LoadFacts {
+        available_memory: 900,
+        ..same
+    };
+    assert!(!due(memory, 101 + LOAD_REFRESH - 1));
+    assert!(due(memory, 101 + LOAD_REFRESH));
+    let disk = LoadFacts {
+        disk_available: 900,
+        ..same
+    };
+    assert!(!due(disk, 101 + LOAD_REFRESH - 1));
+    assert!(due(disk, 101 + LOAD_REFRESH));
+    // What the planner decides by is due at once: the sessions the node holds, and its disk
+    // falling below the headroom it is placed by.
+    assert!(due(
+        LoadFacts {
+            active_weight: 1,
+            ..same
+        },
+        102
+    ));
+    assert!(due(
+        LoadFacts {
+            disk_available: MIN_DISK - 1,
+            ..same
+        },
+        102
+    ));
+    assert!(!due(
+        LoadFacts {
+            disk_available: MIN_DISK,
+            ..same
+        },
+        102
+    ));
+    // A disk that rose past the headroom again waits for the refresh: one hovering at it reports
+    // its fall at most once an interval.
+    let fallen = Some(NodeLoad {
+        disk_available: MIN_DISK - 1,
+        ..load(1, 2, 102)
+    });
+    let risen = LoadFacts {
+        disk_available: MIN_DISK,
+        ..same
+    };
     assert!(!load_due(
         last.get(&partition).copied(),
-        committed,
-        1,
-        2,
-        101 + LOAD_INTERVAL - 1
+        fallen,
+        risen,
+        MIN_DISK,
+        101 + LOAD_REFRESH - 1
     ));
     assert!(load_due(
         last.get(&partition).copied(),
-        committed,
-        1,
-        2,
-        101 + LOAD_INTERVAL
+        fallen,
+        risen,
+        MIN_DISK,
+        101 + LOAD_REFRESH
+    ));
+    assert!(!load_due(
+        last.get(&partition).copied(),
+        fallen,
+        LoadFacts {
+            disk_available: MIN_DISK - 2,
+            ..same
+        },
+        MIN_DISK,
+        102
     ));
     // The previous process's report committed with the level it announced:
     // this binary's level is due at once.
     assert!(load_due(
         last.get(&partition).copied(),
         Some(load(1, 1, 102)),
-        1,
-        2,
+        same,
+        MIN_DISK,
         102
     ));
     // A new generation is due at once.
-    assert!(load_due(
-        last.get(&partition).copied(),
-        committed,
-        2,
-        2,
+    assert!(due(
+        LoadFacts {
+            generation: 2,
+            ..same
+        },
         102
     ));
     // Another intent's outcome leaves the interval where it stands.
