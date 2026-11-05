@@ -64,6 +64,7 @@
     }
   },
   "sources": {
+    "client.delivery_timeout_ms": "creation_default",
     "durability.max_failures": {
       "committed": 1
     },
