@@ -119,6 +119,33 @@ for source in sorted(list((ROOT / "crates").glob("*/src/**/*.rs")) + list((ROOT 
     if YAML_UNBUDGETED.search(production):
         errors.append(f"{source.relative_to(ROOT)}: parses YAML without a stated budget (serde_saphyr::from_str_with_options)")
 
+# Every TLS configuration focal builds reaches an endpoint through focal-wire's
+# ServerTls or ClientTls, which take no certificate compression (RFC 8879): a
+# compressed chain is decompressed before it is verified (the adversarial
+# battery's DB-1). A file that builds one is listed here once it is seen to hand
+# its configuration to them; a new one is refused until it is.
+TLS_BUILDERS = {
+    "crates/focal-wire/src/transport.rs",
+    "crates/focal-node/src/network_listener.rs",
+    "crates/focal-enrollment/src/invitation.rs",
+    "crates/focal-enrollment/src/pki.rs",
+}
+TLS_BUILD = re.compile(r"\brustls::(?:Server|Client)Config::builder")
+for source in sorted(list((ROOT / "crates").glob("*/src/**/*.rs")) + list((ROOT / "tools").glob("*/src/**/*.rs"))):
+    if source.name == "tests.rs" or source.stem.endswith("_tests") or "tests" in source.relative_to(ROOT).parts[3:-1]:
+        continue
+    text = source.read_text()
+    inline = INLINE_TESTS.search(text)
+    production = text[: inline.start()] if inline else text
+    if TLS_BUILD.search(production) and str(source.relative_to(ROOT)) not in TLS_BUILDERS:
+        errors.append(f"{source.relative_to(ROOT)}: builds a TLS configuration outside the files known to hand theirs to ServerTls or ClientTls (certificate compression)")
+
+# The adversarial battery's coverage table names only tests of their targets
+# (docs/qualification/adversarial-battery.md, terminating condition 6).
+import adversarial_battery
+
+errors.extend(adversarial_battery.check(ROOT))
+
 # The one audited unsafe file (decision 11, doc 10). The compiler denies
 # `unsafe_code` everywhere and it is allowed only in this file; this check is
 # the belt-and-suspenders that no other source relaxes the lint or writes an

@@ -321,6 +321,23 @@ pub fn endpoint_budget(
     .map_err(|_| WireError::Limit)
 }
 
+/// What focal's TLS takes of certificate compression (RFC 8879): nothing, either way. A peer's
+/// compressed chain is decompressed during the handshake, before the chain is verified, into the
+/// length the peer declares (the stack refuses one past 64 KiB first), so a decompressor offered
+/// would hand brotli and zlib the bytes of anyone who can reach a listener or answer a dial. focal
+/// offers none and sends its own chain whole, and every configuration its endpoints hold passes
+/// through [`ServerTls`] or [`ClientTls`], which take none (`scripts/check-contracts.py` holds the
+/// builders to them).
+fn without_certificate_compression_server(config: &mut rustls::ServerConfig) {
+    config.cert_compressors = Vec::new();
+    config.cert_decompressors = Vec::new();
+}
+/// [`without_certificate_compression_server`] for a client configuration.
+fn without_certificate_compression_client(config: &mut rustls::ClientConfig) {
+    config.cert_compressors = Vec::new();
+    config.cert_decompressors = Vec::new();
+}
+
 /// The server side of focal's TLS: what a listener presents and verifies its clients by.
 pub struct ServerTls(rustls::ServerConfig);
 /// The client side of focal's TLS: what a dial presents and verifies its server by, and the role
@@ -336,8 +353,9 @@ pub struct ClientTls {
 impl ServerTls {
     /// A configuration the caller built: its certificate resolver, client verifier and protocols
     /// (a listener that serves enrollment beside the data protocol). The endpoint holds it to the
-    /// transport's rules: no early data, a protocol named.
-    pub fn from_config(config: rustls::ServerConfig) -> Self {
+    /// transport's rules: no early data, a protocol named, no certificate compression.
+    pub fn from_config(mut config: rustls::ServerConfig) -> Self {
+        without_certificate_compression_server(&mut config);
         Self(config)
     }
     /// The configuration, for an endpoint a test drives itself.
@@ -348,8 +366,9 @@ impl ServerTls {
 }
 impl ClientTls {
     /// A configuration the caller built (an enrollment's pinned verifier, without client auth),
-    /// for an identity granted as `role`.
-    pub fn from_config(config: rustls::ClientConfig, role: Sender) -> Self {
+    /// for an identity granted as `role`. It takes no certificate compression.
+    pub fn from_config(mut config: rustls::ClientConfig, role: Sender) -> Self {
+        without_certificate_compression_client(&mut config);
         Self { config, role }
     }
     /// The role the identity is granted as.
@@ -386,7 +405,7 @@ pub fn server_tls(
         .with_single_cert(identity.certificate_chain, identity.private_key)
         .map_err(|_| WireError::Authentication)?;
     tls.alpn_protocols = vec![ALPN.to_vec()];
-    Ok(ServerTls(tls))
+    Ok(ServerTls::from_config(tls))
 }
 pub fn client_tls(
     identity: TlsIdentity,
@@ -438,7 +457,7 @@ fn client_tls_with(
         .with_client_auth_cert(identity.certificate_chain, identity.private_key)
         .map_err(|_| WireError::Authentication)?;
     tls.alpn_protocols = vec![ALPN.to_vec()];
-    Ok(ClientTls { config: tls, role })
+    Ok(ClientTls::from_config(tls, role))
 }
 /// The client side of a listener, which never dials: no root, so no server verifies, and the
 /// data protocol named so the endpoint takes it.
@@ -449,6 +468,7 @@ pub(crate) fn listener_client() -> Result<rustls::ClientConfig, WireError> {
         .with_root_certificates(rustls::RootCertStore::empty())
         .with_no_client_auth();
     tls.alpn_protocols = vec![ALPN.to_vec()];
+    without_certificate_compression_client(&mut tls);
     Ok(tls)
 }
 

@@ -71,5 +71,10 @@ jobs:
         # every test binary at once oversubscribes memory and the node correctly
         # refuses admission at capacity, failing a test that is otherwise sound.
         run: bash scripts/cargo.sh test --workspace --locked -- --test-threads=4
+      - name: Adversarial battery
+        # Every case of the threat model's coverage table, run together on the
+        # executables the step above built, and the table printed with each
+        # threat's cases passed (docs/qualification/adversarial-battery.md).
+        run: python3 scripts/adversarial_battery.py run
       - name: Release build
         run: bash scripts/cargo.sh build --release --workspace --locked

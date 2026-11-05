@@ -7185,3 +7185,54 @@ fn the_fence_query_is_a_participants_exchange_answered_by_its_level_alone() {
         .is_err()
     );
 }
+
+/// No TLS configuration focal's endpoints hold takes certificate compression (RFC 8879), either
+/// way: not the builders' (a listener's, a participant's and an adopting dial's, and the
+/// listener's own client side), and not one a caller built on the stack's defaults, which offer
+/// brotli and zlib, once it is handed to an endpoint. A compressed chain is decompressed during the
+/// handshake, before it is verified, so a decompressor offered would take bytes from anyone who can
+/// reach a listener or answer a dial (the adversarial battery's DB-1).
+#[test]
+fn no_tls_configuration_focal_holds_decompresses_a_certificate() {
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(true);
+    let identity = || TlsIdentity::from_pkcs8(vec![certificate.clone()], key.clone());
+    let roots = || vec![pki.ca.der().to_vec()];
+    let takes_none_server = |config: &rustls::ServerConfig| {
+        config.cert_decompressors.is_empty() && config.cert_compressors.is_empty()
+    };
+    let takes_none_client = |config: &rustls::ClientConfig| {
+        config.cert_decompressors.is_empty() && config.cert_compressors.is_empty()
+    };
+    let listener = server_tls(identity(), roots(), &limits()).unwrap();
+    assert!(takes_none_server(&listener.into_config()));
+    let participant = client_tls(identity(), roots(), &limits(), Sender::Participant).unwrap();
+    assert!(takes_none_client(&participant.into_config()));
+    let (adopting, _) = client_tls_adopting(identity(), roots(), &limits(), Sender::Node).unwrap();
+    assert!(takes_none_client(&adopting.into_config()));
+    assert!(takes_none_client(
+        &crate::transport::listener_client().unwrap()
+    ));
+
+    // The stack's defaults offer decompressors, and a configuration built on them takes none
+    // once an endpoint is to hold it.
+    let served = identity();
+    let built = rustls::ServerConfig::builder_with_provider(crate::crypto_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(served.certificate_chain, served.private_key)
+        .unwrap();
+    assert!(!built.cert_decompressors.is_empty(), "the stack's default");
+    assert!(takes_none_server(
+        &ServerTls::from_config(built).into_config()
+    ));
+    let built = rustls::ClientConfig::builder_with_provider(crate::crypto_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+    assert!(!built.cert_decompressors.is_empty(), "the stack's default");
+    let held = ClientTls::from_config(built, Sender::Participant).into_config();
+    assert!(takes_none_client(&held));
+}
