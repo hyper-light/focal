@@ -8,14 +8,15 @@
     clippy::disallowed_macros
 )]
 //! What in focal's dependencies can decompress, and what reaches it (the adversarial battery's
-//! DB-2), read from the workspace's resolved graph (`cargo metadata`, offline and locked). focal's
-//! own codecs expand nothing: they refuse a declared length before allocating (the size bombs). The
-//! one decompressor focal's binary links is the TLS stack's: `hyper-tls` decompresses certificate
-//! chains (RFC 8879) with brotli and zlib, and every configuration focal's endpoints hold takes no
-//! certificate compression (`no_tls_configuration_focal_holds_decompresses_a_certificate`), so no
-//! peer's bytes reach either. zstd is locked for the comparison harness (`focal-compare`) and as a
-//! dev-dependency of the bus's codec benchmarks, never in what focal ships. A decompressor that
-//! comes in any other way fails this test until the threat model says what reaches it.
+//! DB-2), read from the workspace's resolved graph for the platform it runs on (`cargo metadata`,
+//! offline and locked). focal's own codecs expand nothing: they refuse a declared length before
+//! allocating (the size bombs). The one decompressor focal's binary links is the TLS stack's:
+//! `hyper-tls` decompresses certificate chains (RFC 8879) with brotli and zlib, and every
+//! configuration focal's endpoints hold takes no certificate compression
+//! (`no_tls_configuration_focal_holds_decompresses_a_certificate`), so no peer's bytes reach
+//! either. zstd is locked for the comparison harness (`focal-compare`) and as a dev-dependency of
+//! the bus's codec benchmarks, never in what focal ships. A decompressor that comes in any other
+//! way fails this test until the threat model says what reaches it.
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -51,12 +52,29 @@ const CODECS: &[&str] = &[
     "zune-inflate",
 ];
 
-/// The workspace's resolved graph: package id -> (name, the ids it depends on as a library or a
-/// build script, never as a dev-dependency), and its members.
+/// The workspace's resolved graph for the platform this test runs on: package id -> (name, the
+/// ids it depends on as a library or a build script, never as a dev-dependency), and its members.
+/// Each platform CI builds on checks its own: an offline resolve for every platform would need the
+/// crates of platforms its build never fetched.
 struct Graph {
     names: BTreeMap<String, String>,
     shipped: BTreeMap<String, Vec<String>>,
     members: Vec<String>,
+}
+/// The platform the toolchain that built this test runs on, as its `rustc` names it.
+fn host() -> String {
+    let rustc = std::path::Path::new(env!("CARGO"))
+        .with_file_name(format!("rustc{}", std::env::consts::EXE_SUFFIX));
+    let output = std::process::Command::new(&rustc)
+        .arg("-vV")
+        .output()
+        .unwrap_or_else(|error| panic!("{}: {error}", rustc.display()));
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .expect("rustc names its host")
+        .to_owned()
 }
 fn graph() -> Graph {
     let output = std::process::Command::new(env!("CARGO"))
@@ -66,6 +84,8 @@ fn graph() -> Graph {
             "1",
             "--locked",
             "--offline",
+            "--filter-platform",
+            &host(),
             "--manifest-path",
         ])
         .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml"))
