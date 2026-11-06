@@ -17,7 +17,7 @@ every row names where it is recorded, and a gap is written as a gap.
 | 7 | Meta scale by default when distributed | an envelope, not a result |
 | 8 | Spec-compliant MCP with code mode and skills | shown for the spec versions named |
 | 9 | Cross-OS and cross-architecture | shown in CI and release lanes |
-| 10 | Medium-aware disk writing | partly shown |
+| 10 | Medium-aware disk writing | shown: the node detects its device and file system on Linux, macOS and Windows and shows them with what its write path took there; the write path calibrates to what it is told and measures (direct transfers, the write unit, confirmations by measured cost, zeros only on ext2-4 and XFS, btrfs written in place) and an idle node writes a tenth of what it did; measured on an Apple SSD (APFS), a Samsung 9100 PRO (btrfs) and a virtio disk (ext4) |
 | 11 | Tools and skills any agent can adopt | shown for the shipped skills |
 
 ## 1. One binary and CLI, laptop to global
@@ -310,10 +310,26 @@ and smokes eight lanes, among them windows-11-arm (clang-cl) and Alpine musl.
 
 **Recorded.** "2026-10-03 — one medium for every durable install"; "2026-10-19 — Every shared crate
 at hyper-raft e05956a: confirmations as cheap as the drive allows, the log's sweeps and zeros
-counted, and zeros only where the file system needs them".
+counted, and zeros only where the file system needs them"; "2026-11-05 — A node describes its
+medium and its write path, and an idle node stops writing its load every 30 seconds". A node
+detects the device and file system under its data directory on Linux, macOS and Windows, as each
+system describes them and never assumed ([35](../archictecutre/35-medium-and-write-path.md) §1),
+and shows them with what its write path took there in `inspect node --storage`. The write path
+calibrates to what it is told and what it measures (35 §2): direct transfers where the file system
+takes them, the device's write unit as the log's block, each confirmation made durable the way the
+device measured cheaper (a FUA write or a write and a flush), zeros ahead only on ext2-4 and XFS,
+btrfs writing the log in place, group commits whose waits are measured, a node that says when its
+flushes cannot reach stable media, and an idle node that writes its load report at most every five
+minutes where it wrote one every 30 seconds (2,880 reports a day to 288, under a disk's rated head
+loads). Measured on this Mac's Apple SSD (APFS), fedora's Samsung 9100 PRO (btrfs) and this Mac's
+Docker VM disk (ext4 over virtio): each described as its system says, its write path choosing
+differently on each, every claim committed, idle writes a tenth of what they were (35 §4). Green in
+CI on 5c14ef65 on Linux, macOS and Windows.
 
-**Open.** Detecting the medium (NVMe, SSD, HDD) and calibrating to it for throughput, longevity and
-power, as the condition asks, is not shown end to end.
+**Open.** Disks, USB drives and network storage are classified from what their systems say, not
+measured on one; btrfs copies on write every file of the node's but its log; a virtual disk's flush
+is its host's to keep; the device's preferred write granularity is reported, not laid out by; an
+idle node's CPU still wakes 193 to 205 times a second (35 §5).
 
 ## 11. Tools and skills any agent can adopt
 

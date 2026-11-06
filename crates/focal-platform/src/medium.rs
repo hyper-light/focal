@@ -87,7 +87,8 @@ pub enum WriteCache {
     /// Durability needs a flush (or a FUA write) to reach the medium.
     WriteBack,
     /// A write completes on stable media: no cache, or a power-loss-protected one, in which case
-    /// an NVMe flush "shall have no effect" (NVMe 2.0 base specification §7.2; 29 §1, finding 2).
+    /// an NVMe flush "shall have no effect" (NVM Express Base Specification 2.4 §7.2, as 29 §1
+    /// finding 2 cites it).
     WriteThrough,
     Unknown,
 }
@@ -271,7 +272,7 @@ impl Medium {
         }
     }
     /// The class from what the interconnect and the rotational flag say. A virtual disk's flag is
-    /// its hypervisor's or its driver's choice (mantle 02 §7: "driver policy, bridges, VMs"), and
+    /// its hypervisor's or its driver's choice (mantle 02 §6: "driver policy, bridges, VMs"), and
     /// a disk is taken to rotate unless its driver says otherwise, so a virtual disk that says it
     /// rotates is not taken at its word (this machine's Docker VM disk, on flash, says it does),
     /// while one that says it does not is flash.

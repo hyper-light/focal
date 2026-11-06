@@ -18618,3 +18618,60 @@ passed, and its 28 battery cases ran three times: all passed in two, and in the 
 `an_enrollment_kind_is_refused_where_the_protocol_is_not_served` failed, its group taking 39.8 s
 where it takes 1.3 s, with the host's one-minute load at 150 on 18 cores just after. It passed
 alone three times and in its group since; its output was not kept, so it is not root-caused.
+
+### 2026-11-05 — A node describes its medium and its write path, and an idle node stops writing its load every 30 seconds
+
+Terminating condition 10. `focal_platform::medium` describes the device and file system under a
+path as the operating system does ([35](35-medium-and-write-path.md) §1): on Linux from statfs(2),
+statx's mount ID to its mount-table line and sysfs (a partition's whole disk, a mapped device's
+members, btrfs's anonymous device numbers followed to the device its mount names, an overlay to its
+upper directory); on macOS from statfs(2) and Disk Arbitration (`diskutil info -plist`, run once for
+the volume's whole disk as the node opens, polled by its metrics sampler); on Windows from the
+volume's file system name and drive type, `FileFsSectorSizeInformation` and the device's descriptor
+and write cache, in the audited FFI file. What the system does not say is `unknown` and noted with
+the query that did not answer, every read is bounded, nothing recurses, and a virtual disk that says
+it rotates is not taken at its word. `inspect node --storage` shows `medium` beside `write_path`:
+what the log's file took there (direct transfers, its layout block, zeros ahead, btrfs written in
+place) and the log's counts as the log answers them (frames, updates, bytes, flushes, and how each
+confirmation was made durable). A node whose flushes cannot reach stable media says so as its
+description completes (fedora's tmpfs node: "the data directory is on memory (unknown, tmpfs): a
+flush may not reach stable media there, so what this node writes is as durable as its replicas make
+it", from the binary before 5c14ef65 dropped the interconnect where there is no device).
+
+Measured first, an idle node on this Mac's SSD wrote one frame and two flushes every 30 seconds,
+and nothing else that recurred: its load report to the directory, refreshed whether or not anything
+in it had changed (10 frames, 20 flushes and 568 KiB from the process in 300 s; 2,880 reports a
+day, where a disk whose heads unload as it rests is rated for 329 loads a day, mantle 29 §1 finding
+8). The report is now due when what placement decides by changes (the sessions the node holds, its
+generation and level, its disk falling below the planner's 64 MiB headroom) and its measured values
+refresh at most every five minutes, only where they changed (Kubernetes' `nodeStatusReportFrequency`,
+quoted from KubeletConfiguration v1beta1; Kafka takes heartbeats as requests, KIP-631): 288 a day.
+
+Each medium as the node described it and what its write path took and cost there (35 §4; one node,
+`focal-load` over its socket, eight callers, open loop; claims left open):
+
+| | This Mac: Apple SSD, APFS | fedora: Samsung 9100 PRO, btrfs | Docker VM: virtio, ext4 |
+|---|---|---|---|
+| Described | `nvme`, `apple-fabric`, 4,096-byte blocks | `nvme`, `nvme1n1`, 512-byte blocks, FUA | `unknown`, `virtual`, `vda`, no FUA |
+| Write path | direct, no zeros; write + `F_FULLFSYNC` | direct, no zeros, written in place; write + flush, measured cheaper than FUA | direct, zeros ahead; `RWF_DSYNC` |
+| Idle 600 s | 2 frames, 4 flushes (at the old rate, one report each 30 s: 20 and 40) | 2 frames, 4 flushes | 2 frames, 2 flushes |
+| 100/s: log bytes, flushes a claim | 10,953, 1.67 | 9,777, 1.39 | 15,178 (2,799 zeros), 1.01 |
+| 100/s: p50, p99 | 13.9 ms, 147 ms | 27 ms, 283 ms | 2.1 ms, 7.8 ms |
+| 1,000/s offered: sustained | 361/s, flush-bound (4.1 ms) | 303/s, flush-bound (4.6 ms) | 168/s, CPU-bound |
+| 1,000/s: log bytes, flushes a claim | 6,127, 0.59 | 6,026, 0.58 | 7,543, 0.36 |
+
+Every claim committed on every medium (none refused, none unknown). Found while measuring: the VM's
+flush took 0.40 ms where this Mac's own `F_FULLFSYNC` on the same SSD takes 4.1, so the hypervisor
+does not take a guest's flush to its host's media, which the guest cannot see; and on btrfs the
+node's process wrote about twice APFS's bytes a claim for about the same log bytes, its files
+beside the log copied on write. Both are open (35 §5), with disks, USB and network storage not
+measured, the device's preferred write granularity reported but not laid out by, and an idle node's
+CPU wakeups (193 to 205 a second on this Mac).
+
+CI on 5c14ef65, green on all three: Rust contracts on Linux (the workspace's tests in 46 min, the
+adversarial battery 117 of 117 in 104.9 s, the release build) and macOS (tests in 58 min, the battery
+117 of 117 in 118.8 s), and the Windows build (the platform suite with the medium's tests on NTFS, the
+node's library tests, the A1 gates on the real binary). 4fbd25a6 had failed on Linux alone:
+`cli_backup` read the storage view's log counts from the sampler's first round, taken before the
+node's log had written (on Linux the medium answers at once and is in that round; on macOS it is in
+the next); 10e810c0 reads them from the log as the view is asked, and was green on all three.

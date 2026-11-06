@@ -13,7 +13,7 @@ by section, and the platforms' own documentation where a constant comes from it.
 `focal_platform::medium` describes the device and file system under a path as the operating system
 does. A description is the system's claim, never the node's assumption: what the system does not
 say stays `unknown`, and the query that did not answer is noted (`notes`, fourteen at most, one for
-each query the Linux probe makes; names are kept to forty bytes, the length of an NVMe or ATA
+each query of a Linux pass over a path; names are kept to forty bytes, the length of an NVMe or ATA
 model number).
 
 | Fact | Linux | macOS | Windows |
@@ -30,7 +30,7 @@ model number).
 Classes follow from the answers, memory and other hosts' storage first: tmpfs, ramfs or a memory
 device is `memory`; NFS, SMB, Ceph, 9P or a network transport is `network`; an NVMe or Apple fabric
 device is `nvme`; otherwise the rotational flag says `hdd` or `ssd`. A virtual disk's rotational
-flag is its driver's default, set unless the driver clears it (02 §7, "driver policy, bridges,
+flag is its driver's default, set unless the driver clears it (02 §6, "driver policy, bridges,
 VMs"), and this machine's Docker VM disk, on flash, says it rotates: a virtual disk that says it
 rotates is `unknown`, and one that says it does not is `ssd`.
 
@@ -69,7 +69,7 @@ The idle rule is this note's change to the write path. A node's load report (its
 disk, sessions held, enrollment generation and capability level) is a committed directory write:
 one frame the log makes durable, with two flushes when nothing follows it, on every replica of the
 partition. It was refreshed every 30 seconds whether or not anything in it had changed, and it was
-the only write an idle node made. On flash a request's energy is the rule (29 §1 finding 15, "bytes
+the only write an idle node made again and again. On flash a request's energy is the rule (29 §1 finding 15, "bytes
 per joule increases as request size increases"), and a drive Linux has idled into a low-power
 state pays its exit latency on the next write (finding 9); on a disk, a write every 30 seconds keeps
 the heads loaded or loads them again, where a disk rated for 600,000 load/unload cycles over a
@@ -90,8 +90,8 @@ requests (KIP-631); a node's liveness in focal is its failure detector's, never 
 `inspect node --storage` names the medium and the write path ([the operator guide](../cluster-admin.md)):
 `medium` with every fact of §1 and `flushes_reach_stable_media`, and `write_path` with `direct`,
 `layout_block`, `zero_fill`, `written_in_place` and the log's counts as the log answers them when
-the view is read (frames, updates, bytes and flushes, and how its confirmations were made durable). A node whose
-flushes cannot reach stable media writes one line as its description completes.
+the view is read (frames, updates, bytes and flushes, and how its confirmations were made durable).
+A node whose flushes cannot reach stable media writes one line as its description completes.
 
 ## 4. Measured
 
@@ -100,8 +100,8 @@ this change: the node's own counts from its storage view, and the kernel's count
 process wrote (macOS `proc_pid_rusage`'s `ri_diskio_byteswritten`, Linux `/proc/PID/io`'s
 `write_bytes`). Idle is a window that starts 30 seconds after the node is ready; a load is
 `focal-load` over the node's Unix socket, open loop at the rate offered, eight callers, each claim
-created and left open. Both machines were shared with other work while measured (this Mac's
-one-minute load 24 to 39 on 18 cores), so latencies are a busy machine's; the counts are not.
+created and left open. The machines were shared with other work while measured, their loads given
+with each, so latencies are a busy machine's; the counts are not.
 
 **This Mac** (Mac Studio, M-series, 2026-11-05; the binary of 4fbd25a6, the machine's one-minute
 load 5.7 to 12.8 while measured): the data directory on its internal SSD.
@@ -147,7 +147,7 @@ this Mac's SSD.
 | Described as | `unknown` (a virtual disk that says it rotates), `virtual`, `vda`, 512-byte blocks, write-back cache, no FUA, discard; `ext4`; no notes |
 | Write path | direct (`O_DIRECT`), laid out in 4,096-byte blocks, zeros written ahead of new slots (ext4); every confirmation a durable write (`RWF_DSYNC`), one flush a frame where macOS takes two |
 | Idle, this change | 2 frames, 2 flushes and 56 KiB written by the process in 600 s |
-| 3,000 claims at 100/s | all committed; 0.99 claims a frame, 15,178 log bytes a claim (2,799 of them zeros ahead) and 1.00 flushes, 18,214 bytes written by the process; flush 0.40 ms mean, commit wait 0.88 ms; p50 2.1 ms, p99 7.8 ms |
+| 3,000 claims at 100/s | all committed; 0.99 claims a frame, 15,178 log bytes a claim (2,799 of them zeros ahead) and 1.01 flushes, 18,214 bytes written by the process; flush 0.40 ms mean, commit wait 0.88 ms; p50 2.1 ms, p99 7.8 ms |
 | 20,000 claims offered at 1,000/s | all committed at 168/s, bound by the VM's processors rather than its log (busy 4 s of the run's 119); 2.80 claims a frame, 7,543 log bytes (1,822 zeros) and 0.36 flushes a claim, 11,735 bytes written a claim |
 
 The VM's flush took 0.40 ms where this Mac's own `F_FULLFSYNC` on the same SSD takes 4.1: the
