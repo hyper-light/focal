@@ -1117,8 +1117,12 @@ pub struct LocalNetworkAdmin {
     evidence: Option<crate::evidence_service::EvidenceCoordinator>,
     /// The latest metrics snapshot the service sampled (24 §23).
     metrics: Option<focal_rt::watch::Receiver<Option<crate::metrics::MetricsPage>>>,
-    /// What the node log's file took on its medium, where the node runs on the shell.
-    write_path: Option<focal_consensus::storage_open::WritePath>,
+    /// What the node log's file took on its medium, where the node runs on the shell, and the
+    /// storage whose log the storage view reads its counts from as it is asked.
+    write_path: Option<(
+        focal_consensus::storage_open::WritePath,
+        focal_consensus::NodeStorage,
+    )>,
     budget: MemoryBudget,
 }
 impl LocalNetworkAdmin {
@@ -1242,8 +1246,9 @@ impl LocalNetworkAdmin {
     pub fn with_write_path(
         mut self,
         write_path: Option<focal_consensus::storage_open::WritePath>,
+        storage: focal_consensus::NodeStorage,
     ) -> Self {
-        self.write_path = write_path;
+        self.write_path = write_path.map(|path| (path, storage));
         self
     }
     /// Repair a hosted session's custody on this node (24 §20): the replica

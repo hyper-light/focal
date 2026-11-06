@@ -89,8 +89,8 @@ requests (KIP-631); a node's liveness in focal is its failure detector's, never 
 
 `inspect node --storage` names the medium and the write path ([the operator guide](../cluster-admin.md)):
 `medium` with every fact of §1 and `flushes_reach_stable_media`, and `write_path` with `direct`,
-`layout_block`, `zero_fill`, `written_in_place` and the log's counts at the last metrics sample
-(frames, updates, bytes and flushes, and how its confirmations were made durable). A node whose
+`layout_block`, `zero_fill`, `written_in_place` and the log's counts as the log answers them when
+the view is read (frames, updates, bytes and flushes, and how its confirmations were made durable). A node whose
 flushes cannot reach stable media writes one line as its description completes.
 
 ## 4. Measured
@@ -103,19 +103,26 @@ process wrote (macOS `proc_pid_rusage`'s `ri_diskio_byteswritten`, Linux `/proc/
 created and left open. Both machines were shared with other work while measured (this Mac's
 one-minute load 24 to 39 on 18 cores), so latencies are a busy machine's; the counts are not.
 
-**This Mac** (Mac Studio, M-series, 2026-11-05): the data directory on its internal SSD.
+**This Mac** (Mac Studio, M-series, 2026-11-05; the binary of 4fbd25a6, the machine's one-minute
+load 5.7 to 12.8 while measured): the data directory on its internal SSD.
 
 | | |
 |---|---|
 | Described as | `nvme`, `apple-fabric`, `APPLE SSD AP8192Z`, 4,096-byte blocks, not removable, solid state; `apfs`; no notes |
 | Write path | direct (`F_NOCACHE`), laid out in 4,096-byte blocks, no zeros ahead; every confirmation a write and an `F_FULLFSYNC` (`durable_fallbacks`: macOS has no FUA write) |
-| Idle, 30-second load reports (before) | 10 frames, 20 flushes and 568 KiB written by the process in 300 s: 2,880 frames a day |
+| Idle, 30-second load reports (before, the binary of 95e34abd) | 10 frames, 20 flushes and 568 KiB written by the process in 300 s: 2,880 frames a day |
 | Idle, this change | 2 frames, 4 flushes and 120 KiB in 600 s (one report each five minutes, its values changed): 288 a day |
-| 3,000 claims at 100/s | all committed; 2.07 claims a frame, 6,663 log bytes and 0.74 flushes a claim, 24,419 bytes written by the process a claim; flush 8.3 ms mean; p50 76 ms, p99 242 ms |
-| 20,000 claims offered at 1,000/s | all committed at 178/s, the log bound by its flushes (each frame 1.56 `F_FULLFSYNC`s of 7.0 ms mean, 4.7 ms median, 18.9 ms p99); 3.16 claims a frame, 5,529 log bytes and 0.49 flushes a claim, 18,527 bytes written a claim |
+| 3,000 claims at 100/s | all committed; 1.01 claims a frame, 10,953 log bytes and 1.67 flushes a claim, 43,463 bytes written by the process a claim; flush 4.1 ms mean, commit wait 13.2 ms; p50 13.9 ms, p99 147 ms |
+| 20,000 claims offered at 1,000/s | all committed at 361/s, the log bound by its flushes (7,777 frames, each with 1.51 `F_FULLFSYNC`s of 4.1 ms mean, filled the run); 2.57 claims a frame, 6,127 log bytes and 0.59 flushes a claim, 23,120 bytes written a claim |
 
-The interrupt wakeups of the idle node's process were 205 a second before and 193 after: the
-change is to what it writes, not to its timers (§5).
+A claim costs fewer bytes and flushes the more a frame carries, and a frame carries what arrived
+while the one before was made durable: on the same medium with the machine busier (load 24 to 39,
+an earlier binary with the same write path), flushes took 7.0 to 8.3 ms, a frame carried 2.07 claims
+at 100/s and 3.16 at the 1,000/s offer, which the node sustained at 178/s, and a claim cost 6,663
+and 5,529 log bytes. The medium's flush is what sets both a write's cost and the rate.
+
+The interrupt wakeups of the idle node's process were 205 a second before and 193 to 205 after:
+the change is to what it writes, not to its timers (§5).
 
 ## 5. Open
 

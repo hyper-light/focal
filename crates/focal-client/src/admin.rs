@@ -642,7 +642,8 @@ pub struct AdminMedium {
 /// ahead of their first frames, and the log's counts since the node started (frames, updates,
 /// bytes and flushes; confirmations the device made durable on their own, those made with a write
 /// and a flush, and those the device measured cheaper flushed; zeros written ahead; bytes swept a
-/// second time). The counts are the last metrics sample's; `None` before one.
+/// second time). The counts are the log's as its owner answers them when the view is read; `None`
+/// where it does not answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdminWritePath {

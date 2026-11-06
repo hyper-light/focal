@@ -53,8 +53,8 @@ pub(crate) fn admin_medium(medium: &Medium) -> AdminMedium {
     }
 }
 
-/// The storage view's `write_path`: what the log's file took, and the log's counts at the last
-/// sample.
+/// The storage view's `write_path`: what the log's file took, and the log's counts as its owner
+/// answered them for this view.
 pub(crate) fn admin_write_path(path: WritePath, log: Option<&LogMetrics>) -> AdminWritePath {
     AdminWritePath {
         direct: path.direct,

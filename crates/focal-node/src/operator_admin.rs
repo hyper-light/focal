@@ -289,29 +289,25 @@ impl LocalNetworkAdmin {
                         retention: diagnostics.retention.clone(),
                     });
                 }
-                // The medium and the log's counts as the last sample holds them, read after every
-                // wait above and let go before the reply.
-                let (medium, log) = match self.metrics.as_ref() {
-                    Some(view) => {
-                        let page = view.borrow();
-                        let snapshot = page.as_ref().map(|page| &page.snapshot);
-                        (
-                            snapshot
-                                .and_then(|snapshot| snapshot.medium.as_ref())
-                                .map(|medium| Box::new(crate::medium_report::admin_medium(medium))),
-                            snapshot.and_then(|snapshot| match &snapshot.storage {
-                                Some(crate::metrics::StorageMetrics::Log(log)) => Some(*log),
-                                _ => None,
-                            }),
-                        )
-                    }
-                    None => (None, None),
-                };
+                // The medium as the sampler holds it, read after every wait above and let go
+                // before the reply; the log's counts as its owner answers them now.
+                let medium = self.metrics.as_ref().and_then(|view| {
+                    view.borrow()
+                        .as_ref()
+                        .and_then(|page| page.snapshot.medium.as_ref())
+                        .map(|medium| Box::new(crate::medium_report::admin_medium(medium)))
+                });
                 Ok(OperatorReply::Storage(Box::new(AdminStorage {
                     node: self.identity.node,
                     medium,
-                    write_path: self.write_path.map(|path| {
-                        Box::new(crate::medium_report::admin_write_path(path, log.as_ref()))
+                    write_path: self.write_path.as_ref().map(|(path, storage)| {
+                        let log = match storage.backend() {
+                            focal_consensus::StorageBackend::Shell(shell) => shell
+                                .log_stats()
+                                .map(|stats| focal_consensus::LogMetrics::of(&stats)),
+                            focal_consensus::StorageBackend::Wal(_) => None,
+                        };
+                        Box::new(crate::medium_report::admin_write_path(*path, log.as_ref()))
                     }),
                     disk: AdminDiskStats {
                         free: disk.free,

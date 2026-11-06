@@ -1265,7 +1265,7 @@ impl NetworkService {
                     .with_archive(archive_handle.clone())
                     .with_evidence(coordinator.clone())
                     .with_metrics(metrics_view.clone())
-                    .with_write_path(write_path),
+                    .with_write_path(write_path, storage.clone()),
             ));
         }
         let data = DataService {
