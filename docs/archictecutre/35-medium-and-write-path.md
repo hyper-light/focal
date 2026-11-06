@@ -121,6 +121,42 @@ an earlier binary with the same write path), flushes took 7.0 to 8.3 ms, a frame
 at 100/s and 3.16 at the 1,000/s offer, which the node sustained at 178/s, and a claim cost 6,663
 and 5,529 log bytes. The medium's flush is what sets both a write's cost and the rate.
 
+**fedora** (a 32-thread Linux machine, kernel 6.19, 2026-11-05; the binary of 4fbd25a6, built
+there; shared with CI jobs while measured, its one-minute load 13 to 82): the data directory under
+`$HOME`, on its Samsung 9100 PRO.
+
+| | |
+|---|---|
+| Described as | `nvme`, `nvme`, `nvme1n1`, `Samsung SSD 9100 PRO 8TB`, 512-byte blocks (`minimum_io_size` 512), write-back cache with FUA, discard; `btrfs` (the subvolume's anonymous device number followed to the device its mount names, the partition to its whole disk); no notes |
+| Write path | direct (`O_DIRECT`), laid out in 4,096-byte blocks, no zeros ahead (btrfs), the file written in place (`FS_NOCOW_FL`); confirmations written and flushed (`flushed_confirmations`: the drive measured a write and a flush cheaper than its FUA write) |
+| Idle, this change | 2 frames and 4 flushes (4.7 ms mean) in 600 s; 1,192 KiB written by the process, where the files the window touched took 24 KiB of the log's frames and a few hundred bytes else (the load report's journal, the cold store made once): the rest, by what changed, is btrfs's own copy-on-write metadata for them |
+| 3,000 claims at 100/s | all committed; 1.12 claims a frame, 9,777 log bytes and 1.39 flushes a claim, 93,153 bytes written by the process a claim; flush 6.3 ms mean (5.2 median, 14.7 p99), commit wait 23.3 ms; p50 27 ms, p99 283 ms |
+| 20,000 claims offered at 1,000/s | all committed at 303/s, the log bound by its flushes (7,534 frames, each with 1.54 flushes of 4.6 ms mean, writing and flushing 60 s of the run's 66); 2.65 claims a frame, 6,026 log bytes and 0.58 flushes a claim, 44,744 bytes written a claim |
+
+The node's process wrote about twice the bytes a claim on btrfs that it did on APFS, for about the
+same log bytes: the log's file is written in place, and the node's other files that grow by
+appends (a session's payload segments, its checkpoints, the content store) are copied on write,
+their metadata with them (§5).
+
+**A virtual disk on this Mac** (Docker Desktop's Linux VM, 2026-11-05; the binary of 10e810c0, built
+in the VM; the data directory on a Docker volume): ext4 on the VM's virtio disk, whose backing is
+this Mac's SSD.
+
+| | |
+|---|---|
+| Described as | `unknown` (a virtual disk that says it rotates), `virtual`, `vda`, 512-byte blocks, write-back cache, no FUA, discard; `ext4`; no notes |
+| Write path | direct (`O_DIRECT`), laid out in 4,096-byte blocks, zeros written ahead of new slots (ext4); every confirmation a durable write (`RWF_DSYNC`), one flush a frame where macOS takes two |
+| Idle, this change | 2 frames, 2 flushes and 56 KiB written by the process in 600 s |
+| 3,000 claims at 100/s | all committed; 0.99 claims a frame, 15,178 log bytes a claim (2,799 of them zeros ahead) and 1.00 flushes, 18,214 bytes written by the process; flush 0.40 ms mean, commit wait 0.88 ms; p50 2.1 ms, p99 7.8 ms |
+| 20,000 claims offered at 1,000/s | all committed at 168/s, bound by the VM's processors rather than its log (busy 4 s of the run's 119); 2.80 claims a frame, 7,543 log bytes (1,822 zeros) and 0.36 flushes a claim, 11,735 bytes written a claim |
+
+The VM's flush took 0.40 ms where this Mac's own `F_FULLFSYNC` on the same SSD takes 4.1: the
+hypervisor answers a guest's flush without a full flush of its host's device, so what the guest
+writes is as durable as the host's cache leaves it. Mantle's research leaves what a hypervisor does
+with a guest's cache unverified for any particular one (02 §2.5); measured here, this one does not
+take the guest's flush to the host's media. The guest cannot see it: its system says write-back
+with flushes, and the node takes it at its word (§5).
+
 The interrupt wakeups of the idle node's process were 205 a second before and 193 to 205 after:
 the change is to what it writes, not to its timers (§5).
 
@@ -144,6 +180,14 @@ the change is to what it writes, not to its timers (§5).
 - **An idle node's CPU still wakes.** This Mac's idle node took 205 interrupt wakeups a second
   (every group's tick, the placement agent's pass, the sampler's round): a laptop's battery is the
   CPU's as well as the disk's, and an idle node's timers are a separate change from its writes.
+- **btrfs copies every file but the log's.** The log's file is written in place, and on fedora the
+  node's process still wrote 45 to 93 KB a claim where the log took 6 to 10 KB: the files beside
+  it that grow by appends are copied on write. Marking them as the log's is the next longevity
+  step on btrfs, measured against this.
+- **A virtual disk's flush is its host's.** Measured above, a guest's flush on this Mac's Docker VM
+  is answered without the host's full flush; a node in a VM is told write-back with flushes and has
+  no way to learn what its host does with them. Whether a cloud VM's disk keeps a flushed write is
+  its provider's statement (EBS, a persistent disk), not the guest's.
 - **Windows' device queries are its own to answer.** The bus type and the write cache come from
   `IOCTL_STORAGE_QUERY_PROPERTY` on a volume handle opened for no access, which 02 §4.3 leaves
   unverified for an unprivileged process; a refusal is noted and the facts stay `unknown`.

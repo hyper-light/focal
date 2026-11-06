@@ -17,16 +17,20 @@ pub(crate) fn announce(medium: &Medium) {
     if medium.flushes_reach_stable_media() {
         return;
     }
+    let file_system = medium
+        .file_system_name
+        .as_deref()
+        .unwrap_or(medium.file_system.as_str());
+    // What attaches it, where the system named a device: a memory or network file system has none.
+    let attached = match medium.interconnect {
+        focal_platform::medium::Interconnect::Unknown => String::new(),
+        interconnect => format!("{}, ", interconnect.as_str()),
+    };
     let _ = writeln!(
         std::io::stderr().lock(),
-        "focal: the data directory is on {} ({}, {}): a flush may not reach stable media there, \
-         so what this node writes is as durable as its replicas make it",
+        "focal: the data directory is on {} ({attached}{file_system}): a flush may not reach \
+         stable media there, so what this node writes is as durable as its replicas make it",
         medium.class.as_str(),
-        medium.interconnect.as_str(),
-        medium
-            .file_system_name
-            .as_deref()
-            .unwrap_or(medium.file_system.as_str()),
     );
 }
 
