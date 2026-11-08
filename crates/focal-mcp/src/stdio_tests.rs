@@ -134,12 +134,8 @@ impl Running {
         .unwrap();
         let backend = configure(Backend::new(client, build(), context(), store).unwrap());
         let (client, server) = UnixStream::pair().unwrap();
-        client
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        client
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
+        client.set_read_timeout(Some(FROZEN)).unwrap();
+        client.set_write_timeout(Some(FROZEN)).unwrap();
         let reader = server.try_clone().unwrap();
         let (finish, done) = mpsc::sync_channel(1);
         let join = thread::spawn(move || {
@@ -184,7 +180,7 @@ impl Running {
         response
     }
     fn observed(&self) -> Observed {
-        self.requests.recv_timeout(Duration::from_secs(5)).unwrap()
+        self.requests.recv_timeout(FROZEN).unwrap()
     }
     fn stop(mut self) {
         self.input.shutdown(Shutdown::Write).unwrap();
@@ -470,6 +466,39 @@ fn calls_sent_together_wait_their_turn_and_one_cancelled_while_waiting_never_run
         runner.requests.try_recv().is_err(),
         "an inspection reached the ledger"
     );
+    runner.stop();
+}
+
+/// More calls sent together than the protocol's old fixed bound of eight are each answered, in
+/// order: a waiting call is charged what it holds, its decoded frame, so the budget bounds the
+/// wait rather than a count (`Limits::calls_within`). Codex sent eleven at once.
+#[test]
+fn more_calls_sent_together_than_eight_are_each_answered_in_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("operations");
+    let mut core = Core::new(context().ledger, CoreLimits::default());
+    let mut runner = Running::start(&path, false);
+    runner.tool(1, "claim.submit", claim());
+    let epoch = runner.observed();
+    let waiting: Vec<u64> = (2..=24).collect();
+    for id in &waiting {
+        runner.tool(*id, "request.inspect", json!({"operation_id":OPERATION_ID}));
+    }
+    runner.rpc(100, "tools/list", json!({}));
+    assert!(
+        runner.response(100)["result"]["tools"].is_array(),
+        "a waiting call was answered before its turn"
+    );
+    let receipt = apply(&mut core, &epoch.request);
+    answer(epoch, receipt);
+    let pending = runner.observed();
+    let receipt = apply(&mut core, &pending.request);
+    answer(pending, receipt);
+    assert_eq!(application(&runner.response(1)).condition, "Committed");
+    for id in waiting {
+        let response = runner.response(id);
+        assert_eq!(response["result"]["isError"], false, "{response}");
+    }
     runner.stop();
 }
 

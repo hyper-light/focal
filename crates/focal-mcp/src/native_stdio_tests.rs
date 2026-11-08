@@ -577,7 +577,7 @@ fn legacy_answers_and_an_unreachable_owner_keep_the_v1_catalogue_unless_the_jour
     drop(observed.response);
     let result = running
         .done
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(FROZEN)
         .expect("the adapter must stop");
     assert!(matches!(result, Err(ServeError::Probe(_))), "{result:?}");
 }

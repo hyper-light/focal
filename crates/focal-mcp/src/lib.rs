@@ -85,16 +85,46 @@ impl Limits {
         }
         Ok(self)
     }
+    /// What decoding the largest frame these limits admit is charged ([`tree_bytes`] at the
+    /// bounds).
     pub(crate) fn workspace(self) -> Result<usize, ProtocolError> {
-        self.max_frame_bytes
-            .checked_mul(8)
-            .and_then(|n| {
-                self.max_nodes
-                    .checked_mul(128)
-                    .and_then(|m| n.checked_add(m))
-            })
+        tree_bytes(self.max_frame_bytes, self.max_nodes)
+    }
+    /// What one admitted call holds beside its decoded frame: its entry among the active calls
+    /// (its ID at the bound and the entry's fixed part) and its place in a waiting queue.
+    pub(crate) fn call_entry(self) -> Result<usize, ProtocolError> {
+        self.max_id_bytes
+            .checked_add(256)
+            .and_then(|n| n.checked_add(std::mem::size_of::<ToolCall>()))
             .ok_or(ProtocolError::Capacity)
     }
+    /// The most calls `bytes` can hold admitted at once: `bytes` over what the smallest call a
+    /// client can send is charged (its decoded frame and its entry). A call is charged as it is
+    /// admitted, so the count is a statement of the budget's bound, never a reservation.
+    pub fn calls_within(self, bytes: usize) -> Result<usize, ProtocolError> {
+        const SMALLEST_CALL: &[u8] =
+            br#"{"jsonrpc":"2.0","id":0,"method":"tools/call","params":{"name":"a"}}"#;
+        let nodes =
+            focal_client::input::shape::count(SMALLEST_CALL, self.max_nodes, self.max_depth)
+                .map_err(|_| ProtocolError::Limits)?;
+        let smallest = tree_bytes(SMALLEST_CALL.len(), nodes)?
+            .checked_add(self.call_entry()?)
+            .ok_or(ProtocolError::Capacity)?;
+        bytes
+            .checked_div(smallest)
+            .filter(|calls| *calls > 0)
+            .ok_or(ProtocolError::Limits)
+    }
+}
+
+/// What a decoded frame of `bytes` holding `nodes` values is charged: its text at the decoder's
+/// eightfold expansion and each value's node, the model every frame's decoding is bounded by
+/// ([`Limits::workspace`]).
+pub(crate) fn tree_bytes(bytes: usize, nodes: usize) -> Result<usize, ProtocolError> {
+    bytes
+        .checked_mul(8)
+        .and_then(|n| nodes.checked_mul(128).and_then(|m| n.checked_add(m)))
+        .ok_or(ProtocolError::Capacity)
 }
 
 #[derive(Debug, thiserror::Error)]

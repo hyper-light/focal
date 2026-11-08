@@ -473,6 +473,43 @@ fn legacy_call_result_and_unknown_notifications() {
     ));
 }
 
+/// An admitted call is charged what it holds as it is admitted, its decoded frame and its entry,
+/// not the largest frame the limits admit (the worst case that let eight calls wait at most); its
+/// charge goes back as it ends. `calls_within` states how many of the smallest call a budget holds.
+#[test]
+fn a_call_is_charged_its_own_frame_as_it_is_admitted() {
+    let budget = budget();
+    let limits = Limits::default();
+    let mut p = Protocol::new(
+        limits,
+        budget.clone(),
+        ServerInfo {
+            name: "focal".into(),
+            version: "1".into(),
+        },
+        vec![tool("claim.get")],
+    )
+    .unwrap();
+    let before = budget.stats().used;
+    let bytes = modern(
+        json!(1),
+        "tools/call",
+        json!({"name":"claim.get","arguments":{"id":"abc"}}),
+    );
+    let work = call(p.receive(&bytes).unwrap());
+    let charged = budget.stats().used - before;
+    assert!(charged >= bytes.len() * 8, "{charged}");
+    assert!(charged * 100 < limits.workspace().unwrap(), "{charged}");
+    let frame = p.complete(work.token, &json!({}), false).unwrap().unwrap();
+    drop(frame);
+    drop(work);
+    assert_eq!(budget.stats().used, before);
+    // The smallest call is a few kilobytes: a budget of 80 MiB holds tens of thousands.
+    let calls = limits.calls_within(80 << 20).unwrap();
+    assert!(calls > 10_000, "{calls}");
+    assert!(limits.calls_within(1).is_err());
+}
+
 /// A server that declares `resources` answers `resources/templates/list` (Codex asks it of every
 /// server it starts, and logged focal's "Method not found" as an error on every turn): focal has
 /// no templates, since every skill file is listed under its own URI, so the list is empty, in each

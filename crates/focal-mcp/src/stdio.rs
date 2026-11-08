@@ -163,14 +163,11 @@ pub fn serve<
     drop(events);
     let mut jobs = Some(jobs);
     let mut frames = Some(frames);
+    // Each waiting call's place is charged with its admission (`Limits::call_entry`).
     let mut calls = Calls {
         running: None,
         waiting: VecDeque::new(),
     };
-    calls
-        .waiting
-        .try_reserve_exact(limits.max_active_calls)
-        .map_err(|_| ProtocolError::Capacity)?;
     let result = coordinate(
         &mut protocol,
         &budget,
@@ -197,9 +194,9 @@ pub fn serve<
 /// The calls the protocol admitted, in the order they came: the one the worker runs and those
 /// waiting their turn. The worker runs one call at a time, and a call sent while it runs waits
 /// here rather than being refused: Codex and Claude Code send a model's tool calls together, and
-/// refusing all but the first had agents retry them one by one. The protocol admits at most
-/// `max_active_calls`, each charged to the budget as it is admitted, so the wait has the
-/// protocol's bound and its budget's; past them a call is refused, typed.
+/// refusing all but the first had agents retry them one by one. Each call is charged what it
+/// holds as the protocol admits it (its decoded frame and its entry), so the budget bounds the
+/// wait, and `max_active_calls` states that bound in calls; past it a call is refused, typed.
 struct Calls {
     /// The call the worker holds, with the sender that cancels it: taken once it is cancelled,
     /// while the worker finishes it. The next call is handed over only once the worker has.
@@ -391,8 +388,6 @@ struct Adapter {
 }
 impl Adapter {
     fn new() -> Result<Self, ServeError> {
-        // The protocol's own bound on calls admitted at once: the worker runs one at a time and
-        // the rest wait their turn (`Calls`).
         let limits = Limits {
             max_frame_bytes: 278_528,
             max_response_bytes: 16 * MIB,
@@ -405,12 +400,22 @@ impl Adapter {
         // 7.5 MiB for the 47-tool native catalogue) are held together before
         // the admission is released, beside the frame decoder and journals.
         let code_limits = crate::code::CodeLimits::for_adapter(limits, WORKER_STACK)?;
-        let budget = MemoryBudget::new(
-            (160 * MIB)
-                .checked_add(code_limits.reservation()?)
-                .ok_or(ProtocolError::Capacity)?,
-            80 * MIB,
-        )?;
+        let total = (160 * MIB)
+            .checked_add(code_limits.reservation()?)
+            .ok_or(ProtocolError::Capacity)?;
+        let completion_reserve = 80 * MIB;
+        let budget = MemoryBudget::new(total, completion_reserve)?;
+        // The calls admitted at once: the worker runs one at a time and the rest wait their turn
+        // (`Calls`), each charged what it holds as it is admitted, so the ordinary lane bounds
+        // them; the count states that bound at the smallest call (`Limits::calls_within`).
+        let limits = Limits {
+            max_active_calls: limits.calls_within(
+                total
+                    .checked_sub(completion_reserve)
+                    .ok_or(ProtocolError::Capacity)?,
+            )?,
+            ..limits
+        };
         Ok(Self {
             limits,
             code_limits,

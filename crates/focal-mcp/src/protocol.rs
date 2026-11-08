@@ -125,7 +125,6 @@ pub struct Protocol {
     clock_ms: u64,
     _workspace: Allocation,
     _catalog: Allocation,
-    _active: Allocation,
     /// The skills served over the skills extension, with their charge.
     skills: Option<(crate::skills::Skills, Allocation)>,
 }
@@ -240,22 +239,8 @@ impl Protocol {
         let catalog = budget
             .reserve(BudgetKind::Control, BudgetLane::Ordinary, size)?
             .commit();
-        let active_bytes = limits
-            .max_active_calls
-            .checked_mul(
-                limits
-                    .max_id_bytes
-                    .checked_add(256)
-                    .ok_or(ProtocolError::Capacity)?,
-            )
-            .ok_or(ProtocolError::Capacity)?;
-        let active_charge = budget
-            .reserve(BudgetKind::Control, BudgetLane::Completion, active_bytes)?
-            .commit();
-        let mut active = Vec::new();
-        active
-            .try_reserve_exact(limits.max_active_calls)
-            .map_err(|_| ProtocolError::Capacity)?;
+        // Each admitted call's entry is charged with the call, as it is admitted (`call`).
+        let active = Vec::new();
         let mut cursor_key = [0; 32];
         getrandom::fill(&mut cursor_key).map_err(|_| ProtocolError::Dependency)?;
         Ok(Self {
@@ -273,7 +258,6 @@ impl Protocol {
             clock_ms: 0,
             _workspace: workspace,
             _catalog: catalog,
-            _active: active_charge,
             skills: None,
         })
     }
@@ -292,10 +276,12 @@ impl Protocol {
         if bytes.len() > self.limits.max_frame_bytes {
             return Err(ProtocolError::Frame);
         }
-        let value = match crate::json::parse(bytes, self.limits) {
-            Ok(v) => v,
+        let (value, nodes) = match crate::json::parse_counted(bytes, self.limits) {
+            Ok(parsed) => parsed,
             Err(()) => return self.error(Value::Null, -32700, "Parse error", None),
         };
+        // What this frame's call holds while admitted: its decoded frame, charged as decoded.
+        let held = crate::tree_bytes(bytes.len(), nodes)?;
         let Value::Object(mut object) = value else {
             return self.error(Value::Null, -32600, "Invalid request", None);
         };
@@ -411,7 +397,7 @@ impl Protocol {
                 self.reply(id, &Map::<String, Value>::new())
             }
             "tools/list" => self.list(id, profile, params),
-            "tools/call" => self.call(id, profile, params),
+            "tools/call" => self.call(id, profile, params, held),
             "skills/list" | "skills/get" if profile == Profile::Modern && self.skills.is_some() => {
                 self.skill(id, &method, params)
             }
@@ -484,11 +470,15 @@ impl Protocol {
             _ => Action::NoReply,
         }
     }
+    /// Admit one tool call. It is charged what it holds, as it is admitted: its decoded frame
+    /// (`held`) and its entry among the active calls. The calls admitted at once are bounded by
+    /// `max_active_calls` and by what the budget can hold; past either it is refused, typed.
     fn call(
         &mut self,
         id: Value,
         profile: Profile,
         mut params: Map<String, Value>,
+        held: usize,
     ) -> Result<Action, ProtocolError> {
         let Some(Value::String(tool)) = params.remove("name") else {
             return self.error(id, -32602, "Invalid tool name", None);
@@ -507,14 +497,20 @@ impl Protocol {
         if self.active.len() >= self.limits.max_active_calls {
             return self.tool_failure(id, profile, "Tool capacity exhausted");
         }
-        let allocation = match self.budget.reserve(
-            BudgetKind::Pending,
-            BudgetLane::Ordinary,
-            self.limits.workspace()?,
-        ) {
-            Ok(v) => v.commit(),
-            Err(_) => return self.tool_failure(id, profile, "Tool capacity exhausted"),
-        };
+        let charge = held
+            .checked_add(self.limits.call_entry()?)
+            .ok_or(ProtocolError::Capacity)?;
+        let allocation =
+            match self
+                .budget
+                .reserve(BudgetKind::Pending, BudgetLane::Ordinary, charge)
+            {
+                Ok(v) => v.commit(),
+                Err(_) => return self.tool_failure(id, profile, "Tool capacity exhausted"),
+            };
+        if self.active.try_reserve(1).is_err() {
+            return self.tool_failure(id, profile, "Tool capacity exhausted");
+        }
         let next = self.next.checked_add(1).ok_or(ProtocolError::Capacity)?;
         let token = CallToken(next);
         self.next = next;

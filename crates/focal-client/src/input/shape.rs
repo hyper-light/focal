@@ -47,6 +47,11 @@ enum Expect {
 /// Checks the document `bytes` holds at most `max_nodes` values, none deeper than `max_depth` (the
 /// document itself at depth 0), and no object naming a key twice.
 pub fn check(bytes: &[u8], max_nodes: usize, max_depth: usize) -> Result<(), ShapeError> {
+    count(bytes, max_nodes, max_depth).map(|_| ())
+}
+
+/// [`check`], answering how many values the document holds: what its decoded tree is charged by.
+pub fn count(bytes: &[u8], max_nodes: usize, max_depth: usize) -> Result<usize, ShapeError> {
     let mut at = 0usize;
     let mut left = max_nodes;
     let mut open: Vec<Open> = Vec::new();
@@ -82,7 +87,7 @@ pub fn check(bytes: &[u8], max_nodes: usize, max_depth: usize) -> Result<(), Sha
         let Some(container) = open.last_mut() else {
             // The document's one value is done: nothing but whitespace may follow it.
             return if at == bytes.len() {
-                Ok(())
+                max_nodes.checked_sub(left).ok_or(ShapeError::Nodes)
             } else {
                 Err(ShapeError::Syntax)
             };
