@@ -32,6 +32,10 @@ const THREAD_STACK: usize = MIB;
 pub(crate) const WORKER_STACK: usize = 2 * MIB;
 const JOB_BYTES: usize = 32 * MIB;
 const SHUTDOWN: Duration = Duration::from_secs(3);
+/// How long the output may write no frame before its reader counts as gone: the time the MCP SDK
+/// gives a request by default (typescript-sdk `DEFAULT_REQUEST_TIMEOUT_MSEC`, 60 s). A client that
+/// has read nothing for that long has given up on what it asked.
+const OUTPUT_FROZEN: Duration = Duration::from_secs(60);
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
@@ -145,13 +149,15 @@ pub fn serve<
     let _queues = budget
         .reserve(BudgetKind::Control, BudgetLane::Ordinary, 64 * 1024)?
         .commit();
-    let (frames, output) = mpsc::sync_channel(2);
+    let (frames, to_write) = mpsc::sync_channel(2);
+    // One report is enough: an unread one already says the writer moved.
+    let (report_written, written) = mpsc::sync_channel(1);
     let writer = owner(
         "focal-mcp-output",
         THREAD_STACK,
         &budget,
         events.clone(),
-        move |events| write_output(writer, output, events),
+        move |events| write_output(writer, to_write, report_written, events),
     )?;
     let input = owner(
         "focal-mcp-input",
@@ -162,7 +168,10 @@ pub fn serve<
     )?;
     drop(events);
     let mut jobs = Some(jobs);
-    let mut frames = Some(frames);
+    let mut output = Output {
+        frames: Some(frames),
+        written,
+    };
     // Each waiting call's place is charged with its admission (`Limits::call_entry`).
     let mut calls = Calls {
         running: None,
@@ -173,14 +182,14 @@ pub fn serve<
         &budget,
         &receive,
         &mut jobs,
-        &mut frames,
+        &mut output,
         &mut calls,
     );
     if let Some((_, Some(cancel))) = calls.running.take() {
         let _ = cancel.send(());
     }
     drop(jobs);
-    drop(frames);
+    drop(output);
     // Never let joining an OS read/write or filesystem stall defeat the process
     // shutdown bound. Normal EOF has already received both owner-end events.
     for handle in [input, worker, writer] {
@@ -204,6 +213,13 @@ struct Calls {
     waiting: VecDeque<ToolCall>,
 }
 
+/// The coordinator's way to the output owner: the frames it hands over, and word of each one
+/// written. The word is what a full queue waits on (`send_waiting`).
+struct Output {
+    frames: Option<SyncSender<EncodedFrame>>,
+    written: Receiver<()>,
+}
+
 /// One client frame: answered, admitted as a call (run at once if the worker is free, else waiting
 /// its turn), or a cancel: a running call is told to stop, a waiting one is dropped unanswered.
 fn input(
@@ -211,18 +227,18 @@ fn input(
     protocol: &mut Protocol,
     budget: &MemoryBudget,
     jobs: &Option<Sender<Job>>,
-    frames: &mut Option<SyncSender<EncodedFrame>>,
+    output: &Output,
     calls: &mut Calls,
 ) -> Result<(), ServeError> {
     match protocol.receive(frame.as_bytes())? {
-        Action::Reply(frame) => send_frame(frames, frame)?,
+        Action::Reply(frame) => send_frame(output, frame)?,
         Action::Call(call) => {
             calls
                 .waiting
                 .try_reserve(1)
                 .map_err(|_| ProtocolError::Capacity)?;
             calls.waiting.push_back(call);
-            start(protocol, budget, jobs, frames, calls)?;
+            start(protocol, budget, jobs, output, calls)?;
         }
         Action::Cancel(token) => {
             if let Some((running, cancel)) = calls.running.as_mut()
@@ -236,7 +252,7 @@ fn input(
                 // cancellation, forgets it unanswered.
                 calls.waiting.remove(at);
                 if let Some(frame) = protocol.fail(token, "Cancelled before it ran")? {
-                    send_frame(frames, frame)?;
+                    send_frame(output, frame)?;
                 }
             }
         }
@@ -252,7 +268,7 @@ fn start(
     protocol: &mut Protocol,
     budget: &MemoryBudget,
     jobs: &Option<Sender<Job>>,
-    frames: &mut Option<SyncSender<EncodedFrame>>,
+    output: &Output,
     calls: &mut Calls,
 ) -> Result<(), ServeError> {
     while calls.running.is_none() {
@@ -267,7 +283,7 @@ fn start(
                 if let Some(frame) =
                     protocol.fail(token, "Operation capacity exhausted; retry later")?
                 {
-                    send_frame(frames, frame)?;
+                    send_frame(output, frame)?;
                 }
                 continue;
             }
@@ -291,7 +307,7 @@ fn coordinate(
     budget: &MemoryBudget,
     events: &Receiver<Event>,
     jobs: &mut Option<Sender<Job>>,
-    frames: &mut Option<SyncSender<EncodedFrame>>,
+    output: &mut Output,
     calls: &mut Calls,
 ) -> Result<(), ServeError> {
     let mut ended = None;
@@ -313,7 +329,7 @@ fn coordinate(
             // A call that follows a cancellation waits behind the cancelled call until it has
             // ended, as any call waits behind the running one (the MCP claim-wait cancellation
             // test on macOS CI had one refused while the cancel was on its way).
-            Event::Input(frame) => input(frame, protocol, budget, jobs, frames, calls)?,
+            Event::Input(frame) => input(frame, protocol, budget, jobs, output, calls)?,
             Event::Complete(completion) => {
                 completion
                     .result
@@ -343,11 +359,11 @@ fn coordinate(
                         completion.result.is_error() && !inspected_pending,
                     )?
                 {
-                    send_frame(frames, frame)?;
+                    send_frame(output, frame)?;
                 }
                 // The worker is free: the next waiting call is its.
                 if ended.is_none() {
-                    start(protocol, budget, jobs, frames, calls)?;
+                    start(protocol, budget, jobs, output, calls)?;
                 }
             }
             Event::InputEnd => {
@@ -361,7 +377,7 @@ fn coordinate(
                     let _ = cancel.send(());
                 }
                 jobs.take();
-                frames.take();
+                output.frames.take();
             }
             Event::WorkerEnd => {
                 if ended.is_none() {
@@ -582,14 +598,39 @@ pub fn run_code<T: ClientTransport + 'static>(
     .map_err(|_| ServeError::Owner)?
 }
 
-fn send_frame(
-    sender: &Option<SyncSender<EncodedFrame>>,
-    frame: EncodedFrame,
+fn send_frame(output: &Output, frame: EncodedFrame) -> Result<(), ServeError> {
+    send_waiting(
+        output.frames.as_ref().ok_or(ServeError::Owner)?,
+        &output.written,
+        OUTPUT_FROZEN,
+        frame,
+    )
+}
+
+/// Hand `sender` one `item`, waiting while its queue is full: answers a client asked for together
+/// outrun the writer for a moment on a busy machine, which is no reason to end the connection (five
+/// parallel skill reads ended a Codex agent's that way). While this waits, the input owner's events
+/// wait on the coordinator, so the client is held back rather than anything growing. The wait is
+/// charged to the writer's progress: `frozen` with no write reported means the reader is gone. The
+/// coordinator is the queue's one producer, so a write that freed a place keeps it free for this
+/// item: an unread report of an earlier write costs at most one more pass.
+pub(crate) fn send_waiting<T>(
+    sender: &SyncSender<T>,
+    written: &Receiver<()>,
+    frozen: Duration,
+    mut item: T,
 ) -> Result<(), ServeError> {
-    match sender.as_ref().ok_or(ServeError::Owner)?.try_send(frame) {
-        Ok(()) => Ok(()),
-        Err(TrySendError::Full(_)) => Err(ServeError::Backpressure),
-        Err(TrySendError::Disconnected(_)) => Err(ServeError::Owner),
+    loop {
+        match sender.try_send(item) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Disconnected(_)) => return Err(ServeError::Owner),
+            Err(TrySendError::Full(back)) => item = back,
+        }
+        match written.recv_timeout(frozen) {
+            Ok(()) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => return Err(ServeError::Backpressure),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(ServeError::Owner),
+        }
     }
 }
 /// A thread of the adapter's, its `stack` and bookkeeping charged to the budget for its life.
@@ -721,11 +762,14 @@ fn read_input(
 fn write_output(
     mut writer: impl Write,
     frames: Receiver<EncodedFrame>,
+    written: SyncSender<()>,
     events: &SyncSender<Event>,
 ) -> Result<(), ServeError> {
     while let Ok(frame) = frames.recv() {
         writer.write_all(frame.as_bytes())?;
         writer.flush()?;
+        // Full: an earlier report is still unread, and says as much. Closed: no one waits.
+        let _ = written.try_send(());
     }
     events.send(Event::WriterEnd).map_err(|_| ServeError::Owner)
 }

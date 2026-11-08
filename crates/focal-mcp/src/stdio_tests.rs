@@ -105,6 +105,15 @@ impl Running {
         reopen: bool,
         configure: impl FnOnce(Backend<Controlled>) -> Backend<Controlled>,
     ) -> Self {
+        Self::start_writing(path, reopen, configure, |server| server)
+    }
+    /// A runner whose output is `writer` over the server's end of the socket.
+    fn start_writing<W: Write + Send + 'static>(
+        path: &Path,
+        reopen: bool,
+        configure: impl FnOnce(Backend<Controlled>) -> Backend<Controlled>,
+        writer: impl FnOnce(UnixStream) -> W,
+    ) -> Self {
         let store = if reopen {
             OperationStore::open(
                 path,
@@ -137,9 +146,10 @@ impl Running {
         client.set_read_timeout(Some(FROZEN)).unwrap();
         client.set_write_timeout(Some(FROZEN)).unwrap();
         let reader = server.try_clone().unwrap();
+        let writer = writer(server);
         let (finish, done) = mpsc::sync_channel(1);
         let join = thread::spawn(move || {
-            let _ = finish.send(serve(backend, reader, server));
+            let _ = finish.send(serve(backend, reader, writer));
         });
         Self {
             input: client.try_clone().unwrap(),
@@ -467,6 +477,104 @@ fn calls_sent_together_wait_their_turn_and_one_cancelled_while_waiting_never_run
         "an inspection reached the ledger"
     );
     runner.stop();
+}
+
+/// Output whose first write waits for `gate`: a writer held up, as a busy machine holds one.
+struct Gated {
+    gate: Option<mpsc::Receiver<()>>,
+    inner: UnixStream,
+}
+impl Write for Gated {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if let Some(gate) = self.gate.take() {
+            let _ = gate.recv();
+        }
+        self.inner.write(bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Answers asked for together wait for a writer that is held up, rather than ending the
+/// connection. Five parallel skill reads ended a Codex agent's connection on a busy machine, the
+/// queue's two places full while the writer waited.
+#[test]
+fn answers_asked_for_together_wait_for_a_writer_held_up() {
+    let temp = tempfile::tempdir().unwrap();
+    let (release, gate) = mpsc::channel::<()>();
+    let mut runner = Running::start_writing(
+        &temp.path().join("operations"),
+        false,
+        |backend| backend,
+        move |inner| Gated {
+            gate: Some(gate),
+            inner,
+        },
+    );
+    let uri = "skill://focal-claims/references/workflow-contract.md";
+    for id in 1..=16u64 {
+        runner.rpc(id, "resources/read", json!({"uri": uri}));
+    }
+    // One answer is held at the gate and two queue behind it, so the fourth finds the queue full.
+    // A server that ended the connection there says so here; this one has nothing to say, and how
+    // long this looks decides only how surely the old defect would be seen, never whether a good
+    // run passes.
+    assert!(
+        matches!(
+            runner.done.recv_timeout(Duration::from_millis(500)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ),
+        "the connection ended while the output was held up"
+    );
+    drop(release);
+    for id in 1..=16u64 {
+        let read = runner.response(id)["result"].clone();
+        assert!(
+            read["contents"][0]["text"].as_str().unwrap().len() > 20_000,
+            "{id}"
+        );
+    }
+    runner.stop();
+}
+
+/// The wait for the output is charged to its progress: a queue that drains takes every item in
+/// order; one whose writer reports nothing for the bound is refused, typed; a gone writer is an
+/// error at once.
+#[test]
+fn a_full_output_queue_waits_on_the_writers_progress_and_gives_up_without_any() {
+    let (sender, receive) = mpsc::sync_channel(1);
+    let (report, written) = mpsc::sync_channel(1);
+    let reader = thread::spawn(move || {
+        let mut taken = Vec::new();
+        while let Ok(item) = receive.recv() {
+            taken.push(item);
+            let _ = report.try_send(());
+        }
+        taken
+    });
+    for item in 0..64u32 {
+        crate::stdio::send_waiting(&sender, &written, FROZEN, item).unwrap();
+    }
+    drop(sender);
+    assert_eq!(reader.join().unwrap(), (0..64).collect::<Vec<u32>>());
+
+    let (sender, _held) = mpsc::sync_channel(1);
+    let (_report, written) = mpsc::sync_channel::<()>(1);
+    sender.try_send(0u32).unwrap();
+    assert!(matches!(
+        crate::stdio::send_waiting(&sender, &written, Duration::from_millis(20), 1u32),
+        Err(ServeError::Backpressure)
+    ));
+
+    let (sender, _held) = mpsc::sync_channel(1);
+    let (report, written) = mpsc::sync_channel::<()>(1);
+    sender.try_send(0u32).unwrap();
+    drop(report);
+    assert!(matches!(
+        crate::stdio::send_waiting(&sender, &written, FROZEN, 1u32),
+        Err(ServeError::Owner)
+    ));
 }
 
 /// More calls sent together than the protocol's old fixed bound of eight are each answered, in
