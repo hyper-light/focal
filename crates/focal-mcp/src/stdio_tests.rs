@@ -429,6 +429,50 @@ fn unknown_reply_and_eof_leave_exact_epoch_request_recoverable() {
     assert_eq!(journal.next_request().unwrap(), Some(&saved));
 }
 
+/// Calls a client sends together (Codex and Claude Code send a model's tool calls at once) are each
+/// answered, in the order they came, the worker running one at a time: none is refused because the
+/// one before it still runs. A call cancelled while it waits never runs and is never answered.
+#[test]
+fn calls_sent_together_wait_their_turn_and_one_cancelled_while_waiting_never_runs() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("operations");
+    let mut core = Core::new(context().ledger, CoreLimits::default());
+    let mut runner = Running::start(&path, false);
+    // The first holds the worker: its epoch waits on the ledger until this test answers it.
+    runner.tool(1, "claim.submit", claim());
+    let epoch = runner.observed();
+    for id in [2, 3, 4] {
+        runner.tool(id, "request.inspect", json!({"operation_id":OPERATION_ID}));
+    }
+    runner
+        .send(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":3}}));
+    // Answered at once, after every frame before it was taken: the three calls wait (a refusal
+    // would have been answered first) and the cancellation is in.
+    runner.rpc(5, "tools/list", json!({}));
+    assert!(
+        runner.response(5)["result"]["tools"].is_array(),
+        "a waiting call was answered before its turn"
+    );
+    let receipt = apply(&mut core, &epoch.request);
+    answer(epoch, receipt);
+    let pending = runner.observed();
+    let receipt = apply(&mut core, &pending.request);
+    answer(pending, receipt);
+    assert_eq!(application(&runner.response(1)).condition, "Committed");
+    // Then the waiting calls in their order; the cancelled one is never answered (`response`
+    // refuses any other id).
+    for id in [2, 4] {
+        let response = runner.response(id);
+        assert_eq!(response["result"]["isError"], false, "{response}");
+        assert_eq!(application(&response).condition, "Committed", "{response}");
+    }
+    assert!(
+        runner.requests.try_recv().is_err(),
+        "an inspection reached the ledger"
+    );
+    runner.stop();
+}
+
 #[path = "native_stdio_tests.rs"]
 mod native;
 #[path = "traversal_backend_tests.rs"]

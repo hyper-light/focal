@@ -18,9 +18,9 @@ use std::{
 };
 
 const MIB: usize = 1024 * 1024;
-/// The client frames that wait while a cancelled call ends: as many as the
-/// input owner's channel to the coordinator holds (`serve`).
-const HELD_INPUTS: usize = 8;
+/// The coordinator's event channel: as many events (frames read, calls ended)
+/// wait for it before their owners wait in turn (`serve`).
+const QUEUED_EVENTS: usize = 8;
 /// The input and output owners' stack: one blocking read or write and the frame codec.
 const THREAD_STACK: usize = MIB;
 /// The ledger worker's stack. It runs a hyper-rt shard whose root task makes each call: the call's
@@ -101,7 +101,7 @@ pub fn serve<
         code_limits,
         budget,
     } = Adapter::new()?;
-    let (events, receive) = mpsc::sync_channel(HELD_INPUTS);
+    let (events, receive) = mpsc::sync_channel(QUEUED_EVENTS);
     let (jobs, work) = hyper_rt::sync::channel(1).map_err(|_| ServeError::Owner)?;
     let (ready, started) = mpsc::sync_channel(1);
     let worker_budget = budget.clone();
@@ -163,16 +163,23 @@ pub fn serve<
     drop(events);
     let mut jobs = Some(jobs);
     let mut frames = Some(frames);
-    let mut active: Option<(CallToken, OneshotSender<()>)> = None;
+    let mut calls = Calls {
+        running: None,
+        waiting: VecDeque::new(),
+    };
+    calls
+        .waiting
+        .try_reserve_exact(limits.max_active_calls)
+        .map_err(|_| ProtocolError::Capacity)?;
     let result = coordinate(
         &mut protocol,
         &budget,
         &receive,
         &mut jobs,
         &mut frames,
-        &mut active,
+        &mut calls,
     );
-    if let Some((_, cancel)) = active.take() {
+    if let Some((_, Some(cancel))) = calls.running.take() {
         let _ = cancel.send(());
     }
     drop(jobs);
@@ -187,68 +194,99 @@ pub fn serve<
     result
 }
 
-/// One client frame: answered, started as the worker's call, or a cancel sent
-/// to the running call, whose token is returned: the frames after it wait
-/// until that call has ended (`coordinate`).
+/// The calls the protocol admitted, in the order they came: the one the worker runs and those
+/// waiting their turn. The worker runs one call at a time, and a call sent while it runs waits
+/// here rather than being refused: Codex and Claude Code send a model's tool calls together, and
+/// refusing all but the first had agents retry them one by one. The protocol admits at most
+/// `max_active_calls`, each charged to the budget as it is admitted, so the wait has the
+/// protocol's bound and its budget's; past them a call is refused, typed.
+struct Calls {
+    /// The call the worker holds, with the sender that cancels it: taken once it is cancelled,
+    /// while the worker finishes it. The next call is handed over only once the worker has.
+    running: Option<(CallToken, Option<OneshotSender<()>>)>,
+    waiting: VecDeque<ToolCall>,
+}
+
+/// One client frame: answered, admitted as a call (run at once if the worker is free, else waiting
+/// its turn), or a cancel: a running call is told to stop, a waiting one is dropped unanswered.
 fn input(
     frame: InputFrame,
     protocol: &mut Protocol,
     budget: &MemoryBudget,
     jobs: &Option<Sender<Job>>,
     frames: &mut Option<SyncSender<EncodedFrame>>,
-    active: &mut Option<(CallToken, OneshotSender<()>)>,
-) -> Result<Option<CallToken>, ServeError> {
+    calls: &mut Calls,
+) -> Result<(), ServeError> {
     match protocol.receive(frame.as_bytes())? {
         Action::Reply(frame) => send_frame(frames, frame)?,
         Action::Call(call) => {
-            if active.is_some() {
-                return Err(ServeError::Owner);
-            }
-            let allocation =
-                match budget.reserve(BudgetKind::Control, BudgetLane::Ordinary, JOB_BYTES) {
-                    Ok(reservation) => reservation.commit(),
-                    Err(_) => {
-                        if let Some(frame) = protocol
-                            .fail(call.token, "Operation capacity exhausted; retry later")?
-                        {
-                            send_frame(frames, frame)?;
-                        }
-                        return Ok(None);
-                    }
-                };
-            let (cancel, cancelled) = hyper_rt::sync::oneshot().map_err(|_| ServeError::Owner)?;
-            let token = call.token;
-            // The worker still finishing a cancelled call holds the
-            // queue's place: this call is refused, typed, to retry.
-            match jobs.as_ref().ok_or(ServeError::Owner)?.try_send(Job {
-                call,
-                cancel: cancelled,
-                allocation,
-            }) {
-                Ok(()) => *active = Some((token, cancel)),
-                Err(hyper_rt::sync::SyncError::Full(_)) => {
-                    if let Some(frame) =
-                        protocol.fail(token, "Operation capacity exhausted; retry later")?
-                    {
-                        send_frame(frames, frame)?;
-                    }
-                }
-                Err(_) => return Err(ServeError::Owner),
-            }
+            calls
+                .waiting
+                .try_reserve(1)
+                .map_err(|_| ProtocolError::Capacity)?;
+            calls.waiting.push_back(call);
+            start(protocol, budget, jobs, frames, calls)?;
         }
         Action::Cancel(token) => {
-            if active
-                .as_ref()
-                .is_some_and(|(current, _)| *current == token)
-                && let Some((_, cancel)) = active.take()
+            if let Some((running, cancel)) = calls.running.as_mut()
+                && *running == token
             {
-                let _ = cancel.send(());
-                return Ok(Some(token));
+                if let Some(cancel) = cancel.take() {
+                    let _ = cancel.send(());
+                }
+            } else if let Some(at) = calls.waiting.iter().position(|call| call.token == token) {
+                // Cancelled before its turn, it never runs; the protocol, told of the
+                // cancellation, forgets it unanswered.
+                calls.waiting.remove(at);
+                if let Some(frame) = protocol.fail(token, "Cancelled before it ran")? {
+                    send_frame(frames, frame)?;
+                }
             }
         }
         Action::NoReply => {}
     }
-    Ok(None)
+    Ok(())
+}
+
+/// Hand the worker the first waiting call once it holds none. It has then finished the last call
+/// it was given and taken it from its one-slot queue, so the slot is free. A call the job's budget
+/// refuses is answered, typed, and the next is tried.
+fn start(
+    protocol: &mut Protocol,
+    budget: &MemoryBudget,
+    jobs: &Option<Sender<Job>>,
+    frames: &mut Option<SyncSender<EncodedFrame>>,
+    calls: &mut Calls,
+) -> Result<(), ServeError> {
+    while calls.running.is_none() {
+        let Some(call) = calls.waiting.pop_front() else {
+            break;
+        };
+        let token = call.token;
+        let allocation = match budget.reserve(BudgetKind::Control, BudgetLane::Ordinary, JOB_BYTES)
+        {
+            Ok(reservation) => reservation.commit(),
+            Err(_) => {
+                if let Some(frame) =
+                    protocol.fail(token, "Operation capacity exhausted; retry later")?
+                {
+                    send_frame(frames, frame)?;
+                }
+                continue;
+            }
+        };
+        let (cancel, cancelled) = hyper_rt::sync::oneshot().map_err(|_| ServeError::Owner)?;
+        jobs.as_ref()
+            .ok_or(ServeError::Owner)?
+            .try_send(Job {
+                call,
+                cancel: cancelled,
+                allocation,
+            })
+            .map_err(|_| ServeError::Owner)?;
+        calls.running = Some((token, Some(cancel)));
+    }
+    Ok(())
 }
 
 fn coordinate(
@@ -257,14 +295,11 @@ fn coordinate(
     events: &Receiver<Event>,
     jobs: &mut Option<Sender<Job>>,
     frames: &mut Option<SyncSender<EncodedFrame>>,
-    active: &mut Option<(CallToken, OneshotSender<()>)>,
+    calls: &mut Calls,
 ) -> Result<(), ServeError> {
     let mut ended = None;
     let mut worker_ended = false;
     let mut writer_ended = false;
-    // The cancelled call being torn down, and the frames waiting for it.
-    let mut draining: Option<CallToken> = None;
-    let mut held: VecDeque<InputFrame> = VecDeque::new();
     loop {
         if ended.is_some_and(|start: Instant| start.elapsed() >= SHUTDOWN) {
             return Err(ServeError::Shutdown);
@@ -278,29 +313,21 @@ fn coordinate(
             Err(mpsc::RecvTimeoutError::Disconnected) => return Err(ServeError::Owner),
         };
         match event {
-            // A frame after a cancellation waits until the cancelled call has
-            // ended and given its slot back, so a call that follows a cancel
-            // finds it free instead of being refused while the cancel is
-            // still on its way (the MCP claim-wait cancellation test on macOS
-            // CI). As many wait as the input channel holds; past that a frame
-            // is taken at once.
-            Event::Input(frame) => {
-                if draining.is_some() && held.len() < HELD_INPUTS {
-                    held.push_back(frame);
-                } else if let Some(token) = input(frame, protocol, budget, jobs, frames, active)? {
-                    draining = Some(token);
-                }
-            }
+            // A call that follows a cancellation waits behind the cancelled call until it has
+            // ended, as any call waits behind the running one (the MCP claim-wait cancellation
+            // test on macOS CI had one refused while the cancel was on its way).
+            Event::Input(frame) => input(frame, protocol, budget, jobs, frames, calls)?,
             Event::Complete(completion) => {
                 completion
                     .result
                     .validate_metadata()
                     .map_err(|_| ProtocolError::Encode)?;
-                if active
+                if calls
+                    .running
                     .as_ref()
                     .is_some_and(|(token, _)| *token == completion.call.token)
                 {
-                    active.take();
+                    calls.running = None;
                 }
                 // Inspecting a saved pending identity succeeded. Pending is
                 // still explicit in the structured result and implies no
@@ -321,26 +348,19 @@ fn coordinate(
                 {
                     send_frame(frames, frame)?;
                 }
-                // The cancelled call has ended: the frames that waited for it
-                // are taken in order, until one cancels a call again.
-                if draining == Some(completion.call.token) {
-                    draining = None;
-                    while draining.is_none()
-                        && let Some(frame) = held.pop_front()
-                    {
-                        draining = input(frame, protocol, budget, jobs, frames, active)?;
-                    }
+                // The worker is free: the next waiting call is its.
+                if ended.is_none() {
+                    start(protocol, budget, jobs, frames, calls)?;
                 }
             }
             Event::InputEnd => {
-                // What waited for a cancelled call is taken as it stands: the
-                // client is gone, and its last frames are answered first.
-                draining = None;
-                while let Some(frame) = held.pop_front() {
-                    input(frame, protocol, budget, jobs, frames, active)?;
-                }
+                // The client is gone: the calls waiting are dropped unanswered, as no one
+                // reads their answers, and the running call is cancelled.
                 ended = Some(Instant::now());
-                if let Some((_, cancel)) = active.take() {
+                calls.waiting.clear();
+                if let Some((_, cancel)) = calls.running.as_mut()
+                    && let Some(cancel) = cancel.take()
+                {
                     let _ = cancel.send(());
                 }
                 jobs.take();
@@ -371,10 +391,11 @@ struct Adapter {
 }
 impl Adapter {
     fn new() -> Result<Self, ServeError> {
+        // The protocol's own bound on calls admitted at once: the worker runs one at a time and
+        // the rest wait their turn (`Calls`).
         let limits = Limits {
             max_frame_bytes: 278_528,
             max_response_bytes: 16 * MIB,
-            max_active_calls: 1,
             ..Limits::default()
         };
         // One code-mode run at a time (the worker is one owner): its sandbox
