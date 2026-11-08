@@ -473,6 +473,62 @@ fn legacy_call_result_and_unknown_notifications() {
     ));
 }
 
+/// A server that declares `resources` answers `resources/templates/list` (Codex asks it of every
+/// server it starts, and logged focal's "Method not found" as an error on every turn): focal has
+/// no templates, since every skill file is listed under its own URI, so the list is empty, in each
+/// profile's result shape; a cursor it never issued is refused as `resources/list` refuses one.
+#[test]
+fn resource_templates_are_listed_empty_wherever_resources_are_served() {
+    let served = || {
+        protocol(Limits::default(), &["claim.get"])
+            .with_skills(crate::skills::Skills::embedded().unwrap())
+            .unwrap()
+    };
+    let mut p = served();
+    let listed = reply(
+        p.receive(&modern(json!(1), "resources/templates/list", json!({})))
+            .unwrap(),
+    );
+    validate_fixture(
+        MODERN_VERSION,
+        "ListResourceTemplatesResult",
+        &listed["result"],
+    );
+    assert_eq!(
+        listed["result"],
+        json!({"resultType":"complete","resourceTemplates":[],"ttlMs":0,"cacheScope":"public"})
+    );
+    let refused = reply(
+        p.receive(&modern(
+            json!(2),
+            "resources/templates/list",
+            json!({"cursor":"next"}),
+        ))
+        .unwrap(),
+    );
+    assert_eq!(refused["error"]["code"], -32602);
+    let mut legacy = served();
+    legacy_ready(&mut legacy);
+    let listed = reply(
+        legacy
+            .receive(br#"{"jsonrpc":"2.0","id":2,"method":"resources/templates/list"}"#)
+            .unwrap(),
+    );
+    validate_fixture(
+        LEGACY_VERSION,
+        "ListResourceTemplatesResult",
+        &listed["result"],
+    );
+    assert_eq!(listed["result"], json!({"resourceTemplates":[]}));
+    // A server that serves no resources has no such method.
+    let mut bare = protocol(Limits::default(), &["claim.get"]);
+    let missing = reply(
+        bare.receive(&modern(json!(3), "resources/templates/list", json!({})))
+            .unwrap(),
+    );
+    assert_eq!(missing["error"]["code"], -32601);
+}
+
 // Checks the official schema constructs reached by the emitted protocol messages.
 // This test helper is deliberately not a production/general JSON Schema engine.
 fn validate_fixture(version: &str, name: &str, value: &Value) {

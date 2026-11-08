@@ -132,7 +132,8 @@ pub struct Protocol {
 impl Protocol {
     /// Serve `skills` (SEP-2640): declare the `resources` capability and the
     /// `io.modelcontextprotocol/skills` extension, and answer `skills/list`,
-    /// `skills/get`, `resources/list` and `resources/read` from them.
+    /// `skills/get`, `resources/list`, `resources/templates/list` and
+    /// `resources/read` from them.
     pub(crate) fn with_skills(
         mut self,
         skills: crate::skills::Skills,
@@ -414,7 +415,9 @@ impl Protocol {
             "skills/list" | "skills/get" if profile == Profile::Modern && self.skills.is_some() => {
                 self.skill(id, &method, params)
             }
-            "resources/list" | "resources/read" if self.skills.is_some() => {
+            "resources/list" | "resources/templates/list" | "resources/read"
+                if self.skills.is_some() =>
+            {
                 self.resource(id, profile, &method, params)
             }
             _ => self.error(id, -32601, "Method not found", None),
@@ -589,8 +592,9 @@ impl Protocol {
             },
         )
     }
-    /// `resources/list` (every skill file, one page) and `resources/read`
-    /// (one file's text): what a client without the skills extension uses.
+    /// `resources/list` (every skill file, one page), `resources/templates/list`
+    /// (none: every file is listed under its own URI) and `resources/read` (one
+    /// file's text): what a client without the skills extension uses.
     fn resource(
         &self,
         id: Value,
@@ -602,6 +606,32 @@ impl Protocol {
             return self.error(id, -32601, "Method not found", None);
         };
         let modern = profile == Profile::Modern;
+        if method == "resources/templates/list" {
+            // One page, so no cursor is ever issued.
+            if !matches!(params.remove("cursor"), None | Some(Value::Null)) || !params.is_empty() {
+                return self.error(id, -32602, "Invalid parameters", None);
+            }
+            #[derive(Serialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Templates {
+                #[serde(skip_serializing_if = "Option::is_none")]
+                result_type: Option<&'static str>,
+                resource_templates: [Value; 0],
+                #[serde(skip_serializing_if = "Option::is_none")]
+                ttl_ms: Option<u64>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                cache_scope: Option<&'static str>,
+            }
+            return self.reply(
+                id,
+                &Templates {
+                    result_type: profile.result_type(),
+                    resource_templates: [],
+                    ttl_ms: modern.then_some(0),
+                    cache_scope: modern.then_some("public"),
+                },
+            );
+        }
         if method == "resources/list" {
             if !matches!(params.remove("cursor"), None | Some(Value::Null)) || !params.is_empty() {
                 return self.error(id, -32602, "Invalid parameters", None);
