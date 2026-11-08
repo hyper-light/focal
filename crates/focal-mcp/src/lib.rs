@@ -23,6 +23,8 @@ mod codec;
 mod json;
 mod protocol;
 #[cfg(test)]
+mod schema_guidance_tests;
+#[cfg(test)]
 mod skill_contract_tests;
 mod skills;
 mod stdio;

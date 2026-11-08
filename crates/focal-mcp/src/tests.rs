@@ -589,7 +589,7 @@ fn fixture_digests() {
         serde_json::from_str(include_str!("../fixtures/provenance.json")).unwrap();
     assert_eq!(
         provenance["commit"],
-        "e76e9c572c6f2bfcb730357101acc90f2f802e02"
+        "38353251fab3bdeead03dd8283b9e66076ce1a7f"
     );
     for (name, bytes) in [
         (
