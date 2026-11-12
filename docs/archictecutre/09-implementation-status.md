@@ -18721,7 +18721,10 @@ result, kube-focal `main` at 77c9e2a: eight component crates and the end-to-end 
 Rust in 43 files (2,966 implementation, 6,878 tests), 31 commits (the architect 11, the workers 9, 7
 and 3, and the brief). The pinned validator ran the five acceptance tests and then the workspace's
 121; in a separate clone and build directory, `cargo test --workspace` on 77c9e2a passed 121 of 121
-three times, the end-to-end test each time, at load averages of 67 to 84. The repository, the
+three times, the end-to-end test each time, at load averages of 67 to 84, and run alone twenty times
+more, nothing else of the build running, the five acceptance tests and the kubelet's fifteen process
+tests passed every time at load averages of 9.8 to 115 (median 36): the end-to-end test 20 of 20, the
+once racing descendant test 20 of 20. The repository, the
 ledger read back after the build and the harness are kept in
 [`docs/qualification/kube-focal/`](../qualification/kube-focal/README.md).
 

@@ -53,7 +53,8 @@ the ledger only through `focal serve mcp` and its skills, built kube-focal, a Ku
 as processes, kubectl), from a brief to an end-to-end test that runs the services as separate
 processes, applies a three-replica deployment, sees it Running over two nodes, scales and deletes
 it: 25 claims, 14 validations reported (5 failing, each corrected through a new claim), `main` at
-77c9e2a with 121 tests passing three times in the operator's own clone. The repository, the ledger
+77c9e2a with 121 tests passing three times in the operator's own clone, and its acceptance and
+kubelet process tests twenty times more each, every time, at load averages of 9.8 to 115. The repository, the ledger
 read back and the harness are kept in [kube-focal](kube-focal/README.md); the status entry says what
 the operator did during the build, in full.
 
