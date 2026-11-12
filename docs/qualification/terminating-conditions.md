@@ -9,7 +9,7 @@ every row names where it is recorded, and a gap is written as a gap.
 | # | Condition | State |
 |---|---|---|
 | 1 | One binary and CLI, laptop to global, proven by records | partly shown |
-| 2 | More than a thousand agents doing claims, artifacts, testaments and validations | shown at 1,000; the Kubernetes build not attempted |
+| 2 | More than a thousand agents doing claims, artifacts, testaments and validations | shown: 1,000 agents run the work flow at 97.7 claims a second (117.9 at the cluster's ceiling), every lifecycle completed; five Codex agents built a Kubernetes in Rust through focal alone, its end-to-end test passing; graphs of more than about seven dependent claims cannot yet be evaluated |
 | 3 | Delivery under heavy load, horrific networks, dozens of node failures | shown on three nodes and on 33 with twelve failing at once, confirmed on the fixed tree; every lifecycle completed, every claim, artifact, testament and validation committed, in a run of each fault kind (killed, killed outside the control plane, cut off with every connection dropped, partitioned) with agents that send each write once, focal carrying each write through the outage (the client's delivery bound, the custody rule by kind of object, a heal withdrawn only before its copies join); a copy its session no longer places stays on its node and serves (open: m13's ledger 10 waited 97 s for hand-offs, every lifecycle still completing) |
 | 4 | p99s an order of magnitude beyond Kafka, Redis HA, NATS | plan of record; not shown across its conditions |
 | 5 | Post-quantum encryption in transit and at rest | in transit shown; at rest partly |
@@ -43,10 +43,25 @@ eleven writes) among 1,000 enrolled agents, each on a connection of its own, thr
 (CI 39870118553): 1,200 and 3,000 claims satisfied in the measured minute at 20 and 50 claims a
 second, none refused and none unknown; satisfied p50 47 and 128 ms, p99 158 and 622 ms. The
 listener admits what the node's memory funds ("2026-10-20 — A node's listener admits what its
-memory funds: a thousand agents and more").
+memory funds: a thousand agents and more"). "2026-11-11 — Agents build a Kubernetes in Rust through
+focal, and a thousand agents run the work flow past 50 claims a second": among the same thousand
+agents (CI 42435514165), 75, 100 and 150 claims a second offered, 74.9, 97.7 and 117.9 judged, every
+lifecycle completed, none refused, abandoned, expired or unknown; about 118 a second is the ceiling
+of three 1-CPU nodes. Five Codex agents (an architect, three workers, an evaluator), each reaching
+the ledger only through `focal serve mcp` and its skills, built kube-focal, a Kubernetes in Rust
+(API types, store with watches, API server, scheduler, deployment controller, a kubelet running pods
+as processes, kubectl), from a brief to an end-to-end test that runs the services as separate
+processes, applies a three-replica deployment, sees it Running over two nodes, scales and deletes
+it: 25 claims, 14 validations reported (5 failing, each corrected through a new claim), `main` at
+77c9e2a with 121 tests passing three times in the operator's own clone. The repository, the ledger
+read back and the harness are kept in [kube-focal](kube-focal/README.md); the status entry says what
+the operator did during the build, in full.
 
-**Open.** Rates past 50 claims a second among a thousand agents; the condition's application, a
-Kubernetes implementation in Rust built by the agents, has not been attempted.
+**Open.** A claim whose dependency graph holds more than about seven claims cannot be evaluated: a
+failing report settles the whole graph in one record of at most 256 changes, each member funded at
+its lifetime maximum of registrations, so the build ran without `depends_on` relations; the fix is
+propagation in bounded steps across records. focal's `tools/list` costs some 30,000 tokens in every
+model request.
 
 ## 3. Delivery under load, horrific networks and failures
 

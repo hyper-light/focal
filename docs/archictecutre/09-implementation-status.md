@@ -18675,3 +18675,89 @@ node's library tests, the A1 gates on the real binary). 4fbd25a6 had failed on L
 `cli_backup` read the storage view's log counts from the sampler's first round, taken before the
 node's log had written (on Linux the medium answers at once and is in that round; on macOS it is in
 the next); 10e810c0 reads them from the log as the view is asked, and was green on all three.
+
+### 2026-11-11 — Agents build a Kubernetes in Rust through focal, and a thousand agents run the work flow past 50 claims a second
+
+Terminating condition 2, both parts.
+
+**A thousand agents past 50 claims a second.** focal-load's `work` lifecycle (a claim posted,
+taken, its artifact and testament submitted, received, its whole-work validation entered, begun and
+reported, the claim settled and released: eleven writes) among 1,000 enrolled agents, each on a
+connection of its own, three 1-CPU nodes, CI run 42435514165 (branch compare/work-1000-2026-11-07;
+the workflow's 1,000-agent arm kept on fleet-run, 5450c63f), offered 75, 100 and 150 claims a
+second for 75 seconds each. Every lifecycle completed: 5,625, 7,500 and 11,250 claims judged, none
+refused, abandoned, expired or unknown, at 74.9, 97.7 and 117.9 claims a second (5,625 in 75.1 s,
+7,500 in 76.8 s, 11,250 in 95.4 s). A write's p50 and p99 were 4.6 and 90 ms, 133 and 396 ms,
+437 ms and 13.3 s; a claim was satisfied at p99 in 0.96, 4.6 and 21.5 s. At 150 a second the offer
+outran the cluster (its schedule delay p99 13 s): about 118 claims a second is the ceiling among a
+thousand agents on three 1-CPU nodes, 2.4 times the condition's 50.
+
+**The build.** Five Codex agents (codex-cli 0.166.0, later 0.167.0; gpt-6.1-sol at reasoning
+effort max), each turn a `codex exec` in a workspace-write sandbox with network access: an
+architect, three workers and an evaluator, each an enrolled client context of one native focal node
+that it reached only through `focal serve mcp` and the skills it serves. The brief asked for a
+Kubernetes in Rust as one Cargo workspace: API types (Pod, Deployment, Node), a versioned store with
+optimistic concurrency and watches, an HTTP API server with a binding subresource, a scheduler, a
+deployment controller, a kubelet that runs pods as local processes under their restart policies,
+kubectl (apply, get, delete, scale), and an end-to-end test that starts the API server, scheduler,
+controller and two kubelets as separate processes, applies a three-replica deployment running
+`sleep 30`, sees three Running pods spread over both nodes, scales it to one, deletes it and sees
+every pod gone. Nobody outside the ledger assigned work. The architect split the brief into claims,
+each with a required delivery receipt and a required test validation by the evaluator, pinned to a
+validator script by its hash; a worker took a claim, delivered a commit named in its work artifact
+and closed it with a testament; the architect received the testament; the evaluator checked out the
+commit the artifact named, ran the pinned checks and reported pass or fail with its evidence; the
+architect merged what passed and posted a correction claim for each failure. From 2026-11-07 17:47
+to 2026-11-11 23:38 (stopped from 11-08 05:36 to 11-11 20:02), 63 turns (the architect 22, the
+evaluator 11, each worker 10): 197 operations committed by the agents (the architect 97, the
+evaluator 41, the workers 27, 20 and 12; the ledger's sequence ends at 200), 25 claims created, 14
+validations reported, 9 passing and 5 failing, each failure corrected through a new claim that then
+passed: generated pod names that broke DNS rules, a kubelet race reaping children after shutdown,
+its test reading an empty PID file, the end-to-end test's scale step timing out with a setup error
+masked, and the diagnosis of that timeout (which settled on a kubelet test whose descendant wrote
+its file after a 0.3 s sleep, replaced by a gated one, and live clusters serialized). The agents
+used 151.0 M input tokens (144.5 M cached) and 0.82 M output tokens over 2,297 MCP calls. The
+result, kube-focal `main` at 77c9e2a: eight component crates and the end-to-end test, 9,844 lines of
+Rust in 43 files (2,966 implementation, 6,878 tests), 31 commits (the architect 11, the workers 9, 7
+and 3, and the brief). The pinned validator ran the five acceptance tests and then the workspace's
+121; in a separate clone and build directory, `cargo test --workspace` on 77c9e2a passed 121 of 121
+three times, the end-to-end test each time, at load averages of 67 to 84. The repository, the
+ledger read back after the build and the harness are kept in
+[`docs/qualification/kube-focal/`](../qualification/kube-focal/README.md).
+
+**What the operator did, said in full.** Turns ran in rounds (the architect, the three workers
+together, the architect, the evaluator), each round starting the node and stopping it after. Codex
+keeps an agent's `.git` read-only by design, so a harness service did the git writes an agent asked
+of it (`kgit`: fetch, branch, checkout, commit, merge) on the agent's own clone, with hooks and
+fsmonitor off and no user git configuration read. Codex asks a person to approve an MCP tool marked
+destructive; with no person there, the four focal tools so marked (`request.acknowledge`,
+`request.retry`, `claim.cancel`, `monitor.cancel`) were set to approve. During the build the prompts
+gained `kgit`, the architect's step of receiving testaments, a note not to declare `depends_on`
+relations (below), and a note that the operator's own test run had overlapped the evaluator's first
+validation of the end-to-end test on a loaded machine; that validation had failed on a timeout, and
+the agents' second correction followed the note. One probe acknowledged the architect's one pending
+request, one diagnostic `validation.begin` was sent as the evaluator (refused, as its own three had
+been), and the node ran 22 minutes on an instrumented binary to name that refusal's counts. The
+kube-focal code is the agents' throughout.
+
+**What the build found in focal.** Fixed on fleet-run, green in CI on ad7e4e5e on Linux, macOS and
+Windows: `resources/templates/list` answered -32601, which Codex logged as an error on every turn
+(f763e940); the stdio adapter admitted one call at a time and answered a model's parallel tool calls
+"Tool capacity exhausted" (451bfea2: calls wait their turn; c7dd547d: each is charged its own frame,
+so the budget, not a count of eight, bounds how many wait); a client's parallel reads answered
+faster than the writer moved them ended the connection (ad7e4e5e: the coordinator waits for the
+writer and gives up after 60 s with no frame written, the MCP SDK's request timeout). Across the
+agents' turns: 26 calls refused in the 8 turns on the first binary (up to 9 in flight); 3 refused
+and 4 lost to a closed connection in the 14 on the second (up to 11); none refused and no connection
+closed in the 41 on ad7e4e5e (up to 15 in flight).
+
+**Open.** A claim whose dependency graph holds more than about seven claims cannot be evaluated.
+`validation.begin` installs its report's completion, and a failing report settles the whole graph
+in one record of at most 256 changes, each member funded at its lifetime maximum of registrations:
+the build's first component, with five dependents and two consultation claims, came to 289 changes
+(counted on the instrumented binary), so the build declared no `depends_on` relations after the
+first plan. The fix is propagation in bounded steps across records, as Kubernetes' background
+cascading deletion and Temporal's parent-close processor apply a closed root's consequences after
+it closes. focal's `tools/list` is 180 KB (88 KB of input schemas), some 30,000 tokens in every
+model request. One architect turn's MCP server missed Codex's 30-second handshake while the machine
+was near a load of 150 (its startup answers in 0.61 s at a load of 40).

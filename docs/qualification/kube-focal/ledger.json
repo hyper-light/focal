@@ -1,0 +1,3399 @@
+{
+ "claims": [
+  {
+   "id": "19371bc0552ca4ea908be85843ed8097",
+   "status": "ValidationFailed",
+   "issuer": "architect",
+   "subject": "worker-2",
+   "responses": 1
+  },
+  {
+   "id": "6abb4f54dec49a8316d34ac3d7b36dc9",
+   "status": "Satisfied",
+   "issuer": "architect",
+   "subject": "worker-3",
+   "responses": 1
+  },
+  {
+   "id": "771bd42fd112c2f8d2916be28ab0cdb5",
+   "status": "Satisfied",
+   "issuer": "architect",
+   "subject": "worker-1",
+   "responses": 1
+  },
+  {
+   "id": "8f692913f0f21e5db7f2d41305edcc98",
+   "status": "Cancelled",
+   "issuer": "evaluator",
+   "subject": "evaluator",
+   "responses": 0
+  },
+  {
+   "id": "ba7dba81095ce53a9776c18b52461874",
+   "status": "Cancelled",
+   "issuer": "architect",
+   "subject": "architect",
+   "responses": 0
+  },
+  {
+   "id": "bd40765beff6281b17dc37b9432e4844",
+   "status": "ValidationFailed",
+   "issuer": "architect",
+   "subject": "worker-3",
+   "responses": 1
+  },
+  {
+   "id": "bf065c1e419919fdc19d56384d8a5855",
+   "status": "Satisfied",
+   "issuer": "architect",
+   "subject": "worker-2",
+   "responses": 1
+  },
+  {
+   "id": "c120396f9b7642458758b9ea1512e6f5",
+   "status": "Cancelled",
+   "issuer": "architect",
+   "subject": "worker-2",
+   "responses": 0
+  },
+  {
+   "id": "c9992eaa15aa28006f50259fd2d312bb",
+   "status": "Satisfied",
+   "issuer": "architect",
+   "subject": "worker-1",
+   "responses": 1
+  },
+  {
+   "id": "d0d408abe4f1a763f4a6e98d004577f5",
+   "status": "Satisfied",
+   "issuer": "architect",
+   "subject": "worker-2",
+   "responses": 1
+  },
+  {
+   "id": "d5fb257840511c3a7166bbba2be8b38d",
+   "status": "TestamentGenerated",
+   "issuer": "worker-3",
+   "subject": "evaluator",
+   "responses": 1
+  },
+  {
+   "id": "dbeb29bf807b68d82432b3f362831885",
+   "status": "Satisfied",
+   "issuer": "architect",
+   "subject": "worker-3",
+   "responses": 1
+  },
+  {
+   "id": "e3c241609dc185f08867e4e747b047df",
+   "status": "ValidationFailed",
+   "issuer": "architect",
+   "subject": "worker-3",
+   "responses": 1
+  },
+  {
+   "id": "ed5c9565eb4a9b0a12d085240221c20b",
+   "status": "TestamentAcknowledged",
+   "issuer": "evaluator",
+   "subject": "architect",
+   "responses": 1
+  },
+  {
+   "id": "f3706e69f53fc368605b73af80c855c7",
+   "status": "TestamentAcknowledged",
+   "issuer": "evaluator",
+   "subject": "architect",
+   "responses": 1
+  },
+  {
+   "id": "f4b1ce83b1ebc166345dd065461bd054",
+   "status": "Cancelled",
+   "issuer": "architect",
+   "subject": "architect",
+   "responses": 0
+  }
+ ],
+ "evaluations": [
+  {
+   "claim": "19371bc0552ca4ea908be85843ed8097",
+   "validation": "314e3b2b5350874b4ba7ed180b3e9146",
+   "state": "ValidationFailed",
+   "evaluator": "evaluator",
+   "begun": true,
+   "attempt": 0
+  },
+  {
+   "claim": "19371bc0552ca4ea908be85843ed8097",
+   "validation": "32fbb4a0afe8986d54fae23cb65dec84",
+   "state": "Validated",
+   "evaluator": "architect",
+   "begun": false,
+   "attempt": null
+  },
+  {
+   "claim": "6abb4f54dec49a8316d34ac3d7b36dc9",
+   "validation": "30d17bb0f42ffcd167dd82ba873483e8",
+   "state": "Validated",
+   "evaluator": "evaluator",
+   "begun": true,
+   "attempt": 0
+  },
+  {
+   "claim": "6abb4f54dec49a8316d34ac3d7b36dc9",
+   "validation": "c0dc6d069f99513cd1b45b8b1348af92",
+   "state": "Validated",
+   "evaluator": "architect",
+   "begun": false,
+   "attempt": null
+  },
+  {
+   "claim": "771bd42fd112c2f8d2916be28ab0cdb5",
+   "validation": "64a97df44ba5fe2879c5ca56a27d8707",
+   "state": "Validated",
+   "evaluator": "architect",
+   "begun": false,
+   "attempt": null
+  },
+  {
+   "claim": "771bd42fd112c2f8d2916be28ab0cdb5",
+   "validation": "952818f1f8cbdef5352ff65268a4c6d9",
+   "state": "Validated",
+   "evaluator": "evaluator",
+   "begun": true,
+   "attempt": 0
+  },
+  {
+   "claim": "bd40765beff6281b17dc37b9432e4844",
+   "validation": "00803b59eb83ecb5499fb428fe4fc437",
+   "state": "Validated",
+   "evaluator": "architect",
+   "begun": false,
+   "attempt": null
+  },
+  {
+   "claim": "bd40765beff6281b17dc37b9432e4844",
+   "validation": "fedd4ae4961d4cf6d0cae86d4a76101b",
+   "state": "ValidationFailed",
+   "evaluator": "evaluator",
+   "begun": true,
+   "attempt": 0
+  },
+  {
+   "claim": "bf065c1e419919fdc19d56384d8a5855",
+   "validation": "b0dda24a8f8992f3b98428b60898f653",
+   "state": "Validated",
+   "evaluator": "evaluator",
+   "begun": true,
+   "attempt": 0
+  },
+  {
+   "claim": "bf065c1e419919fdc19d56384d8a5855",
+   "validation": "fb2c2748f626f9e72b2d9cc3fc3c650f",
+   "state": "Validated",
+   "evaluator": "architect",
+   "begun": false,
+   "attempt": null
+  },
+  {
+   "claim": "c9992eaa15aa28006f50259fd2d312bb",
+   "validation": "4949d3cc455189b54bef9f5d543c404e",
+   "state": "Validated",
+   "evaluator": "evaluator",
+   "begun": true,
+   "attempt": 0
+  },
+  {
+   "claim": "c9992eaa15aa28006f50259fd2d312bb",
+   "validation": "90d71cda55000b15f5c82825b264d817",
+   "state": "Validated",
+   "evaluator": "architect",
+   "begun": false,
+   "attempt": null
+  },
+  {
+   "claim": "d0d408abe4f1a763f4a6e98d004577f5",
+   "validation": "73d3e389cfd1a589b67ad5395550f081",
+   "state": "Validated",
+   "evaluator": "architect",
+   "begun": false,
+   "attempt": null
+  },
+  {
+   "claim": "d0d408abe4f1a763f4a6e98d004577f5",
+   "validation": "b678080d5278a285225caeaa407b3ff5",
+   "state": "Validated",
+   "evaluator": "evaluator",
+   "begun": true,
+   "attempt": 0
+  },
+  {
+   "claim": "dbeb29bf807b68d82432b3f362831885",
+   "validation": "713f54326430974fb77967ced8f11e86",
+   "state": "Validated",
+   "evaluator": "architect",
+   "begun": false,
+   "attempt": null
+  },
+  {
+   "claim": "dbeb29bf807b68d82432b3f362831885",
+   "validation": "f97a6b7e18cc27a54f80760b0cc4cb7a",
+   "state": "Validated",
+   "evaluator": "evaluator",
+   "begun": true,
+   "attempt": 0
+  },
+  {
+   "claim": "e3c241609dc185f08867e4e747b047df",
+   "validation": "2423db4aad65cacb251050968c756216",
+   "state": "Validated",
+   "evaluator": "architect",
+   "begun": false,
+   "attempt": null
+  },
+  {
+   "claim": "e3c241609dc185f08867e4e747b047df",
+   "validation": "3964a73f193c216d316d38b6662a0ea7",
+   "state": "ValidationFailed",
+   "evaluator": "evaluator",
+   "begun": true,
+   "attempt": 0
+  },
+  {
+   "claim": "ed5c9565eb4a9b0a12d085240221c20b",
+   "validation": "4f22c713291cd85768130903f15b1d51",
+   "state": "Validated",
+   "evaluator": "evaluator",
+   "begun": false,
+   "attempt": null
+  },
+  {
+   "claim": "f3706e69f53fc368605b73af80c855c7",
+   "validation": "cc7dd65882c841a1ae62338792b5235c",
+   "state": "Validated",
+   "evaluator": "evaluator",
+   "begun": false,
+   "attempt": null
+  }
+ ],
+ "events": [
+  {
+   "sequence": 1,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Created"
+  },
+  {
+   "sequence": 1,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Definition",
+   "kind": null
+  },
+  {
+   "sequence": 2,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Cancelled"
+  },
+  {
+   "sequence": 2,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Registrations",
+   "kind": null
+  },
+  {
+   "sequence": 3,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Created"
+  },
+  {
+   "sequence": 3,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Definition",
+   "kind": null
+  },
+  {
+   "sequence": 3,
+   "ordinal": 2,
+   "by": "architect",
+   "fact": "Definition",
+   "kind": null
+  },
+  {
+   "sequence": 4,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Posted"
+  },
+  {
+   "sequence": 5,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Created"
+  },
+  {
+   "sequence": 5,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Definition",
+   "kind": null
+  },
+  {
+   "sequence": 5,
+   "ordinal": 2,
+   "by": "architect",
+   "fact": "Definition",
+   "kind": null
+  },
+  {
+   "sequence": 6,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Posted"
+  },
+  {
+   "sequence": 7,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Created"
+  },
+  {
+   "sequence": 7,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Definition",
+   "kind": null
+  },
+  {
+   "sequence": 7,
+   "ordinal": 2,
+   "by": "architect",
+   "fact": "Definition",
+   "kind": null
+  },
+  {
+   "sequence": 8,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Posted"
+  },
+  {
+   "sequence": 9,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Created"
+  },
+  {
+   "sequence": 9,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Definition",
+   "kind": null
+  },
+  {
+   "sequence": 9,
+   "ordinal": 2,
+   "by": "architect",
+   "fact": "Definition",
+   "kind": null
+  },
+  {
+   "sequence": 10,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Posted"
+  },
+  {
+   "sequence": 19,
+   "ordinal": 0,
+   "by": "worker-2",
+   "fact": "Claim",
+   "kind": "Received"
+  },
+  {
+   "sequence": 19,
+   "ordinal": 1,
+   "by": "worker-2",
+   "fact": "Receipt",
+   "kind": null
+  },
+  {
+   "sequence": 20,
+   "ordinal": 0,
+   "by": "worker-3",
+   "fact": "Claim",
+   "kind": "Received"
+  },
+  {
+   "sequence": 20,
+   "ordinal": 1,
+   "by": "worker-3",
+   "fact": "Receipt",
+   "kind": null
+  },
+  {
+   "sequence": 21,
+   "ordinal": 0,
+   "by": "worker-1",
+   "fact": "Claim",
+   "kind": "Received"
+  },
+  {
+   "sequence": 21,
+   "ordinal": 1,
+   "by": "worker-1",
+   "fact": "Receipt",
+   "kind": null
+  },
+  {
+   "sequence": 22,
+   "ordinal": 0,
+   "by": "worker-1",
+   "fact": "Artifact",
+   "kind": null
+  },
+  {
+   "sequence": 22,
+   "ordinal": 1,
+   "by": "worker-1",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 23,
+   "ordinal": 0,
+   "by": "worker-1",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 23,
+   "ordinal": 1,
+   "by": "worker-1",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 23,
+   "ordinal": 2,
+   "by": "worker-1",
+   "fact": "Claim",
+   "kind": "TestamentGenerated"
+  },
+  {
+   "sequence": 24,
+   "ordinal": 0,
+   "by": "worker-1",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 24,
+   "ordinal": 1,
+   "by": "worker-1",
+   "fact": "Claim",
+   "kind": "ResponseObserved"
+  },
+  {
+   "sequence": 25,
+   "ordinal": 0,
+   "by": "worker-3",
+   "fact": "Artifact",
+   "kind": null
+  },
+  {
+   "sequence": 25,
+   "ordinal": 1,
+   "by": "worker-3",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 26,
+   "ordinal": 0,
+   "by": "worker-3",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 26,
+   "ordinal": 1,
+   "by": "worker-3",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 26,
+   "ordinal": 2,
+   "by": "worker-3",
+   "fact": "Claim",
+   "kind": "TestamentGenerated"
+  },
+  {
+   "sequence": 27,
+   "ordinal": 0,
+   "by": "worker-3",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 27,
+   "ordinal": 1,
+   "by": "worker-3",
+   "fact": "Claim",
+   "kind": "ResponseObserved"
+  },
+  {
+   "sequence": 28,
+   "ordinal": 0,
+   "by": "worker-2",
+   "fact": "Artifact",
+   "kind": null
+  },
+  {
+   "sequence": 28,
+   "ordinal": 1,
+   "by": "worker-2",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 29,
+   "ordinal": 0,
+   "by": "worker-2",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 29,
+   "ordinal": 1,
+   "by": "worker-2",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 29,
+   "ordinal": 2,
+   "by": "worker-2",
+   "fact": "Claim",
+   "kind": "TestamentGenerated"
+  },
+  {
+   "sequence": 30,
+   "ordinal": 0,
+   "by": "worker-2",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 30,
+   "ordinal": 1,
+   "by": "worker-2",
+   "fact": "Claim",
+   "kind": "ResponseObserved"
+  },
+  {
+   "sequence": 31,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 31,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Evaluation",
+   "kind": "Materialized"
+  },
+  {
+   "sequence": 31,
+   "ordinal": 2,
+   "by": "architect",
+   "fact": "Delivery",
+   "kind": null
+  },
+  {
+   "sequence": 31,
+   "ordinal": 3,
+   "by": "architect",
+   "fact": "Evaluation",
+   "kind": "Materialized"
+  },
+  {
+   "sequence": 31,
+   "ordinal": 4,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "TestamentAcknowledged"
+  },
+  {
+   "sequence": 32,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 32,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Evaluation",
+   "kind": "Materialized"
+  },
+  {
+   "sequence": 32,
+   "ordinal": 2,
+   "by": "architect",
+   "fact": "Delivery",
+   "kind": null
+  },
+  {
+   "sequence": 32,
+   "ordinal": 3,
+   "by": "architect",
+   "fact": "Evaluation",
+   "kind": "Materialized"
+  },
+  {
+   "sequence": 32,
+   "ordinal": 4,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "TestamentAcknowledged"
+  },
+  {
+   "sequence": 33,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 33,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Evaluation",
+   "kind": "Materialized"
+  },
+  {
+   "sequence": 33,
+   "ordinal": 2,
+   "by": "architect",
+   "fact": "Delivery",
+   "kind": null
+  },
+  {
+   "sequence": 33,
+   "ordinal": 3,
+   "by": "architect",
+   "fact": "Evaluation",
+   "kind": "Materialized"
+  },
+  {
+   "sequence": 33,
+   "ordinal": 4,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "TestamentAcknowledged"
+  },
+  {
+   "sequence": 34,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "Created"
+  },
+  {
+   "sequence": 34,
+   "ordinal": 1,
+   "by": "evaluator",
+   "fact": "Definition",
+   "kind": null
+  },
+  {
+   "sequence": 35,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "Posted"
+  },
+  {
+   "sequence": 36,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "Created"
+  },
+  {
+   "sequence": 36,
+   "ordinal": 1,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "ChildRegistered"
+  },
+  {
+   "sequence": 36,
+   "ordinal": 2,
+   "by": "evaluator",
+   "fact": "Definition",
+   "kind": null
+  },
+  {
+   "sequence": 37,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "Cancelled"
+  },
+  {
+   "sequence": 37,
+   "ordinal": 1,
+   "by": "evaluator",
+   "fact": "Registrations",
+   "kind": null
+  },
+  {
+   "sequence": 38,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "OwnerReleased"
+  },
+  {
+   "sequence": 39,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "Created"
+  },
+  {
+   "sequence": 39,
+   "ordinal": 1,
+   "by": "evaluator",
+   "fact": "Definition",
+   "kind": null
+  },
+  {
+   "sequence": 40,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "Posted"
+  },
+  {
+   "sequence": 41,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Cancelled"
+  },
+  {
+   "sequence": 46,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Received"
+  },
+  {
+   "sequence": 46,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Receipt",
+   "kind": null
+  },
+  {
+   "sequence": 47,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 47,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "TestamentGenerated"
+  },
+  {
+   "sequence": 48,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 48,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "ResponseObserved"
+  },
+  {
+   "sequence": 49,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Received"
+  },
+  {
+   "sequence": 49,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Receipt",
+   "kind": null
+  },
+  {
+   "sequence": 50,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 50,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "TestamentGenerated"
+  },
+  {
+   "sequence": 51,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 51,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "ResponseObserved"
+  },
+  {
+   "sequence": 52,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "OwnerReleased"
+  },
+  {
+   "sequence": 57,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 57,
+   "ordinal": 1,
+   "by": "evaluator",
+   "fact": "Evaluation",
+   "kind": "Materialized"
+  },
+  {
+   "sequence": 57,
+   "ordinal": 2,
+   "by": "evaluator",
+   "fact": "Delivery",
+   "kind": null
+  },
+  {
+   "sequence": 57,
+   "ordinal": 3,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "TestamentAcknowledged"
+  },
+  {
+   "sequence": 58,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 58,
+   "ordinal": 1,
+   "by": "evaluator",
+   "fact": "Evaluation",
+   "kind": "Materialized"
+  },
+  {
+   "sequence": 58,
+   "ordinal": 2,
+   "by": "evaluator",
+   "fact": "Delivery",
+   "kind": null
+  },
+  {
+   "sequence": 58,
+   "ordinal": 3,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "TestamentAcknowledged"
+  },
+  {
+   "sequence": 59,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Evaluation",
+   "kind": "Begun"
+  },
+  {
+   "sequence": 59,
+   "ordinal": 1,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "Validating"
+  },
+  {
+   "sequence": 59,
+   "ordinal": 2,
+   "by": "evaluator",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 59,
+   "ordinal": 3,
+   "by": "evaluator",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 60,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Artifact",
+   "kind": null
+  },
+  {
+   "sequence": 60,
+   "ordinal": 1,
+   "by": "evaluator",
+   "fact": "Evaluation",
+   "kind": "Reported"
+  },
+  {
+   "sequence": 60,
+   "ordinal": 2,
+   "by": "evaluator",
+   "fact": "Accepted",
+   "kind": null
+  },
+  {
+   "sequence": 60,
+   "ordinal": 3,
+   "by": "evaluator",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 60,
+   "ordinal": 4,
+   "by": "evaluator",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 60,
+   "ordinal": 5,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "LocallyComplete"
+  },
+  {
+   "sequence": 60,
+   "ordinal": 6,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "Satisfied"
+  },
+  {
+   "sequence": 60,
+   "ordinal": 7,
+   "by": "evaluator",
+   "fact": "Registrations",
+   "kind": null
+  },
+  {
+   "sequence": 61,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Evaluation",
+   "kind": "Begun"
+  },
+  {
+   "sequence": 61,
+   "ordinal": 1,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "Validating"
+  },
+  {
+   "sequence": 61,
+   "ordinal": 2,
+   "by": "evaluator",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 61,
+   "ordinal": 3,
+   "by": "evaluator",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 62,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Artifact",
+   "kind": null
+  },
+  {
+   "sequence": 62,
+   "ordinal": 1,
+   "by": "evaluator",
+   "fact": "Evaluation",
+   "kind": "Reported"
+  },
+  {
+   "sequence": 62,
+   "ordinal": 2,
+   "by": "evaluator",
+   "fact": "Accepted",
+   "kind": null
+  },
+  {
+   "sequence": 62,
+   "ordinal": 3,
+   "by": "evaluator",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 62,
+   "ordinal": 4,
+   "by": "evaluator",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 62,
+   "ordinal": 5,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "LocallyComplete"
+  },
+  {
+   "sequence": 62,
+   "ordinal": 6,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "Satisfied"
+  },
+  {
+   "sequence": 62,
+   "ordinal": 7,
+   "by": "evaluator",
+   "fact": "Registrations",
+   "kind": null
+  },
+  {
+   "sequence": 63,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Evaluation",
+   "kind": "Begun"
+  },
+  {
+   "sequence": 63,
+   "ordinal": 1,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "Validating"
+  },
+  {
+   "sequence": 63,
+   "ordinal": 2,
+   "by": "evaluator",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 63,
+   "ordinal": 3,
+   "by": "evaluator",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 64,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Artifact",
+   "kind": null
+  },
+  {
+   "sequence": 64,
+   "ordinal": 1,
+   "by": "evaluator",
+   "fact": "Evaluation",
+   "kind": "Reported"
+  },
+  {
+   "sequence": 64,
+   "ordinal": 2,
+   "by": "evaluator",
+   "fact": "Accepted",
+   "kind": null
+  },
+  {
+   "sequence": 64,
+   "ordinal": 3,
+   "by": "evaluator",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 64,
+   "ordinal": 4,
+   "by": "evaluator",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 64,
+   "ordinal": 5,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "LocallyComplete"
+  },
+  {
+   "sequence": 64,
+   "ordinal": 6,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "Satisfied"
+  },
+  {
+   "sequence": 64,
+   "ordinal": 7,
+   "by": "evaluator",
+   "fact": "Registrations",
+   "kind": null
+  },
+  {
+   "sequence": 65,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "ResultTestament",
+   "kind": null
+  },
+  {
+   "sequence": 66,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "ResultTestament",
+   "kind": null
+  },
+  {
+   "sequence": 67,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "ResultTestament",
+   "kind": null
+  },
+  {
+   "sequence": 68,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "ResultTestament",
+   "kind": null
+  },
+  {
+   "sequence": 69,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "ResultTestament",
+   "kind": null
+  },
+  {
+   "sequence": 70,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "ResultTestament",
+   "kind": null
+  },
+  {
+   "sequence": 95,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Created"
+  },
+  {
+   "sequence": 95,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Definition",
+   "kind": null
+  },
+  {
+   "sequence": 95,
+   "ordinal": 2,
+   "by": "architect",
+   "fact": "Definition",
+   "kind": null
+  },
+  {
+   "sequence": 98,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Posted"
+  },
+  {
+   "sequence": 123,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Created"
+  },
+  {
+   "sequence": 123,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Definition",
+   "kind": null
+  },
+  {
+   "sequence": 123,
+   "ordinal": 2,
+   "by": "architect",
+   "fact": "Definition",
+   "kind": null
+  },
+  {
+   "sequence": 124,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Posted"
+  },
+  {
+   "sequence": 125,
+   "ordinal": 0,
+   "by": "worker-2",
+   "fact": "Claim",
+   "kind": "Received"
+  },
+  {
+   "sequence": 125,
+   "ordinal": 1,
+   "by": "worker-2",
+   "fact": "Receipt",
+   "kind": null
+  },
+  {
+   "sequence": 126,
+   "ordinal": 0,
+   "by": "worker-1",
+   "fact": "Claim",
+   "kind": "Received"
+  },
+  {
+   "sequence": 126,
+   "ordinal": 1,
+   "by": "worker-1",
+   "fact": "Receipt",
+   "kind": null
+  },
+  {
+   "sequence": 127,
+   "ordinal": 0,
+   "by": "worker-1",
+   "fact": "Artifact",
+   "kind": null
+  },
+  {
+   "sequence": 127,
+   "ordinal": 1,
+   "by": "worker-1",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 128,
+   "ordinal": 0,
+   "by": "worker-1",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 128,
+   "ordinal": 1,
+   "by": "worker-1",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 128,
+   "ordinal": 2,
+   "by": "worker-1",
+   "fact": "Claim",
+   "kind": "TestamentGenerated"
+  },
+  {
+   "sequence": 129,
+   "ordinal": 0,
+   "by": "worker-1",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 129,
+   "ordinal": 1,
+   "by": "worker-1",
+   "fact": "Claim",
+   "kind": "ResponseObserved"
+  },
+  {
+   "sequence": 130,
+   "ordinal": 0,
+   "by": "worker-2",
+   "fact": "Artifact",
+   "kind": null
+  },
+  {
+   "sequence": 130,
+   "ordinal": 1,
+   "by": "worker-2",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 131,
+   "ordinal": 0,
+   "by": "worker-2",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 131,
+   "ordinal": 1,
+   "by": "worker-2",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 131,
+   "ordinal": 2,
+   "by": "worker-2",
+   "fact": "Claim",
+   "kind": "TestamentGenerated"
+  },
+  {
+   "sequence": 132,
+   "ordinal": 0,
+   "by": "worker-2",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 132,
+   "ordinal": 1,
+   "by": "worker-2",
+   "fact": "Claim",
+   "kind": "ResponseObserved"
+  },
+  {
+   "sequence": 133,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 133,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Evaluation",
+   "kind": "Materialized"
+  },
+  {
+   "sequence": 133,
+   "ordinal": 2,
+   "by": "architect",
+   "fact": "Delivery",
+   "kind": null
+  },
+  {
+   "sequence": 133,
+   "ordinal": 3,
+   "by": "architect",
+   "fact": "Evaluation",
+   "kind": "Materialized"
+  },
+  {
+   "sequence": 133,
+   "ordinal": 4,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "TestamentAcknowledged"
+  },
+  {
+   "sequence": 134,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 134,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Evaluation",
+   "kind": "Materialized"
+  },
+  {
+   "sequence": 134,
+   "ordinal": 2,
+   "by": "architect",
+   "fact": "Delivery",
+   "kind": null
+  },
+  {
+   "sequence": 134,
+   "ordinal": 3,
+   "by": "architect",
+   "fact": "Evaluation",
+   "kind": "Materialized"
+  },
+  {
+   "sequence": 134,
+   "ordinal": 4,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "TestamentAcknowledged"
+  },
+  {
+   "sequence": 135,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Evaluation",
+   "kind": "Begun"
+  },
+  {
+   "sequence": 135,
+   "ordinal": 1,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "Validating"
+  },
+  {
+   "sequence": 135,
+   "ordinal": 2,
+   "by": "evaluator",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 135,
+   "ordinal": 3,
+   "by": "evaluator",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 136,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Artifact",
+   "kind": null
+  },
+  {
+   "sequence": 136,
+   "ordinal": 1,
+   "by": "evaluator",
+   "fact": "Evaluation",
+   "kind": "Reported"
+  },
+  {
+   "sequence": 136,
+   "ordinal": 2,
+   "by": "evaluator",
+   "fact": "Accepted",
+   "kind": null
+  },
+  {
+   "sequence": 136,
+   "ordinal": 3,
+   "by": "evaluator",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 136,
+   "ordinal": 4,
+   "by": "evaluator",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 136,
+   "ordinal": 5,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "ValidationFailed"
+  },
+  {
+   "sequence": 136,
+   "ordinal": 6,
+   "by": "evaluator",
+   "fact": "Registrations",
+   "kind": null
+  },
+  {
+   "sequence": 137,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Evaluation",
+   "kind": "Begun"
+  },
+  {
+   "sequence": 137,
+   "ordinal": 1,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "Validating"
+  },
+  {
+   "sequence": 137,
+   "ordinal": 2,
+   "by": "evaluator",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 137,
+   "ordinal": 3,
+   "by": "evaluator",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 138,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Artifact",
+   "kind": null
+  },
+  {
+   "sequence": 138,
+   "ordinal": 1,
+   "by": "evaluator",
+   "fact": "Evaluation",
+   "kind": "Reported"
+  },
+  {
+   "sequence": 138,
+   "ordinal": 2,
+   "by": "evaluator",
+   "fact": "Accepted",
+   "kind": null
+  },
+  {
+   "sequence": 138,
+   "ordinal": 3,
+   "by": "evaluator",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 138,
+   "ordinal": 4,
+   "by": "evaluator",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 138,
+   "ordinal": 5,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "LocallyComplete"
+  },
+  {
+   "sequence": 138,
+   "ordinal": 6,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "Satisfied"
+  },
+  {
+   "sequence": 138,
+   "ordinal": 7,
+   "by": "evaluator",
+   "fact": "Registrations",
+   "kind": null
+  },
+  {
+   "sequence": 142,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "ResultTestament",
+   "kind": null
+  },
+  {
+   "sequence": 143,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "ResultTestament",
+   "kind": null
+  },
+  {
+   "sequence": 144,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "ResultTestament",
+   "kind": null
+  },
+  {
+   "sequence": 145,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "ResultTestament",
+   "kind": null
+  },
+  {
+   "sequence": 146,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Created"
+  },
+  {
+   "sequence": 146,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Definition",
+   "kind": null
+  },
+  {
+   "sequence": 146,
+   "ordinal": 2,
+   "by": "architect",
+   "fact": "Definition",
+   "kind": null
+  },
+  {
+   "sequence": 147,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Posted"
+  },
+  {
+   "sequence": 148,
+   "ordinal": 0,
+   "by": "worker-2",
+   "fact": "Claim",
+   "kind": "Received"
+  },
+  {
+   "sequence": 148,
+   "ordinal": 1,
+   "by": "worker-2",
+   "fact": "Receipt",
+   "kind": null
+  },
+  {
+   "sequence": 149,
+   "ordinal": 0,
+   "by": "worker-2",
+   "fact": "Artifact",
+   "kind": null
+  },
+  {
+   "sequence": 149,
+   "ordinal": 1,
+   "by": "worker-2",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 150,
+   "ordinal": 0,
+   "by": "worker-2",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 150,
+   "ordinal": 1,
+   "by": "worker-2",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 150,
+   "ordinal": 2,
+   "by": "worker-2",
+   "fact": "Claim",
+   "kind": "TestamentGenerated"
+  },
+  {
+   "sequence": 151,
+   "ordinal": 0,
+   "by": "worker-2",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 151,
+   "ordinal": 1,
+   "by": "worker-2",
+   "fact": "Claim",
+   "kind": "ResponseObserved"
+  },
+  {
+   "sequence": 152,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 152,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Evaluation",
+   "kind": "Materialized"
+  },
+  {
+   "sequence": 152,
+   "ordinal": 2,
+   "by": "architect",
+   "fact": "Delivery",
+   "kind": null
+  },
+  {
+   "sequence": 152,
+   "ordinal": 3,
+   "by": "architect",
+   "fact": "Evaluation",
+   "kind": "Materialized"
+  },
+  {
+   "sequence": 152,
+   "ordinal": 4,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "TestamentAcknowledged"
+  },
+  {
+   "sequence": 153,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Evaluation",
+   "kind": "Begun"
+  },
+  {
+   "sequence": 153,
+   "ordinal": 1,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "Validating"
+  },
+  {
+   "sequence": 153,
+   "ordinal": 2,
+   "by": "evaluator",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 153,
+   "ordinal": 3,
+   "by": "evaluator",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 154,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Artifact",
+   "kind": null
+  },
+  {
+   "sequence": 154,
+   "ordinal": 1,
+   "by": "evaluator",
+   "fact": "Evaluation",
+   "kind": "Reported"
+  },
+  {
+   "sequence": 154,
+   "ordinal": 2,
+   "by": "evaluator",
+   "fact": "Accepted",
+   "kind": null
+  },
+  {
+   "sequence": 154,
+   "ordinal": 3,
+   "by": "evaluator",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 154,
+   "ordinal": 4,
+   "by": "evaluator",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 154,
+   "ordinal": 5,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "LocallyComplete"
+  },
+  {
+   "sequence": 154,
+   "ordinal": 6,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "Satisfied"
+  },
+  {
+   "sequence": 154,
+   "ordinal": 7,
+   "by": "evaluator",
+   "fact": "Registrations",
+   "kind": null
+  },
+  {
+   "sequence": 155,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "ResultTestament",
+   "kind": null
+  },
+  {
+   "sequence": 156,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "ResultTestament",
+   "kind": null
+  },
+  {
+   "sequence": 157,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Created"
+  },
+  {
+   "sequence": 157,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Definition",
+   "kind": null
+  },
+  {
+   "sequence": 157,
+   "ordinal": 2,
+   "by": "architect",
+   "fact": "Definition",
+   "kind": null
+  },
+  {
+   "sequence": 158,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Posted"
+  },
+  {
+   "sequence": 159,
+   "ordinal": 0,
+   "by": "worker-3",
+   "fact": "Claim",
+   "kind": "Received"
+  },
+  {
+   "sequence": 159,
+   "ordinal": 1,
+   "by": "worker-3",
+   "fact": "Receipt",
+   "kind": null
+  },
+  {
+   "sequence": 160,
+   "ordinal": 0,
+   "by": "worker-3",
+   "fact": "Artifact",
+   "kind": null
+  },
+  {
+   "sequence": 160,
+   "ordinal": 1,
+   "by": "worker-3",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 161,
+   "ordinal": 0,
+   "by": "worker-3",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 161,
+   "ordinal": 1,
+   "by": "worker-3",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 161,
+   "ordinal": 2,
+   "by": "worker-3",
+   "fact": "Claim",
+   "kind": "TestamentGenerated"
+  },
+  {
+   "sequence": 162,
+   "ordinal": 0,
+   "by": "worker-3",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 162,
+   "ordinal": 1,
+   "by": "worker-3",
+   "fact": "Claim",
+   "kind": "ResponseObserved"
+  },
+  {
+   "sequence": 163,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 163,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Evaluation",
+   "kind": "Materialized"
+  },
+  {
+   "sequence": 163,
+   "ordinal": 2,
+   "by": "architect",
+   "fact": "Delivery",
+   "kind": null
+  },
+  {
+   "sequence": 163,
+   "ordinal": 3,
+   "by": "architect",
+   "fact": "Evaluation",
+   "kind": "Materialized"
+  },
+  {
+   "sequence": 163,
+   "ordinal": 4,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "TestamentAcknowledged"
+  },
+  {
+   "sequence": 164,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Validating"
+  },
+  {
+   "sequence": 164,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 164,
+   "ordinal": 2,
+   "by": "architect",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 165,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Evaluation",
+   "kind": "Begun"
+  },
+  {
+   "sequence": 166,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Artifact",
+   "kind": null
+  },
+  {
+   "sequence": 166,
+   "ordinal": 1,
+   "by": "evaluator",
+   "fact": "Evaluation",
+   "kind": "Reported"
+  },
+  {
+   "sequence": 166,
+   "ordinal": 2,
+   "by": "evaluator",
+   "fact": "Accepted",
+   "kind": null
+  },
+  {
+   "sequence": 166,
+   "ordinal": 3,
+   "by": "evaluator",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 166,
+   "ordinal": 4,
+   "by": "evaluator",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 166,
+   "ordinal": 5,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "ValidationFailed"
+  },
+  {
+   "sequence": 166,
+   "ordinal": 6,
+   "by": "evaluator",
+   "fact": "Registrations",
+   "kind": null
+  },
+  {
+   "sequence": 167,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "ResultTestament",
+   "kind": null
+  },
+  {
+   "sequence": 168,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "ResultTestament",
+   "kind": null
+  },
+  {
+   "sequence": 169,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Created"
+  },
+  {
+   "sequence": 169,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Definition",
+   "kind": null
+  },
+  {
+   "sequence": 169,
+   "ordinal": 2,
+   "by": "architect",
+   "fact": "Definition",
+   "kind": null
+  },
+  {
+   "sequence": 170,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Posted"
+  },
+  {
+   "sequence": 171,
+   "ordinal": 0,
+   "by": "worker-3",
+   "fact": "Claim",
+   "kind": "Received"
+  },
+  {
+   "sequence": 171,
+   "ordinal": 1,
+   "by": "worker-3",
+   "fact": "Receipt",
+   "kind": null
+  },
+  {
+   "sequence": 172,
+   "ordinal": 0,
+   "by": "worker-3",
+   "fact": "Claim",
+   "kind": "Created"
+  },
+  {
+   "sequence": 172,
+   "ordinal": 1,
+   "by": "worker-3",
+   "fact": "Definition",
+   "kind": null
+  },
+  {
+   "sequence": 173,
+   "ordinal": 0,
+   "by": "worker-3",
+   "fact": "Claim",
+   "kind": "Posted"
+  },
+  {
+   "sequence": 174,
+   "ordinal": 0,
+   "by": "worker-3",
+   "fact": "Artifact",
+   "kind": null
+  },
+  {
+   "sequence": 174,
+   "ordinal": 1,
+   "by": "worker-3",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 175,
+   "ordinal": 0,
+   "by": "worker-3",
+   "fact": "Artifact",
+   "kind": null
+  },
+  {
+   "sequence": 175,
+   "ordinal": 1,
+   "by": "worker-3",
+   "fact": "Diagnostic",
+   "kind": null
+  },
+  {
+   "sequence": 176,
+   "ordinal": 0,
+   "by": "worker-3",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 176,
+   "ordinal": 1,
+   "by": "worker-3",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 176,
+   "ordinal": 2,
+   "by": "worker-3",
+   "fact": "Claim",
+   "kind": "TestamentGenerated"
+  },
+  {
+   "sequence": 177,
+   "ordinal": 0,
+   "by": "worker-3",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 177,
+   "ordinal": 1,
+   "by": "worker-3",
+   "fact": "Claim",
+   "kind": "ResponseObserved"
+  },
+  {
+   "sequence": 178,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 178,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Evaluation",
+   "kind": "Materialized"
+  },
+  {
+   "sequence": 178,
+   "ordinal": 2,
+   "by": "architect",
+   "fact": "Delivery",
+   "kind": null
+  },
+  {
+   "sequence": 178,
+   "ordinal": 3,
+   "by": "architect",
+   "fact": "Evaluation",
+   "kind": "Materialized"
+  },
+  {
+   "sequence": 178,
+   "ordinal": 4,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "TestamentAcknowledged"
+  },
+  {
+   "sequence": 179,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "Received"
+  },
+  {
+   "sequence": 179,
+   "ordinal": 1,
+   "by": "evaluator",
+   "fact": "Receipt",
+   "kind": null
+  },
+  {
+   "sequence": 180,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Artifact",
+   "kind": null
+  },
+  {
+   "sequence": 180,
+   "ordinal": 1,
+   "by": "evaluator",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 181,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 181,
+   "ordinal": 1,
+   "by": "evaluator",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 181,
+   "ordinal": 2,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "TestamentGenerated"
+  },
+  {
+   "sequence": 182,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 182,
+   "ordinal": 1,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "ResponseObserved"
+  },
+  {
+   "sequence": 183,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Evaluation",
+   "kind": "Begun"
+  },
+  {
+   "sequence": 183,
+   "ordinal": 1,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "Validating"
+  },
+  {
+   "sequence": 183,
+   "ordinal": 2,
+   "by": "evaluator",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 183,
+   "ordinal": 3,
+   "by": "evaluator",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 184,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Artifact",
+   "kind": null
+  },
+  {
+   "sequence": 184,
+   "ordinal": 1,
+   "by": "evaluator",
+   "fact": "Evaluation",
+   "kind": "Reported"
+  },
+  {
+   "sequence": 184,
+   "ordinal": 2,
+   "by": "evaluator",
+   "fact": "Accepted",
+   "kind": null
+  },
+  {
+   "sequence": 184,
+   "ordinal": 3,
+   "by": "evaluator",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 184,
+   "ordinal": 4,
+   "by": "evaluator",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 184,
+   "ordinal": 5,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "ValidationFailed"
+  },
+  {
+   "sequence": 184,
+   "ordinal": 6,
+   "by": "evaluator",
+   "fact": "Registrations",
+   "kind": null
+  },
+  {
+   "sequence": 185,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Created"
+  },
+  {
+   "sequence": 185,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Definition",
+   "kind": null
+  },
+  {
+   "sequence": 185,
+   "ordinal": 2,
+   "by": "architect",
+   "fact": "Definition",
+   "kind": null
+  },
+  {
+   "sequence": 186,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Posted"
+  },
+  {
+   "sequence": 187,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "ResultTestament",
+   "kind": null
+  },
+  {
+   "sequence": 188,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "ResultTestament",
+   "kind": null
+  },
+  {
+   "sequence": 189,
+   "ordinal": 0,
+   "by": "worker-3",
+   "fact": "Claim",
+   "kind": "Received"
+  },
+  {
+   "sequence": 189,
+   "ordinal": 1,
+   "by": "worker-3",
+   "fact": "Receipt",
+   "kind": null
+  },
+  {
+   "sequence": 190,
+   "ordinal": 0,
+   "by": "worker-3",
+   "fact": "Artifact",
+   "kind": null
+  },
+  {
+   "sequence": 190,
+   "ordinal": 1,
+   "by": "worker-3",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 191,
+   "ordinal": 0,
+   "by": "worker-3",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 191,
+   "ordinal": 1,
+   "by": "worker-3",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 191,
+   "ordinal": 2,
+   "by": "worker-3",
+   "fact": "Claim",
+   "kind": "TestamentGenerated"
+  },
+  {
+   "sequence": 192,
+   "ordinal": 0,
+   "by": "worker-3",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 192,
+   "ordinal": 1,
+   "by": "worker-3",
+   "fact": "Claim",
+   "kind": "ResponseObserved"
+  },
+  {
+   "sequence": 193,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 193,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Evaluation",
+   "kind": "Materialized"
+  },
+  {
+   "sequence": 193,
+   "ordinal": 2,
+   "by": "architect",
+   "fact": "Delivery",
+   "kind": null
+  },
+  {
+   "sequence": 193,
+   "ordinal": 3,
+   "by": "architect",
+   "fact": "Evaluation",
+   "kind": "Materialized"
+  },
+  {
+   "sequence": 193,
+   "ordinal": 4,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "TestamentAcknowledged"
+  },
+  {
+   "sequence": 194,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Evaluation",
+   "kind": "Begun"
+  },
+  {
+   "sequence": 194,
+   "ordinal": 1,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "Validating"
+  },
+  {
+   "sequence": 194,
+   "ordinal": 2,
+   "by": "evaluator",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 194,
+   "ordinal": 3,
+   "by": "evaluator",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 195,
+   "ordinal": 0,
+   "by": "evaluator",
+   "fact": "Artifact",
+   "kind": null
+  },
+  {
+   "sequence": 195,
+   "ordinal": 1,
+   "by": "evaluator",
+   "fact": "Evaluation",
+   "kind": "Reported"
+  },
+  {
+   "sequence": 195,
+   "ordinal": 2,
+   "by": "evaluator",
+   "fact": "Accepted",
+   "kind": null
+  },
+  {
+   "sequence": 195,
+   "ordinal": 3,
+   "by": "evaluator",
+   "fact": "Work",
+   "kind": null
+  },
+  {
+   "sequence": 195,
+   "ordinal": 4,
+   "by": "evaluator",
+   "fact": "Response",
+   "kind": null
+  },
+  {
+   "sequence": 195,
+   "ordinal": 5,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "LocallyComplete"
+  },
+  {
+   "sequence": 195,
+   "ordinal": 6,
+   "by": "evaluator",
+   "fact": "Claim",
+   "kind": "Satisfied"
+  },
+  {
+   "sequence": 195,
+   "ordinal": 7,
+   "by": "evaluator",
+   "fact": "Registrations",
+   "kind": null
+  },
+  {
+   "sequence": 196,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "ResultTestament",
+   "kind": null
+  },
+  {
+   "sequence": 197,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "ResultTestament",
+   "kind": null
+  },
+  {
+   "sequence": 198,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Created"
+  },
+  {
+   "sequence": 198,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Definition",
+   "kind": null
+  },
+  {
+   "sequence": 199,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "Cancelled"
+  },
+  {
+   "sequence": 199,
+   "ordinal": 1,
+   "by": "architect",
+   "fact": "Registrations",
+   "kind": null
+  },
+  {
+   "sequence": 200,
+   "ordinal": 0,
+   "by": "architect",
+   "fact": "Claim",
+   "kind": "OwnerReleased"
+  }
+ ],
+ "turns": {
+  "architect-1": {
+   "mcp_calls": 26,
+   "mcp_failed": 3,
+   "usage": {
+    "input_tokens": 2192495,
+    "cached_input_tokens": 2110720,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 20433,
+    "reasoning_output_tokens": 8302
+   }
+  },
+  "architect-10": {
+   "mcp_calls": 40,
+   "mcp_failed": 0,
+   "usage": {
+    "input_tokens": 1234158,
+    "cached_input_tokens": 1090944,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 4648,
+    "reasoning_output_tokens": 1476
+   }
+  },
+  "architect-11": {
+   "mcp_calls": 47,
+   "mcp_failed": 0,
+   "usage": {
+    "input_tokens": 2590600,
+    "cached_input_tokens": 2453760,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 9139,
+    "reasoning_output_tokens": 2934
+   }
+  },
+  "architect-12": {
+   "mcp_calls": 28,
+   "mcp_failed": 1,
+   "usage": {
+    "input_tokens": 704107,
+    "cached_input_tokens": 618240,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 4009,
+    "reasoning_output_tokens": 1338
+   }
+  },
+  "architect-13": {
+   "mcp_calls": 44,
+   "mcp_failed": 0,
+   "usage": {
+    "input_tokens": 2250281,
+    "cached_input_tokens": 2109568,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 11698,
+    "reasoning_output_tokens": 5601
+   }
+  },
+  "architect-14": {
+   "mcp_calls": 23,
+   "mcp_failed": 0,
+   "usage": {
+    "input_tokens": 493448,
+    "cached_input_tokens": 417280,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 2770,
+    "reasoning_output_tokens": 979
+   }
+  },
+  "architect-15": {
+   "mcp_calls": 33,
+   "mcp_failed": 0,
+   "usage": {
+    "input_tokens": 1220681,
+    "cached_input_tokens": 1109376,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 4776,
+    "reasoning_output_tokens": 1755
+   }
+  },
+  "architect-16": {
+   "mcp_calls": 5,
+   "mcp_failed": 3,
+   "usage": {
+    "input_tokens": 870468,
+    "cached_input_tokens": 810496,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 3697,
+    "reasoning_output_tokens": 1597
+   }
+  },
+  "architect-17": {
+   "mcp_calls": 38,
+   "mcp_failed": 0,
+   "usage": {
+    "input_tokens": 1122494,
+    "cached_input_tokens": 1016704,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 7967,
+    "reasoning_output_tokens": 2653
+   }
+  },
+  "architect-18": {
+   "mcp_calls": 25,
+   "mcp_failed": 0,
+   "usage": {
+    "input_tokens": 503502,
+    "cached_input_tokens": 421376,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 2898,
+    "reasoning_output_tokens": 1026
+   }
+  },
+  "architect-19": {
+   "mcp_calls": 30,
+   "mcp_failed": 0,
+   "usage": {
+    "input_tokens": 695692,
+    "cached_input_tokens": 614400,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 4868,
+    "reasoning_output_tokens": 2134
+   }
+  },
+  "architect-2": {
+   "mcp_calls": 39,
+   "mcp_failed": 1,
+   "usage": {
+    "input_tokens": 906456,
+    "cached_input_tokens": 845184,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 5734,
+    "reasoning_output_tokens": 1985
+   }
+  },
+  "architect-20": {
+   "mcp_calls": 50,
+   "mcp_failed": 0,
+   "usage": {
+    "input_tokens": 1714930,
+    "cached_input_tokens": 1590912,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 10247,
+    "reasoning_output_tokens": 3617
+   }
+  },
+  "architect-21": {
+   "mcp_calls": 26,
+   "mcp_failed": 1,
+   "usage": {
+    "input_tokens": 1201779,
+    "cached_input_tokens": 1086720,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 6548,
+    "reasoning_output_tokens": 2830
+   }
+  },
+  "architect-22": {
+   "mcp_calls": 56,
+   "mcp_failed": 2,
+   "usage": {
+    "input_tokens": 4349448,
+    "cached_input_tokens": 4195072,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 13704,
+    "reasoning_output_tokens": 6035
+   }
+  },
+  "architect-3": {
+   "mcp_calls": 42,
+   "mcp_failed": 12,
+   "usage": {
+    "input_tokens": 1394088,
+    "cached_input_tokens": 1294976,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 5539,
+    "reasoning_output_tokens": 1562
+   }
+  },
+  "architect-4": {
+   "mcp_calls": 81,
+   "mcp_failed": 3,
+   "usage": {
+    "input_tokens": 962743,
+    "cached_input_tokens": 851712,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 7191,
+    "reasoning_output_tokens": 2919
+   }
+  },
+  "architect-5": {
+   "mcp_calls": 67,
+   "mcp_failed": 1,
+   "usage": {
+    "input_tokens": 2699440,
+    "cached_input_tokens": 2567936,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 11362,
+    "reasoning_output_tokens": 4885
+   }
+  },
+  "architect-6": {
+   "mcp_calls": 33,
+   "mcp_failed": 0,
+   "usage": {
+    "input_tokens": 963219,
+    "cached_input_tokens": 860416,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 4363,
+    "reasoning_output_tokens": 1194
+   }
+  },
+  "architect-7": {
+   "mcp_calls": 47,
+   "mcp_failed": 1,
+   "usage": {
+    "input_tokens": 2172938,
+    "cached_input_tokens": 2049920,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 8990,
+    "reasoning_output_tokens": 3247
+   }
+  },
+  "architect-8": {
+   "mcp_calls": 41,
+   "mcp_failed": 0,
+   "usage": {
+    "input_tokens": 1644703,
+    "cached_input_tokens": 1517440,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 10016,
+    "reasoning_output_tokens": 4024
+   }
+  },
+  "architect-9": {
+   "mcp_calls": 49,
+   "mcp_failed": 0,
+   "usage": {
+    "input_tokens": 1871542,
+    "cached_input_tokens": 1740800,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 8502,
+    "reasoning_output_tokens": 2277
+   }
+  },
+  "evaluator-1": {
+   "mcp_calls": 22,
+   "mcp_failed": 2,
+   "usage": {
+    "input_tokens": 654710,
+    "cached_input_tokens": 571648,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 5273,
+    "reasoning_output_tokens": 2511
+   }
+  },
+  "evaluator-10": {
+   "mcp_calls": 54,
+   "mcp_failed": 2,
+   "usage": {
+    "input_tokens": 3646522,
+    "cached_input_tokens": 3491328,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 21701,
+    "reasoning_output_tokens": 8949
+   }
+  },
+  "evaluator-11": {
+   "mcp_calls": 39,
+   "mcp_failed": 1,
+   "usage": {
+    "input_tokens": 5930235,
+    "cached_input_tokens": 5779200,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 25447,
+    "reasoning_output_tokens": 10273
+   }
+  },
+  "evaluator-2": {
+   "mcp_calls": 75,
+   "mcp_failed": 13,
+   "usage": {
+    "input_tokens": 9161783,
+    "cached_input_tokens": 8978688,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 36445,
+    "reasoning_output_tokens": 21046
+   }
+  },
+  "evaluator-3": {
+   "mcp_calls": 59,
+   "mcp_failed": 0,
+   "usage": {
+    "input_tokens": 4005069,
+    "cached_input_tokens": 3854464,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 15578,
+    "reasoning_output_tokens": 5651
+   }
+  },
+  "evaluator-4": {
+   "mcp_calls": 44,
+   "mcp_failed": 1,
+   "usage": {
+    "input_tokens": 4190293,
+    "cached_input_tokens": 4036992,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 20824,
+    "reasoning_output_tokens": 10627
+   }
+  },
+  "evaluator-5": {
+   "mcp_calls": 47,
+   "mcp_failed": 0,
+   "usage": {
+    "input_tokens": 3723450,
+    "cached_input_tokens": 3568000,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 15272,
+    "reasoning_output_tokens": 4616
+   }
+  },
+  "evaluator-6": {
+   "mcp_calls": 45,
+   "mcp_failed": 1,
+   "usage": {
+    "input_tokens": 7182953,
+    "cached_input_tokens": 7008896,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 26558,
+    "reasoning_output_tokens": 13149
+   }
+  },
+  "evaluator-7": {
+   "mcp_calls": 34,
+   "mcp_failed": 1,
+   "usage": {
+    "input_tokens": 4835719,
+    "cached_input_tokens": 4675840,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 17767,
+    "reasoning_output_tokens": 8574
+   }
+  },
+  "evaluator-8": {
+   "mcp_calls": 33,
+   "mcp_failed": 2,
+   "usage": {
+    "input_tokens": 4398316,
+    "cached_input_tokens": 4248832,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 23470,
+    "reasoning_output_tokens": 12980
+   }
+  },
+  "evaluator-9": {
+   "mcp_calls": 22,
+   "mcp_failed": 0,
+   "usage": {
+    "input_tokens": 384879,
+    "cached_input_tokens": 318208,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 2530,
+    "reasoning_output_tokens": 792
+   }
+  },
+  "worker-1-1": {
+   "mcp_calls": 43,
+   "mcp_failed": 8,
+   "usage": {
+    "input_tokens": 3954565,
+    "cached_input_tokens": 3847424,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 23867,
+    "reasoning_output_tokens": 11364
+   }
+  },
+  "worker-1-10": {
+   "mcp_calls": 25,
+   "mcp_failed": 1,
+   "usage": {
+    "input_tokens": 546407,
+    "cached_input_tokens": 481664,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 2731,
+    "reasoning_output_tokens": 1129
+   }
+  },
+  "worker-1-2": {
+   "mcp_calls": 9,
+   "mcp_failed": 4,
+   "usage": {
+    "input_tokens": 684659,
+    "cached_input_tokens": 623232,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 3830,
+    "reasoning_output_tokens": 1555
+   }
+  },
+  "worker-1-3": {
+   "mcp_calls": 37,
+   "mcp_failed": 1,
+   "usage": {
+    "input_tokens": 3006691,
+    "cached_input_tokens": 2903168,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 22668,
+    "reasoning_output_tokens": 8570
+   }
+  },
+  "worker-1-4": {
+   "mcp_calls": 38,
+   "mcp_failed": 1,
+   "usage": {
+    "input_tokens": 2864849,
+    "cached_input_tokens": 2758144,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 22617,
+    "reasoning_output_tokens": 7852
+   }
+  },
+  "worker-1-5": {
+   "mcp_calls": 25,
+   "mcp_failed": 1,
+   "usage": {
+    "input_tokens": 628108,
+    "cached_input_tokens": 574848,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 2393,
+    "reasoning_output_tokens": 658
+   }
+  },
+  "worker-1-6": {
+   "mcp_calls": 23,
+   "mcp_failed": 1,
+   "usage": {
+    "input_tokens": 459123,
+    "cached_input_tokens": 402944,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 2227,
+    "reasoning_output_tokens": 745
+   }
+  },
+  "worker-1-7": {
+   "mcp_calls": 23,
+   "mcp_failed": 1,
+   "usage": {
+    "input_tokens": 620324,
+    "cached_input_tokens": 565504,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 2741,
+    "reasoning_output_tokens": 990
+   }
+  },
+  "worker-1-8": {
+   "mcp_calls": 37,
+   "mcp_failed": 1,
+   "usage": {
+    "input_tokens": 1537513,
+    "cached_input_tokens": 1446016,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 7288,
+    "reasoning_output_tokens": 2985
+   }
+  },
+  "worker-1-9": {
+   "mcp_calls": 26,
+   "mcp_failed": 1,
+   "usage": {
+    "input_tokens": 609134,
+    "cached_input_tokens": 555008,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 3033,
+    "reasoning_output_tokens": 1252
+   }
+  },
+  "worker-2-1": {
+   "mcp_calls": 45,
+   "mcp_failed": 3,
+   "usage": {
+    "input_tokens": 6781331,
+    "cached_input_tokens": 6635648,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 29722,
+    "reasoning_output_tokens": 11786
+   }
+  },
+  "worker-2-10": {
+   "mcp_calls": 20,
+   "mcp_failed": 0,
+   "usage": {
+    "input_tokens": 576430,
+    "cached_input_tokens": 525696,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 2519,
+    "reasoning_output_tokens": 829
+   }
+  },
+  "worker-2-2": {
+   "mcp_calls": 35,
+   "mcp_failed": 0,
+   "usage": {
+    "input_tokens": 2987107,
+    "cached_input_tokens": 2881280,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 24414,
+    "reasoning_output_tokens": 7596
+   }
+  },
+  "worker-2-3": {
+   "mcp_calls": 35,
+   "mcp_failed": 0,
+   "usage": {
+    "input_tokens": 2296938,
+    "cached_input_tokens": 2205824,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 31893,
+    "reasoning_output_tokens": 13132
+   }
+  },
+  "worker-2-4": {
+   "mcp_calls": 37,
+   "mcp_failed": 0,
+   "usage": {
+    "input_tokens": 2712704,
+    "cached_input_tokens": 2588160,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 21190,
+    "reasoning_output_tokens": 10249
+   }
+  },
+  "worker-2-5": {
+   "mcp_calls": 41,
+   "mcp_failed": 0,
+   "usage": {
+    "input_tokens": 4718595,
+    "cached_input_tokens": 4602496,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 27917,
+    "reasoning_output_tokens": 16270
+   }
+  },
+  "worker-2-6": {
+   "mcp_calls": 20,
+   "mcp_failed": 0,
+   "usage": {
+    "input_tokens": 509304,
+    "cached_input_tokens": 446080,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 2043,
+    "reasoning_output_tokens": 662
+   }
+  },
+  "worker-2-7": {
+   "mcp_calls": 19,
+   "mcp_failed": 0,
+   "usage": {
+    "input_tokens": 854009,
+    "cached_input_tokens": 764800,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 2911,
+    "reasoning_output_tokens": 1024
+   }
+  },
+  "worker-2-8": {
+   "mcp_calls": 20,
+   "mcp_failed": 0,
+   "usage": {
+    "input_tokens": 356253,
+    "cached_input_tokens": 310528,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 2117,
+    "reasoning_output_tokens": 821
+   }
+  },
+  "worker-2-9": {
+   "mcp_calls": 24,
+   "mcp_failed": 0,
+   "usage": {
+    "input_tokens": 395001,
+    "cached_input_tokens": 331264,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 1944,
+    "reasoning_output_tokens": 662
+   }
+  },
+  "worker-3-1": {
+   "mcp_calls": 44,
+   "mcp_failed": 5,
+   "usage": {
+    "input_tokens": 3764652,
+    "cached_input_tokens": 3656192,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 27952,
+    "reasoning_output_tokens": 12752
+   }
+  },
+  "worker-3-10": {
+   "mcp_calls": 46,
+   "mcp_failed": 2,
+   "usage": {
+    "input_tokens": 5315940,
+    "cached_input_tokens": 5190912,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 35420,
+    "reasoning_output_tokens": 19771
+   }
+  },
+  "worker-3-2": {
+   "mcp_calls": 42,
+   "mcp_failed": 2,
+   "usage": {
+    "input_tokens": 3289554,
+    "cached_input_tokens": 3183872,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 26114,
+    "reasoning_output_tokens": 10155
+   }
+  },
+  "worker-3-3": {
+   "mcp_calls": 43,
+   "mcp_failed": 1,
+   "usage": {
+    "input_tokens": 3958711,
+    "cached_input_tokens": 3830144,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 19380,
+    "reasoning_output_tokens": 8505
+   }
+  },
+  "worker-3-4": {
+   "mcp_calls": 24,
+   "mcp_failed": 1,
+   "usage": {
+    "input_tokens": 846400,
+    "cached_input_tokens": 781184,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 3733,
+    "reasoning_output_tokens": 987
+   }
+  },
+  "worker-3-5": {
+   "mcp_calls": 22,
+   "mcp_failed": 0,
+   "usage": {
+    "input_tokens": 436126,
+    "cached_input_tokens": 382848,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 1921,
+    "reasoning_output_tokens": 530
+   }
+  },
+  "worker-3-6": {
+   "mcp_calls": 30,
+   "mcp_failed": 1,
+   "usage": null
+  },
+  "worker-3-7": {
+   "mcp_calls": 38,
+   "mcp_failed": 1,
+   "usage": {
+    "input_tokens": 4178408,
+    "cached_input_tokens": 4060544,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 27502,
+    "reasoning_output_tokens": 14693
+   }
+  },
+  "worker-3-8": {
+   "mcp_calls": 26,
+   "mcp_failed": 0,
+   "usage": {
+    "input_tokens": 533709,
+    "cached_input_tokens": 462976,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 2480,
+    "reasoning_output_tokens": 877
+   }
+  },
+  "worker-3-9": {
+   "mcp_calls": 56,
+   "mcp_failed": 0,
+   "usage": {
+    "input_tokens": 9753220,
+    "cached_input_tokens": 9588736,
+    "cache_write_input_tokens": 0,
+    "output_tokens": 58520,
+    "reasoning_output_tokens": 34007
+   }
+  }
+ },
+ "totals": {
+  "turns": 63,
+  "input": 151048906,
+  "cached": 144493184,
+  "output": 823051,
+  "mcp_calls": 2297,
+  "mcp_failed": 87
+ }
+}

@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""kgit: the git writes your sandbox refuses (your .git is read-only), done by the harness on your
+own clone. Run it from inside your clone. Read-only git (status, diff, log, show, rev-parse,
+ls-files, merge-base) works directly; use kgit for every write.
+
+  kgit fetch                    fetch every remote of your clone
+  kgit branch NAME START        create or reset branch NAME at START and check it out (checkout -B)
+  kgit checkout REF             check out REF, detached
+  kgit commit -m MESSAGE        stage everything (add -A) and commit; prints the new commit hash
+  kgit merge REF [-m MESSAGE]   merge REF with a merge commit; on conflict, fix the files, then
+                                kgit commit -m MESSAGE (or kgit merge-abort)
+  kgit merge-abort              abandon a merge in progress
+  kgit reset REF                reset --hard to REF (untracked files stay)
+"""
+import json
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+PORT = 47100
+
+
+def usage(code):
+    sys.stderr.write(__doc__)
+    sys.exit(code)
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        usage(0 if argv else 2)
+    op, rest = argv[0], argv[1:]
+    message = None
+    if "-m" in rest:
+        at = rest.index("-m")
+        if at + 1 >= len(rest):
+            usage(2)
+        message = rest[at + 1]
+        rest = rest[:at] + rest[at + 2:]
+    if op == "fetch" and not rest:
+        args = {}
+    elif op == "branch" and len(rest) == 2:
+        args = {"name": rest[0], "start": rest[1]}
+    elif op in ("checkout", "reset") and len(rest) == 1:
+        args = {"ref": rest[0]}
+    elif op == "commit" and not rest and message:
+        args = {"message": message}
+    elif op == "merge" and len(rest) == 1:
+        args = {"ref": rest[0], "message": message}
+    elif op == "merge-abort" and not rest:
+        args = {}
+    else:
+        usage(2)
+    top = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True
+    )
+    if top.returncode != 0:
+        sys.stderr.write("kgit: run it inside your clone\n")
+        sys.exit(2)
+    body = json.dumps({"repo": top.stdout.strip(), "op": op, "args": args}).encode()
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{PORT}/", data=body, headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=900) as response:
+            answer = json.loads(response.read())
+    except urllib.error.HTTPError as error:
+        answer = json.loads(error.read() or b'{"code":2,"out":"refused"}')
+    except OSError as error:
+        sys.stderr.write(f"kgit: the harness's git service did not answer: {error}\n")
+        sys.exit(3)
+    sys.stdout.write(answer.get("out", ""))
+    if op == "commit" and answer.get("code") == 0:
+        sys.stdout.write(f"commit {answer.get('head', '')}\n")
+    sys.exit(answer.get("code", 1))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
